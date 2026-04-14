@@ -1,0 +1,8 @@
+*.o
+*.ncu-rep
+deltanet_test
+bench_k1
+bench_k2
+bench_k3
+bench_k4
+bench_k5
