@@ -1,33 +1,23 @@
 #include "deltanet.h"
 
 // ============================================================================
-// Kernel 3: Prefill gated delta rule
+// Kernel 3: Prefill gated delta rule (recurrent implementation)
 //
-// Implements the recurrent form for correctness (sequential over timesteps).
 // Each block handles one (batch, head) pair.
-// Thread vid owns COLUMN vid of the (head_dim × head_dim) state matrix,
-// i.e., state[k][vid] for k=0..head_dim-1.
-//
-// This avoids cross-thread reductions for the core matrix-vector operations.
-//
-// Performance note: a chunked implementation would be faster for long sequences
-// by enabling intra-chunk parallelism, but this recurrent version is correct
-// and simpler to verify.
+// Thread vid owns COLUMN vid of the (head_dim × head_dim) state matrix.
+// No cross-thread reductions needed for core matrix-vector operations.
 // ============================================================================
 
 #define HEAD_DIM_MAX 128
 
-// Block-level sum reduction for 128 threads (4 warps)
 static __device__ __forceinline__ float reduce_sum_128(float val, float* warp_buf, float* result_buf) {
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
 
-    // Warp-level reduction
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_down_sync(0xffffffff, val, offset);
-
     if (lane == 0) warp_buf[warp_id] = val;
     __syncthreads();
 
@@ -51,23 +41,20 @@ __global__ void chunk_gated_delta_rule_kernel(
     int seq_len, int heads, int head_dim,
     float scale, bool use_l2norm)
 {
-    const int bh = blockIdx.x;        // (batch * heads)
+    const int bh = blockIdx.x;
     const int b = bh / heads;
     const int h = bh % heads;
-    const int vid = threadIdx.x;      // 0..head_dim-1
+    const int vid = threadIdx.x;
 
-    // State registers: column vid of the (head_dim × head_dim) matrix
-    // state[kd] represents h_matrix[kd][vid]
     float state[HEAD_DIM_MAX];
     #pragma unroll
     for (int k = 0; k < HEAD_DIM_MAX; k++)
         state[k] = 0.0f;
 
-    // Shared memory for broadcasting vectors and scalars
-    __shared__ float s_vec[HEAD_DIM_MAX];  // for k or q vector
-    __shared__ float s_warp[4];            // for warp reduction
-    __shared__ float s_result[1];          // for reduction result
-    __shared__ float s_scalar[2];          // [g, beta]
+    __shared__ float s_vec[HEAD_DIM_MAX];
+    __shared__ float s_warp[4];
+    __shared__ float s_result[1];
+    __shared__ float s_scalar[2];
 
     for (int t = 0; t < seq_len; t++) {
         const long long bhd_base = (long long)b * seq_len * heads * head_dim
@@ -76,7 +63,6 @@ __global__ void chunk_gated_delta_rule_kernel(
         const long long bh_base  = (long long)b * seq_len * heads
                                  + (long long)t * heads + h;
 
-        // --- Load K[t] into shared memory ---
         s_vec[vid] = __bfloat162float(K[bhd_base + vid]);
         if (vid == 0) {
             s_scalar[0] = g[bh_base];
@@ -84,7 +70,6 @@ __global__ void chunk_gated_delta_rule_kernel(
         }
         __syncthreads();
 
-        // L2 normalize K if requested
         if (use_l2norm) {
             float norm = reduce_sum_128(s_vec[vid] * s_vec[vid], s_warp, s_result);
             norm = sqrtf(norm + 1e-6f);
@@ -96,32 +81,26 @@ __global__ void chunk_gated_delta_rule_kernel(
         const float beta_val = s_scalar[1];
         const float v_val = __bfloat162float(V[bhd_base + vid]);
 
-        // --- 1. Decay state by exp(g) ---
         const float decay = expf(g_val);
         #pragma unroll
         for (int k = 0; k < HEAD_DIM_MAX; k++)
             state[k] *= decay;
 
-        // --- 2. h^T @ k: dot = sum_{kd} state[kd] * k[kd] ---
         float dot = 0.0f;
         #pragma unroll
         for (int k = 0; k < HEAD_DIM_MAX; k++)
             dot += state[k] * s_vec[k];
 
-        // --- 3. Delta update: v_new = beta * (v - dot) ---
         const float v_new = beta_val * (v_val - dot);
 
-        // --- 4. Rank-1 update: state[kd] += k[kd] * v_new ---
         #pragma unroll
         for (int k = 0; k < HEAD_DIM_MAX; k++)
             state[k] += s_vec[k] * v_new;
 
-        // --- 5. Load Q[t] into shared memory ---
         __syncthreads();
         s_vec[vid] = __bfloat162float(Q[bhd_base + vid]);
         __syncthreads();
 
-        // L2 normalize Q if requested
         if (use_l2norm) {
             float norm = reduce_sum_128(s_vec[vid] * s_vec[vid], s_warp, s_result);
             norm = sqrtf(norm + 1e-6f);
@@ -129,7 +108,6 @@ __global__ void chunk_gated_delta_rule_kernel(
             __syncthreads();
         }
 
-        // --- 6. Output: out[vid] = scale * sum_{kd} state[kd] * q[kd] ---
         float out_val = 0.0f;
         #pragma unroll
         for (int k = 0; k < HEAD_DIM_MAX; k++)
@@ -140,7 +118,6 @@ __global__ void chunk_gated_delta_rule_kernel(
         __syncthreads();
     }
 
-    // Store final state to global memory (fp32)
     if (state_out) {
         float* sp = state_out + (long long)b * heads * head_dim * head_dim
                               + (long long)h * head_dim * head_dim;
@@ -159,9 +136,49 @@ void chunk_gated_delta_rule(
 {
     const float scale = 1.0f / sqrtf((float)head_dim);
     const int num_blocks = batch * heads;
-
-    // Request enough registers per thread for the state array
     chunk_gated_delta_rule_kernel<<<num_blocks, head_dim, 0, stream>>>(
         Q, K, V, g, beta, output, state_out,
         seq_len, heads, head_dim, scale, use_l2norm);
 }
+
+// ============================================================================
+#ifdef BENCH
+#include "bench_utils.h"
+
+// Usage: ./chunk_gated_delta_rule [seq_len]
+int main(int argc, char** argv) {
+    int seq = (argc > 1) ? atoi(argv[1]) : 3823;
+    const int BATCH = 1, HEADS = 64, HD = 128, CS = 64;
+    printf("bench K3: chunk_gated_delta_rule  seq=%d heads=%d dim=%d\n", seq, HEADS, HD);
+
+    long long qkv_n = (long long)BATCH * seq * HEADS * HD;
+    long long gb_n  = (long long)BATCH * seq * HEADS;
+    long long st_n  = (long long)BATCH * HEADS * HD * HD;
+
+    __nv_bfloat16 *d_Q, *d_K, *d_V, *d_out;
+    float *d_g, *d_beta, *d_state;
+    BENCH_CHECK(cudaMalloc(&d_Q, qkv_n * sizeof(__nv_bfloat16)));
+    BENCH_CHECK(cudaMalloc(&d_K, qkv_n * sizeof(__nv_bfloat16)));
+    BENCH_CHECK(cudaMalloc(&d_V, qkv_n * sizeof(__nv_bfloat16)));
+    BENCH_CHECK(cudaMalloc(&d_out, qkv_n * sizeof(__nv_bfloat16)));
+    BENCH_CHECK(cudaMalloc(&d_g, gb_n * sizeof(float)));
+    BENCH_CHECK(cudaMalloc(&d_beta, gb_n * sizeof(float)));
+    BENCH_CHECK(cudaMalloc(&d_state, st_n * sizeof(float)));
+    BENCH_CHECK(cudaMemset(d_state, 0, st_n * sizeof(float)));
+
+    host_rand_bf16(d_Q, qkv_n, 0.3f, 1);
+    host_rand_bf16(d_K, qkv_n, 0.3f, 2);
+    host_rand_bf16(d_V, qkv_n, 0.3f, 3);
+    host_rand_logsig(d_g, gb_n, 4);
+    host_rand_sig(d_beta, gb_n, 5);
+
+    chunk_gated_delta_rule(d_Q, d_K, d_V, d_g, d_beta,
+                           d_out, d_state,
+                           BATCH, seq, HEADS, HD, CS, true);
+    BENCH_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_out);
+    cudaFree(d_g); cudaFree(d_beta); cudaFree(d_state);
+    return 0;
+}
+#endif

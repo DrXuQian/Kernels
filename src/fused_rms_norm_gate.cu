@@ -6,10 +6,9 @@
 // y = (x / rms) * weight * sigmoid(z)
 // where rms = sqrt(mean(x^2) + eps)
 //
-// Grid: (N,), Block: (BLOCK_SIZE)
+// Grid: (N,), Block: (256)
 // Each block handles one row of (N, D).
 // ============================================================================
-
 __global__ void fused_rms_norm_gate_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ z,
@@ -27,14 +26,12 @@ __global__ void fused_rms_norm_gate_kernel(
     const __nv_bfloat16* z_row = z + (long long)row * D;
     __nv_bfloat16* out_row = output + (long long)row * D;
 
-    // --- Pass 1: compute sum of squares ---
     float local_sum_sq = 0.0f;
     for (int i = tid; i < D; i += nthreads) {
         float v = __bfloat162float(x_row[i]);
         local_sum_sq += v * v;
     }
 
-    // Block-level reduction
     __shared__ float warp_sums[32];
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
@@ -55,7 +52,6 @@ __global__ void fused_rms_norm_gate_kernel(
 
     const float inv_rms = rsqrtf(warp_sums[0] / D + eps);
 
-    // --- Pass 2: normalize, scale, gate, and store ---
     for (int i = tid; i < D; i += nthreads) {
         float xv = __bfloat162float(x_row[i]) * inv_rms;
         float wv = __bfloat162float(weight[i]);
@@ -71,8 +67,39 @@ void fused_rms_norm_gate(
     int N, int D, float eps,
     cudaStream_t stream)
 {
-    // Use 256 threads per block for D up to ~8K
     const int block_size = 256;
     fused_rms_norm_gate_kernel<<<N, block_size, 0, stream>>>(
         x, z, weight, output, N, D, eps);
 }
+
+// ============================================================================
+#ifdef BENCH
+#include "bench_utils.h"
+
+// Usage: ./fused_rms_norm_gate [N]
+//   prefill: N = seq_len (default 3823)
+//   decode:  N = 1
+int main(int argc, char** argv) {
+    int N = (argc > 1) ? atoi(argv[1]) : 3823;
+    const int D = 8192;
+    const float EPS = 1e-6f;
+    printf("bench K5: fused_rms_norm_gate  N=%d D=%d\n", N, D);
+
+    long long total = (long long)N * D;
+    __nv_bfloat16 *d_x, *d_z, *d_w, *d_out;
+    BENCH_CHECK(cudaMalloc(&d_x, total * sizeof(__nv_bfloat16)));
+    BENCH_CHECK(cudaMalloc(&d_z, total * sizeof(__nv_bfloat16)));
+    BENCH_CHECK(cudaMalloc(&d_w, D * sizeof(__nv_bfloat16)));
+    BENCH_CHECK(cudaMalloc(&d_out, total * sizeof(__nv_bfloat16)));
+
+    host_rand_bf16(d_x, total, 1.0f, 1);
+    host_rand_bf16(d_z, total, 1.0f, 2);
+    host_rand_bf16(d_w, D, 1.0f, 3);
+
+    fused_rms_norm_gate(d_x, d_z, d_w, d_out, N, D, EPS);
+    BENCH_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_x); cudaFree(d_z); cudaFree(d_w); cudaFree(d_out);
+    return 0;
+}
+#endif

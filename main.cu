@@ -5,9 +5,9 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <curand_kernel.h>
 #include "deltanet.h"
 #include "naive_reference.h"
+#include "bench_utils.h"
 
 // ============================================================================
 // Model config (Qwen3.5-122B-A10B DeltaNet layer)
@@ -49,35 +49,6 @@ struct GpuTimer {
         return ms;
     }
 };
-
-// ============================================================================
-// GPU initialization kernels
-// ============================================================================
-__global__ void init_random_bf16_kernel(__nv_bfloat16* data, int n, float scale, unsigned seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    curandState st;
-    curand_init(seed, idx, 0, &st);
-    data[idx] = __float2bfloat16(curand_normal(&st) * scale);
-}
-
-__global__ void init_logsigmoid_kernel(float* data, int n, unsigned seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    curandState st;
-    curand_init(seed, idx, 0, &st);
-    float x = curand_normal(&st);
-    data[idx] = logf(1.0f / (1.0f + expf(-x)));  // log-sigmoid → negative
-}
-
-__global__ void init_sigmoid_kernel(float* data, int n, unsigned seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    curandState st;
-    curand_init(seed, idx, 0, &st);
-    float x = curand_normal(&st);
-    data[idx] = 1.0f / (1.0f + expf(-x));  // sigmoid → (0,1)
-}
 
 // Extract channels [ch_start, ch_start + dim) from (batch, total_dim, seq_len)
 // and transpose to (batch, seq_len, heads, head_dim) layout.
@@ -123,18 +94,18 @@ __global__ void repeat_interleave_kernel(
 }
 
 // ============================================================================
-// Helper launch functions
+// Helper launch functions (init uses host-side from bench_utils.h)
 // ============================================================================
-void init_bf16(void* ptr, long long n, float scale, unsigned seed) {
-    init_random_bf16_kernel<<<((int)n+255)/256, 256>>>((__nv_bfloat16*)ptr, (int)n, scale, seed);
+void init_bf16(__nv_bfloat16* ptr, long long n, float scale, unsigned seed) {
+    host_rand_bf16(ptr, n, scale, seed);
 }
 
 void init_logsig(float* ptr, long long n, unsigned seed) {
-    init_logsigmoid_kernel<<<((int)n+255)/256, 256>>>(ptr, (int)n, seed);
+    host_rand_logsig(ptr, n, seed);
 }
 
 void init_sig(float* ptr, long long n, unsigned seed) {
-    init_sigmoid_kernel<<<((int)n+255)/256, 256>>>(ptr, (int)n, seed);
+    host_rand_sig(ptr, n, seed);
 }
 
 void extract_transpose(const __nv_bfloat16* in, __nv_bfloat16* out,
