@@ -87,16 +87,17 @@ ncu --set full --kernel-name "Marlin" -o gemm_prefill ./bench_marlin_moe 128 64 
 Marlin GEMM (gate_up) 输出 `[gate, up]` 拼接，此 kernel 计算 `SiLU(gate) * up`。
 
 ```bash
-./bench_silu_and_mul [num_tokens] [hidden_size]
+./bench_silu_and_mul [num_tokens] [top_k] [hidden_size]
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `num_tokens` | 1 | token 数 |
+| `top_k` | 8 | 每个 token 选的 expert 数，实际行数 = M × top_k |
 | `hidden_size` | 5632 | intermediate_size（N），input 宽度为 2*N |
 
 ```bash
-ncu --set full --kernel-name "silu_and_mul" -o silu ./bench_silu_and_mul 1 5632
+ncu --set full --kernel-name "silu_and_mul" -o silu ./bench_silu_and_mul 1 8 5632
 ```
 
 ### 5. MoE Sum — `bench_moe_sum`

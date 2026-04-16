@@ -43,23 +43,25 @@ void silu_and_mul_launch(
 #include <cstdlib>
 #include <vector>
 
-// Usage: ./silu_and_mul [num_tokens] [hidden_size]
-// hidden_size = intermediate_size (N) of the MoE FFN
+// Usage: ./silu_and_mul [num_tokens] [top_k] [hidden_size]
+// Actual rows = num_tokens * top_k (each token replicated per expert)
 int main(int argc, char** argv) {
     int M = (argc > 1) ? atoi(argv[1]) : 1;
-    int D = (argc > 2) ? atoi(argv[2]) : 5632;
-    printf("bench silu_and_mul: tokens=%d hidden=%d\n", M, D);
+    int topk = (argc > 2) ? atoi(argv[2]) : 8;
+    int D = (argc > 3) ? atoi(argv[3]) : 5632;
+    int rows = M * topk;
+    printf("bench silu_and_mul: tokens=%d top_k=%d rows=%d hidden=%d\n", M, topk, rows, D);
 
     __half *d_in, *d_out;
-    cudaMalloc(&d_in, (long long)M * 2 * D * sizeof(__half));
-    cudaMalloc(&d_out, (long long)M * D * sizeof(__half));
+    cudaMalloc(&d_in, (long long)rows * 2 * D * sizeof(__half));
+    cudaMalloc(&d_out, (long long)rows * D * sizeof(__half));
 
-    std::vector<__half> h(M * 2 * D);
+    std::vector<__half> h(rows * 2 * D);
     srand(42);
     for (auto& v : h) v = __float2half((float)rand() / RAND_MAX * 0.1f);
     cudaMemcpy(d_in, h.data(), h.size() * sizeof(__half), cudaMemcpyHostToDevice);
 
-    silu_and_mul_launch(d_out, d_in, M, D, 0);
+    silu_and_mul_launch(d_out, d_in, rows, D, 0);
     cudaDeviceSynchronize();
 
     cudaFree(d_in); cudaFree(d_out);
