@@ -1,14 +1,12 @@
-# Marlin MoE W4A16 Standalone Bench
+# MoE Kernel Standalone Bench
 
-从 vLLM 提取的 Marlin MoE kernel，零 PyTorch 依赖，可直接 ncu profile。
+从 vLLM 提取的完整 MoE pipeline kernel，零 PyTorch 依赖，可直接 ncu profile。
 
-## 配置
+## MoE Pipeline
 
-- **Activation**: FP16 (half)
-- **Weight**: INT4 (U4, unsigned 4-bit)
-- **Output/Scales**: FP16
-- **Group size**: 128 (`group_blocks=8`)
-- **无 zero-point, 无 act_order**
+```
+topk_gating → moe_align → Marlin GEMM → moe_sum
+```
 
 ## 编译
 
@@ -16,60 +14,117 @@
 # 修改 Makefile 中 ARCH:
 #   A100: -arch=sm_80    H100: -arch=sm_90    5090: -arch=sm_120
 
-make
+make        # 编译全部 4 个 bench
+make bench_marlin_moe   # 只编译 GEMM
 ```
 
-## 运行
+## Kernel 列表
+
+### 1. TopK Gating — `bench_topk_gating`
+
+融合 softmax + topK 选 expert，warp butterfly reduce。
 
 ```bash
-# Usage: ./bench_marlin_moe [M] [num_experts] [top_k] [K] [N]
-#   M: token 数 (1=decode, >1=prefill)
-#   K: hidden_size (must % 16 == 0)
-#   N: intermediate_size (must % 64 == 0)
-
-# Decode
-./bench_marlin_moe 1 64 8 2048 5632
-
-# Prefill
-./bench_marlin_moe 128 64 8 2048 5632
+./bench_topk_gating [num_tokens] [num_experts] [topk]
 ```
 
-## ncu Profile
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_tokens` | 1 | token 数（decode=1, prefill>1） |
+| `num_experts` | 64 | expert 数（须为 8/16/32/64/128/256） |
+| `topk` | 8 | 每个 token 选几个 expert |
+
+```bash
+# ncu
+ncu --set full --kernel-name "topkGating" -o topk ./bench_topk_gating 1 64 8
+```
+
+### 2. MoE Align — `bench_moe_align`
+
+按 expert 排序 token，对齐到 block_size 边界，生成 sorted_token_ids 和 expert_ids。
+
+```bash
+./bench_moe_align [num_tokens] [num_experts] [topk] [block_size]
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_tokens` | 1 | token 数 |
+| `num_experts` | 64 | expert 数 |
+| `topk` | 8 | top-k |
+| `block_size` | 16 | Marlin 的 moe_block_size（8 或 16） |
+
+```bash
+ncu --set full --kernel-name "moe_align" -o align ./bench_moe_align 1 64 8 16
+```
+
+### 3. Marlin MoE GEMM — `bench_marlin_moe`
+
+W4A16 量化 MoE GEMM（FP16 activation + INT4 weight + group_size=128）。
+
+```bash
+./bench_marlin_moe [M] [num_experts] [top_k] [K] [N]
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `M` | 1 | token 数（decode=1） |
+| `num_experts` | 64 | expert 数 |
+| `top_k` | 8 | top-k |
+| `K` | 2048 | hidden_size（须 % 16 == 0） |
+| `N` | 5632 | intermediate_size（须 % 64 == 0） |
 
 ```bash
 # Decode
-ncu --set full --kernel-name "Marlin" -o marlin_decode ./bench_marlin_moe 1 64 8 2048 5632
+ncu --set full --kernel-name "Marlin" -o gemm_decode ./bench_marlin_moe 1 64 8 2048 5632
 
 # Prefill
-ncu --set full --kernel-name "Marlin" -o marlin_prefill ./bench_marlin_moe 128 64 8 2048 5632
+ncu --set full --kernel-name "Marlin" -o gemm_prefill ./bench_marlin_moe 128 64 8 2048 5632
 ```
 
-## 从 vLLM 提取的文件
+### 4. MoE Sum — `bench_moe_sum`
 
-| 文件 | 来源 | 修改 |
-|------|------|------|
-| `include/marlin_template.h` | `csrc/moe/marlin_moe_wna16/` | include 路径扁平化 |
-| `include/marlin.cuh` | `csrc/quantization/marlin/` | 删 `torch/all.h` |
-| `include/scalar_type.hpp` | `csrc/core/` | `TORCH_CHECK` → `assert` |
-| `include/dequant.h` | `csrc/quantization/marlin/` | 无修改 |
-| `include/marlin_mma.h` | `csrc/quantization/marlin/` | 无修改 |
-| `include/marlin_dtypes.cuh` | `csrc/quantization/marlin/` | include 路径 |
-| `include/kernel.h` | `csrc/moe/marlin_moe_wna16/` | include 路径 |
-| `include/kernel_selector.h` | 重写 | 只保留 FP16+U4+group128 |
-| `src/kernel_fp16_u4.cu` | 重写 | 15 个模板实例化（原 130+）|
-| `src/dispatch.cu` | `csrc/moe/marlin_moe_wna16/ops.cu` | 删 PyTorch wrapper |
-| `include/compat.h` | 新建 | `TORCH_CHECK` polyfill |
+聚合 topk 个 expert 输出（element-wise sum）。
 
-## Kernel 变体说明
+```bash
+./bench_moe_sum [num_tokens] [topk] [hidden_size]
+```
 
-15 个实例化覆盖所有需要的 thread block 配置：
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_tokens` | 1 | token 数 |
+| `topk` | 8 | top-k（支持 2/4/8） |
+| `hidden_size` | 5632 | 输出维度 |
 
-| 场景 | thread_m_blocks | m_block_size_8 | thread configs |
-|------|----------------|----------------|----------------|
-| Decode (BS≤8) | 1 | true | 3 种 |
-| Decode (BS 9-16) | 1 | false | 3 种 |
-| Prefill (small) | 2 | false | 3 种 |
-| Prefill (medium) | 3 | false | 3 种 |
-| Prefill (large) | 4 | false | 3 种 |
+```bash
+ncu --set full --kernel-name "moe_sum" -o sum ./bench_moe_sum 1 8 5632
+```
 
-运行时 `determine_exec_config()` 自动选最优配置。
+## 目录结构
+
+```
+src/
+  topk_gating.cu         # K1: fused softmax + topK
+  moe_align.cu           # K2: token alignment/sorting
+  kernel_fp16_u4.cu      # K3: Marlin GEMM 模板实例化
+  dispatch.cu            # K3: Marlin GEMM host dispatch
+  moe_sum.cu             # K4: output aggregation
+include/
+  moe_compat.h           # K1/K2/K4 的 standalone compat layer
+  compat.h               # K3 (Marlin) 的 TORCH_CHECK polyfill
+  marlin_template.h      # Marlin GEMM kernel (2241 行, 零修改)
+  kernel_selector.h      # FP16+U4+group128 only (15 变体)
+  ...                    # 其他 Marlin headers
+bench_marlin_moe.cu      # K3 bench main
+```
+
+## 配置说明
+
+- **Marlin GEMM**: FP16 act + INT4 weight + FP16 output, group_size=128, 无 zero-point, 无 act_order
+- **TopK Gating**: float32 gating scores, int32 indices, softmax scoring
+- **MoE Align**: int32 topk_ids, small-batch-expert 模式（< 1024 tokens, ≤ 64 experts）
+- **MoE Sum**: FP16 input/output
+
+## 来源
+
+所有 kernel 代码从 [vllm-project/vllm](https://github.com/vllm-project/vllm) `csrc/moe/` 提取，kernel 函数零修改，仅删除 PyTorch/Python 依赖。
