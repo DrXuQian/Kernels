@@ -2,10 +2,10 @@
 
 从 vLLM 提取的完整 MoE pipeline kernel，零 PyTorch 依赖，可直接 ncu profile。
 
-## MoE Pipeline
+## MoE FFN Pipeline
 
 ```
-topk_gating → moe_align → Marlin GEMM → moe_sum
+topk_gating → moe_align → Marlin GEMM (gate_up) → silu_and_mul → Marlin GEMM (down) → moe_sum
 ```
 
 ## 编译
@@ -82,7 +82,24 @@ ncu --set full --kernel-name "Marlin" -o gemm_decode ./bench_marlin_moe 1 64 8 2
 ncu --set full --kernel-name "Marlin" -o gemm_prefill ./bench_marlin_moe 128 64 8 2048 5632
 ```
 
-### 4. MoE Sum — `bench_moe_sum`
+### 4. SiLU + Mul — `bench_silu_and_mul`
+
+Marlin GEMM (gate_up) 输出 `[gate, up]` 拼接，此 kernel 计算 `SiLU(gate) * up`。
+
+```bash
+./bench_silu_and_mul [num_tokens] [hidden_size]
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_tokens` | 1 | token 数 |
+| `hidden_size` | 5632 | intermediate_size（N），input 宽度为 2*N |
+
+```bash
+ncu --set full --kernel-name "silu_and_mul" -o silu ./bench_silu_and_mul 1 5632
+```
+
+### 5. MoE Sum — `bench_moe_sum`
 
 聚合 topk 个 expert 输出（element-wise sum）。
 
@@ -108,7 +125,8 @@ src/
   moe_align.cu           # K2: token alignment/sorting
   kernel_fp16_u4.cu      # K3: Marlin GEMM 模板实例化
   dispatch.cu            # K3: Marlin GEMM host dispatch
-  moe_sum.cu             # K4: output aggregation
+  silu_and_mul.cu        # K4: SiLU activation + multiply
+  moe_sum.cu             # K5: output aggregation
 include/
   moe_compat.h           # K1/K2/K4 的 standalone compat layer
   compat.h               # K3 (Marlin) 的 TORCH_CHECK polyfill
