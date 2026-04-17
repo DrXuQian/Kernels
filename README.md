@@ -1,3 +1,39 @@
+# CUDA Kernels
+
+CUDA kernel 提取、编译与性能对比。
+
+## 项目列表
+
+| 目录 | 内容 | 来源 |
+|------|------|------|
+| [`w4a16_gemm_bench/`](w4a16_gemm_bench/) | W4A16 GEMM: Marlin vs CUTLASS SM90 vs BF16 cuBLAS | IST-DASLab/marlin + CUTLASS example 55 |
+| [`moe_w4a16_bench/`](moe_w4a16_bench/) | MoE W4A16 GEMM: moe_wna16 vs Marlin MoE vs BF16 | vLLM `csrc/moe/` |
+| [`marlin_moe/`](marlin_moe/) | MoE 全 pipeline standalone (topk + align + Marlin + silu + sum) | vLLM `csrc/moe/` |
+| `src/` + `include/` | DeltaNet CUDA Kernels (Qwen3.5-122B) | — |
+
+---
+
+## W4A16 GEMM Benchmark 摘要 (H800 PCIe, 1024x1024x1024)
+
+| Kernel | 延迟 (ms) | TFLOPS | 说明 |
+|--------|-----------|--------|------|
+| BF16 cuBLAS | 0.020 | 106.5 | baseline |
+| Marlin W4A16 | 0.019 | 112.6 | Ampere MMA |
+| CUTLASS SM90 W4A16 | 0.017 | 123.3 | Hopper WGMMA + TMA |
+
+## MoE W4A16 GEMM Benchmark 摘要 (H800, Mixtral-8x7B shape)
+
+| Config | moe_wna16 | Marlin MoE | BF16 x8 | Marlin/BF16 |
+|--------|-----------|------------|---------|-------------|
+| bs=1 (decode) | 0.132ms | 0.300ms | 0.547ms | **0.55x** |
+| bs=16 | 0.602ms | 0.312ms | 0.552ms | **0.56x** |
+| bs=128 (prefill) | 3.537ms | 0.336ms | 0.545ms | **0.62x** |
+| bs=512 | 14.12ms | 0.635ms | 0.582ms | 1.09x |
+
+详见各子目录 README。
+
+---
+
 # DeltaNet CUDA Kernels
 
 Qwen3.5-122B-A10B DeltaNet layer 的 5 个 CUDA kernel 实现。
