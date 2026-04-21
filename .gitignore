@@ -6,3 +6,5 @@ bench_k2
 bench_k3
 bench_k4
 bench_k5
+*.o
+bench_*
