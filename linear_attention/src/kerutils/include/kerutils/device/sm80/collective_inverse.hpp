@@ -42,7 +42,7 @@ using namespace cute;
 
 template <int dim, typename Layout>
 constexpr bool
-is_contiguous(Layout&& layout) {
+is_contiguous(Layout layout) {
   auto dim_layout = get<dim>(layout);
   if constexpr(rank(dim_layout) == 0) {
     return stride(dim_layout) == 1;
