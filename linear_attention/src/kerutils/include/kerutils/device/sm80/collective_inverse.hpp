@@ -354,9 +354,7 @@ private:
     static_assert(size<0>(L) == 16);
     static_assert(size<1>(L) == 16);
 
-    // Note: is_contiguous may not be constexpr on all CUDA/CUTLASS versions
-    // static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
-    assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
+    static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
     constexpr bool is_col_major = is_contiguous<0>(L);
 
     auto mat_8x8_2x2 = flat_divide(std::forward<TensorT>(mat), Shape<_8, _8>{});
@@ -479,9 +477,7 @@ private:
     static_assert(size<0>(L) == 32);
     static_assert(size<1>(L) == 32);
 
-    // Note: is_contiguous may not be constexpr on all CUDA/CUTLASS versions
-    // static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
-    assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
+    static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
     // row-major
     constexpr bool is_col_major = is_contiguous<0>(L);
 
@@ -603,9 +599,7 @@ private:
     static_assert(size<0>(L) == 64);
     static_assert(size<1>(L) == 64);
 
-    // Note: is_contiguous may not be constexpr on all CUDA/CUTLASS versions
-    // static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
-    assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
+    static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
     constexpr bool is_col_major = is_contiguous<0>(L);
 
     auto mat_32x32_2x2 = flat_divide(std::forward<TensorT>(mat), select<0,1>(Shape<_32, _32>{}));
@@ -874,9 +868,7 @@ private:
     static_assert(size<0>(L) == 16);
     static_assert(size<1>(L) == 16);
 
-    // Note: is_contiguous may not be constexpr on all CUDA/CUTLASS versions
-    // static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
-    assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
+    static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
     constexpr bool is_col_major = is_contiguous<0>(L);
 
     auto mat_8x8_2x2 = flat_divide(std::forward<TensorT>(mat), Shape<_8, _8>{});
@@ -961,9 +953,7 @@ private:
     static_assert(size<0>(L) == 32);
     static_assert(size<1>(L) == 32);
 
-    // Note: is_contiguous may not be constexpr on all CUDA/CUTLASS versions
-    // static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
-    assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
+    static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
     constexpr bool is_col_major = is_contiguous<0>(L);
 
     using TileShape = Shape<_16, _16, _16>;
@@ -1046,9 +1036,7 @@ private:
     static_assert(size<0>(L) == 64);
     static_assert(size<1>(L) == 64);
 
-    // Note: is_contiguous may not be constexpr on all CUDA/CUTLASS versions
-    // static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
-    assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
+    static_assert(is_contiguous<0>(L) == 1 || is_contiguous<1>(L) == 1);
     constexpr bool is_col_major = is_contiguous<0>(L);
 
     auto mat_32x32_2x2 = flat_divide(std::forward<TensorT>(mat), select<0,1>(Shape<_32, _32>{}));
