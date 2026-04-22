@@ -1,5 +1,5 @@
 NVCC       := nvcc
-ARCH       := -arch=sm_120
+ARCH       := -arch=sm_90
 CFLAGS     := -O2 -std=c++17 $(ARCH) -Iinclude --expt-relaxed-constexpr
 
 BINS       := bench_topk_gating bench_moe_align bench_silu_and_mul bench_moe_sum
