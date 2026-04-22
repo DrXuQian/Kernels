@@ -31,34 +31,30 @@
 #pragma once
 
 // Inline PTX helpers replacing <cuda/ptx> (libcu++ not always available)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 namespace kda_ptx {
 
 __device__ __forceinline__ void
 tensormap_replace_global_dim_1(void* tensormap, uint32_t new_val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile(
         "tensormap.replace.tile.global_dim.global.b1024.b32 [%0], 1, %1;"
         :: "l"(tensormap), "r"(new_val) : "memory");
-#endif
 }
 
 __device__ __forceinline__ void
 fence_proxy_tensormap_release_cta() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("fence.proxy.tensormap::generic.release.cta;");
-#endif
 }
 
 __device__ __forceinline__ void
 fence_proxy_tensormap_acquire_cta(void* tensormap, uint32_t size) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile(
         "fence.proxy.tensormap::generic.acquire.cta [%0], %1;"
         :: "l"(tensormap), "r"(size) : "memory");
-#endif
 }
 
 }  // namespace kda_ptx
+#endif
 
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -300,6 +296,7 @@ struct CollectiveStoreTma {
     template <typename WorkDesc>
     CUTE_DEVICE void
     create_tensormap_for_tail(WorkDesc const& work_desc, uint32_t lane_predicate) {
+        namespace ptx = cuda::ptx;
         constexpr int num_of_16B = sizeof(cute::TmaDescriptor) / sizeof(uint128_t);
 
         cute::TmaDescriptor* tensormap = static_cast<cute::TmaDescriptor*>(tensormaps_) + smid();
