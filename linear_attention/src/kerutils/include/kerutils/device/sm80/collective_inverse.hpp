@@ -40,15 +40,24 @@ namespace kerutils {
 
 using namespace cute;
 
+// Pure type-level contiguity check via decltype (no constexpr function calls).
+// Works on nvcc 12.x and 13.x where CuTE get/stride aren't constexpr-safe.
+template <int dim, typename Layout>
+struct IsContiguous {
+  using DimLayout = decltype(get<dim>(Layout{}));
+  // rank-0: stride is scalar; rank>0: check stride<0>
+  using StrideVal = std::conditional_t<
+      (rank(DimLayout{}) == 0),
+      decltype(stride(DimLayout{})),
+      decltype(stride<0>(DimLayout{}))>;
+  static constexpr bool value = std::is_same_v<std::decay_t<StrideVal>, cute::_1>;
+};
+
+// Keep function interface for backward compat
 template <int dim, typename Layout>
 constexpr bool
-is_contiguous(Layout layout) {
-  auto dim_layout = get<dim>(layout);
-  if constexpr(rank(dim_layout) == 0) {
-    return stride(dim_layout) == 1;
-  } else {
-    return stride<0>(dim_layout) == 1;
-  }
+is_contiguous(Layout) {
+  return IsContiguous<dim, Layout>::value;
 }
 
 namespace detail::SM80 {
