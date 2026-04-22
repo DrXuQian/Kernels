@@ -9,7 +9,8 @@ linear_attention/                DeltaNet layer
   src/flashinfer_gdn/            GDN chunked prefill (FlashInfer CUTLASS SM90, GVA)
   src/kda/                       KDA chunked prefill (cuLA CUTLASS SM90)
   src/causal_conv1d_*.cu         conv1d fwd/update (Dao-AILab)
-  src/gated_delta_net.cu         GDN decode recurrent (llama.cpp)
+  src/gated_delta_net.cu         GDN decode recurrent (llama.cpp CUDA)
+  src/bench_gdn_decode.py        GDN decode recurrent (fla Triton, matches vLLM)
 moe_w4a16/                       MoE FFN layer
   marlin/                        W4A16 Marlin GEMM (vLLM)
   auxiliary/                     topk, align, silu_and_mul, sum (vLLM)
@@ -91,7 +92,8 @@ vLLM 配置：Qwen3.5-35B-A3B-GPTQ-Int4, gptq_marlin, enforce_eager, prefill ~20
 | **FlashInfer GDN prefill** (q=16,v=32,seq=205,4chunks) | 42.0 | 52.0 (4×13) | **YES** |
 | conv1d_fwd prefill (seq=3823,dim=12288) | 128.6 | — | |
 | conv1d_update decode (dim=12288) | 2.5 | 2.7 | **YES** |
-| gated_delta_net decode (h=64,d=128) | 4.5 | 6.4 | ~YES |
+| GDN decode fla Triton (h=64,d=128) | 4.9 | 6.4 | **YES** |
+| GDN decode llama.cpp CUDA (h=64,d=128) | 4.5 | — | (不同 kernel) |
 
 #### MoE FFN (decode, M=1, 64 experts, topk=8)
 
@@ -103,7 +105,13 @@ vLLM 配置：Qwen3.5-35B-A3B-GPTQ-Int4, gptq_marlin, enforce_eager, prefill ~20
 | silu_and_mul | 3.6 | 5.2 | ~YES |
 | moe_sum | 2.2 | — | |
 
-> moe_align 差异因为 vLLM 用了不同的 kernel variant（small_batch_expert_kernel vs 标准版）。
+> **moe_align 差异说明**：standalone bench 使用 M=1 (decode)，`numel=8 < 1024` 走 `small_batch_expert_kernel`（10.1μs）。
+> vLLM 使用 chunked prefill，prefill+decode 混合 batch 导致 `numel > 1024`，走 generic `moe_align_block_size_kernel`（4.4μs）。
+> 不同输入走不同 kernel variant，非 kernel 不一致。
+>
+> **GDN decode 说明**：vLLM 使用 fla 的 `fused_recurrent_gated_delta_rule_packed_decode_kernel`（Triton JIT）。
+> 原 standalone 使用 llama.cpp 的 `gated_delta_net_cuda`（纯 CUDA）。已添加 fla Triton 版 bench (`bench_gdn_decode.py`) 对齐。
+> fla Triton 4.9μs vs vLLM 6.4μs — 接近（vLLM 用 packed 变体，略有差异）。
 
 ### GDN Prefill 三路对比 (122B config: q=16, v=64, dim=128)
 
