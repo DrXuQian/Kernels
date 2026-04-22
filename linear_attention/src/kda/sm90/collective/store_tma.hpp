@@ -30,31 +30,7 @@
 
 #pragma once
 
-// Inline PTX helpers replacing <cuda/ptx> (libcu++ not always available)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-namespace kda_ptx {
-
-__device__ __forceinline__ void
-tensormap_replace_global_dim_1(void* tensormap, uint32_t new_val) {
-    asm volatile(
-        "tensormap.replace.tile.global_dim.global.b1024.b32 [%0], 1, %1;"
-        :: "l"(tensormap), "r"(new_val) : "memory");
-}
-
-__device__ __forceinline__ void
-fence_proxy_tensormap_release_cta() {
-    asm volatile("fence.proxy.tensormap::generic.release.cta;");
-}
-
-__device__ __forceinline__ void
-fence_proxy_tensormap_acquire_cta(void* tensormap, uint32_t size) {
-    asm volatile(
-        "fence.proxy.tensormap::generic.acquire.cta [%0], %1;"
-        :: "l"(tensormap), "r"(size) : "memory");
-}
-
-}  // namespace kda_ptx
-#endif
+#include <cuda/ptx>
 
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -312,17 +288,18 @@ struct CollectiveStoreTma {
 
         if (lane_predicate == 1) {
             uint32_t new_total_seqlen = work_desc.tok_offset + work_desc.seq_len;
-            kda_ptx::tensormap_replace_global_dim_1(tensormap, new_total_seqlen);
+            ptx::tensormap_replace_global_dim(ptx::space_global, tensormap, /*ord=*/ptx::n32_t<1>{}, new_total_seqlen);
         }
         __syncwarp();
 
-        kda_ptx::fence_proxy_tensormap_release_cta();
+        ptx::fence_proxy_tensormap_generic(ptx::sem_release, ptx::scope_cta);
     }
 
     CUTE_DEVICE cute::TmaDescriptor*
     acquire_tensormap_for_tail() {
+        namespace ptx = cuda::ptx;
         cute::TmaDescriptor* tensormap = static_cast<cute::TmaDescriptor*>(tensormaps_) + smid();
-        kda_ptx::fence_proxy_tensormap_acquire_cta(tensormap, 128);
+        ptx::fence_proxy_tensormap_generic(ptx::sem_acquire, ptx::scope_cta, tensormap, /*size=*/ptx::n32_t<128>{});
         return tensormap;
     }
 
