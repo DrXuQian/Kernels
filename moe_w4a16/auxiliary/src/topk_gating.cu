@@ -162,9 +162,14 @@ void topk_gating_softmax_launch(
 #ifdef BENCH
 #include <cstdlib>
 #include <vector>
+#include "bench_timer.h"
 
-// Usage: ./topk_gating [num_tokens] [num_experts] [topk]
+// Usage: ./bench_topk_gating [num_tokens] [num_experts] [topk] [--bench warmup iters]
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     int M = (argc > 1) ? atoi(argv[1]) : 1;
     int E = (argc > 2) ? atoi(argv[2]) : 64;
     int K = (argc > 3) ? atoi(argv[3]) : 8;
@@ -182,8 +187,9 @@ int main(int argc, char** argv) {
     for (auto& v : h) v = (float)rand() / RAND_MAX;
     cudaMemcpy(d_gating, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    topk_gating_softmax_launch(d_gating, d_weights, d_indices, d_source, M, E, K, true, 0);
-    cudaDeviceSynchronize();
+    timer.run([&]() {
+        topk_gating_softmax_launch(d_gating, d_weights, d_indices, d_source, M, E, K, true, 0);
+    });
 
     cudaFree(d_gating); cudaFree(d_weights); cudaFree(d_indices); cudaFree(d_source);
     printf("Done.\n");

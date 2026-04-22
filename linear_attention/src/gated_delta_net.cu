@@ -205,11 +205,16 @@ static void launch_gated_delta_net(
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include "bench_timer.h"
 
-// Usage: ./gated_delta_net [n_tokens] [heads] [head_dim] [n_seqs]
+// Usage: ./gated_delta_net [n_tokens] [heads] [head_dim] [n_seqs] [--bench warmup iters]
 // Runs the recurrent gated delta net kernel (prefill + decode).
 // Note: this kernel is recurrent (sequential over tokens), same for prefill and decode.
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     int n_tokens = (argc > 1) ? atoi(argv[1]) : 1;
     int H        = (argc > 2) ? atoi(argv[2]) : 64;
     int S_v      = (argc > 3) ? atoi(argv[3]) : 128;
@@ -266,13 +271,14 @@ int main(int argc, char** argv) {
 
     float scale = 1.0f / sqrtf((float)S_v);
 
-    launch_gated_delta_net<false>(
-        d_q, d_k, d_v, d_g, d_beta, d_state, d_dst,
-        S_v, H, n_tokens, n_seqs,
-        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-        /*neqk1=*/H, /*rq3=*/1,
-        scale, 0);
-    cudaDeviceSynchronize();
+    timer.run([&]() {
+        launch_gated_delta_net<false>(
+            d_q, d_k, d_v, d_g, d_beta, d_state, d_dst,
+            S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+            /*neqk1=*/H, /*rq3=*/1,
+            scale, 0);
+    });
 
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
     cudaFree(d_g); cudaFree(d_beta); cudaFree(d_state); cudaFree(d_dst);

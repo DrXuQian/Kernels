@@ -98,9 +98,14 @@ void moe_align_block_size_launch(
 #ifdef BENCH
 #include <cstdlib>
 #include <vector>
+#include "bench_timer.h"
 
-// Usage: ./moe_align [num_tokens] [num_experts] [topk] [block_size]
+// Usage: ./moe_align [num_tokens] [num_experts] [topk] [block_size] [--bench warmup iters]
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     int M = (argc > 1) ? atoi(argv[1]) : 1;
     int E = (argc > 2) ? atoi(argv[2]) : 64;
     int K = (argc > 3) ? atoi(argv[3]) : 8;
@@ -120,9 +125,10 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_npost, sizeof(int32_t));
     cudaMemcpy(d_ids, h_ids.data(), numel * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-    moe_align_block_size_launch(d_ids, d_sorted, d_experts, d_npost,
-                                numel, E, BS, padded, 0);
-    cudaDeviceSynchronize();
+    timer.run([&]() {
+        moe_align_block_size_launch(d_ids, d_sorted, d_experts, d_npost,
+                                    numel, E, BS, padded, 0);
+    });
 
     cudaFree(d_ids); cudaFree(d_sorted); cudaFree(d_experts); cudaFree(d_npost);
     printf("Done.\n");

@@ -1,6 +1,6 @@
 NVCC       := nvcc
 ARCH       := -arch=sm_90a
-CFLAGS     := -O2 -std=c++17 $(ARCH) -Iinclude --expt-relaxed-constexpr
+CFLAGS     := -O2 -std=c++17 $(ARCH) -Iinclude -I../../include --expt-relaxed-constexpr
 
 BINS       := bench_topk_gating bench_moe_align bench_silu_and_mul bench_moe_sum
 

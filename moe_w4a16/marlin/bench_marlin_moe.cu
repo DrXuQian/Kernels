@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 
 #include "scalar_type.hpp"
+#include "bench_timer.h"
 
 // Forward declare marlin_mm from dispatch.cu
 namespace marlin_moe_wna16 {
@@ -36,6 +37,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 } while(0)
 
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     // Default: decode-like, Qwen3.5-MoE dimensions
     int M           = (argc > 1) ? atoi(argv[1]) : 1;      // num tokens
     int num_experts = (argc > 2) ? atoi(argv[2]) : 64;
@@ -162,52 +167,52 @@ int main(int argc, char** argv) {
     CHECK(cudaMemset(d_workspace, 0, workspace_size * sizeof(int)));
 
     // ---- Launch Marlin MoE ----
-    marlin_moe_wna16::marlin_mm(
-        /*A=*/d_A,
-        /*B=*/d_B,
-        /*C=*/d_C,
-        /*C_tmp=*/d_C_tmp,
-        /*b_bias=*/d_bias,
-        /*a_s=*/d_a_scales,
-        /*b_s=*/d_scales,
-        /*g_s=*/d_g_scales,
-        /*zp=*/d_zp,
-        /*g_idx=*/d_g_idx,
-        /*perm=*/d_perm,
-        /*a_tmp=*/d_a_tmp,
-        /*sorted_token_ids=*/d_sorted_ids,
-        /*expert_ids=*/d_expert_ids,
-        /*num_tokens_past_padded=*/d_num_tokens_padded,
-        /*topk_weights=*/d_topk_weights,
-        /*moe_block_size=*/moe_block_size,
-        /*num_experts=*/num_experts,
-        /*top_k=*/top_k,
-        /*mul_topk_weights=*/true,
-        /*prob_m=*/M,
-        /*prob_n=*/N,
-        /*prob_k=*/K,
-        /*workspace=*/d_workspace,
-        /*a_type=*/vllm::kFloat16,
-        /*b_type=*/vllm::kU4,
-        /*c_type=*/vllm::kFloat16,
-        /*s_type=*/vllm::kFloat16,
-        /*has_bias=*/false,
-        /*has_act_order=*/false,
-        /*is_k_full=*/true,
-        /*has_zp=*/false,
-        /*num_groups=*/num_groups,
-        /*group_size=*/group_size,
-        /*dev=*/0,
-        /*stream=*/0,
-        /*thread_k=*/-1,  // auto
-        /*thread_n=*/-1,  // auto
-        /*sms=*/sms,
-        /*blocks_per_sm=*/-1, // auto
-        /*use_atomic_add=*/true,
-        /*use_fp32_reduce=*/false,
-        /*is_zp_float=*/false);
-
-    CHECK(cudaDeviceSynchronize());
+    timer.run([&]() {
+        marlin_moe_wna16::marlin_mm(
+            /*A=*/d_A,
+            /*B=*/d_B,
+            /*C=*/d_C,
+            /*C_tmp=*/d_C_tmp,
+            /*b_bias=*/d_bias,
+            /*a_s=*/d_a_scales,
+            /*b_s=*/d_scales,
+            /*g_s=*/d_g_scales,
+            /*zp=*/d_zp,
+            /*g_idx=*/d_g_idx,
+            /*perm=*/d_perm,
+            /*a_tmp=*/d_a_tmp,
+            /*sorted_token_ids=*/d_sorted_ids,
+            /*expert_ids=*/d_expert_ids,
+            /*num_tokens_past_padded=*/d_num_tokens_padded,
+            /*topk_weights=*/d_topk_weights,
+            /*moe_block_size=*/moe_block_size,
+            /*num_experts=*/num_experts,
+            /*top_k=*/top_k,
+            /*mul_topk_weights=*/true,
+            /*prob_m=*/M,
+            /*prob_n=*/N,
+            /*prob_k=*/K,
+            /*workspace=*/d_workspace,
+            /*a_type=*/vllm::kFloat16,
+            /*b_type=*/vllm::kU4,
+            /*c_type=*/vllm::kFloat16,
+            /*s_type=*/vllm::kFloat16,
+            /*has_bias=*/false,
+            /*has_act_order=*/false,
+            /*is_k_full=*/true,
+            /*has_zp=*/false,
+            /*num_groups=*/num_groups,
+            /*group_size=*/group_size,
+            /*dev=*/0,
+            /*stream=*/0,
+            /*thread_k=*/-1,  // auto
+            /*thread_n=*/-1,  // auto
+            /*sms=*/sms,
+            /*blocks_per_sm=*/-1, // auto
+            /*use_atomic_add=*/true,
+            /*use_fp32_reduce=*/false,
+            /*is_zp_float=*/false);
+    });
     CHECK(cudaGetLastError());
 
     printf("Done.\n");

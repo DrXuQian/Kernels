@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "causal_conv1d.h"
+#include "bench_timer.h"
 
 // Forward declare
 template<typename input_t, typename weight_t>
@@ -16,6 +17,10 @@ void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream);
 #define CHECK(e) do { cudaError_t _e=(e); if(_e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(_e));exit(1);} }while(0)
 
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     int seq   = (argc > 1) ? atoi(argv[1]) : 3823;
     int dim   = (argc > 2) ? atoi(argv[2]) : 12288;
     int width = (argc > 3) ? atoi(argv[3]) : 4;
@@ -76,8 +81,9 @@ int main(int argc, char** argv) {
     params.final_states_c_stride = width - 1;
     params.final_states_l_stride = 1;
 
-    causal_conv1d_fwd_cuda<T, T>(params, 0);
-    CHECK(cudaDeviceSynchronize());
+    timer.run([&]() {
+        causal_conv1d_fwd_cuda<T, T>(params, 0);
+    });
     CHECK(cudaGetLastError());
 
     printf("Done.\n");

@@ -11,6 +11,7 @@
 #include <cutlass/arch/arch.h>
 
 #include "kda/sm90/prefill_kernel.hpp"
+#include "bench_timer.h"
 
 #define CHECK(err) do { \
     cudaError_t e = (err); \
@@ -21,6 +22,10 @@
 } while(0)
 
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     int seq_len   = (argc > 1) ? atoi(argv[1]) : 3823;
     int num_heads = (argc > 2) ? atoi(argv[2]) : 64;
     int head_dim  = (argc > 3) ? atoi(argv[3]) : 128;
@@ -98,25 +103,25 @@ int main(int argc, char** argv) {
     CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
 
     // Launch
-    kda::sm90::launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, float>(
-        /*stream=*/0,
-        d_output,
-        d_state,       // output_state
-        d_q, d_k, d_v,
-        nullptr,       // input_state (null = zero init)
-        d_alpha,
-        d_beta,
-        d_cu_seqlens,
-        d_workspace,
-        num_seqs,
-        num_heads,
-        head_dim,
-        total_seq,
-        scale,
-        /*safe_gate=*/true,
-        sm_count);
-
-    CHECK(cudaDeviceSynchronize());
+    timer.run([&]() {
+        kda::sm90::launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, float>(
+            /*stream=*/0,
+            d_output,
+            d_state,       // output_state
+            d_q, d_k, d_v,
+            nullptr,       // input_state (null = zero init)
+            d_alpha,
+            d_beta,
+            d_cu_seqlens,
+            d_workspace,
+            num_seqs,
+            num_heads,
+            head_dim,
+            total_seq,
+            scale,
+            /*safe_gate=*/true,
+            sm_count);
+    });
     CHECK(cudaGetLastError());
 
     printf("Done.\n");

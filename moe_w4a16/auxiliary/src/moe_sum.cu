@@ -44,9 +44,14 @@ void moe_sum_launch(
 #ifdef BENCH
 #include <cstdlib>
 #include <vector>
+#include "bench_timer.h"
 
-// Usage: ./moe_sum [num_tokens] [topk] [hidden_size]
+// Usage: ./moe_sum [num_tokens] [topk] [hidden_size] [--bench warmup iters]
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     int M = (argc > 1) ? atoi(argv[1]) : 1;
     int K = (argc > 2) ? atoi(argv[2]) : 8;
     int D = (argc > 3) ? atoi(argv[3]) : 5632;
@@ -61,8 +66,9 @@ int main(int argc, char** argv) {
     for (auto& v : h) v = __float2half((float)rand() / RAND_MAX * 0.1f);
     cudaMemcpy(d_in, h.data(), h.size() * sizeof(__half), cudaMemcpyHostToDevice);
 
-    moe_sum_launch(d_out, d_in, M, K, D, 0);
-    cudaDeviceSynchronize();
+    timer.run([&]() {
+        moe_sum_launch(d_out, d_in, M, K, D, 0);
+    });
 
     cudaFree(d_in); cudaFree(d_out);
     printf("Done.\n");

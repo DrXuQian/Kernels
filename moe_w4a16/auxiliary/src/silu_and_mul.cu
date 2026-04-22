@@ -42,10 +42,15 @@ void silu_and_mul_launch(
 #ifdef BENCH
 #include <cstdlib>
 #include <vector>
+#include "bench_timer.h"
 
-// Usage: ./silu_and_mul [num_tokens] [top_k] [hidden_size]
+// Usage: ./silu_and_mul [num_tokens] [top_k] [hidden_size] [--bench warmup iters]
 // Actual rows = num_tokens * top_k (each token replicated per expert)
 int main(int argc, char** argv) {
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+
     int M = (argc > 1) ? atoi(argv[1]) : 1;
     int topk = (argc > 2) ? atoi(argv[2]) : 8;
     int D = (argc > 3) ? atoi(argv[3]) : 5632;
@@ -61,8 +66,9 @@ int main(int argc, char** argv) {
     for (auto& v : h) v = __float2half((float)rand() / RAND_MAX * 0.1f);
     cudaMemcpy(d_in, h.data(), h.size() * sizeof(__half), cudaMemcpyHostToDevice);
 
-    silu_and_mul_launch(d_out, d_in, rows, D, 0);
-    cudaDeviceSynchronize();
+    timer.run([&]() {
+        silu_and_mul_launch(d_out, d_in, rows, D, 0);
+    });
 
     cudaFree(d_in); cudaFree(d_out);
     printf("Done.\n");
