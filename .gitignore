@@ -1,10 +1,13 @@
 *.o
 *.ncu-rep
-deltanet_test
-bench_k1
-bench_k2
-bench_k3
-bench_k4
-bench_k5
-*.o
-bench_*
+
+# bench binaries (no extension)
+bench_conv1d_fwd
+bench_conv1d_update
+bench_gated_delta_net
+bench_kda_prefill
+bench_marlin_moe
+bench_topk_gating
+bench_moe_align
+bench_silu_and_mul
+bench_moe_sum
