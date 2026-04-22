@@ -1,5 +1,5 @@
 NVCC       := nvcc
-CUTLASS    := /root/cutlass
+CUTLASS    := third_party/cutlass
 CFLAGS_BASE := -O2 -std=c++17 --expt-relaxed-constexpr -diag-suppress 3288
 INC_KDA    := -Isrc -Isrc/kerutils/include -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include
 
