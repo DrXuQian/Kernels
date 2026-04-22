@@ -1,5 +1,5 @@
 NVCC       := nvcc
-ARCH       := -arch=sm_90
+ARCH       := -arch=sm_90a
 CFLAGS     := -O2 -std=c++17 $(ARCH) -Iinclude --expt-relaxed-constexpr
 
 BINS       := bench_marlin_moe
