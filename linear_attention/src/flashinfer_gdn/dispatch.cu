@@ -55,8 +55,18 @@ void launch_gdn_prefill_bf16(
             LAUNCH(true, false, false, false);
         }
     } else {
-        // Non-GVA fallback (not instantiated — will linker-error if reached)
-        fprintf(stderr, "ERROR: non-GVA not instantiated in this build\n");
+        // Non-GVA (uniform heads)
+        if (needs_beta && needs_alpha) {
+            if (init_state) { LAUNCH(false, true, true, true); }
+            else            { LAUNCH(false, true, true, false); }
+        } else if (!needs_beta && needs_alpha) {
+            if (init_state) { LAUNCH(false, false, true, true); }
+            else            { LAUNCH(false, false, true, false); }
+        } else if (needs_beta && !needs_alpha) {
+            LAUNCH(false, true, false, false);
+        } else {
+            LAUNCH(false, false, false, false);
+        }
     }
 #undef LAUNCH
 }

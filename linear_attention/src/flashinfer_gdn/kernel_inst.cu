@@ -31,6 +31,14 @@ INST(true, false, true, true,  false)
 INST(true, true, false, false, false)
 INST(true, false, false, false, false)
 
+// Non-GVA (uniform heads, q_heads == v_heads)
+INST(false, true, true, false, false)
+INST(false, true, true, true,  false)
+INST(false, false, true, false, false)
+INST(false, false, true, true,  false)
+INST(false, true, false, false, false)
+INST(false, false, false, false, false)
+
 #undef INST
 
 }  // namespace flat

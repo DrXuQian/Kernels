@@ -8,7 +8,8 @@ ARCH_SM90  := -arch=sm_90a
 INC        := -Isrc -Iinclude -I../include
 INC_KDA    := $(INC) -Isrc/kerutils/include -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include -DCULA_SM90A_ENABLED
 
-BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net bench_kda_prefill
+BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net
+# KDA: slow to compile (~10min), build separately with: make bench_kda_prefill
 
 .PHONY: all clean
 

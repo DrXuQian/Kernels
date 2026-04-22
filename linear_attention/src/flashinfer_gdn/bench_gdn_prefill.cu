@@ -2,11 +2,16 @@
 // Qwen3.5-122B DeltaNet GVA config:
 //   num_k_heads=16, num_v_heads=64, head_dim=128
 //
-// Usage: ./bench_gdn_prefill [total_seqlen] [--bench warmup iters]
-// Example:
-//   ./bench_gdn_prefill 3823
-//   ./bench_gdn_prefill 3823 --bench 10 50
-//   ncu --set full ./bench_gdn_prefill 3823
+// Usage: ./bench_gdn_prefill [seqlen] [num_q_heads] [num_v_heads] [head_dim] [num_seqs] [--bench W I]
+// Defaults: Qwen3.5-122B DeltaNet GVA (seqlen=3823, q=16, v=64, dim=128, seqs=1)
+// Examples:
+//   ./bench_gdn_prefill                                # defaults
+//   ./bench_gdn_prefill 3823                           # just seqlen
+//   ./bench_gdn_prefill 3823 16 64 128                 # GVA: q=16, v=64
+//   ./bench_gdn_prefill 3823 32 32 128                 # uniform h=32 (TP=2)
+//   ./bench_gdn_prefill 3823 64 64 128                 # uniform h=64
+//   ./bench_gdn_prefill 3823 16 64 128 1 --bench 10 50 # with timing
+//   ncu --set full ./bench_gdn_prefill 3823 16 64 128
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,15 +44,16 @@ int main(int argc, char** argv) {
     timer.parse(argc, argv);
     argc = BenchTimer::strip_bench_args(argc, argv);
 
-    // Qwen3.5-122B DeltaNet GVA config (fixed)
+    // Usage: ./bench_gdn_prefill [seqlen] [num_q_heads] [num_v_heads] [head_dim] [num_seqs] [--bench W I]
+    // Defaults: Qwen3.5-122B DeltaNet GVA config
     int total_seqlen  = (argc > 1) ? atoi(argv[1]) : 3823;
-    int num_seqs      = (argc > 2) ? atoi(argv[2]) : 1;
-    int num_q_heads   = 16;   // = num_k_heads
-    int num_k_heads   = 16;
-    int num_v_heads   = 64;
-    int num_o_heads   = 64;   // = max(num_q_heads, num_v_heads)
-    int head_dim      = 128;
-    int num_sab_heads = 64;   // max(num_q_heads, num_v_heads)
+    int num_q_heads   = (argc > 2) ? atoi(argv[2]) : 16;
+    int num_v_heads   = (argc > 3) ? atoi(argv[3]) : 64;
+    int head_dim      = (argc > 4) ? atoi(argv[4]) : 128;
+    int num_seqs      = (argc > 5) ? atoi(argv[5]) : 1;
+    int num_k_heads   = num_q_heads;
+    int num_o_heads   = (num_q_heads > num_v_heads) ? num_q_heads : num_v_heads;
+    int num_sab_heads = num_o_heads;
     float scale       = 1.0f / sqrtf((float)head_dim);
 
     printf("bench gdn_prefill (FlashInfer SM90): seqlen=%d seqs=%d "
