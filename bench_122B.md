@@ -34,7 +34,7 @@ H800 PCIe (SM 9.0, HBM 2.0 TB/s)
 | 4 | in_proj_b (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 5 | in_proj_a (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 6 | **conv1d decode** | dim=12288, w=4 | **5.4 μs** | `./bench_conv1d_update 12288 4 1 --bench 20 100` |
-| 7 | **GDN decode** (llama.cpp CUDA) | Q,K,V:(1,64,128) state:(64,128,128) | **5.4 μs** | `./bench_gated_delta_net` |
+| 7 | **GDN decode** (llama.cpp CUDA) | Q,K,V:(1,64,128) state:(64,128,128) | **5.4 μs** | `./bench_gated_delta_net 1 64 128 1 --bench 20 100` |
 | 8 | **FusedRMSNormGated** | (64,128)→(64,128) | **5.3 μs** | `./bench_fused_rms_norm_gate 64 128 --bench 20 100` |
 | 9 | out_proj (W4A16) | (1,8192)→(1,3072) | — | not in repo (Marlin GEMV) |
 
