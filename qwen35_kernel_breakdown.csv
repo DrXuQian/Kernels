@@ -1,0 +1,34 @@
+Phase,Kernel,Category,Calls/pass,Avg(μs),Total/pass(μs),Pct,In Repo,Note
+
+prefill,FlashAttention v3 prefill,attention,27,66562.0,1797174,84.7%,NO (FlashAttn),Full attention layers
+prefill,"Marlin MoE GEMM (prefill, gate_up)",moe_gemm,160,1087.0,173920,8.2%,YES,40 layers × 4 chunks
+prefill,cuBLAS attn QKV proj (prefill),cublas,27,1487.0,40149,1.9%,NO (cuBLAS),10 full_attn layers
+prefill,cuBLAS attn O proj (prefill),cublas,27,714.0,19278,0.9%,NO (cuBLAS),10 full_attn layers
+prefill,"Marlin MoE GEMM (prefill, down)",moe_gemm,160,206.0,32960,1.6%,YES,40 layers × 4 chunks
+prefill,RoPE (prefill),rope,27,714.0,19278,0.9%,NO (generic),10 full_attn layers
+prefill,GELU (shared expert),activation,27,613.0,16551,0.8%,NO (generic),shared expert activation
+prefill,RMSNorm (prefill),norm,55,295.0,16225,0.8%,NO (generic),~40 layers
+prefill,GDN inverse (merge 16→64),gdn_prefill,120,36.0,4320,0.2%,YES,30 layers × 4 chunks
+prefill,conv1d prefill,conv1d,30,6.8,204,0.0%,YES,30 linear layers
+prefill,FlashInfer GDN prefill (CUTLASS),gdn_prefill,120,13.0,1560,0.1%,YES,30 layers × 4 chunks
+prefill,l2norm (GDN prefill),gdn_prefill,240,1.8,432,0.0%,YES,30 layers × 2(Q+K) × 4 chunks
+prefill,topk_gating (prefill),moe_aux,40,6.8,272,0.0%,YES,40 layers
+prefill,moe_align (prefill),moe_aux,40,4.6,184,0.0%,YES,40 layers
+prefill,silu_and_mul (prefill),moe_aux,80,5.7,456,0.0%,YES,40 layers × 2
+prefill,moe_sum (prefill),moe_aux,40,2.2,88,0.0%,YES,40 layers
+prefill,TOTAL,,,,2123051,100%,,2123.1 ms
+
+decode,sampling (topk_topp),sampling,1,38795.0,38795,66.2%,NO (sampling),once per step
+decode,cuBLAS attn QKV+O proj (decode),cublas,10,968.0,9680,16.5%,NO (cuBLAS),10 full_attn layers
+decode,RoPE (decode),rope,10,714.0,7140,12.2%,NO (generic),10 full_attn layers
+decode,RMSNorm (decode),norm,80,8.5,680,1.2%,NO (generic),~40 layers × 2
+decode,"Marlin MoE GEMM (decode, gate_up)",moe_gemm,40,14.6,584,1.0%,YES,40 layers
+decode,"Marlin MoE GEMM (decode, down)",moe_gemm,40,9.9,396,0.7%,YES,40 layers
+decode,topk_gating (decode),moe_aux,40,6.8,272,0.5%,YES,40 layers
+decode,GDN decode (fla Triton),gdn_decode,30,6.4,192,0.3%,YES (Python),30 linear layers
+decode,silu_and_mul (decode),moe_aux,80,5.7,456,0.8%,YES,40 layers × 2
+decode,moe_align (decode),moe_aux,40,4.6,184,0.3%,YES,40 layers
+decode,FlashAttention v3 decode,attention,10,9.2,92,0.2%,NO (FlashAttn),10 full_attn layers
+decode,conv1d decode,conv1d,30,2.7,81,0.1%,YES,30 linear layers
+decode,moe_sum (decode),moe_aux,40,2.2,88,0.2%,YES,40 layers
+decode,TOTAL (per step),,,,58640,100%,,58.6 ms
