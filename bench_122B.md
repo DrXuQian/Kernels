@@ -46,7 +46,8 @@ H800 PCIe (SM 9.0, HBM 2.0 TB/s)
 | 2 | in_proj_z (W4A16) | (3823,3072)→(3823,8192) | — | not in repo (Marlin GEMM) |
 | 3 | **conv1d prefill** | (1,12288,3823) | **134.0 μs** | `./bench_conv1d_fwd 3823 12288 4 1 --bench 10 50` |
 | 4 | **FlashInfer GDN prefill** (CUTLASS SM90) | Q:(3823,16,128) K:(3823,16,128) V:(3823,64,128) | **525.9 μs** | `./bench_gdn_prefill 3823 16 64 128 1 --bench 10 50` |
-| 5 | out_proj (W4A16) | (3823,8192)→(3823,3072) | — | not in repo (Marlin GEMM) |
+| 5 | **FusedRMSNormGated** | (3823×64,128)→(3823×64,128) | — | `./bench_fused_rms_norm_gate 245472 128 --bench 10 50` |
+| 6 | out_proj (W4A16) | (3823,8192)→(3823,3072) | — | not in repo (Marlin GEMM) |
 
 ## MoE FFN (×48 layers, 256 experts, topk=8)
 
