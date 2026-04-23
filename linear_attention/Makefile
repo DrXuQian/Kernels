@@ -8,7 +8,7 @@ ARCH_SM90  := -arch=sm_90a
 INC        := -Isrc -Iinclude -I../include
 INC_KDA    := $(INC) -Isrc/kerutils/include -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include -DCULA_SM90A_ENABLED
 
-BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net
+BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net bench_fused_rms_norm_gate
 # KDA: slow to compile (~10min), build separately with: make bench_kda_prefill
 
 .PHONY: all clean
@@ -38,6 +38,10 @@ bench_conv1d_update: bench_conv1d_update.o conv1d_update.o
 # --- Gated Delta Net recurrent (llama.cpp) ---
 bench_gated_delta_net: src/gated_delta_net.cu
 	$(NVCC) $(CFLAGS) $(ARCH) $(INC) -DBENCH $< -o $@
+
+# --- Fused RMSNorm + Sigmoid Gate ---
+bench_fused_rms_norm_gate: src/fused_rms_norm_gate.cu
+	$(NVCC) $(CFLAGS) $(ARCH) $(INC) $< -o $@
 
 # --- cuLA chunked KDA prefill (SM90 only) ---
 kda_safe_gate.o: src/kda/sm90/kda_fwd_sm90_safe_gate.cu
