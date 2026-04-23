@@ -21,13 +21,9 @@ NUM_KV_HEADS= int(sys.argv[4]) if len(sys.argv) > 4 else 2
 HEAD_DIM    = int(sys.argv[5]) if len(sys.argv) > 5 else 256
 WARMUP, REPEAT = 20, 100
 
-try:
-    from flash_attn import flash_attn_func
-    FA = "flash_attn"
-except ImportError:
-    FA = "sdpa"
+from flash_attn import flash_attn_func
 
-print(f"bench {FA} {mode}: heads={NUM_HEADS} kv_heads={NUM_KV_HEADS} dim={HEAD_DIM} seq={seq_len}")
+print(f"bench flash_attn {mode}: heads={NUM_HEADS} kv_heads={NUM_KV_HEADS} dim={HEAD_DIM} seq={seq_len}")
 
 # ── Allocate on CPU, then copy to GPU (no GPU RNG kernel) ──
 if mode == "decode":
@@ -44,23 +40,11 @@ k = k_cpu.cuda()
 v = v_cpu.cuda()
 torch.cuda.synchronize()  # ensure copy done before timing
 
-# ── Build kernel function (no extra GPU ops in the lambda) ──
-if FA == "flash_attn":
-    if mode == "decode":
-        kernel = lambda: flash_attn_func(q, k, v)
-    else:
-        kernel = lambda: flash_attn_func(q, k, v, causal=True)
+# ── Build kernel function ──
+if mode == "decode":
+    kernel = lambda: flash_attn_func(q, k, v)
 else:
-    # SDPA fallback: pre-expand KV on GPU (one-time), then only SDPA in loop
-    rep = NUM_HEADS // NUM_KV_HEADS
-    k_exp = k.repeat_interleave(rep, dim=2)
-    v_exp = v.repeat_interleave(rep, dim=2)
-    qt = q.transpose(1, 2)
-    kt = k_exp.transpose(1, 2)
-    vt = v_exp.transpose(1, 2)
-    is_causal = (mode == "prefill")
-    torch.cuda.synchronize()
-    kernel = lambda: torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, is_causal=is_causal)
+    kernel = lambda: flash_attn_func(q, k, v, causal=True)
 
 # ── Warmup ──
 for _ in range(WARMUP):
@@ -77,5 +61,5 @@ for i in range(REPEAT):
 torch.cuda.synchronize()
 
 times = np.array([s.elapsed_time(e) * 1000 for s, e in zip(starts, ends)])
-print(f"  {FA} {mode}: median={np.median(times):.1f} μs, min={np.min(times):.1f} μs")
+print(f"  flash_attn {mode}: median={np.median(times):.1f} μs, min={np.min(times):.1f} μs")
 print("Done.")
