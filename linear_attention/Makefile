@@ -8,8 +8,7 @@ ARCH_SM90  := -arch=sm_90a
 INC        := -Isrc -Iinclude -I../include
 INC_GDN    := $(INC) -Isrc/flashinfer_gdn -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include -DFLAT_SM90A_ENABLED
 
-BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net bench_fused_rms_norm_gate
-# SM90-only target (slow to compile), build separately: make bench_gdn_prefill
+BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net bench_fused_rms_norm_gate bench_gdn_prefill
 
 .PHONY: all clean
 
