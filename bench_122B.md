@@ -34,8 +34,7 @@ H800 PCIe (SM 9.0, HBM 2.0 TB/s)
 | 4 | in_proj_b (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 5 | in_proj_a (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 6 | **conv1d decode** | dim=12288, w=4 | **5.4 μs** | `./bench_conv1d_update 12288 4 1 --bench 20 100` |
-| 7a | **GDN decode** (llama.cpp CUDA) | Q,K,V:(1,64,128) state:(64,128,128) | **5.4 μs** | `./bench_gated_delta_net` |
-| 7b | GDN decode (fla Triton) | Q,K:(1,16,128) V:(1,64,128) state:(64,128,128) | **85.7 μs** (含 Python overhead) | `python3 bench_gdn_decode.py 64 128` |
+| 7 | **GDN decode** (llama.cpp CUDA) | Q,K,V:(1,64,128) state:(64,128,128) | **5.4 μs** | `./bench_gated_delta_net` |
 | 8 | **FusedRMSNormGated** | (64,128)→(64,128) | **5.3 μs** | `./bench_fused_rms_norm_gate 64 128 --bench 20 100` |
 | 9 | out_proj (W4A16) | (1,8192)→(1,3072) | — | not in repo (Marlin GEMV) |
 
@@ -78,6 +77,31 @@ H800 PCIe (SM 9.0, HBM 2.0 TB/s)
 | 7 | **Marlin MoE down** (W4A16) | (8,3823,1024)→(8,3823,3072) | — | `./bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50` |
 | 8 | **moe_sum** | (8,3823,3072)→(3823,3072) | — | `./bench_moe_sum 3823 8 3072 --bench 10 50` |
 
+## Full Attention (×12 layers)
+
+### Decode (batch=1, ctx=3823)
+
+| # | Kernel | Shape | Latency | Command |
+|---|--------|-------|---------|---------|
+| 1 | RMSNorm | (1,3072)→(1,3072) | — | not in repo (generic) |
+| 2 | q_proj (W4A16) | (1,3072)→(1,16384) | — | not in repo (Marlin GEMV, ×2 for gate) |
+| 3 | k_proj (W4A16) | (1,3072)→(1,512) | — | not in repo (Marlin GEMV) |
+| 4 | v_proj (W4A16) | (1,3072)→(1,512) | — | not in repo (Marlin GEMV) |
+| 5 | q/k RMSNorm | (1,32,256) / (1,2,256) | — | not in repo (generic) |
+| 6 | MRoPE | Q:(1,32,256) K:(1,2,256) | — | not in repo (generic) |
+| 7 | **FlashAttention v3 decode** | Q:(1,32,256) KV:(ctx,2,256) | — | `python3 bench_flash_attn.py decode 3823` |
+| 8 | output gate | sigmoid × (1,8192) | — | elementwise |
+| 9 | o_proj (W4A16) | (1,8192)→(1,3072) | — | not in repo (Marlin GEMV) |
+| + | MoE FFN (same as above) | | | |
+
+### Prefill (seq=3823)
+
+| # | Kernel | Shape | Latency | Command |
+|---|--------|-------|---------|---------|
+| 7 | **FlashAttention v3 prefill** | Q:(3823,32,256) KV:(3823,2,256) | — | `python3 bench_flash_attn.py prefill 3823` |
+
+> FlashAttention bench 使用 `flash_attn` 库（需 pip install flash-attn），如未安装自动 fallback 到 torch SDPA。
+
 ## Decode 单层时间估算
 
 ### DeltaNet 层 (per layer)
@@ -113,7 +137,7 @@ cd Kernels
 
 # ── DeltaNet Decode ──
 linear_attention/bench_conv1d_update 12288 4 1 --bench 20 100
-python3 linear_attention/src/bench_gdn_decode.py 64 128
+linear_attention/bench_gated_delta_net 1 64 128 1 --bench 20 100
 linear_attention/bench_fused_rms_norm_gate 64 128 --bench 20 100
 
 # ── DeltaNet Prefill (seq=3823) ──
@@ -135,6 +159,10 @@ moe_w4a16/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50
 moe_w4a16/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50
 moe_w4a16/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
 moe_w4a16/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50
+
+# ── Full Attention (FlashAttn, Python) ──
+python3 linear_attention/src/bench_flash_attn.py decode 3823
+python3 linear_attention/src/bench_flash_attn.py prefill 3823
 
 # ── nsys (纯 GPU kernel time) ──
 nsys profile --trace=cuda -o trace ./bench_xxx [args]
