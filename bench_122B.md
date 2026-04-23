@@ -143,7 +143,7 @@ linear_attention/bench_fused_rms_norm_gate 64 128 --bench 20 100
 
 # ── DeltaNet Prefill (seq=3823) ──
 linear_attention/bench_conv1d_fwd 3823 12288 4 1 --bench 10 50
-linear_attention/src/flashinfer_gdn/bench_gdn_prefill 3823 16 64 128 1 --bench 10 50
+linear_attention/bench_gdn_prefill 3823 16 64 128 1 --bench 10 50
 
 # ── MoE FFN Decode ──
 moe_w4a16/auxiliary/bench_topk_gating 1 256 8 --bench 20 100
@@ -162,8 +162,8 @@ moe_w4a16/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
 moe_w4a16/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50
 
 # ── Full Attention (FlashAttn, Python) ──
-python3 linear_attention/src/bench_flash_attn.py decode 3823
-python3 linear_attention/src/bench_flash_attn.py prefill 3823
+python3 flash_attn/bench_flash_attn.py decode 3823
+python3 flash_attn/bench_flash_attn.py prefill 3823
 
 # ── nsys (纯 GPU kernel time) ──
 nsys profile --trace=cuda -o trace ./bench_xxx [args]
