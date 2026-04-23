@@ -6,10 +6,10 @@ ARCH       := -arch=sm_80
 ARCH_SM90  := -arch=sm_90a
 
 INC        := -Isrc -Iinclude -I../include
-INC_KDA    := $(INC) -Isrc/kerutils/include -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include -DCULA_SM90A_ENABLED
+INC_GDN    := $(INC) -Isrc/flashinfer_gdn -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include -DFLAT_SM90A_ENABLED
 
 BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net bench_fused_rms_norm_gate
-# KDA: slow to compile (~10min), build separately with: make bench_kda_prefill
+# SM90-only target (slow to compile), build separately: make bench_gdn_prefill
 
 .PHONY: all clean
 
@@ -43,18 +43,18 @@ bench_gated_delta_net: src/gated_delta_net.cu
 bench_fused_rms_norm_gate: src/fused_rms_norm_gate.cu
 	$(NVCC) $(CFLAGS) $(ARCH) $(INC) $< -o $@
 
-# --- cuLA chunked KDA prefill (SM90 only) ---
-kda_safe_gate.o: src/kda/sm90/kda_fwd_sm90_safe_gate.cu
-	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_KDA) -dc $< -o $@
+# --- FlashInfer GDN prefill (SM90 only) ---
+gdn_kernel_inst.o: src/flashinfer_gdn/kernel_inst.cu
+	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_GDN) -dc $< -o $@
 
-kda_dispatch.o: src/kda/sm90/kda_fwd_sm90.cu
-	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_KDA) -dc $< -o $@
+gdn_dispatch.o: src/flashinfer_gdn/dispatch.cu
+	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_GDN) -dc $< -o $@
 
-bench_kda.o: src/bench_kda_prefill.cu
-	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_KDA) -dc $< -o $@
+bench_gdn.o: src/flashinfer_gdn/bench_gdn_prefill.cu
+	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_GDN) -dc $< -o $@
 
-bench_kda_prefill: bench_kda.o kda_dispatch.o kda_safe_gate.o
+bench_gdn_prefill: bench_gdn.o gdn_dispatch.o gdn_kernel_inst.o
 	$(NVCC) $(ARCH_SM90) $^ -o $@
 
 clean:
-	rm -f *.o $(BINS)
+	rm -f *.o $(BINS) bench_gdn_prefill
