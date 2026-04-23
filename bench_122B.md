@@ -146,20 +146,20 @@ linear_attention/bench_conv1d_fwd 3823 12288 4 1 --bench 10 50
 linear_attention/bench_gdn_prefill 3823 16 64 128 1 --bench 10 50
 
 # ── MoE FFN Decode ──
-moe_w4a16/auxiliary/bench_topk_gating 1 256 8 --bench 20 100
-moe_w4a16/auxiliary/bench_moe_align 1 256 8 16 --bench 20 100
-moe_w4a16/marlin/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100
-moe_w4a16/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100
-moe_w4a16/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100
-moe_w4a16/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100
+moe_w4a16/bench_topk_gating 1 256 8 --bench 20 100
+moe_w4a16/bench_moe_align 1 256 8 16 --bench 20 100
+moe_w4a16/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100
+moe_w4a16/bench_silu_and_mul 1 8 1024 --bench 20 100
+moe_w4a16/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100
+moe_w4a16/bench_moe_sum 1 8 3072 --bench 20 100
 
 # ── MoE FFN Prefill (seq=3823) ──
-moe_w4a16/auxiliary/bench_topk_gating 3823 256 8 --bench 10 50
-moe_w4a16/auxiliary/bench_moe_align 3823 256 8 16 --bench 10 50
-moe_w4a16/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50
-moe_w4a16/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50
-moe_w4a16/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
-moe_w4a16/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50
+moe_w4a16/bench_topk_gating 3823 256 8 --bench 10 50
+moe_w4a16/bench_moe_align 3823 256 8 16 --bench 10 50
+moe_w4a16/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50
+moe_w4a16/bench_silu_and_mul 3823 8 1024 --bench 10 50
+moe_w4a16/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
+moe_w4a16/bench_moe_sum 3823 8 3072 --bench 10 50
 
 # ── Full Attention (FlashAttn, Python) ──
 python3 flash_attn/bench_flash_attn.py decode 3823
