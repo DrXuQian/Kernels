@@ -94,6 +94,7 @@ All standalone CUDA, no Python overhead. groupsize=128.
 |--------|-----------|--------|--------|---------|
 | BF16 cuBLAS | 238 | 578.3 | 76.5% | 1.00x |
 | FP16 cuBLAS | 239 | 576.2 | 76.2% | 1.00x |
+| **fpAIntB SM90** | **324** | **424.1** | **56.1%** | **0.73x** |
 | CUTLASS SM90 W4A16 (shuffle ON) | 396 | 346.6 | 45.8% | 0.60x |
 | Marlin W4A16 | 510 | 269.6 | 35.7% | 0.47x |
 | CUTLASS SM90 W4A16 (shuffle OFF) | 524 | 262.1 | 34.7% | 0.45x |
