@@ -1089,24 +1089,28 @@ int main(int argc, char* argv[]) {
   cudaMalloc(&d_s, s_size);
   cudaMalloc(&d_workspace, workspace_size);
 
-  // Initialize with random data
-  printf("Initializing with random data...\n");
+  // Initialize with deterministic data
+  printf("Initializing with deterministic data...\n");
   {
-    srand(42);
-    // A: random small FP16 values
+    // A: all 1.0 in FP16
     std::vector<half> h_A(M * K);
-    for (auto& v : h_A) v = __float2half(0.01f * ((float)rand() / RAND_MAX - 0.5f));
+    for (auto& v : h_A) v = __float2half(1.0f);
     cudaMemcpy(d_A, h_A.data(), A_size, cudaMemcpyHostToDevice);
 
-    // B: random bytes (packed INT4 weights)
+    // B: packed INT4 weights, nibbles cycle 0,1,2,...,15,0,1,...
+    // Each byte packs two INT4 values: low nibble | (high nibble << 4)
     std::vector<uint8_t> h_B(B_size);
-    for (auto& v : h_B) v = rand() & 0xFF;
+    for (size_t i = 0; i < h_B.size(); i++) {
+      uint8_t lo = (2 * i) % 16;       // 0,1,2,...,15,0,1,...
+      uint8_t hi = (2 * i + 1) % 16;   // 1,2,3,...,15,0,1,...
+      h_B[i] = lo | (hi << 4);
+    }
     cudaMemcpy(d_B, h_B.data(), B_size, cudaMemcpyHostToDevice);
 
-    // Scales: small positive FP16 values
+    // Scales: all 1.0 in FP16
     int num_scale_rows = (groupsize == -1) ? 1 : K / groupsize;
     std::vector<half> h_s(num_scale_rows * N);
-    for (auto& v : h_s) v = __float2half(0.01f + 0.005f * ((float)rand() / RAND_MAX));
+    for (auto& v : h_s) v = __float2half(1.0f);
     cudaMemcpy(d_s, h_s.data(), s_size, cudaMemcpyHostToDevice);
   }
   cudaMemset(d_C, 0, C_size);
