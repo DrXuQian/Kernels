@@ -104,8 +104,10 @@ BenchResult benchmark_gemm(
     return {median, min_t, max_t, tflops};
 }
 
-int main() {
-    int M = 1024, N = 1024, K = 1024;
+int main(int argc, char* argv[]) {
+    int M = (argc > 1) ? atoi(argv[1]) : 1024;
+    int N = (argc > 2) ? atoi(argv[2]) : 1024;
+    int K = (argc > 3) ? atoi(argv[3]) : 1024;
     int warmup = 50, repeat = 200;
 
     // Print GPU info

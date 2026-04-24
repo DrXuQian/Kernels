@@ -2,7 +2,7 @@
 
 Single GEMM: Marlin W4A16 vs CUTLASS SM90 W4A16 vs BF16 cuBLAS
 
-Shape: M=1024, N=1024, K=1024 on NVIDIA H800 PCIe (SM 9.0)
+NVIDIA H800 PCIe (SM 9.0, BF16 dense peak 756 TFLOPS)
 
 ## Kernel 来源
 
@@ -25,8 +25,9 @@ Machete 本质是 CUTLASS 3.x collective builder 构建的 SM90 mixed-type GEMM�
 ## 编译
 
 ```bash
-# 1. Marlin (需要 PyTorch)
-cd kernels/marlin && python3 setup.py build_ext --inplace
+# 1. Marlin (standalone, 无需 PyTorch)
+nvcc -O2 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr \
+  -diag-suppress 177,179,39 marlin_standalone.cu -o marlin_standalone
 
 # 2. CUTLASS SM90 (需要 CUTLASS headers)
 nvcc -O3 -std=c++17 -arch=sm_90a --expt-relaxed-constexpr \
@@ -35,49 +36,53 @@ nvcc -O3 -std=c++17 -arch=sm_90a --expt-relaxed-constexpr \
   <CUTLASS>/examples/55_hopper_mixed_dtype_gemm/55_hopper_int4_bf16_gemm.cu \
   -o cutlass_w4a16_bench -lcublas
 
-# 3. cuBLAS BF16
+# 3. cuBLAS BF16/FP16
 nvcc -O3 -std=c++17 -arch=sm_90 cublas_bf16_bench.cu -o cublas_bf16_bench -lcublas
 ```
 
 ## 运行
 
 ```bash
-# Marlin + BF16 (PyTorch)
-python3 bench_marlin.py
+# Marlin W4A16 (standalone)
+./marlin_standalone -m 4096 -n 4096 -k 4096 -w 50 -i 200
+./marlin_standalone -m 4096 -n 4096 -k 4096 -g 128 -w 50 -i 200
 
-# CUTLASS (standalone, mode=1 for scaled W4A16, g=128 group size)
-./cutlass_w4a16_bench --m=1024 --n=1024 --k=1024 --g=128 --mode=1 --shuffle=true --iterations=200
+# CUTLASS SM90 W4A16
+./cutlass_w4a16_bench --m=4096 --n=4096 --k=4096 --g=128 --mode=1 --shuffle=true --iterations=200
+./cutlass_w4a16_bench --m=4096 --n=4096 --k=4096 --g=128 --mode=1 --shuffle=false --iterations=200
 
-# cuBLAS BF16
-./cublas_bf16_bench
+# cuBLAS BF16/FP16
+./cublas_bf16_bench 4096 4096 4096
 ```
 
-## Benchmark 结果 (H800 PCIe, 1024x1024x1024)
+## Benchmark 结果 (H800 PCIe, 4096x4096x4096)
 
-| Kernel | 延迟 (ms) | TFLOPS | vs BF16 |
-|--------|-----------|--------|---------|
-| BF16 cuBLAS (torch.mm) | 0.0202 | 106.5 | 1.00x |
-| FP16 cuBLAS (torch.mm) | 0.0204 | 105.5 | 0.99x |
-| Marlin W4A16 (FP16 act) | 0.0191 | 112.6 | **1.06x** |
-| CUTLASS SM90 W4A16 (shuffle ON) | 0.0174 | 123.3 | **1.16x** |
-| CUTLASS SM90 W4A16 (shuffle OFF) | 0.0219 | 98.1 | 0.84x |
+All standalone CUDA, no Python overhead.
+
+| Kernel | 延迟 (ms) | TFLOPS | 利用率 | vs BF16 |
+|--------|-----------|--------|--------|---------|
+| BF16 cuBLAS | 0.238 | 578.3 | 76.5% | 1.00x |
+| FP16 cuBLAS | 0.239 | 576.2 | 76.2% | 1.00x |
+| CUTLASS SM90 W4A16 (shuffle ON) | 0.396 | 346.6 | 45.8% | 0.60x |
+| Marlin W4A16 (per-column) | 0.510 | 269.6 | 35.7% | 0.47x |
+| CUTLASS SM90 W4A16 (shuffle OFF) | 0.524 | 262.1 | 34.7% | 0.45x |
 
 ### 分析
 
-- **1024x1024x1024 接近 compute-bound**，W4A16 的带宽优势不大
-- **CUTLASS SM90 > Marlin**：WGMMA + TMA 比 `mma.sync` 高效 ~9%
-- **Shuffle ON 提速 25%**：离线 weight reorder 减少 shared memory load 指令
+- **4096x4096x4096 是 compute-bound**，W4A16 的带宽优势无法体现
+- **CUTLASS SM90 > Marlin 29%**：WGMMA + TMA 比 `mma.sync` 吞吐更高
+- **Shuffle ON 提速 32%**：离线 weight reorder 减少 shared memory load 指令
+- **Marlin 对大 M 会拆为多次 launch**（M=4096 → 4 次），cuBLAS 仅 1 次
 - W4A16 的真正优势在 **memory-bound 场景**（小 batch, 大 weight），见 MoE benchmark
 
 ## 文件
 
 ```
+marlin_standalone.cu          # Marlin W4A16 standalone (含正确性验证)
 cublas_bf16_bench.cu          # cuBLAS BF16/FP16 standalone benchmark
-bench_marlin.py               # Marlin + torch.mm benchmark
 kernels/
   marlin/
-    marlin_cuda_kernel.cu     # Marlin CUDA kernel (822 lines)
-    marlin_cuda.cpp           # PyTorch binding
+    marlin_cuda_kernel.cu     # 原始 Marlin CUDA kernel
+    marlin_cuda.cpp           # PyTorch binding (可选)
     setup.py
-  cutlass_sm90/               # 使用 CUTLASS repo example 55 编译
 ```
