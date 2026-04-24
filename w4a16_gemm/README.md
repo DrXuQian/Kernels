@@ -13,46 +13,38 @@ NVIDIA H800 PCIe (SM 9.0, BF16 dense peak 756 TFLOPS)
 | **CUTLASS SM90 W4A16** | CUTLASS example 55 (`55_hopper_int4_bf16_gemm`) | BF16 act + INT4 weight, WGMMA + TMA |
 | **BF16 cuBLAS** | standalone cuBLAS | cuBLAS `cublasGemmEx` with BF16/FP16 |
 
-## vLLM Kernel 选择策略
-
-在 Hopper (sm_90) 上，vLLM 对非 MoE linear 层的 W4A16 kernel 选择优先级：
-
-```
-CutlassW4A8 → MacheteLinearKernel (sm_90+, CUTLASS) → MarlinLinearKernel (fallback)
-```
-
-Machete 本质是 CUTLASS 3.x collective builder 构建的 SM90 mixed-type GEMM，与 example 55 底层相同。
-
-TRT-LLM 的 fpAIntB 则自带 dispatch：M < 16 走 CUDA core GEMV，M >= 16 走 CUTLASS WGMMA。
-
 ## 编译
 
 ```bash
+# 初始化 submodule（fpAIntB）
+git submodule update --init w4a16_gemm/fpA_intB
+
 # 1. Marlin (standalone, 无需 PyTorch)
 nvcc -O2 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr \
   -diag-suppress 177,179,39 marlin_standalone.cu -o marlin_standalone
 
-# 2. CUTLASS SM90 (需要 CUTLASS headers)
+# 2. CUTLASS SM90
 nvcc -O3 -std=c++17 -arch=sm_90a --expt-relaxed-constexpr \
-  -I<CUTLASS>/include -I<CUTLASS>/tools/util/include -I<CUTLASS>/examples/common \
+  -I../third_party/cutlass/include -I../third_party/cutlass/tools/util/include \
+  -I../third_party/cutlass/examples/common \
   -DCUTLASS_ARCH_MMA_SM90_SUPPORTED=1 \
-  <CUTLASS>/examples/55_hopper_mixed_dtype_gemm/55_hopper_int4_bf16_gemm.cu \
+  ../third_party/cutlass/examples/55_hopper_mixed_dtype_gemm/55_hopper_int4_bf16_gemm.cu \
   -o cutlass_w4a16_bench -lcublas
 
 # 3. cuBLAS BF16/FP16
 nvcc -O3 -std=c++17 -arch=sm_90 cublas_bf16_bench.cu -o cublas_bf16_bench -lcublas
 
-# 4. fpAIntB (TRT-LLM extracted, 需要 CUTLASS headers)
-# See https://github.com/DrXuQian/w4a16 for standalone extraction
-cd fpA_intB_standalone/build
-cmake .. -DCUTLASS_DIR=<CUTLASS> -DCMAKE_CUDA_ARCHITECTURES="90a-real"
+# 4. fpAIntB (TRT-LLM extracted)
+cd fpA_intB/fpA_intB_standalone
+mkdir -p build && cd build
+cmake .. -DCUTLASS_DIR=../../../third_party/cutlass -DCMAKE_CUDA_ARCHITECTURES="90a-real"
 make -j$(nproc)
 ```
 
 ## 运行
 
 ```bash
-# Marlin W4A16 (standalone)
+# Marlin W4A16
 ./marlin_standalone -m 3823 -n 12288 -k 3072 -g 128 -w 10 -i 100
 
 # CUTLASS SM90 W4A16
@@ -61,9 +53,17 @@ make -j$(nproc)
 # cuBLAS BF16/FP16
 ./cublas_bf16_bench 3823 12288 3072
 
-# fpAIntB (TRT-LLM)
-./test_fpA_intB_gemm --m=3823 --n=12288 --k=3072 --group_size=128 --warmup=10 --iters=100
+# fpAIntB (with tactic cache to skip online profiling)
+cd fpA_intB/fpA_intB_standalone/build
+./test_fpA_intB_gemm --m=3823 --n=12288 --k=3072 --group_size=128 \
+    --tactic=../tactics_h800.cache --warmup=10 --iters=100
+
+# Single inference (no profiling, no warmup)
+./test_fpA_intB_gemm --m=1 --n=12288 --k=3072 --group_size=128 \
+    --tactic=../tactics_h800.cache --warmup=0 --iters=1
 ```
+
+fpAIntB 详细用法见 [fpA_intB/README.md](fpA_intB/README.md)。
 
 ## Benchmark 结果 (H800 PCIe)
 
@@ -108,16 +108,22 @@ All standalone CUDA, no Python overhead. groupsize=128.
 - **Marlin 多次 launch**（M=3823 → 4 次），fpAIntB/cuBLAS 单次 launch
 - **CUTLASS ex55 shuffle ON 提速 ~35%**（vs shuffle OFF），但仍不如 fpAIntB 的 tile heuristic
 
-## 文件
+## 文件结构
 
 ```
-marlin_standalone.cu          # Marlin W4A16 standalone (含正确性验证)
-cublas_bf16_bench.cu          # cuBLAS BF16/FP16 standalone benchmark
-kernels/
-  marlin/
-    marlin_cuda_kernel.cu     # 原始 Marlin CUDA kernel
-    marlin_cuda.cpp           # PyTorch binding (可选)
-    setup.py
+w4a16_gemm/
+├── README.md                 # 本文件（benchmark 入口）
+├── marlin_standalone.cu      # Marlin W4A16 standalone (含正确性验证)
+├── cublas_bf16_bench.cu      # cuBLAS BF16/FP16 standalone benchmark
+├── fpA_intB/                 # submodule: DrXuQian/w4a16
+│   └── fpA_intB_standalone/
+│       ├── CMakeLists.txt
+│       ├── tactics_h800.cache  # H800 预 profiled tactic 缓存
+│       └── test/
+│           └── test_fpA_intB_gemm.cu
+└── kernels/
+    └── marlin/
+        ├── marlin_cuda_kernel.cu
+        ├── marlin_cuda.cpp
+        └── setup.py
 ```
-
-fpAIntB standalone 提取见 [DrXuQian/w4a16](https://github.com/DrXuQian/w4a16)
