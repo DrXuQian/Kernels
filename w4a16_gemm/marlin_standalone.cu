@@ -1092,25 +1092,27 @@ int main(int argc, char* argv[]) {
   // Initialize with deterministic data
   printf("Initializing with deterministic data...\n");
   {
-    // A: all 1.0 in FP16
+    // A: deterministic pattern, A[i] = 0.01 * ((i % 101) - 50)  range [-0.5, 0.5]
     std::vector<half> h_A(M * K);
-    for (auto& v : h_A) v = __float2half(1.0f);
+    for (size_t i = 0; i < h_A.size(); i++)
+      h_A[i] = __float2half(0.01f * ((int)(i % 101) - 50));
     cudaMemcpy(d_A, h_A.data(), A_size, cudaMemcpyHostToDevice);
 
     // B: packed INT4 weights, nibbles cycle 0,1,2,...,15,0,1,...
     // Each byte packs two INT4 values: low nibble | (high nibble << 4)
     std::vector<uint8_t> h_B(B_size);
     for (size_t i = 0; i < h_B.size(); i++) {
-      uint8_t lo = (2 * i) % 16;       // 0,1,2,...,15,0,1,...
-      uint8_t hi = (2 * i + 1) % 16;   // 1,2,3,...,15,0,1,...
+      uint8_t lo = (2 * i) % 16;
+      uint8_t hi = (2 * i + 1) % 16;
       h_B[i] = lo | (hi << 4);
     }
     cudaMemcpy(d_B, h_B.data(), B_size, cudaMemcpyHostToDevice);
 
-    // Scales: all 1.0 in FP16
+    // Scales: deterministic pattern, s[i] = 0.01 * (1 + (i % 7))  range [0.01, 0.07]
     int num_scale_rows = (groupsize == -1) ? 1 : K / groupsize;
     std::vector<half> h_s(num_scale_rows * N);
-    for (auto& v : h_s) v = __float2half(1.0f);
+    for (size_t i = 0; i < h_s.size(); i++)
+      h_s[i] = __float2half(0.01f * (1 + (int)(i % 7)));
     cudaMemcpy(d_s, h_s.data(), s_size, cudaMemcpyHostToDevice);
   }
   cudaMemset(d_C, 0, C_size);
