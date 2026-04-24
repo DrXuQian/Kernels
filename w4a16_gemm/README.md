@@ -55,25 +55,46 @@ nvcc -O3 -std=c++17 -arch=sm_90 cublas_bf16_bench.cu -o cublas_bf16_bench -lcubl
 ./cublas_bf16_bench 4096 4096 4096
 ```
 
-## Benchmark 结果 (H800 PCIe, 4096x4096x4096)
+## Benchmark 结果 (H800 PCIe)
 
-All standalone CUDA, no Python overhead.
+All standalone CUDA, no Python overhead. groupsize=128.
 
-| Kernel | 延迟 (ms) | TFLOPS | 利用率 | vs BF16 |
+### 4096x4096x4096
+
+| Kernel | 延迟 (us) | TFLOPS | 利用率 | vs BF16 |
 |--------|-----------|--------|--------|---------|
-| BF16 cuBLAS | 0.238 | 578.3 | 76.5% | 1.00x |
-| FP16 cuBLAS | 0.239 | 576.2 | 76.2% | 1.00x |
-| CUTLASS SM90 W4A16 (shuffle ON) | 0.396 | 346.6 | 45.8% | 0.60x |
-| Marlin W4A16 (per-column) | 0.510 | 269.6 | 35.7% | 0.47x |
-| CUTLASS SM90 W4A16 (shuffle OFF) | 0.524 | 262.1 | 34.7% | 0.45x |
+| BF16 cuBLAS | 238 | 578.3 | 76.5% | 1.00x |
+| FP16 cuBLAS | 239 | 576.2 | 76.2% | 1.00x |
+| CUTLASS SM90 W4A16 (shuffle ON) | 396 | 346.6 | 45.8% | 0.60x |
+| Marlin W4A16 | 510 | 269.6 | 35.7% | 0.47x |
+| CUTLASS SM90 W4A16 (shuffle OFF) | 524 | 262.1 | 34.7% | 0.45x |
+
+### Prefill (M=3823, Qwen3.5-122B shapes)
+
+| Shape (M×N×K) | Marlin (us) | TFLOPS | cuBLAS BF16 (us) | TFLOPS | CUTLASS shuf (us) | TFLOPS | Marlin vs BF16 |
+|---------------|-------------|--------|------------------|--------|-------------------|--------|----------------|
+| 3823×12288×3072 | 1148 | 251 | 465 | 621 | 839 | 344 | 0.40x |
+| 3823×8192×3072 | 763 | 252 | 309 | 624 | 549 | 350 | 0.40x |
+| 3823×3072×8192 | 758 | 254 | 323 | 596 | 555 | 347 | 0.43x |
+| 3823×16384×3072 | 1604 | 240 | 620 | 621 | 1135 | 339 | 0.39x |
+| 3823×512×3072 | 150 | 80 | 31 | 386 | 66 | 181 | 0.21x |
+
+### Decode (M=1)
+
+| Shape (M×N×K) | Marlin (us) | cuBLAS BF16 (us) | CUTLASS shuf (us) | Marlin vs BF16 |
+|---------------|-------------|------------------|-------------------|----------------|
+| 1×12288×3072 | 15.0 | 48.6 | 38.4 | **3.19x** |
+| 1×8192×3072 | 12.5 | 36.0 | 35.3 | **2.93x** |
+| 1×3072×8192 | 15.9 | 39.9 | 79.5 | **2.53x** |
+| 1×16384×3072 | 17.7 | 60.9 | 65.6 | **3.48x** |
 
 ### 分析
 
-- **4096x4096x4096 是 compute-bound**，W4A16 的带宽优势无法体现
-- **CUTLASS SM90 > Marlin 29%**：WGMMA + TMA 比 `mma.sync` 吞吐更高
-- **Shuffle ON 提速 32%**：离线 weight reorder 减少 shared memory load 指令
-- **Marlin 对大 M 会拆为多次 launch**（M=4096 → 4 次），cuBLAS 仅 1 次
-- W4A16 的真正优势在 **memory-bound 场景**（小 batch, 大 weight），见 MoE benchmark
+- **Prefill (M=3823) compute-bound**：W4A16 全面慢于 BF16，权重带宽减半无法弥补 dequant 开销
+- **Decode (M=1) memory-bound**：Marlin 比 cuBLAS BF16 快 **2.5-3.5x**，INT4 权重体积减半直接转化为带宽优势
+- **CUTLASS SM90 > Marlin (prefill)**：WGMMA + TMA 比 `mma.sync` 吞吐更高，但 decode 场景 CUTLASS 反而不如 Marlin
+- **Marlin 对大 M 拆为多次 launch**（M=3823 → 4 次），cuBLAS 仅 1 次
+- **Shuffle ON 提速 ~35%**（prefill），离线 weight reorder 减少 shared memory load 指令
 
 ## 文件
 
