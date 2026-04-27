@@ -20,18 +20,25 @@
 #include "cutlass/cutlass.h"
 #include "flashinfer/flat/cute_ext.hpp"
 
+#include <type_traits>
+
 namespace flat::collective {
 
 using namespace cute;
 
 template <int dim, typename Layout>
-constexpr bool is_contiguous(Layout&& layout) {
-  auto dim_layout = get<dim>(layout);
-  if constexpr (rank(dim_layout) == 0) {
-    return stride(dim_layout) == 1;
-  } else {
-    return stride<0>(dim_layout) == 1;
-  }
+struct IsContiguous {
+  using DimLayout = decltype(get<dim>(Layout{}));
+  using StrideVal = std::conditional_t<
+      (rank(DimLayout{}) == 0),
+      decltype(stride(DimLayout{})),
+      decltype(stride<0>(DimLayout{}))>;
+  static constexpr bool value = std::is_same_v<std::decay_t<StrideVal>, cute::_1>;
+};
+
+template <int dim, typename Layout>
+constexpr bool is_contiguous(Layout) {
+  return IsContiguous<dim, Layout>::value;
 }
 
 namespace detail::SM80 {

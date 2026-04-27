@@ -1,13 +1,22 @@
 *.o
+*.so
 *.ncu-rep
+.ninja_deps
+.ninja_log
+build.ninja
 
 # bench binaries (no extension)
 bench_conv1d_fwd
 bench_conv1d_update
 bench_gated_delta_net
+bench_fused_rms_norm_gate
+bench_gdn_prefill
 bench_kda_prefill
 bench_marlin_moe
 bench_topk_gating
 bench_moe_align
 bench_silu_and_mul
 bench_moe_sum
+cublas_bf16_bench
+cutlass_w4a16_bench
+marlin_standalone
