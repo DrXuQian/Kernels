@@ -1,6 +1,7 @@
 // Standalone Marlin MoE W4A16 benchmark
 // FP16 activation, INT4 weight, group_size=128
 // Usage: ./bench_marlin_moe [num_tokens] [num_experts] [top_k] [K] [N]
+//        [--balanced] [--no-topk-weights]
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,14 +48,21 @@ int main(int argc, char** argv) {
     int top_k       = (argc > 3) ? atoi(argv[3]) : 8;
     int K           = (argc > 4) ? atoi(argv[4]) : 2048;    // hidden_size
     int N           = (argc > 5) ? atoi(argv[5]) : 5632;    // intermediate_size (must be % 64 == 0)
+    bool balanced_routing = false;
+    bool mul_topk_weights = true;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--balanced") == 0) balanced_routing = true;
+        if (strcmp(argv[i], "--no-topk-weights") == 0) mul_topk_weights = false;
+    }
 
     int group_size  = 128;
     int moe_block_size = (M * top_k <= 8) ? 8 : 16;
     int num_groups = K / group_size;
     int pack_factor = 8; // 32 / 4bits
 
-    printf("Marlin MoE W4A16 bench: M=%d experts=%d top_k=%d K=%d N=%d group=%d moe_block=%d\n",
-           M, num_experts, top_k, K, N, group_size, moe_block_size);
+    printf("Marlin MoE W4A16 bench: M=%d experts=%d top_k=%d K=%d N=%d group=%d moe_block=%d routing=%s mul_topk=%d\n",
+           M, num_experts, top_k, K, N, group_size, moe_block_size,
+           balanced_routing ? "balanced" : "expert0", (int)mul_topk_weights);
 
     // Validate alignment
     if (K % 16 != 0 || N % 64 != 0) {
@@ -105,29 +113,48 @@ int main(int argc, char** argv) {
     CHECK(cudaMemset(d_a_tmp, 0, (long long)M * top_k * K * sizeof(half)));
 
     // ---- MoE routing data ----
-    // Simulate: each token selects top_k experts.
     // Marlin expects sorted_token_ids grouped by expert, padded to moe_block_size.
-    // We send all M*top_k token slots to expert 0 (simplest valid routing for profiling).
-    int num_moe_blocks = (M * top_k + moe_block_size - 1) / moe_block_size;
-    int total_tokens_padded = num_moe_blocks * moe_block_size;
+    int num_moe_blocks = 0;
+    int total_tokens_padded = 0;
+    if (balanced_routing) {
+        if (top_k > num_experts) {
+            fprintf(stderr, "--balanced requires top_k <= num_experts\n");
+            return 1;
+        }
+        int blocks_per_expert = (M + moe_block_size - 1) / moe_block_size;
+        num_moe_blocks = blocks_per_expert * top_k;
+        total_tokens_padded = num_moe_blocks * moe_block_size;
+    } else {
+        num_moe_blocks = (M * top_k + moe_block_size - 1) / moe_block_size;
+        total_tokens_padded = num_moe_blocks * moe_block_size;
+    }
 
-    std::vector<int32_t> h_sorted_ids(total_tokens_padded);
-    std::vector<int32_t> h_expert_ids(num_moe_blocks);
+    std::vector<int32_t> h_sorted_ids(total_tokens_padded, M * top_k);
+    std::vector<int32_t> h_expert_ids(num_moe_blocks, 0);
     std::vector<float> h_topk_weights(M * top_k);
     int32_t h_num_tokens_padded[1] = {total_tokens_padded};
 
-    // All valid tokens map to sequential indices, assigned to expert 0
     for (int i = 0; i < M * top_k; i++) {
-        h_sorted_ids[i] = i;
-        h_topk_weights[i] = 1.0f / top_k;
+        h_topk_weights[i] = mul_topk_weights ? 1.0f / top_k : 1.0f;
     }
-    // Pad with invalid token ids (>= M * top_k → skipped by kernel)
-    for (int i = M * top_k; i < total_tokens_padded; i++)
-        h_sorted_ids[i] = M * top_k;
 
-    // All blocks assigned to expert 0
-    for (int i = 0; i < num_moe_blocks; i++)
-        h_expert_ids[i] = 0;
+    if (balanced_routing) {
+        int out = 0;
+        int blocks_per_expert = (M + moe_block_size - 1) / moe_block_size;
+        for (int expert = 0; expert < top_k; ++expert) {
+            for (int block = 0; block < blocks_per_expert; ++block) {
+                h_expert_ids[expert * blocks_per_expert + block] = expert;
+                for (int lane = 0; lane < moe_block_size; ++lane) {
+                    int token = block * moe_block_size + lane;
+                    h_sorted_ids[out++] = token < M ? token * top_k + expert : M * top_k;
+                }
+            }
+        }
+    } else {
+        // All valid token slots map to expert 0. This is the original profiling mode.
+        for (int i = 0; i < M * top_k; i++) h_sorted_ids[i] = i;
+        for (int i = 0; i < num_moe_blocks; i++) h_expert_ids[i] = 0;
+    }
 
     int32_t *d_sorted_ids, *d_expert_ids, *d_num_tokens_padded;
     float* d_topk_weights;
@@ -188,7 +215,7 @@ int main(int argc, char** argv) {
             /*moe_block_size=*/moe_block_size,
             /*num_experts=*/num_experts,
             /*top_k=*/top_k,
-            /*mul_topk_weights=*/true,
+            /*mul_topk_weights=*/mul_topk_weights,
             /*prob_m=*/M,
             /*prob_n=*/N,
             /*prob_k=*/K,
