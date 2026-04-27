@@ -94,7 +94,7 @@ All standalone CUDA, no Python overhead. groupsize=128.
 |--------|-----------|--------|--------|---------|
 | BF16 cuBLAS | 238 | 578.3 | 76.5% | 1.00x |
 | FP16 cuBLAS | 239 | 576.2 | 76.2% | 1.00x |
-| **fpAIntB SM90** | **306** | **449.5** | **59.5%** | **0.78x** |
+| **fpAIntB SM90** | **308** | **445.5** | **58.9%** | **0.77x** |
 | CUTLASS SM90 W4A16 (shuffle ON) | 396 | 346.6 | 45.8% | 0.60x |
 | Marlin W4A16 | 510 | 269.6 | 35.7% | 0.47x |
 | CUTLASS SM90 W4A16 (shuffle OFF) | 524 | 262.1 | 34.7% | 0.45x |
@@ -108,6 +108,8 @@ All standalone CUDA, no Python overhead. groupsize=128.
 - **Decode memory-bound**：INT4 权重体积减半，带宽优势直接转化为 4-5x 加速
 - **Marlin 多次 launch**（M=3823 → 4 次），fpAIntB/cuBLAS 单次 launch
 - **CUTLASS ex55 shuffle ON 提速 ~35%**（vs shuffle OFF），但仍不如 fpAIntB 的 tile heuristic
+- fpAIntB 4096x4096x4096 的完整 SM90 config sweep 见
+  [fpA_intB/fpA_intB_standalone/README.md](fpA_intB/fpA_intB_standalone/README.md)。
 
 ## 文件结构
 
