@@ -14,7 +14,11 @@ linear_attention/                DeltaNet layer
 moe_w4a16/                       MoE FFN layer
   marlin/                        W4A16 Marlin GEMM (vLLM)
   auxiliary/                     topk, align, silu_and_mul, sum (vLLM)
-w4a16_gemm/                      Single GEMM bench: Marlin vs cuBLAS (Python)
+w4a16_gemm/                      W4A16 GEMM standalone benches
+  fpA_intB/fpA_intB_standalone/   TensorRT-LLM fpA_intB dense GEMM
+  fpA_intB/moe_w4a16_standalone/ TensorRT-LLM MoE grouped GEMM
+  fpA_intB/machete_standalone/   vLLM Machete GEMM + CUTLASS55 backend
+  fpA_intB/cutlass55_standalone/ CUTLASS example 55 standalone
 third_party/cutlass/             CUTLASS (git submodule)
 ```
 
@@ -28,6 +32,11 @@ third_party/cutlass/             CUTLASS (git submodule)
 | `linear_attention/` | gated_delta_net decode | [llama.cpp](https://github.com/ggml-org/llama.cpp) | 删 ggml wrapper |
 | `moe_w4a16/marlin/` | Marlin MoE GEMM | [vLLM](https://github.com/vllm-project/vllm) | 删 PyTorch wrapper |
 | `moe_w4a16/auxiliary/` | topk, align, silu, sum | vLLM | 删 torch/cub wrapper |
+| `w4a16_gemm/fpA_intB/fpA_intB_standalone/` | fpA_intB dense W4A16 GEMM | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | standalone CMake, no TensorRT/Torch runtime |
+| `w4a16_gemm/fpA_intB/moe_w4a16_standalone/` | MoE W4A16 grouped GEMM | TensorRT-LLM | standalone CMake, TRT-LLM-style tactic cache |
+| `w4a16_gemm/fpA_intB/machete_standalone/` | Machete W4A16 GEMM | vLLM | standalone CMake, includes vLLM heuristic/search |
+| `w4a16_gemm/fpA_intB/cutlass55_standalone/` | Hopper mixed dtype GEMM | NVIDIA CUTLASS example 55 | standalone CMake wrapper |
+| `third_party/cutlass/` | CUTLASS | [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) | kept as git submodule |
 
 ## Qwen3.5 DeltaNet 参数
 

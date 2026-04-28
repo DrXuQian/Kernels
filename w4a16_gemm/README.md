@@ -16,8 +16,8 @@ NVIDIA H800 PCIe (SM 9.0, BF16 dense peak 756 TFLOPS)
 ## 编译
 
 ```bash
-# 初始化 submodule（fpAIntB）
-git submodule update --init w4a16_gemm/fpA_intB
+# From Kernels/w4a16_gemm: initialize the CUTLASS submodule kept by the parent repo.
+git -C .. submodule update --init third_party/cutlass
 
 # 1. Marlin (standalone, 无需 PyTorch)
 nvcc -O2 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr \
@@ -35,10 +35,13 @@ nvcc -O3 -std=c++17 -arch=sm_90a --expt-relaxed-constexpr \
 nvcc -O3 -std=c++17 -arch=sm_90 cublas_bf16_bench.cu -o cublas_bf16_bench -lcublas
 
 # 4. fpAIntB (TRT-LLM extracted)
-cd fpA_intB/fpA_intB_standalone
-mkdir -p build && cd build
-cmake .. -DCUTLASS_DIR=../../../third_party/cutlass -DCMAKE_CUDA_ARCHITECTURES="90a-real"
-make -j$(nproc)
+cmake -S fpA_intB/fpA_intB_standalone \
+  -B fpA_intB/fpA_intB_standalone/build_cmake_release \
+  -DGPU_ARCH=sm_90a \
+  -DCUTLASS_DIR=$PWD/../third_party/cutlass \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build fpA_intB/fpA_intB_standalone/build_cmake_release \
+  --target test_fpA_intB_gemm -j$(nproc)
 ```
 
 ## 运行
@@ -54,13 +57,14 @@ make -j$(nproc)
 ./cublas_bf16_bench 3823 12288 3072
 
 # fpAIntB (with tactic cache to skip online profiling)
-cd fpA_intB/fpA_intB_standalone/build
-./test_fpA_intB_gemm --m=3823 --n=12288 --k=3072 --group_size=128 \
-    --tactic=../tactics_h800.cache --warmup=10 --iters=100
+fpA_intB/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
+    --m=3823 --n=12288 --k=3072 --group_size=128 \
+    --tactic=fpA_intB/fpA_intB_standalone/tactics_h800.cache --warmup=10 --iters=100
 
 # Single inference (no profiling, no warmup)
-./test_fpA_intB_gemm --m=1 --n=12288 --k=3072 --group_size=128 \
-    --tactic=../tactics_h800.cache --warmup=0 --iters=1
+fpA_intB/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
+    --m=1 --n=12288 --k=3072 --group_size=128 \
+    --tactic=fpA_intB/fpA_intB_standalone/tactics_h800.cache --warmup=0 --iters=1
 ```
 
 fpAIntB 详细用法见 [fpA_intB/README.md](fpA_intB/README.md)。
@@ -118,12 +122,11 @@ w4a16_gemm/
 ├── README.md                 # 本文件（benchmark 入口）
 ├── marlin_standalone.cu      # Marlin W4A16 standalone (含正确性验证)
 ├── cublas_bf16_bench.cu      # cuBLAS BF16/FP16 standalone benchmark
-├── fpA_intB/                 # submodule: DrXuQian/w4a16
-│   └── fpA_intB_standalone/
-│       ├── CMakeLists.txt
-│       ├── tactics_h800.cache  # H800 预 profiled tactic 缓存
-│       └── test/
-│           └── test_fpA_intB_gemm.cu
+├── fpA_intB/                 # extracted standalone W4A16 GEMM projects
+│   ├── fpA_intB_standalone/  # TensorRT-LLM dense fpA_intB
+│   ├── moe_w4a16_standalone/ # TensorRT-LLM MoE grouped GEMM
+│   ├── machete_standalone/   # vLLM Machete + CUTLASS55 backend
+│   └── cutlass55_standalone/ # CUTLASS example 55 standalone
 └── kernels/
     └── marlin/
         ├── marlin_cuda_kernel.cu

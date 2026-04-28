@@ -1,0 +1,8 @@
+fp16,8,3823,3072,2048,128|cuda=0,tma=0,tile80=11,stages=4,splitk=1,sk_style=0
+fp16,8,3823,1024,3072,128|cuda=0,tma=0,tile80=11,stages=4,splitk=1,sk_style=0
+fp16,8,1,3072,2048,128|cuda=0,tma=0,tile80=3,stages=4,splitk=1,sk_style=0
+fp16,8,1,1024,3072,128|cuda=0,tma=0,tile80=3,stages=4,splitk=1,sk_style=0
+bf16,8,3823,3072,2048,128|cuda=0,tma=0,tile80=11,stages=3,splitk=1,sk_style=0
+bf16,8,3823,1024,3072,128|cuda=0,tma=0,tile80=11,stages=4,splitk=1,sk_style=0
+bf16,8,1,3072,2048,128|cuda=0,tma=0,tile80=3,stages=4,splitk=1,sk_style=0
+bf16,8,1,1024,3072,128|cuda=0,tma=0,tile80=3,stages=4,splitk=1,sk_style=0

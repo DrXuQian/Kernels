@@ -1,0 +1,4 @@
+build*/
+*.a
+*.o
+test_machete_gemm
