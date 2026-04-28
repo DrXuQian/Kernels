@@ -19,6 +19,26 @@ CHECK_ENV=1
 CHECK_ELF=1
 VERBOSE=0
 NVCC=""
+CURRENT_TARGET=""
+FAILED_TARGET=""
+SUMMARY_STATUS="not started"
+COMPLETED_TARGETS=()
+
+on_exit() {
+  local status=$?
+  if [[ "$status" == 0 ]]; then
+    SUMMARY_STATUS="ok"
+  else
+    SUMMARY_STATUS="failed"
+    if [[ -z "$FAILED_TARGET" && -n "$CURRENT_TARGET" ]]; then
+      FAILED_TARGET="$CURRENT_TARGET"
+    fi
+  fi
+  if [[ -n "${TARGETS+x}" && "$COMMAND" != "list" && "$COMMAND" != "env" ]]; then
+    print_summary "$status"
+  fi
+}
+trap on_exit EXIT
 
 usage() {
   cat <<'EOF'
@@ -247,6 +267,7 @@ cmake_common_args() {
   if [[ -n "$cccl" ]]; then
     printf '%s\n' "-DCMAKE_CUDA_FLAGS=-I$cccl"
     printf '%s\n' "-DCMAKE_CXX_FLAGS=-I$cccl"
+    printf '%s\n' "-DCUDA_CCCL_INCLUDE_DIR=$cccl"
   fi
 }
 
@@ -338,6 +359,64 @@ verify_ppu_elf_version() {
   if ! printf '%s\n' "$output" | grep -Fq "PPU $expected"; then
     die "expected $binary to contain PPU $expected ELF code. Rebuild with CUDA_ROOT/PPU_ROOT pointing to the matching SDK."
   fi
+}
+
+print_summary() {
+  local status="${1:-0}"
+  echo
+  echo "============================================================"
+  echo "[compile] summary"
+  echo "command:     $COMMAND"
+  echo "targets:     ${TARGETS[*]}"
+  if [[ ${#COMPLETED_TARGETS[@]} -gt 0 ]]; then
+    echo "completed:   ${COMPLETED_TARGETS[*]}"
+  else
+    echo "completed:   <none>"
+  fi
+  if [[ -n "$FAILED_TARGET" ]]; then
+    echo "failed:      $FAILED_TARGET"
+  fi
+  echo "repo root:   $ROOT_DIR"
+  echo "cuda root:   ${CUDA_ROOT:-<unset>}"
+  echo "ppu root:    ${PPU_ROOT:-<unset>}"
+  echo "nvcc:        ${NVCC:-<not found>}"
+  echo "gpu arch:    $GPU_ARCH"
+  echo "linear arch: $LINEAR_ARCH"
+  echo "marlin arch: $MARLIN_ARCH"
+  echo "build type:  $BUILD_TYPE"
+  echo "cutlass dir: $CUTLASS_DIR"
+  if [[ "$CHECK_ELF" == 1 ]]; then
+    echo "elf check:   PPU $PPU_ELF_VERSION"
+  else
+    echo "elf check:   disabled"
+  fi
+  echo "status:      $SUMMARY_STATUS"
+  echo "exit code:   $status"
+  echo "============================================================"
+}
+
+run_target_action() {
+  local action="$1"
+  local target
+  shift
+
+  for target in "${TARGETS[@]}"; do
+    CURRENT_TARGET="$target"
+    "$action" "$target"
+    COMPLETED_TARGETS+=("$target")
+    CURRENT_TARGET=""
+  done
+}
+
+run_rebuild_targets() {
+  local target
+  for target in "${TARGETS[@]}"; do
+    CURRENT_TARGET="$target"
+    clean_target "$target"
+    build_target "$target"
+    COMPLETED_TARGETS+=("$target")
+    CURRENT_TARGET=""
+  done
 }
 
 build_make_dir() {
@@ -795,25 +874,16 @@ fi
 
 case "$COMMAND" in
   build)
-    for target in "${TARGETS[@]}"; do
-      build_target "$target"
-    done
+    run_target_action build_target
     ;;
   configure)
-    for target in "${TARGETS[@]}"; do
-      configure_target "$target"
-    done
+    run_target_action configure_target
     ;;
   clean)
-    for target in "${TARGETS[@]}"; do
-      clean_target "$target"
-    done
+    run_target_action clean_target
     ;;
   rebuild)
-    for target in "${TARGETS[@]}"; do
-      clean_target "$target"
-      build_target "$target"
-    done
+    run_rebuild_targets
     ;;
   *)
     die "unknown command: $COMMAND"

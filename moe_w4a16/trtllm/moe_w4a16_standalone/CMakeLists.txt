@@ -11,6 +11,22 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
+set(_CUDA_CCCL_INCLUDE_CANDIDATES
+    "${CUDAToolkit_TARGET_DIR}/include/cccl"
+    "$ENV{CUDA_ROOT}/targets/x86_64-linux/include/cccl"
+)
+set(CUDA_CCCL_INCLUDE_DIR "" CACHE PATH "Path to CUDA CCCL include directory")
+foreach(_candidate IN LISTS _CUDA_CCCL_INCLUDE_CANDIDATES)
+    if(NOT CUDA_CCCL_INCLUDE_DIR AND EXISTS "${_candidate}/cuda/std/utility")
+        set(CUDA_CCCL_INCLUDE_DIR "${_candidate}" CACHE PATH "Path to CUDA CCCL include directory" FORCE)
+    endif()
+endforeach()
+if(CUDA_CCCL_INCLUDE_DIR)
+    message(STATUS "CUDA CCCL include: ${CUDA_CCCL_INCLUDE_DIR}")
+else()
+    message(WARNING "CUDA CCCL include directory was not found; CUTLASS C++ sources may fail to include cuda/std headers.")
+endif()
+
 set(_DEFAULT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/cutlass")
 if(NOT EXISTS "${_DEFAULT_CUTLASS_DIR}/include/cutlass/cutlass.h")
     set(_DEFAULT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/cutlass")
@@ -38,6 +54,7 @@ target_include_directories(moe_w4a16_gemm PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tensorrt_llm
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tensorrt_llm/cutlass_extensions/include
     ${CUTLASS_DIR}/include
+    ${CUDA_CCCL_INCLUDE_DIR}
 )
 
 target_compile_definitions(moe_w4a16_gemm PUBLIC ${MOE_W4A16_COMPILE_DEFS})
