@@ -52,7 +52,7 @@ cmake --build w4a16_gemm/machete_standalone/build_cmake_release \
   --target test_machete_gemm -j$(nproc)
 ```
 
-If the machine has multiple CUDA/PPU SDKs in `PATH`, configure CMake with the
+If the machine has multiple CUDA-compatible SDKs in `PATH`, configure CMake with the
 intended compiler explicitly:
 
 ```

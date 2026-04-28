@@ -64,10 +64,16 @@ third_party/cutlass/             CUTLASS (git submodule)
 git clone --recursive https://github.com/DrXuQian/Kernels.git
 cd Kernels
 
-# 全部编译
-make
+# 推荐：统一编译入口，可检查当前环境并按目标选择
+./compile.sh env
+./compile.sh list
+./compile.sh build
+./compile.sh build general linear_attention
+./compile.sh build moe-vllm w4a16-fpa
+./compile.sh configure w4a16-fpa
+./compile.sh clean all
 
-# 或单独编译
+# 也可以进入子目录单独编译
 cd general && make
 cd linear_attention && make
 cd linear_attention/src/flashinfer_gdn && make    # FlashInfer GDN prefill (~5min)

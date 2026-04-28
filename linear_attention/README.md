@@ -18,23 +18,12 @@ make                        # 全部
 make bench_conv1d_fwd       # 单个
 ```
 
-PPU/H800 环境建议显式绑定同一套 SDK 和 SM90a arch，避免 `PATH` 中多个 SDK
-混用后生成错误的 PPU target：
+也可以从 repo 根目录使用统一编译脚本选择目标，并让脚本检查当前环境：
 
 ```bash
-export CUDA_ROOT=/sim/eec/shared/junfu.qx/Perf_Model_Latest/PM1p7_0420_cuda13.0/PPU_SDK/CUDA_SDK
-export PPU_ROOT=/sim/eec/shared/junfu.qx/Perf_Model_Latest/PM1p7_0420_cuda13.0/PPU_SDK
-export PATH=$CUDA_ROOT/bin:$PPU_ROOT/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_ROOT/lib64:$PPU_ROOT/lib:$LD_LIBRARY_PATH
-
-make clean
-make -B bench_conv1d_fwd CUDA_ROOT=$CUDA_ROOT ARCH=-arch=sm_90a
-```
-
-检查生成 binary 的 PPU target：
-
-```bash
-$PPU_ROOT/bin/hgobjdump --list-elf ./bench_conv1d_fwd | grep -E "ELF FILE|PPU|causal_conv1d_fwd_kernel"
+./compile.sh env
+./compile.sh build linear_attention
+./compile.sh build flashinfer-gdn
 ```
 
 ## 运行

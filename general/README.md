@@ -13,9 +13,8 @@ Standalone benchmarks for kernels that are not specific to one model block.
 ```bash
 make -C general
 
-# PPU/H800 example
-make -C general clean
-make -C general bench_layernorm CUDA_ROOT=$CUDA_ROOT ARCH=-arch=sm_90a
+# Or from the repo root:
+./compile.sh build general
 ```
 
 ## Run
