@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# Qwen3.5-122B-A10B standalone kernel profile suite.
+# Qwen3.5-122B-A10B standalone kernel benchmark suite.
 #
-# This script uses Nsight Systems GPU-kernel summaries and runs each benchmark
-# with a single timed kernel launch: no warmup and exactly one iteration.
+# This script runs each standalone benchmark with no warmup and exactly one
+# measured iteration. Benchmark stdout/stderr is written to per-case logs.
 
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-NSYS="${NSYS:-nsys}"
 BENCH_RUN_ID="${BENCH_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_profiles/nsys_$BENCH_RUN_ID}"
+OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_logs/bench_$BENCH_RUN_ID}"
 
 PREFILL_TOKENS=3823
 DECODE_TOKENS=1
@@ -70,8 +69,7 @@ After the selected cases finish, if ./perfrawlog exists, the script runs:
   python -m perf_model.perf_statistics_gen --report_dir_path <unique-dir> --mp 16 . perfrawlog
 
 Environment variables:
-  NSYS                     Nsight Systems executable. Default: nsys
-  OUT_DIR                  Nsight output directory. Default: .bench_profiles/nsys_<timestamp>
+  OUT_DIR                  Log output directory. Default: .bench_logs/bench_<timestamp>
   BENCH_RUN_ID             Timestamp/name used when OUT_DIR is not set.
   PERF_STATISTICS_DIR      Override perf statistics report directory.
   PERF_STATISTICS_MP       perf_statistics_gen --mp value. Default: 16
@@ -177,11 +175,9 @@ selection_name() {
   safe_name "$name"
 }
 
-profile_case() {
+run_case() {
   local label="$1"
-  local capture_mode="$2"
-  local expected_instances="$3"
-  shift 3
+  shift 1
 
   if [[ "$LIST_CASES" == 1 ]]; then
     echo "$label"
@@ -210,22 +206,7 @@ profile_case() {
 
   local safe
   safe="$(safe_name "$label")"
-  local out="$OUT_DIR/$safe"
-  local log="$out.log"
-  local stats="$out.cuda_gpu_kern_sum.csv"
-
-  local -a nsys_args=(
-    profile
-    --force-overwrite=true
-    --trace=cuda
-    --sample=none
-    --cpuctxsw=none
-    --output="$out"
-  )
-
-  if [[ "$capture_mode" == "cudaProfilerApi" ]]; then
-    nsys_args+=(--capture-range=cudaProfilerApi --capture-range-end=stop)
-  fi
+  local log="$OUT_DIR/$safe.log"
 
   echo
   echo "=== $label ==="
@@ -233,39 +214,24 @@ profile_case() {
   printf ' %q' "$@"
   echo
   echo "[bench_all] log: $log"
-  echo "[bench_all] stats: $stats"
 
   {
     echo "label: $label"
-    echo "capture_mode: $capture_mode"
-    echo "expected_instances: $expected_instances"
     printf 'command:'
     printf ' %q' "$@"
-    echo
-    printf 'nsys_command:'
-    printf ' %q' "$NSYS" "${nsys_args[@]}" "$@"
     echo
     echo "started_at: $(date -Is)"
     echo "---- output ----"
   } >"$log"
 
-  "$NSYS" "${nsys_args[@]}" "$@" >>"$log" 2>&1
-  "$NSYS" stats --report cuda_gpu_kern_sum --format csv --force-export=true "$out.nsys-rep" >"$stats"
-
-  local instances total_ns avg_us
-  instances="$(awk -F, '/^[0-9]/ {s += $3} END {print s + 0}' "$stats")"
-  total_ns="$(awk -F, '/^[0-9]/ {s += $2} END {printf "%.0f", s + 0}' "$stats")"
-  if [[ "$instances" -gt 0 ]]; then
-    avg_us="$(awk -v total="$total_ns" -v inst="$instances" 'BEGIN {printf "%.3f", total / inst / 1000.0}')"
+  if "$@" >>"$log" 2>&1; then
+    echo "finished_at: $(date -Is)" >>"$log"
+    printf '[bench_all] %-34s ok\n' "$label"
   else
-    avg_us="nan"
-  fi
-
-  awk -F, '/^[0-9]/ {printf "  kernels=%s avg_us=%s name=%s\n", $3, $4 / 1000.0, $9}' "$stats"
-  printf '[bench_all] %-34s instances=%s expected=%s avg_us=%s\n' "$label" "$instances" "$expected_instances" "$avg_us"
-
-  if [[ "$instances" != "$expected_instances" ]]; then
-    echo "[bench_all][warn] $label captured $instances GPU kernel launches, expected $expected_instances" >&2
+    local status=$?
+    echo "failed_at: $(date -Is)" >>"$log"
+    echo "exit_status: $status" >>"$log"
+    printf '[bench_all] %-34s failed exit_status=%s\n' "$label" "$status" >&2
     FAILED=1
   fi
 }
@@ -307,11 +273,6 @@ run_perfrawlog_postprocess() {
 }
 
 if [[ "$LIST_CASES" != 1 ]]; then
-  command -v "$NSYS" >/dev/null 2>&1 || {
-    echo "[bench_all][error] nsys not found. Set NSYS=/path/to/nsys." >&2
-    exit 1
-  }
-
   mkdir -p "$OUT_DIR"
 fi
 
@@ -319,8 +280,8 @@ if [[ "$LIST_CASES" == 1 ]]; then
   echo "Available benchmark cases:"
 else
   echo "============================================================"
-  echo "Qwen3.5-122B-A10B standalone kernel nsys suite"
-  echo "profiles: $OUT_DIR"
+  echo "Qwen3.5-122B-A10B standalone kernel benchmark suite"
+  echo "logs: $OUT_DIR"
   echo "prefill tokens: $PREFILL_TOKENS"
   echo "decode tokens:  $DECODE_TOKENS"
   echo "moe prefill:    TensorRT-LLM components"
@@ -331,19 +292,19 @@ else
   echo "============================================================"
 fi
 
-profile_case "linear_decode_conv1d_update" all 1 \
+run_case "linear_decode_conv1d_update" \
   linear_attention/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --bench 0 1
 
-profile_case "linear_decode_gdn" all 1 \
+run_case "linear_decode_gdn" \
   linear_attention/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
-profile_case "linear_prefill_conv1d_fwd" all 1 \
+run_case "linear_prefill_conv1d_fwd" \
   linear_attention/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --bench 0 1
 
-profile_case "linear_prefill_flashinfer_gdn" all 1 \
+run_case "linear_prefill_flashinfer_gdn" \
   linear_attention/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
-profile_case "w4a16_prefill_cutlass55" cudaProfilerApi 1 \
+run_case "w4a16_prefill_cutlass55" \
   --require-file "$MACHETE_TACTIC" \
   "$MACHETE_BIN" \
   --backend=cutlass55 \
@@ -353,26 +314,26 @@ profile_case "w4a16_prefill_cutlass55" cudaProfilerApi 1 \
   --offline_prepack --profile_gemm_only --no_checksum \
   --warmup=0 --iters=1
 
-profile_case "w4a16_decode_fpA_intB" all 1 \
+run_case "w4a16_decode_fpA_intB" \
   --require-file "$FPA_TACTIC" \
   "$FPA_BIN" \
   --m="$DECODE_TOKENS" --n="$W4A16_N" --k="$W4A16_K" --group_size="$W4A16_GROUP" \
   --tactic="$FPA_TACTIC" \
   --warmup=0 --iters=1
 
-profile_case "moe_routing_prefill_trtllm" all 1 \
+run_case "moe_routing_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
   --bench 0 1
 
-profile_case "moe_expert_map_prefill_trtllm" all 3 \
+run_case "moe_expert_map_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_expert_map" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" auto \
   --bench 0 1
 
-profile_case "moe_expand_prefill_trtllm" all 1 \
+run_case "moe_expand_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_GATE_K" fp16 \
   --bench 0 1
 
-profile_case "moe_gate_up_prefill_trtllm" all 1 \
+run_case "moe_gate_up_prefill_trtllm" \
   --require-file "$MOE_TRTLLM_TACTIC" \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
@@ -380,11 +341,11 @@ profile_case "moe_gate_up_prefill_trtllm" all 1 \
   --tactic="$MOE_TRTLLM_TACTIC" \
   --warmup=0 --iters=1
 
-profile_case "moe_gated_prefill_trtllm" all 1 \
+run_case "moe_gated_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" fp16 \
   --bench 0 1
 
-profile_case "moe_down_prefill_trtllm" all 1 \
+run_case "moe_down_prefill_trtllm" \
   --require-file "$MOE_TRTLLM_TACTIC" \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
@@ -392,31 +353,31 @@ profile_case "moe_down_prefill_trtllm" all 1 \
   --tactic="$MOE_TRTLLM_TACTIC" \
   --warmup=0 --iters=1
 
-profile_case "moe_finalize_prefill_trtllm" all 1 \
+run_case "moe_finalize_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
   --bench 0 1
 
-profile_case "moe_routing_decode_vllm" all 1 \
+run_case "moe_routing_decode_vllm" \
   "$MOE_VLLM_AUX_DIR/bench_topk_gating" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" \
   --bench 0 1
 
-profile_case "moe_align_decode_vllm" all 1 \
+run_case "moe_align_decode_vllm" \
   "$MOE_VLLM_AUX_DIR/bench_moe_align" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 \
   --bench 0 1
 
-profile_case "moe_gate_up_decode_vllm" all 1 \
+run_case "moe_gate_up_decode_vllm" \
   "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_GATE_K" "$MOE_GATE_N" \
   --balanced --no-topk-weights --bench 0 1
 
-profile_case "moe_gated_decode_vllm" all 1 \
+run_case "moe_gated_decode_vllm" \
   "$MOE_VLLM_AUX_DIR/bench_silu_and_mul" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" \
   --bench 0 1
 
-profile_case "moe_down_decode_vllm" all 1 \
+run_case "moe_down_decode_vllm" \
   "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_DOWN_K" "$MOE_DOWN_N" \
   --balanced --bench 0 1
 
-profile_case "moe_finalize_decode_vllm" all 1 \
+run_case "moe_finalize_decode_vllm" \
   "$MOE_VLLM_AUX_DIR/bench_moe_sum" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" \
   --bench 0 1
 
@@ -432,12 +393,12 @@ fi
 
 echo
 echo "============================================================"
-echo "nsys profiles and CSV summaries are under: $OUT_DIR"
+echo "benchmark logs are under: $OUT_DIR"
 echo "ran cases: $RAN_CASES"
 if [[ "$FAILED" == 0 ]]; then
-  echo "All captured cases matched the expected GPU kernel launch count."
+  echo "All selected cases completed successfully."
 else
-  echo "Some cases did not match the expected GPU kernel launch count."
+  echo "Some selected cases failed."
 fi
 echo "============================================================"
 

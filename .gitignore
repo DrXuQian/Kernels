@@ -28,3 +28,4 @@ cublas_bf16_bench
 cutlass_w4a16_bench
 w4a16_gemm/marlin_standalone/marlin_standalone
 .bench_profiles/
+.bench_logs/
