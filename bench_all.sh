@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT_DIR"
+RUN_DIR="${RUN_DIR:-${PERF_MODEL_DIR:-$ROOT_DIR}}"
 
 BENCH_RUN_ID="${BENCH_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_logs/bench_$BENCH_RUN_ID}"
@@ -34,16 +34,25 @@ W4A16_N=4096
 W4A16_K=4096
 W4A16_GROUP=128
 
-MACHETE_BIN="w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm"
-FPA_BIN="w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm"
-MOE_TRTLLM_BIN="moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm"
-MOE_TRTLLM_AUX_DIR="moe_w4a16/trtllm/auxiliary"
-MOE_VLLM_MARLIN_BIN="moe_w4a16/vllm/marlin/bench_marlin_moe"
-MOE_VLLM_AUX_DIR="moe_w4a16/vllm/auxiliary"
+repo_path() {
+  local path="$1"
+  if [[ "$path" == /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s/%s\n' "$ROOT_DIR" "$path"
+  fi
+}
 
-MACHETE_TACTIC="w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache"
-FPA_TACTIC="w4a16_gemm/fpA_intB_standalone/tactics_h800.cache"
-MOE_TRTLLM_TACTIC="moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache"
+MACHETE_BIN="$(repo_path "w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm")"
+FPA_BIN="$(repo_path "w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm")"
+MOE_TRTLLM_BIN="$(repo_path "moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
+MOE_TRTLLM_AUX_DIR="$(repo_path "moe_w4a16/trtllm/auxiliary")"
+MOE_VLLM_MARLIN_BIN="$(repo_path "moe_w4a16/vllm/marlin/bench_marlin_moe")"
+MOE_VLLM_AUX_DIR="$(repo_path "moe_w4a16/vllm/auxiliary")"
+
+MACHETE_TACTIC="$(repo_path "w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache")"
+FPA_TACTIC="$(repo_path "w4a16_gemm/fpA_intB_standalone/tactics_h800.cache")"
+MOE_TRTLLM_TACTIC="$(repo_path "moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache")"
 
 FAILED=0
 LIST_CASES=0
@@ -58,6 +67,7 @@ Usage:
   ./bench_all.sh --list                  # list available case labels
   ./bench_all.sh --case LABEL            # run one case
   ./bench_all.sh --kernel LABEL          # alias for --case
+  ./bench_all.sh --run-dir DIR           # run every benchmark with DIR as cwd
   ./bench_all.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings. Examples:
@@ -69,6 +79,8 @@ After the selected cases finish, if ./perfrawlog exists, the script runs:
   python -m perf_model.perf_statistics_gen --report_dir_path <unique-dir> --mp 16 . perfrawlog
 
 Environment variables:
+  RUN_DIR                 Benchmark working directory. Default: PERF_MODEL_DIR or repo root.
+  PERF_MODEL_DIR          Alias/default source for RUN_DIR.
   OUT_DIR                  Log output directory. Default: .bench_logs/bench_<timestamp>
   BENCH_RUN_ID             Timestamp/name used when OUT_DIR is not set.
   PERF_STATISTICS_DIR      Override perf statistics report directory.
@@ -102,6 +114,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --list)
       LIST_CASES=1
+      shift
+      ;;
+    --run-dir|--perf-model-dir)
+      RUN_DIR="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --run-dir=*|--perf-model-dir=*)
+      RUN_DIR="${1#*=}"
       shift
       ;;
     -h|--help|help)
@@ -196,7 +216,12 @@ run_case() {
     shift 2
   done
 
-  require_bin "$1"
+  local -a cmd=("$@")
+  if [[ "${cmd[0]}" != /* ]]; then
+    cmd[0]="$(repo_path "${cmd[0]}")"
+  fi
+
+  require_bin "${cmd[0]}"
   local required_file
   for required_file in "${required_files[@]}"; do
     require_file "$required_file"
@@ -211,20 +236,23 @@ run_case() {
   echo
   echo "=== $label ==="
   printf '[bench_all] command:'
-  printf ' %q' "$@"
+  printf ' cd %q &&' "$RUN_DIR"
+  printf ' %q' "${cmd[@]}"
   echo
   echo "[bench_all] log: $log"
 
   {
     echo "label: $label"
+    echo "run_dir: $RUN_DIR"
     printf 'command:'
-    printf ' %q' "$@"
+    printf ' cd %q &&' "$RUN_DIR"
+    printf ' %q' "${cmd[@]}"
     echo
     echo "started_at: $(date -Is)"
     echo "---- output ----"
   } >"$log"
 
-  if "$@" >>"$log" 2>&1; then
+  if (cd "$RUN_DIR" && "${cmd[@]}") >>"$log" 2>&1; then
     echo "finished_at: $(date -Is)" >>"$log"
     printf '[bench_all] %-34s ok\n' "$label"
   else
@@ -232,6 +260,8 @@ run_case() {
     echo "failed_at: $(date -Is)" >>"$log"
     echo "exit_status: $status" >>"$log"
     printf '[bench_all] %-34s failed exit_status=%s\n' "$label" "$status" >&2
+    echo "[bench_all][error] last lines from $log:" >&2
+    tail -80 "$log" >&2 || true
     FAILED=1
   fi
 }
@@ -242,37 +272,50 @@ run_perfrawlog_postprocess() {
     return
   fi
 
-  if [[ ! -e "$ROOT_DIR/perfrawlog" ]]; then
-    echo "[bench_all] no root perfrawlog found, skip perf statistics generation."
+  local perfrawlog_path="${PERFRAWLOG_PATH:-$RUN_DIR/perfrawlog}"
+  if [[ ! -e "$perfrawlog_path" ]]; then
+    echo "[bench_all] no perfrawlog found under run dir, skip perf statistics generation."
     return
   fi
 
-  local out_base report_dir log
+  local out_base report_dir log perfrawlog_arg
   out_base="$(safe_name "$(basename "$OUT_DIR")")"
   report_dir="${PERF_STATISTICS_DIR:-perfstatistics_$(selection_name)_$out_base}"
   log="$OUT_DIR/perf_statistics_gen.log"
+  perfrawlog_arg="$perfrawlog_path"
+  if [[ "$perfrawlog_path" == "$RUN_DIR/perfrawlog" ]]; then
+    perfrawlog_arg="perfrawlog"
+  fi
 
   echo
   echo "=== perfrawlog statistics ==="
-  echo "[bench_all] perfrawlog: $ROOT_DIR/perfrawlog"
+  echo "[bench_all] run_dir: $RUN_DIR"
+  echo "[bench_all] perfrawlog: $perfrawlog_path"
   echo "[bench_all] report_dir: $report_dir"
   echo "[bench_all] log: $log"
 
   {
     echo "report_dir: $report_dir"
     echo "mp: ${PERF_STATISTICS_MP:-16}"
+    echo "run_dir: $RUN_DIR"
+    echo "perfrawlog: $perfrawlog_path"
     echo "started_at: $(date -Is)"
-    echo "command: python -m perf_model.perf_statistics_gen --report_dir_path $report_dir --mp ${PERF_STATISTICS_MP:-16} . perfrawlog"
+    echo "command: cd $RUN_DIR && python -m perf_model.perf_statistics_gen --report_dir_path $report_dir --mp ${PERF_STATISTICS_MP:-16} . $perfrawlog_arg"
     echo "---- output ----"
   } >"$log"
 
-  python -m perf_model.perf_statistics_gen \
+  (cd "$RUN_DIR" && python -m perf_model.perf_statistics_gen \
     --report_dir_path "$report_dir" \
     --mp "${PERF_STATISTICS_MP:-16}" \
-    . perfrawlog 2>&1 | tee -a "$log"
+    . "$perfrawlog_arg") 2>&1 | tee -a "$log"
 }
 
 if [[ "$LIST_CASES" != 1 ]]; then
+  if [[ ! -d "$RUN_DIR" ]]; then
+    echo "[bench_all][error] run dir does not exist: $RUN_DIR" >&2
+    exit 1
+  fi
+  RUN_DIR="$(cd "$RUN_DIR" && pwd)"
   mkdir -p "$OUT_DIR"
 fi
 
@@ -281,6 +324,8 @@ if [[ "$LIST_CASES" == 1 ]]; then
 else
   echo "============================================================"
   echo "Qwen3.5-122B-A10B standalone kernel benchmark suite"
+  echo "repo: $ROOT_DIR"
+  echo "run dir: $RUN_DIR"
   echo "logs: $OUT_DIR"
   echo "prefill tokens: $PREFILL_TOKENS"
   echo "decode tokens:  $DECODE_TOKENS"
