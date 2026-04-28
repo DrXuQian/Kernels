@@ -10,7 +10,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 NSYS="${NSYS:-nsys}"
-OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_profiles/nsys_$(date +%Y%m%d_%H%M%S)}"
+BENCH_RUN_ID="${BENCH_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_profiles/nsys_$BENCH_RUN_ID}"
 
 PREFILL_TOKENS=3823
 DECODE_TOKENS=1
@@ -46,6 +47,87 @@ FPA_TACTIC="w4a16_gemm/fpA_intB_standalone/tactics_h800.cache"
 MOE_TRTLLM_TACTIC="moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache"
 
 FAILED=0
+LIST_CASES=0
+MATCHED_CASES=0
+RAN_CASES=0
+CASE_FILTERS=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./bench_all.sh                         # run all benchmark cases
+  ./bench_all.sh --list                  # list available case labels
+  ./bench_all.sh --case LABEL            # run one case
+  ./bench_all.sh --kernel LABEL          # alias for --case
+  ./bench_all.sh LABEL [LABEL ...]       # run selected cases
+
+Case matching accepts exact labels or substrings. Examples:
+  ./bench_all.sh w4a16_decode_fpA_intB
+  ./bench_all.sh --case moe_gate_up_decode_vllm
+  ./bench_all.sh decode_vllm
+
+After the selected cases finish, if ./perfrawlog exists, the script runs:
+  python -m perf_model.perf_statistics_gen --report_dir_path <unique-dir> --mp 16 . perfrawlog
+
+Environment variables:
+  NSYS                     Nsight Systems executable. Default: nsys
+  OUT_DIR                  Nsight output directory. Default: .bench_profiles/nsys_<timestamp>
+  BENCH_RUN_ID             Timestamp/name used when OUT_DIR is not set.
+  PERF_STATISTICS_DIR      Override perf statistics report directory.
+  PERF_STATISTICS_MP       perf_statistics_gen --mp value. Default: 16
+  PERFRAWLOG_POSTPROCESS   Set to 0 to skip perfrawlog post-processing.
+EOF
+}
+
+add_case_filter() {
+  local value="$1"
+  local part
+  local old_ifs="$IFS"
+  IFS=','
+  for part in $value; do
+    if [[ -n "$part" ]]; then
+      CASE_FILTERS+=("$part")
+    fi
+  done
+  IFS="$old_ifs"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --case|--kernel|--only)
+      add_case_filter "${2:?missing value for $1}"
+      shift 2
+      ;;
+    --case=*|--kernel=*|--only=*)
+      add_case_filter "${1#*=}"
+      shift
+      ;;
+    --list)
+      LIST_CASES=1
+      shift
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        add_case_filter "$1"
+        shift
+      done
+      ;;
+    -*)
+      echo "[bench_all][error] unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      add_case_filter "$1"
+      shift
+      ;;
+  esac
+done
 
 require_bin() {
   local path="$1"
@@ -69,11 +151,62 @@ safe_name() {
   echo "$1" | tr ' /:' '___' | tr -cd '[:alnum:]_.-'
 }
 
+case_selected() {
+  local label="$1"
+  local safe_label filter
+
+  if [[ ${#CASE_FILTERS[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  safe_label="$(safe_name "$label")"
+  for filter in "${CASE_FILTERS[@]}"; do
+    if [[ "$label" == "$filter" || "$safe_label" == "$filter" || "$label" == *"$filter"* ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+selection_name() {
+  local name="all"
+  if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
+    name="$(IFS=_; echo "${CASE_FILTERS[*]}")"
+  fi
+  safe_name "$name"
+}
+
 profile_case() {
   local label="$1"
   local capture_mode="$2"
   local expected_instances="$3"
   shift 3
+
+  if [[ "$LIST_CASES" == 1 ]]; then
+    echo "$label"
+    return
+  fi
+
+  if ! case_selected "$label"; then
+    return
+  fi
+
+  MATCHED_CASES=$((MATCHED_CASES + 1))
+
+  local required_files=()
+  while [[ $# -gt 0 && "$1" == "--require-file" ]]; do
+    required_files+=("${2:?missing file after --require-file}")
+    shift 2
+  done
+
+  require_bin "$1"
+  local required_file
+  for required_file in "${required_files[@]}"; do
+    require_file "$required_file"
+  done
+
+  RAN_CASES=$((RAN_CASES + 1))
 
   local safe
   safe="$(safe_name "$label")"
@@ -137,42 +270,66 @@ profile_case() {
   fi
 }
 
-command -v "$NSYS" >/dev/null 2>&1 || {
-  echo "[bench_all][error] nsys not found. Set NSYS=/path/to/nsys." >&2
-  exit 1
+run_perfrawlog_postprocess() {
+  if [[ "${PERFRAWLOG_POSTPROCESS:-1}" == 0 ]]; then
+    echo "[bench_all] PERFRAWLOG_POSTPROCESS=0, skip perfrawlog post-processing."
+    return
+  fi
+
+  if [[ ! -e "$ROOT_DIR/perfrawlog" ]]; then
+    echo "[bench_all] no root perfrawlog found, skip perf statistics generation."
+    return
+  fi
+
+  local out_base report_dir log
+  out_base="$(safe_name "$(basename "$OUT_DIR")")"
+  report_dir="${PERF_STATISTICS_DIR:-perfstatistics_$(selection_name)_$out_base}"
+  log="$OUT_DIR/perf_statistics_gen.log"
+
+  echo
+  echo "=== perfrawlog statistics ==="
+  echo "[bench_all] perfrawlog: $ROOT_DIR/perfrawlog"
+  echo "[bench_all] report_dir: $report_dir"
+  echo "[bench_all] log: $log"
+
+  {
+    echo "report_dir: $report_dir"
+    echo "mp: ${PERF_STATISTICS_MP:-16}"
+    echo "started_at: $(date -Is)"
+    echo "command: python -m perf_model.perf_statistics_gen --report_dir_path $report_dir --mp ${PERF_STATISTICS_MP:-16} . perfrawlog"
+    echo "---- output ----"
+  } >"$log"
+
+  python -m perf_model.perf_statistics_gen \
+    --report_dir_path "$report_dir" \
+    --mp "${PERF_STATISTICS_MP:-16}" \
+    . perfrawlog 2>&1 | tee -a "$log"
 }
 
-mkdir -p "$OUT_DIR"
+if [[ "$LIST_CASES" != 1 ]]; then
+  command -v "$NSYS" >/dev/null 2>&1 || {
+    echo "[bench_all][error] nsys not found. Set NSYS=/path/to/nsys." >&2
+    exit 1
+  }
 
-require_bin linear_attention/bench_conv1d_update
-require_bin linear_attention/bench_conv1d_fwd
-require_bin linear_attention/bench_gated_delta_net
-require_bin linear_attention/bench_gdn_prefill
-require_bin "$MACHETE_BIN"
-require_bin "$FPA_BIN"
-require_bin "$MOE_TRTLLM_BIN"
-require_bin "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing"
-require_bin "$MOE_TRTLLM_AUX_DIR/bench_moe_align"
-require_bin "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows"
-require_bin "$MOE_TRTLLM_AUX_DIR/bench_gated_activation"
-require_bin "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing"
-require_bin "$MOE_VLLM_MARLIN_BIN"
-require_bin "$MOE_VLLM_AUX_DIR/bench_topk_gating"
-require_bin "$MOE_VLLM_AUX_DIR/bench_moe_align"
-require_bin "$MOE_VLLM_AUX_DIR/bench_silu_and_mul"
-require_bin "$MOE_VLLM_AUX_DIR/bench_moe_sum"
-require_file "$MACHETE_TACTIC"
-require_file "$FPA_TACTIC"
-require_file "$MOE_TRTLLM_TACTIC"
+  mkdir -p "$OUT_DIR"
+fi
 
-echo "============================================================"
-echo "Qwen3.5-122B-A10B standalone kernel nsys suite"
-echo "profiles: $OUT_DIR"
-echo "prefill tokens: $PREFILL_TOKENS"
-echo "decode tokens:  $DECODE_TOKENS"
-echo "moe prefill:    TensorRT-LLM components"
-echo "moe decode:     vLLM components"
-echo "============================================================"
+if [[ "$LIST_CASES" == 1 ]]; then
+  echo "Available benchmark cases:"
+else
+  echo "============================================================"
+  echo "Qwen3.5-122B-A10B standalone kernel nsys suite"
+  echo "profiles: $OUT_DIR"
+  echo "prefill tokens: $PREFILL_TOKENS"
+  echo "decode tokens:  $DECODE_TOKENS"
+  echo "moe prefill:    TensorRT-LLM components"
+  echo "moe decode:     vLLM components"
+  if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
+    echo "case filters:   ${CASE_FILTERS[*]}"
+  fi
+  echo "============================================================"
+fi
 
 profile_case "linear_decode_conv1d_update" all 1 \
   linear_attention/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --bench 0 1
@@ -187,6 +344,7 @@ profile_case "linear_prefill_flashinfer_gdn" all 1 \
   linear_attention/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
 profile_case "w4a16_prefill_cutlass55" cudaProfilerApi 1 \
+  --require-file "$MACHETE_TACTIC" \
   "$MACHETE_BIN" \
   --backend=cutlass55 \
   --cutlass55_tactic="$MACHETE_TACTIC" \
@@ -196,6 +354,7 @@ profile_case "w4a16_prefill_cutlass55" cudaProfilerApi 1 \
   --warmup=0 --iters=1
 
 profile_case "w4a16_decode_fpA_intB" all 1 \
+  --require-file "$FPA_TACTIC" \
   "$FPA_BIN" \
   --m="$DECODE_TOKENS" --n="$W4A16_N" --k="$W4A16_K" --group_size="$W4A16_GROUP" \
   --tactic="$FPA_TACTIC" \
@@ -214,6 +373,7 @@ profile_case "moe_expand_prefill_trtllm" all 1 \
   --bench 0 1
 
 profile_case "moe_gate_up_prefill_trtllm" all 1 \
+  --require-file "$MOE_TRTLLM_TACTIC" \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
   --n="$MOE_GATE_N" --k="$MOE_GATE_K" --group_size="$MOE_GROUP" \
@@ -225,6 +385,7 @@ profile_case "moe_gated_prefill_trtllm" all 1 \
   --bench 0 1
 
 profile_case "moe_down_prefill_trtllm" all 1 \
+  --require-file "$MOE_TRTLLM_TACTIC" \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
   --n="$MOE_DOWN_N" --k="$MOE_DOWN_K" --group_size="$MOE_GROUP" \
@@ -259,14 +420,27 @@ profile_case "moe_finalize_decode_vllm" all 1 \
   "$MOE_VLLM_AUX_DIR/bench_moe_sum" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" \
   --bench 0 1
 
+if [[ "$LIST_CASES" == 1 ]]; then
+  exit 0
+fi
+
+if [[ ${#CASE_FILTERS[@]} -gt 0 && "$MATCHED_CASES" == 0 ]]; then
+  echo "[bench_all][error] no benchmark case matched: ${CASE_FILTERS[*]}" >&2
+  echo "[bench_all][hint] run ./bench_all.sh --list to see available labels." >&2
+  exit 1
+fi
+
 echo
 echo "============================================================"
 echo "nsys profiles and CSV summaries are under: $OUT_DIR"
+echo "ran cases: $RAN_CASES"
 if [[ "$FAILED" == 0 ]]; then
   echo "All captured cases matched the expected GPU kernel launch count."
 else
   echo "Some cases did not match the expected GPU kernel launch count."
 fi
 echo "============================================================"
+
+run_perfrawlog_postprocess
 
 exit "$FAILED"
