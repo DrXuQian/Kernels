@@ -13,17 +13,18 @@ The vLLM path is a complete standalone component pipeline:
 topk_gating -> moe_align -> Marlin gate/up GEMM -> silu_and_mul -> Marlin down GEMM -> moe_sum
 ```
 
-The TensorRT-LLM path is not a complete end-to-end standalone MoE pipeline yet.
-The extracted pieces currently cover:
+The TensorRT-LLM path is now represented as standalone component kernels:
 
 ```
-custom_moe_routing -> moe_align -> CUTLASS grouped gate/up GEMM -> CUTLASS grouped down GEMM
+custom_moe_routing -> moe_align -> expandInputRows -> CUTLASS grouped gate/up GEMM
+-> gated activation -> CUTLASS grouped down GEMM -> finalizeMoeRouting
 ```
 
-The TRT-LLM `expandInputRows`, gated activation, and `finalizeMoeRouting`
-helpers from `cutlass_kernels/moe_gemm/moe_kernels.cu` are not extracted yet.
-Therefore the TRT-LLM totals below are "available component" lower bounds, not
-full production end-to-end times.
+The `expandInputRows`, gated activation, and `finalizeMoeRouting` helpers are
+FP16/BF16 standalone specializations of the corresponding kernels in
+`cutlass_kernels/moe_gemm/moe_kernels.cu`. This is still a component-level
+benchmark: it does not use TRT-LLM's fused-finalize GEMM epilogue or run the
+whole production runner in a single process.
 
 ## Shapes
 
@@ -56,22 +57,25 @@ input buffers in the benchmark.
 | vLLM | Marlin down GEMM | 1 | 14.719 |
 | vLLM | moe_sum | 1 | 1.728 |
 | vLLM | total | 6 | 54.494 |
-| TRT-LLM | custom_moe_routing | 1 | 2.304 |
-| TRT-LLM | moe_align | 1 | 10.271 |
-| TRT-LLM | CUTLASS grouped gate/up GEMM | 1 | 20.799 |
-| TRT-LLM | CUTLASS grouped down GEMM | 1 | 27.070 |
-| TRT-LLM | available component total | 4 | 60.444 |
+| TRT-LLM | custom_moe_routing | 1 | 2.240 |
+| TRT-LLM | moe_align | 1 | 10.272 |
+| TRT-LLM | expandInputRows | 1 | 3.999 |
+| TRT-LLM | CUTLASS grouped gate/up GEMM | 1 | 20.607 |
+| TRT-LLM | gated activation | 1 | 6.560 |
+| TRT-LLM | CUTLASS grouped down GEMM | 1 | 27.455 |
+| TRT-LLM | finalizeMoeRouting | 1 | 11.360 |
+| TRT-LLM | component total | 7 | 82.493 |
 
 Decode GEMM-only:
 
 | Path | gate/up (us) | down (us) | total (us) |
 |------|--------------|-----------|------------|
 | vLLM Marlin | 21.055 | 14.719 | 35.774 |
-| TRT-LLM CUTLASS grouped GEMM | 20.799 | 27.070 | 47.869 |
+| TRT-LLM CUTLASS grouped GEMM | 20.607 | 27.455 | 48.062 |
 
-For decode, vLLM is currently better in the down projection. The TRT-LLM
-available total is also missing activation and final reduction, so it should not
-be read as a complete TRT-LLM MoE decode time.
+For decode, vLLM is currently better overall. TRT-LLM's gate/up GEMM is about
+flat, but its down projection and the extra standalone expand/finalize helpers
+make the component sum slower for batch=1.
 
 ## Prefill
 
@@ -84,24 +88,26 @@ be read as a complete TRT-LLM MoE decode time.
 | vLLM | Marlin down GEMM | 1 | 1418.235 |
 | vLLM | moe_sum | 1 | 39.357 |
 | vLLM | total | 6 | 5107.345 |
-| TRT-LLM | custom_moe_routing | 1 | 6.527 |
-| TRT-LLM | moe_align generic count/sort | 2 | 165.876 |
-| TRT-LLM | CUTLASS grouped gate/up GEMM | 1 | 1325.764 |
-| TRT-LLM | CUTLASS grouped down GEMM | 1 | 677.777 |
-| TRT-LLM | available component total | 5 | 2175.944 |
+| TRT-LLM | custom_moe_routing | 1 | 6.656 |
+| TRT-LLM | moe_align generic count/sort | 2 | 165.945 |
+| TRT-LLM | expandInputRows | 1 | 281.428 |
+| TRT-LLM | CUTLASS grouped gate/up GEMM | 1 | 1327.658 |
+| TRT-LLM | gated activation | 1 | 391.216 |
+| TRT-LLM | CUTLASS grouped down GEMM | 1 | 681.477 |
+| TRT-LLM | finalizeMoeRouting | 1 | 99.164 |
+| TRT-LLM | component total | 8 | 2953.544 |
 
 Prefill GEMM-only:
 
 | Path | gate/up (us) | down (us) | total (us) |
 |------|--------------|-----------|------------|
 | vLLM Marlin | 2862.930 | 1418.235 | 4281.165 |
-| TRT-LLM CUTLASS grouped GEMM | 1325.764 | 677.777 | 2003.541 |
+| TRT-LLM CUTLASS grouped GEMM | 1327.658 | 681.477 | 2009.135 |
 
 For prefill, TRT-LLM's grouped CUTLASS GEMM is about 2.14x faster than the
-current vLLM Marlin standalone GEMM sum on these shapes. The available TRT-LLM
-component sum is about 2.35x lower than the vLLM standalone pipeline, but this
-is a lower bound because the TRT-LLM activation/finalize/expand helpers are not
-included.
+current vLLM Marlin standalone GEMM sum on these shapes. Including standalone
+expand, gated activation, and finalize helpers, the TRT-LLM component pipeline
+is about 1.73x faster than the vLLM standalone pipeline.
 
 ## Kernel Differences
 
@@ -120,10 +126,14 @@ TensorRT-LLM path:
 - Alignment uses TRT-LLM `moe_align_block_size`; prefill selects the generic
   count/sort path, which launches two kernels.
 - GEMM uses TRT-LLM's CUTLASS `MoeFCGemm` grouped-GEMM path with a tactic cache.
-- The standalone GEMM harness expects rows already grouped by expert and uses
-  identity activation.
-- The production TRT-LLM path has extra helpers for input expansion, gated
-  activation, and finalize/reduction that are not yet represented here.
+- `expandInputRows` duplicates the input activation rows according to the
+  permuted expert layout before the first grouped GEMM.
+- Gated activation is represented as a standalone FP16/BF16 Swiglu helper.
+- `finalizeMoeRouting` unpermutes, applies top-k scales, and reduces the expert
+  outputs back to one row per token.
+- The standalone GEMM harness itself still expects rows already grouped by
+  expert; the helper benchmarks measure the missing component kernels
+  separately.
 
 ## Commands
 
@@ -140,14 +150,17 @@ moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 1024 --bench 0 1
 
 moe_w4a16/trtllm/auxiliary/bench_custom_moe_routing 3823 64 8 fp16 --bench 0 1
 moe_w4a16/trtllm/auxiliary/bench_moe_align 3823 64 8 16 auto --bench 0 1
+moe_w4a16/trtllm/auxiliary/bench_expand_input_rows 3823 8 2048 fp16 --bench 0 1
 moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=3823 --n=3072 --k=2048 \
   --group_size=128 --tactic=moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
+moe_w4a16/trtllm/auxiliary/bench_gated_activation 3823 8 3072 fp16 --bench 0 1
 moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=3823 --n=1024 --k=3072 \
   --group_size=128 --tactic=moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
+moe_w4a16/trtllm/auxiliary/bench_finalize_moe_routing 3823 8 1024 fp16 --bench 0 1
 ```
 
 Use the same commands with `3823` replaced by `1` for decode.

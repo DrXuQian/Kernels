@@ -61,21 +61,44 @@ template <typename T>
 T trtllm_aux_from_float(float value);
 
 template <>
-inline float trtllm_aux_from_float<float>(float value)
+__host__ __device__ inline float trtllm_aux_from_float<float>(float value)
 {
     return value;
 }
 
 template <>
-inline half trtllm_aux_from_float<half>(float value)
+__host__ __device__ inline half trtllm_aux_from_float<half>(float value)
 {
     return __float2half(value);
 }
 
 #if ENABLE_BF16
 template <>
-inline __nv_bfloat16 trtllm_aux_from_float<__nv_bfloat16>(float value)
+__host__ __device__ inline __nv_bfloat16 trtllm_aux_from_float<__nv_bfloat16>(float value)
 {
     return __float2bfloat16(value);
+}
+#endif
+
+template <typename T>
+__host__ __device__ inline float trtllm_aux_to_float(T value);
+
+template <>
+__host__ __device__ inline float trtllm_aux_to_float<float>(float value)
+{
+    return value;
+}
+
+template <>
+__host__ __device__ inline float trtllm_aux_to_float<half>(half value)
+{
+    return __half2float(value);
+}
+
+#if ENABLE_BF16
+template <>
+__host__ __device__ inline float trtllm_aux_to_float<__nv_bfloat16>(__nv_bfloat16 value)
+{
+    return __bfloat162float(value);
 }
 #endif

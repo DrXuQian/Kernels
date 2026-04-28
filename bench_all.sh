@@ -21,6 +21,7 @@ LINEAR_V_HEADS=64
 LINEAR_HEAD_DIM=128
 
 MOE_EXPERTS=8
+MOE_ROUTER_EXPERTS=64
 MOE_TOPK=8
 MOE_GROUP=128
 MOE_GATE_N=3072
@@ -36,6 +37,7 @@ W4A16_GROUP=128
 MACHETE_BIN="w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm"
 FPA_BIN="w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm"
 MOE_TRTLLM_BIN="moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm"
+MOE_TRTLLM_AUX_DIR="moe_w4a16/trtllm/auxiliary"
 
 MACHETE_TACTIC="w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache"
 FPA_TACTIC="w4a16_gemm/fpA_intB_standalone/tactics_h800.cache"
@@ -131,6 +133,11 @@ require_bin linear_attention/bench_gdn_prefill
 require_bin "$MACHETE_BIN"
 require_bin "$FPA_BIN"
 require_bin "$MOE_TRTLLM_BIN"
+require_bin "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing"
+require_bin "$MOE_TRTLLM_AUX_DIR/bench_moe_align"
+require_bin "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows"
+require_bin "$MOE_TRTLLM_AUX_DIR/bench_gated_activation"
+require_bin "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing"
 require_file "$MACHETE_TACTIC"
 require_file "$FPA_TACTIC"
 require_file "$MOE_TRTLLM_TACTIC"
@@ -169,12 +176,28 @@ profile_case "w4a16_decode_fpA_intB" all 1 \
   --tactic="$FPA_TACTIC" \
   --warmup=0 --iters=1
 
+profile_case "moe_routing_prefill_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
+  --bench 0 1
+
+profile_case "moe_align_prefill_trtllm" all 2 \
+  "$MOE_TRTLLM_AUX_DIR/bench_moe_align" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 auto \
+  --bench 0 1
+
+profile_case "moe_expand_prefill_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_GATE_K" fp16 \
+  --bench 0 1
+
 profile_case "moe_gate_up_prefill_trtllm" all 1 \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
   --n="$MOE_GATE_N" --k="$MOE_GATE_K" --group_size="$MOE_GROUP" \
   --tactic="$MOE_TRTLLM_TACTIC" \
   --warmup=0 --iters=1
+
+profile_case "moe_gated_prefill_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" fp16 \
+  --bench 0 1
 
 profile_case "moe_down_prefill_trtllm" all 1 \
   "$MOE_TRTLLM_BIN" \
@@ -183,12 +206,32 @@ profile_case "moe_down_prefill_trtllm" all 1 \
   --tactic="$MOE_TRTLLM_TACTIC" \
   --warmup=0 --iters=1
 
+profile_case "moe_finalize_prefill_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
+  --bench 0 1
+
+profile_case "moe_routing_decode_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
+  --bench 0 1
+
+profile_case "moe_align_decode_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_moe_align" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 auto \
+  --bench 0 1
+
+profile_case "moe_expand_decode_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_K" fp16 \
+  --bench 0 1
+
 profile_case "moe_gate_up_decode_trtllm" all 1 \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$DECODE_TOKENS" \
   --n="$MOE_GATE_N" --k="$MOE_GATE_K" --group_size="$MOE_GROUP" \
   --tactic="$MOE_TRTLLM_TACTIC" \
   --warmup=0 --iters=1
+
+profile_case "moe_gated_decode_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" fp16 \
+  --bench 0 1
 
 profile_case "moe_down_decode_trtllm" all 1 \
   "$MOE_TRTLLM_BIN" \
@@ -197,13 +240,17 @@ profile_case "moe_down_decode_trtllm" all 1 \
   --tactic="$MOE_TRTLLM_TACTIC" \
   --warmup=0 --iters=1
 
+profile_case "moe_finalize_decode_trtllm" all 1 \
+  "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
+  --bench 0 1
+
 echo
 echo "============================================================"
 echo "nsys profiles and CSV summaries are under: $OUT_DIR"
 if [[ "$FAILED" == 0 ]]; then
-  echo "All captured cases have exactly one GPU kernel launch."
+  echo "All captured cases matched the expected GPU kernel launch count."
 else
-  echo "Some cases did not capture exactly one GPU kernel launch."
+  echo "Some cases did not match the expected GPU kernel launch count."
 fi
 echo "============================================================"
 

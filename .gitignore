@@ -19,6 +19,9 @@ bench_marlin_moe
 bench_topk_gating
 bench_moe_align
 bench_custom_moe_routing
+bench_expand_input_rows
+bench_gated_activation
+bench_finalize_moe_routing
 bench_silu_and_mul
 bench_moe_sum
 cublas_bf16_bench
