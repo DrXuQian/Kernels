@@ -39,15 +39,16 @@ Not included:
 
 Build
 -----
-From this directory's parent repo:
+From the repo root:
 
 ```
-cmake -S machete_standalone -B machete_standalone/build_cmake_release \
+cmake -S w4a16_gemm/machete_standalone \
+  -B w4a16_gemm/machete_standalone/build_cmake_release \
   -DGPU_ARCH=sm_90a \
-  -DCUTLASS_DIR=$PWD/../../third_party/cutlass \
+  -DCUTLASS_DIR=$PWD/third_party/cutlass \
   -DCMAKE_BUILD_TYPE=Release
 
-cmake --build machete_standalone/build_cmake_release \
+cmake --build w4a16_gemm/machete_standalone/build_cmake_release \
   --target test_machete_gemm -j$(nproc)
 ```
 
@@ -57,10 +58,11 @@ intended compiler explicitly:
 ```
 CUDA_ROOT=/path/to/CUDA_SDK
 CUDACXX=$CUDA_ROOT/bin/nvcc \
-cmake -S machete_standalone -B machete_standalone/build_cmake_release \
+cmake -S w4a16_gemm/machete_standalone \
+  -B w4a16_gemm/machete_standalone/build_cmake_release \
   -DCUDAToolkit_ROOT=$CUDA_ROOT \
   -DGPU_ARCH=sm_90a \
-  -DCUTLASS_DIR=$PWD/../../third_party/cutlass \
+  -DCUTLASS_DIR=$PWD/third_party/cutlass \
   -DCMAKE_BUILD_TYPE=Release
 ```
 
@@ -69,7 +71,7 @@ Run
 Default run, using heuristic schedule selection:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=gptq_u4b8 \
   --warmup=100 --iters=1000
@@ -81,7 +83,7 @@ shuffle layout. The default config is the original example-55
 `128x128x64_1x1x1` tile/cluster shape.
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --backend=cutlass55 \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=cutlass_s4 \
@@ -91,14 +93,14 @@ machete_standalone/build_cmake_release/test_machete_gemm \
 List CUTLASS55 configs:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --list_cutlass55_configs
 ```
 
 Force one CUTLASS55 config:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --backend=cutlass55 \
   --cutlass55_config=256x128x64_1x1x1 \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
@@ -109,7 +111,7 @@ machete_standalone/build_cmake_release/test_machete_gemm \
 Search all compiled CUTLASS55 configs sequentially:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --search_cutlass55_configs \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=cutlass_s4 \
@@ -119,20 +121,20 @@ machete_standalone/build_cmake_release/test_machete_gemm \
 Save the best searched config into a tactic cache:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --search_cutlass55_configs \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=cutlass_s4 \
   --offline_prepack --no_checksum --warmup=100 --iters=1000 \
-  --save_cutlass55_tactic=machete_standalone/cutlass55_tactics_h800.cache
+  --save_cutlass55_tactic=w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache
 ```
 
 Load a cached config directly:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --backend=cutlass55 \
-  --cutlass55_tactic=machete_standalone/cutlass55_tactics_h800.cache \
+  --cutlass55_tactic=w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=cutlass_s4 \
   --offline_prepack --no_checksum --warmup=100 --iters=1000
@@ -147,10 +149,10 @@ m,n,k,group,act|config=<cutlass55_config>,avg_us=<measured_time>
 Batch-search a list of shapes and emit both a cache and a markdown table:
 
 ```
-machete_standalone/tools/search_cutlass55_tactics.sh \
-  --bin machete_standalone/build_cmake_release/test_machete_gemm \
-  --out-cache machete_standalone/cutlass55_tactics_h800.cache \
-  --out-md machete_standalone/CUTLASS55_TACTICS_H800.md \
+w4a16_gemm/machete_standalone/tools/search_cutlass55_tactics.sh \
+  --bin w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
+  --out-cache w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
+  --out-md w4a16_gemm/machete_standalone/CUTLASS55_TACTICS_H800.md \
   --warmup 100 --iters 1000
 ```
 
@@ -163,7 +165,7 @@ M N K GROUP ACT
 AWQ-style u4:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=bf16 --quant=awq_u4 \
   --warmup=100 --iters=1000
@@ -172,13 +174,13 @@ machete_standalone/build_cmake_release/test_machete_gemm \
 List schedules:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm --list_schedules
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm --list_schedules
 ```
 
 Force a schedule:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m=128 --n=4096 --k=4096 --group_size=128 \
   --schedule=128x32_2x1x1_TmaMI_TmaCoop_streamK
 ```
@@ -186,7 +188,7 @@ machete_standalone/build_cmake_release/test_machete_gemm \
 Save a Machete-prepacked weight file once:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=gptq_u4b8 \
   --save_prepacked=/tmp/machete_b_4096x4096_fp16_gptq_u4b8.bin \
@@ -197,7 +199,7 @@ Run later with the weight already prepacked offline. This skips the runtime GPU
 prepack kernel and loads B from the saved file:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=gptq_u4b8 \
   --offline_prepack=/tmp/machete_b_4096x4096_fp16_gptq_u4b8.bin \
@@ -210,7 +212,7 @@ copies it to the device before timing. This does not run runtime prepack or file
 IO, and avoids the unrealistic all-zero/unwritten-buffer timing path:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=gptq_u4b8 \
   --offline_prepack --no_checksum --warmup=0 --iters=1
@@ -222,7 +224,7 @@ range capture:
 ```
 nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi \
   --capture-range-end=stop -f true -o /tmp/machete_gemm_only \
-  machete_standalone/build_cmake_release/test_machete_gemm \
+  w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
     --m=4096 --n=4096 --k=4096 --group_size=128 \
     --act=fp16 --quant=gptq_u4b8 \
     --offline_prepack \
@@ -239,8 +241,8 @@ nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum \
 Run all schedules:
 
 ```
-machete_standalone/tools/run_all_schedules.sh \
-  --bin machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/tools/run_all_schedules.sh \
+  --bin w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m 4096 --n 4096 --k 4096 --group 128 \
   --act fp16 --quant gptq_u4b8 \
   --warmup 100 --iters 1000 --out /tmp/machete_4096_all_schedules.txt
@@ -256,7 +258,7 @@ timed GEMM loop; Machete prepack is run before timing. Effective dense TFLOPS is
 Command:
 
 ```
-machete_standalone/build_cmake_release/test_machete_gemm \
+w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --m=4096 --n=4096 --k=4096 --group_size=128 \
   --act=fp16 --quant=gptq_u4b8 \
   --warmup=100 --iters=1000
@@ -275,7 +277,7 @@ For reference, CUTLASS example 55 FP16 mode 1 was measured on the same shape
 with initialized inputs and offline reorder before timing:
 
 ```
-cutlass55_standalone/build_cmake_release/cutlass55_fp16_gemm \
+w4a16_gemm/cutlass55_standalone/build_cmake_release/cutlass55_fp16_gemm \
   --m=4096 --n=4096 --k=4096 --g=128 \
   --mode=1 --shuffle=true --skip_verify \
   --warmup=100 --iterations=1000

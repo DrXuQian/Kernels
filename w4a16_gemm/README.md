@@ -20,8 +20,7 @@ NVIDIA H800 PCIe (SM 9.0, BF16 dense peak 756 TFLOPS)
 git -C .. submodule update --init third_party/cutlass
 
 # 1. Marlin (standalone, 无需 PyTorch)
-nvcc -O2 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr \
-  -diag-suppress 177,179,39 marlin_standalone.cu -o marlin_standalone
+make -C marlin_standalone
 
 # 2. CUTLASS SM90
 nvcc -O3 -std=c++17 -arch=sm_90a --expt-relaxed-constexpr \
@@ -35,12 +34,12 @@ nvcc -O3 -std=c++17 -arch=sm_90a --expt-relaxed-constexpr \
 nvcc -O3 -std=c++17 -arch=sm_90 cublas_bf16_bench.cu -o cublas_bf16_bench -lcublas
 
 # 4. fpAIntB (TRT-LLM extracted)
-cmake -S fpA_intB/fpA_intB_standalone \
-  -B fpA_intB/fpA_intB_standalone/build_cmake_release \
+cmake -S fpA_intB_standalone \
+  -B fpA_intB_standalone/build_cmake_release \
   -DGPU_ARCH=sm_90a \
   -DCUTLASS_DIR=$PWD/../third_party/cutlass \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build fpA_intB/fpA_intB_standalone/build_cmake_release \
+cmake --build fpA_intB_standalone/build_cmake_release \
   --target test_fpA_intB_gemm -j$(nproc)
 ```
 
@@ -48,7 +47,7 @@ cmake --build fpA_intB/fpA_intB_standalone/build_cmake_release \
 
 ```bash
 # Marlin W4A16
-./marlin_standalone -m 3823 -n 12288 -k 3072 -g 128 -w 10 -i 100
+./marlin_standalone/marlin_standalone -m 3823 -n 12288 -k 3072 -g 128 -w 10 -i 100
 
 # CUTLASS SM90 W4A16
 ./cutlass_w4a16_bench --m=3823 --n=12288 --k=3072 --g=128 --mode=1 --shuffle=true --iterations=100
@@ -57,17 +56,17 @@ cmake --build fpA_intB/fpA_intB_standalone/build_cmake_release \
 ./cublas_bf16_bench 3823 12288 3072
 
 # fpAIntB (with tactic cache to skip online profiling)
-fpA_intB/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
+fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
     --m=3823 --n=12288 --k=3072 --group_size=128 \
-    --tactic=fpA_intB/fpA_intB_standalone/tactics_h800.cache --warmup=10 --iters=100
+    --tactic=fpA_intB_standalone/tactics_h800.cache --warmup=10 --iters=100
 
 # Single inference (no profiling, no warmup)
-fpA_intB/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
+fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
     --m=1 --n=12288 --k=3072 --group_size=128 \
-    --tactic=fpA_intB/fpA_intB_standalone/tactics_h800.cache --warmup=0 --iters=1
+    --tactic=fpA_intB_standalone/tactics_h800.cache --warmup=0 --iters=1
 ```
 
-fpAIntB 详细用法见 [fpA_intB/README.md](fpA_intB/README.md)。
+fpAIntB 详细用法见 [fpA_intB_standalone/README.md](fpA_intB_standalone/README.md)。
 
 ## Benchmark 结果 (H800 PCIe)
 
@@ -113,23 +112,20 @@ All standalone CUDA, no Python overhead. groupsize=128.
 - **Marlin 多次 launch**（M=3823 → 4 次），fpAIntB/cuBLAS 单次 launch
 - **CUTLASS ex55 shuffle ON 提速 ~35%**（vs shuffle OFF），但仍不如 fpAIntB 的 tile heuristic
 - fpAIntB 4096x4096x4096 的完整 SM90 config sweep 见
-  [fpA_intB/fpA_intB_standalone/README.md](fpA_intB/fpA_intB_standalone/README.md)。
+  [fpA_intB_standalone/README.md](fpA_intB_standalone/README.md)。
 
 ## 文件结构
 
 ```
 w4a16_gemm/
 ├── README.md                 # 本文件（benchmark 入口）
-├── marlin_standalone.cu      # Marlin W4A16 standalone (含正确性验证)
 ├── cublas_bf16_bench.cu      # cuBLAS BF16/FP16 standalone benchmark
-├── fpA_intB/                 # extracted standalone W4A16 GEMM projects
-│   ├── fpA_intB_standalone/  # TensorRT-LLM dense fpA_intB
-│   ├── moe_w4a16_standalone/ # TensorRT-LLM MoE grouped GEMM
-│   ├── machete_standalone/   # vLLM Machete + CUTLASS55 backend
-│   └── cutlass55_standalone/ # CUTLASS example 55 standalone
-└── kernels/
-    └── marlin/
-        ├── marlin_cuda_kernel.cu
-        ├── marlin_cuda.cpp
-        └── setup.py
+├── cutlass_w4a16_bench.cu    # CUTLASS example 55 direct benchmark
+├── fpA_intB_standalone/      # TensorRT-LLM dense fpA_intB
+├── machete_standalone/       # vLLM Machete + CUTLASS55 backend
+├── cutlass55_standalone/     # CUTLASS example 55 standalone
+└── marlin_standalone/        # Marlin W4A16 standalone
+    ├── marlin_standalone.cu  # standalone CUDA binary source
+    ├── bench_marlin.py       # older PyTorch extension benchmark
+    └── kernels/marlin/       # older PyTorch extension sources
 ```

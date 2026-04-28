@@ -18,28 +18,29 @@ Build
 -----
 
 ```
-cmake -S cutlass55_standalone -B cutlass55_standalone/build_cmake_release \
+cmake -S w4a16_gemm/cutlass55_standalone \
+  -B w4a16_gemm/cutlass55_standalone/build_cmake_release \
   -DGPU_ARCH=sm_90a \
-  -DCUTLASS_DIR=$PWD/../../third_party/cutlass \
+  -DCUTLASS_DIR=$PWD/third_party/cutlass \
   -DCMAKE_BUILD_TYPE=Release
 
-cmake --build cutlass55_standalone/build_cmake_release \
+cmake --build w4a16_gemm/cutlass55_standalone/build_cmake_release \
   --target cutlass55_fp16_gemm cutlass55_bf16_gemm -j$(nproc)
 ```
 
 Direct `nvcc` build for FP16:
 
 ```
-CUTLASS_DIR=$PWD/../../third_party/cutlass
+CUTLASS_DIR=$PWD/third_party/cutlass
 nvcc -O3 -std=c++17 -arch=sm_90a --expt-relaxed-constexpr \
   -DCUTLASS_ARCH_MMA_SM90_SUPPORTED=1 \
   -DCUTLASS_USE_FP16=1 \
-  -Icutlass55_standalone \
+  -Iw4a16_gemm/cutlass55_standalone \
   -I$CUTLASS_DIR/include \
   -I$CUTLASS_DIR/tools/util/include \
   -I$CUTLASS_DIR/examples/common \
   -I$CUTLASS_DIR/examples/55_hopper_mixed_dtype_gemm \
-  cutlass55_standalone/cutlass55_gemm.cu \
+  w4a16_gemm/cutlass55_standalone/cutlass55_gemm.cu \
   -o /tmp/cutlass55_fp16_gemm
 ```
 
@@ -52,7 +53,7 @@ synthetic data before timing. It also skips the correctness warmup GEMM,
 reference GEMM, and comparison kernel:
 
 ```
-cutlass55_standalone/build_cmake_release/cutlass55_fp16_gemm \
+w4a16_gemm/cutlass55_standalone/build_cmake_release/cutlass55_fp16_gemm \
   --m=4096 --n=4096 --k=4096 --g=128 \
   --mode=1 --shuffle=true \
   --skip_setup_kernels --skip_verify \
@@ -66,7 +67,7 @@ kernel path.
 Launch exactly one target GEMM kernel:
 
 ```
-cutlass55_standalone/build_cmake_release/cutlass55_fp16_gemm \
+w4a16_gemm/cutlass55_standalone/build_cmake_release/cutlass55_fp16_gemm \
   --m=4096 --n=4096 --k=4096 --g=128 \
   --mode=1 --shuffle=true \
   --single_kernel --profile_gemm_only

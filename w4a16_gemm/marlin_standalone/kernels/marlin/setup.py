@@ -10,7 +10,7 @@ setup(
     install_requires=['numpy', 'torch'],
     packages=['marlin'],
     ext_modules=[cpp_extension.CUDAExtension(
-        'marlin_cuda', ['marlin/marlin_cuda.cpp', 'marlin/marlin_cuda_kernel.cu']
+        'marlin_cuda', ['marlin_cuda.cpp', 'marlin_cuda_kernel.cu']
     )],
     cmdclass={'build_ext': cpp_extension.BuildExtension},
 )

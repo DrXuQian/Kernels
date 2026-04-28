@@ -1,0 +1,15 @@
+# Build directories / artifacts
+build/
+build_*/
+build-*/
+build.*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.d
+__pycache__/
+*.pyc

@@ -11,14 +11,17 @@ linear_attention/                DeltaNet layer
   src/causal_conv1d_*.cu         conv1d fwd/update (Dao-AILab)
   src/gated_delta_net.cu         GDN decode recurrent (llama.cpp CUDA)
   src/bench_gdn_decode.py        GDN decode recurrent (fla Triton, matches vLLM)
+general/                         General standalone CUDA kernels
+  bench_layernorm.cu             LayerNorm benchmark (OneFlow)
 moe_w4a16/                       MoE FFN layer
-  marlin/                        W4A16 Marlin GEMM (vLLM)
-  auxiliary/                     topk, align, silu_and_mul, sum (vLLM)
+  vllm/marlin/                   W4A16 Marlin GEMM (vLLM)
+  vllm/auxiliary/                topk, align, silu_and_mul, sum (vLLM)
+  trtllm/moe_w4a16_standalone/   TensorRT-LLM MoE grouped GEMM
 w4a16_gemm/                      W4A16 GEMM standalone benches
-  fpA_intB/fpA_intB_standalone/   TensorRT-LLM fpA_intB dense GEMM
-  fpA_intB/moe_w4a16_standalone/ TensorRT-LLM MoE grouped GEMM
-  fpA_intB/machete_standalone/   vLLM Machete GEMM + CUTLASS55 backend
-  fpA_intB/cutlass55_standalone/ CUTLASS example 55 standalone
+  fpA_intB_standalone/           TensorRT-LLM fpA_intB dense GEMM
+  machete_standalone/            vLLM Machete GEMM + CUTLASS55 backend
+  cutlass55_standalone/          CUTLASS example 55 standalone
+  marlin_standalone/             Marlin W4A16 standalone
 third_party/cutlass/             CUTLASS (git submodule)
 ```
 
@@ -30,12 +33,14 @@ third_party/cutlass/             CUTLASS (git submodule)
 | `linear_attention/src/kda/` | KDA chunked prefill | [cuLA](https://github.com/inclusionAI/cuLA) | 零修改复制 |
 | `linear_attention/` | causal_conv1d fwd/update | [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) | 删 c10 include |
 | `linear_attention/` | gated_delta_net decode | [llama.cpp](https://github.com/ggml-org/llama.cpp) | 删 ggml wrapper |
-| `moe_w4a16/marlin/` | Marlin MoE GEMM | [vLLM](https://github.com/vllm-project/vllm) | 删 PyTorch wrapper |
-| `moe_w4a16/auxiliary/` | topk, align, silu, sum | vLLM | 删 torch/cub wrapper |
-| `w4a16_gemm/fpA_intB/fpA_intB_standalone/` | fpA_intB dense W4A16 GEMM | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | standalone CMake, no TensorRT/Torch runtime |
-| `w4a16_gemm/fpA_intB/moe_w4a16_standalone/` | MoE W4A16 grouped GEMM | TensorRT-LLM | standalone CMake, TRT-LLM-style tactic cache |
-| `w4a16_gemm/fpA_intB/machete_standalone/` | Machete W4A16 GEMM | vLLM | standalone CMake, includes vLLM heuristic/search |
-| `w4a16_gemm/fpA_intB/cutlass55_standalone/` | Hopper mixed dtype GEMM | NVIDIA CUTLASS example 55 | standalone CMake wrapper |
+| `general/bench_layernorm.cu` | LayerNorm | [OneFlow](https://github.com/Oneflow-Inc/oneflow) | standalone benchmark harness |
+| `moe_w4a16/vllm/marlin/` | Marlin MoE GEMM | [vLLM](https://github.com/vllm-project/vllm) | 删 PyTorch wrapper |
+| `moe_w4a16/vllm/auxiliary/` | topk, align, silu, sum | vLLM | 删 torch/cub wrapper |
+| `w4a16_gemm/fpA_intB_standalone/` | fpA_intB dense W4A16 GEMM | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | standalone CMake, no TensorRT/Torch runtime |
+| `moe_w4a16/trtllm/moe_w4a16_standalone/` | MoE W4A16 grouped GEMM | TensorRT-LLM | standalone CMake, TRT-LLM-style tactic cache |
+| `w4a16_gemm/machete_standalone/` | Machete W4A16 GEMM | vLLM | standalone CMake, includes vLLM heuristic/search |
+| `w4a16_gemm/cutlass55_standalone/` | Hopper mixed dtype GEMM | NVIDIA CUTLASS example 55 | standalone CMake wrapper |
+| `w4a16_gemm/marlin_standalone/` | Marlin W4A16 GEMM | IST-DASLab Marlin | standalone CUDA benchmark |
 | `third_party/cutlass/` | CUTLASS | [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) | kept as git submodule |
 
 ## Qwen3.5 DeltaNet 参数
@@ -63,10 +68,11 @@ cd Kernels
 make
 
 # 或单独编译
+cd general && make
 cd linear_attention && make
 cd linear_attention/src/flashinfer_gdn && make    # FlashInfer GDN prefill (~5min)
-cd moe_w4a16/marlin && make
-cd moe_w4a16/auxiliary && make
+cd moe_w4a16/vllm/marlin && make
+cd moe_w4a16/vllm/auxiliary && make
 ```
 
 ## Benchmark
@@ -176,6 +182,6 @@ cd linear_attention
 ncu --set full --kernel-name "causal_conv1d_fwd" ./bench_conv1d_fwd 3823 12288 4 1
 
 # MoE Marlin GEMM decode
-cd moe_w4a16/marlin
+cd moe_w4a16/vllm/marlin
 ncu --set full --kernel-name "Marlin" ./bench_marlin_moe 1 64 8 2048 5632
 ```

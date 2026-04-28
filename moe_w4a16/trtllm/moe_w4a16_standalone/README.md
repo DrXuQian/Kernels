@@ -70,16 +70,17 @@ Build
 From the repo root:
 
 ```
-cmake -S moe_w4a16_standalone -B moe_w4a16_standalone/build_cmake_release \
+cmake -S moe_w4a16/trtllm/moe_w4a16_standalone \
+  -B moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release \
   -DCMAKE_CUDA_ARCHITECTURES=90 \
-  -DCUTLASS_DIR=$PWD/../../third_party/cutlass \
+  -DCUTLASS_DIR=$PWD/third_party/cutlass \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build moe_w4a16_standalone/build_cmake_release \
+cmake --build moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release \
   --target test_moe_w4a16_gemm -j$(nproc)
 ```
 
 The output binary is
-`moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm`.
+`moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm`.
 Use `-DCMAKE_CUDA_ARCHITECTURES=80` for an Ampere build. The MoE W4A16
 extraction uses the SM80 grouped GEMM fallback on Hopper, so `90` is sufficient.
 
@@ -88,28 +89,28 @@ Run
 FP16 sanity check:
 
 ```
-moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=4 --m_per_expert=16 --n=128 --k=128 --verify
 ```
 
 BF16 sanity check:
 
 ```
-moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=bf16 --experts=4 --m_per_expert=16 --n=128 --k=128 --verify
 ```
 
 List configs:
 
 ```
-moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --list_configs
 ```
 
 Sweep configs for one shape:
 
 ```
-moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=1 --n=1024 --k=3072 \
   --group_size=128 --warmup=100 --iters=1000 --sweep_configs
 ```
@@ -117,10 +118,10 @@ moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
 Use the H800 tactic cache:
 
 ```
-moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=1 --n=1024 --k=3072 \
   --group_size=128 --warmup=100 --iters=1000 \
-  --tactic=moe_w4a16_standalone/tactics_h800.cache
+  --tactic=moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache
 ```
 
 Qwen MoE shapes in `tactics_h800.cache`
@@ -142,7 +143,7 @@ Meaning:
 
 - `tile_enum`: the integer value of
   `cutlass_extensions::CutlassTileConfig` (see
-  `moe_w4a16_standalone/cpp/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h`).
+  `moe_w4a16/trtllm/moe_w4a16_standalone/cpp/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h`).
 - `stages`: CUTLASS mainloop pipeline stages.
 - `split_k`: serial split-K factor. This extraction only keeps `split_k=1`
   candidates for MoE W4A16.

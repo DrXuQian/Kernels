@@ -57,12 +57,12 @@ H800 PCIe (SM 9.0, HBM 2.0 TB/s)
 |---|--------|-------|---------|---------|
 | 1 | RMSNorm | (1,3072)→(1,3072) | — | not in repo (generic) |
 | 2 | Router gate (FP16) | (1,3072)→(1,256) | — | not in repo (cuBLAS GEMV) |
-| 3 | **topk_gating** | (1,256)→w:(1,8) idx:(1,8) | **8.4 μs** | `./bench_topk_gating 1 256 8 --bench 20 100` |
-| 4 | **moe_align** | (1,8)→sorted_ids, expert_ids | **3.3 μs** | `./bench_moe_align 1 256 8 16 --bench 20 100` |
-| 5 | **Marlin MoE gate_up** (W4A16) | (8,1,3072)→(8,1,2048) | **11.5 μs** | `./bench_marlin_moe 1 256 8 3072 1024 --bench 20 100` |
-| 6 | **silu_and_mul** | (8,1,2048)→(8,1,1024) | **5.0 μs** | `./bench_silu_and_mul 1 8 1024 --bench 20 100` |
-| 7 | **Marlin MoE down** (W4A16) | (8,1,1024)→(8,1,3072) | **12.3 μs** | `./bench_marlin_moe 1 256 8 1024 3072 --bench 20 100` |
-| 8 | **moe_sum** | (8,1,3072)→(1,3072) | **5.4 μs** | `./bench_moe_sum 1 8 3072 --bench 20 100` |
+| 3 | **topk_gating** | (1,256)→w:(1,8) idx:(1,8) | **8.4 μs** | `moe_w4a16/vllm/auxiliary/bench_topk_gating 1 256 8 --bench 20 100` |
+| 4 | **moe_align** | (1,8)→sorted_ids, expert_ids | **3.3 μs** | `moe_w4a16/vllm/auxiliary/bench_moe_align 1 256 8 16 --bench 20 100` |
+| 5 | **Marlin MoE gate_up** (W4A16) | (8,1,3072)→(8,1,2048) | **11.5 μs** | `moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100` |
+| 6 | **silu_and_mul** | (8,1,2048)→(8,1,1024) | **5.0 μs** | `moe_w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100` |
+| 7 | **Marlin MoE down** (W4A16) | (8,1,1024)→(8,1,3072) | **12.3 μs** | `moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100` |
+| 8 | **moe_sum** | (8,1,3072)→(1,3072) | **5.4 μs** | `moe_w4a16/vllm/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100` |
 | 9 | Shared gate_up (W4A16) | (1,3072)→(1,2048) | — | not in repo (Marlin GEMV) |
 | 10 | Shared SwiGLU | (1,2048)→(1,1024) | — | not in repo |
 | 11 | Shared down (W4A16) | (1,1024)→(1,3072) | — | not in repo (Marlin GEMV) |
@@ -71,12 +71,12 @@ H800 PCIe (SM 9.0, HBM 2.0 TB/s)
 
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
-| 3 | **topk_gating** | (3823,256)→... | — | `./bench_topk_gating 3823 256 8 --bench 10 50` |
-| 4 | **moe_align** | (3823,8)→... | — | `./bench_moe_align 3823 256 8 16 --bench 10 50` |
-| 5 | **Marlin MoE gate_up** (W4A16) | (8,3823,3072)→(8,3823,2048) | — | `./bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50` |
-| 6 | **silu_and_mul** | (8,3823,2048)→(8,3823,1024) | — | `./bench_silu_and_mul 3823 8 1024 --bench 10 50` |
-| 7 | **Marlin MoE down** (W4A16) | (8,3823,1024)→(8,3823,3072) | — | `./bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50` |
-| 8 | **moe_sum** | (8,3823,3072)→(3823,3072) | — | `./bench_moe_sum 3823 8 3072 --bench 10 50` |
+| 3 | **topk_gating** | (3823,256)→... | — | `moe_w4a16/vllm/auxiliary/bench_topk_gating 3823 256 8 --bench 10 50` |
+| 4 | **moe_align** | (3823,8)→... | — | `moe_w4a16/vllm/auxiliary/bench_moe_align 3823 256 8 16 --bench 10 50` |
+| 5 | **Marlin MoE gate_up** (W4A16) | (8,3823,3072)→(8,3823,2048) | — | `moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50` |
+| 6 | **silu_and_mul** | (8,3823,2048)→(8,3823,1024) | — | `moe_w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50` |
+| 7 | **Marlin MoE down** (W4A16) | (8,3823,1024)→(8,3823,3072) | — | `moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50` |
+| 8 | **moe_sum** | (8,3823,3072)→(3823,3072) | — | `moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50` |
 
 ## Full Attention (×12 layers)
 
@@ -146,20 +146,20 @@ linear_attention/bench_conv1d_fwd 3823 12288 4 1 --bench 10 50
 linear_attention/bench_gdn_prefill 3823 16 64 128 1 --bench 10 50
 
 # ── MoE FFN Decode ──
-moe_w4a16/bench_topk_gating 1 256 8 --bench 20 100
-moe_w4a16/bench_moe_align 1 256 8 16 --bench 20 100
-moe_w4a16/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100
-moe_w4a16/bench_silu_and_mul 1 8 1024 --bench 20 100
-moe_w4a16/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100
-moe_w4a16/bench_moe_sum 1 8 3072 --bench 20 100
+moe_w4a16/vllm/auxiliary/bench_topk_gating 1 256 8 --bench 20 100
+moe_w4a16/vllm/auxiliary/bench_moe_align 1 256 8 16 --bench 20 100
+moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100
+moe_w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100
+moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100
+moe_w4a16/vllm/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100
 
 # ── MoE FFN Prefill (seq=3823) ──
-moe_w4a16/bench_topk_gating 3823 256 8 --bench 10 50
-moe_w4a16/bench_moe_align 3823 256 8 16 --bench 10 50
-moe_w4a16/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50
-moe_w4a16/bench_silu_and_mul 3823 8 1024 --bench 10 50
-moe_w4a16/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
-moe_w4a16/bench_moe_sum 3823 8 3072 --bench 10 50
+moe_w4a16/vllm/auxiliary/bench_topk_gating 3823 256 8 --bench 10 50
+moe_w4a16/vllm/auxiliary/bench_moe_align 3823 256 8 16 --bench 10 50
+moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50
+moe_w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50
+moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
+moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50
 
 # ── Full Attention (FlashAttn, Python) ──
 python3 flash_attn/bench_flash_attn.py decode 3823

@@ -1,4 +1,4 @@
-SUBDIRS := linear_attention moe_w4a16/marlin moe_w4a16/auxiliary
+SUBDIRS := general linear_attention moe_w4a16/vllm/marlin moe_w4a16/vllm/auxiliary
 
 .PHONY: all clean $(SUBDIRS)
 

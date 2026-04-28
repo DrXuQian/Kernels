@@ -49,19 +49,19 @@ time_cmd "kda_prefill (seq=3823, heads=64, dim=128)" \
 echo ""
 echo "=== MoE FFN (Decode, M=1, 64 experts, topk=8) ==="
 time_cmd "topk_gating (experts=64, topk=8)" \
-    moe_w4a16/auxiliary/bench_topk_gating 1 64 8
+    moe_w4a16/vllm/auxiliary/bench_topk_gating 1 64 8
 
 time_cmd "moe_align (experts=64, topk=8, block=16)" \
-    moe_w4a16/auxiliary/bench_moe_align 1 64 8 16
+    moe_w4a16/vllm/auxiliary/bench_moe_align 1 64 8 16
 
 time_cmd "Marlin MoE GEMM (K=2048, N=5632)" \
-    moe_w4a16/marlin/bench_marlin_moe 1 64 8 2048 5632
+    moe_w4a16/vllm/marlin/bench_marlin_moe 1 64 8 2048 5632
 
 time_cmd "silu_and_mul (topk=8, hidden=5632)" \
-    moe_w4a16/auxiliary/bench_silu_and_mul 1 8 5632
+    moe_w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 5632
 
 time_cmd "moe_sum (topk=8, hidden=2048)" \
-    moe_w4a16/auxiliary/bench_moe_sum 1 8 2048
+    moe_w4a16/vllm/auxiliary/bench_moe_sum 1 8 2048
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"

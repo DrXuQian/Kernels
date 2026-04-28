@@ -79,7 +79,7 @@ def run_standalone(exe, case, warmup, iters, tactic):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--standalone", default=str(MOE_DIR / "build_sm90_clean/test_moe_w4a16_gemm"))
-    parser.add_argument("--marlin", default=str(KERNELS_ROOT / "moe_w4a16/marlin/bench_marlin_moe"))
+    parser.add_argument("--marlin", default=str(KERNELS_ROOT / "moe_w4a16/vllm/marlin/bench_marlin_moe"))
     parser.add_argument("--prefill_warmup", type=int, default=20)
     parser.add_argument("--prefill_iters", type=int, default=100)
     parser.add_argument("--decode_warmup", type=int, default=200)

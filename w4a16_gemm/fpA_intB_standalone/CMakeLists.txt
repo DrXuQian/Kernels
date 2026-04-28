@@ -32,12 +32,12 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 set(_FPA_INTB_CUTLASS_CANDIDATES
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/cutlass"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../thirdparty/cutlass"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/cutlass"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/cutlass"
     "${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/cutlass"
     "$ENV{HOME}/TensorRT-LLM/3rdparty/cutlass"
 )
-set(_FPA_INTB_DEFAULT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/cutlass")
+set(_FPA_INTB_DEFAULT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/cutlass")
 foreach(_candidate IN LISTS _FPA_INTB_CUTLASS_CANDIDATES)
     if(EXISTS "${_candidate}/include/cutlass/cutlass.h")
         set(_FPA_INTB_DEFAULT_CUTLASS_DIR "${_candidate}")
