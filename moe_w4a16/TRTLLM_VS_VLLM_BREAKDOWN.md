@@ -26,6 +26,11 @@ FP16/BF16 standalone specializations of the corresponding kernels in
 benchmark: it does not use TRT-LLM's fused-finalize GEMM epilogue or run the
 whole production runner in a single process.
 
+Default policy in `bench_all.sh`: use the TensorRT-LLM component pipeline for
+prefill and the vLLM component pipeline for decode. This matches the measured
+component totals below: TRT-LLM is faster for prefill, while vLLM is faster for
+decode.
+
 ## Shapes
 
 Qwen3.5-122B-A10B MoE settings used here:

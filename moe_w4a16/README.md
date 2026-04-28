@@ -7,6 +7,9 @@ auxiliary kernels, so they live in separate subtrees.
 For the current Nsight Systems component breakdown, see
 `TRTLLM_VS_VLLM_BREAKDOWN.md`.
 
+The root `bench_all.sh` default uses the faster measured path for each phase:
+TensorRT-LLM components for prefill and vLLM components for decode.
+
 ## Layout
 
 ```

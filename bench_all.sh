@@ -38,6 +38,8 @@ MACHETE_BIN="w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm
 FPA_BIN="w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm"
 MOE_TRTLLM_BIN="moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm"
 MOE_TRTLLM_AUX_DIR="moe_w4a16/trtllm/auxiliary"
+MOE_VLLM_MARLIN_BIN="moe_w4a16/vllm/marlin/bench_marlin_moe"
+MOE_VLLM_AUX_DIR="moe_w4a16/vllm/auxiliary"
 
 MACHETE_TACTIC="w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache"
 FPA_TACTIC="w4a16_gemm/fpA_intB_standalone/tactics_h800.cache"
@@ -50,7 +52,7 @@ require_bin() {
   if [[ ! -x "$path" ]]; then
     echo "[bench_all][error] missing executable: $path" >&2
     echo "[bench_all][hint] build required targets first, for example:" >&2
-    echo "  ./compile.sh build linear_attention w4a16-machete w4a16-fpa moe-trtllm" >&2
+    echo "  ./compile.sh build linear_attention w4a16-machete w4a16-fpa moe-trtllm moe-trtllm-auxiliary moe-vllm" >&2
     exit 1
   fi
 }
@@ -138,6 +140,11 @@ require_bin "$MOE_TRTLLM_AUX_DIR/bench_moe_align"
 require_bin "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows"
 require_bin "$MOE_TRTLLM_AUX_DIR/bench_gated_activation"
 require_bin "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing"
+require_bin "$MOE_VLLM_MARLIN_BIN"
+require_bin "$MOE_VLLM_AUX_DIR/bench_topk_gating"
+require_bin "$MOE_VLLM_AUX_DIR/bench_moe_align"
+require_bin "$MOE_VLLM_AUX_DIR/bench_silu_and_mul"
+require_bin "$MOE_VLLM_AUX_DIR/bench_moe_sum"
 require_file "$MACHETE_TACTIC"
 require_file "$FPA_TACTIC"
 require_file "$MOE_TRTLLM_TACTIC"
@@ -147,6 +154,8 @@ echo "Qwen3.5-122B-A10B standalone kernel nsys suite"
 echo "profiles: $OUT_DIR"
 echo "prefill tokens: $PREFILL_TOKENS"
 echo "decode tokens:  $DECODE_TOKENS"
+echo "moe prefill:    TensorRT-LLM components"
+echo "moe decode:     vLLM components"
 echo "============================================================"
 
 profile_case "linear_decode_conv1d_update" all 1 \
@@ -210,38 +219,28 @@ profile_case "moe_finalize_prefill_trtllm" all 1 \
   "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
   --bench 0 1
 
-profile_case "moe_routing_decode_trtllm" all 1 \
-  "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
+profile_case "moe_routing_decode_vllm" all 1 \
+  "$MOE_VLLM_AUX_DIR/bench_topk_gating" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" \
   --bench 0 1
 
-profile_case "moe_align_decode_trtllm" all 1 \
-  "$MOE_TRTLLM_AUX_DIR/bench_moe_align" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 auto \
+profile_case "moe_align_decode_vllm" all 1 \
+  "$MOE_VLLM_AUX_DIR/bench_moe_align" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 \
   --bench 0 1
 
-profile_case "moe_expand_decode_trtllm" all 1 \
-  "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_K" fp16 \
+profile_case "moe_gate_up_decode_vllm" all 1 \
+  "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_GATE_K" "$MOE_GATE_N" \
+  --balanced --no-topk-weights --bench 0 1
+
+profile_case "moe_gated_decode_vllm" all 1 \
+  "$MOE_VLLM_AUX_DIR/bench_silu_and_mul" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" \
   --bench 0 1
 
-profile_case "moe_gate_up_decode_trtllm" all 1 \
-  "$MOE_TRTLLM_BIN" \
-  --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$DECODE_TOKENS" \
-  --n="$MOE_GATE_N" --k="$MOE_GATE_K" --group_size="$MOE_GROUP" \
-  --tactic="$MOE_TRTLLM_TACTIC" \
-  --warmup=0 --iters=1
+profile_case "moe_down_decode_vllm" all 1 \
+  "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_DOWN_K" "$MOE_DOWN_N" \
+  --balanced --bench 0 1
 
-profile_case "moe_gated_decode_trtllm" all 1 \
-  "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" fp16 \
-  --bench 0 1
-
-profile_case "moe_down_decode_trtllm" all 1 \
-  "$MOE_TRTLLM_BIN" \
-  --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$DECODE_TOKENS" \
-  --n="$MOE_DOWN_N" --k="$MOE_DOWN_K" --group_size="$MOE_GROUP" \
-  --tactic="$MOE_TRTLLM_TACTIC" \
-  --warmup=0 --iters=1
-
-profile_case "moe_finalize_decode_trtllm" all 1 \
-  "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
+profile_case "moe_finalize_decode_vllm" all 1 \
+  "$MOE_VLLM_AUX_DIR/bench_moe_sum" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" \
   --bench 0 1
 
 echo
