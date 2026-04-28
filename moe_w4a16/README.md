@@ -4,6 +4,9 @@ Standalone MoE kernels are split by upstream implementation. The vLLM and
 TensorRT-LLM paths use different MoE GEMM implementations and different
 auxiliary kernels, so they live in separate subtrees.
 
+For the current Nsight Systems component breakdown, see
+`TRTLLM_VS_VLLM_BREAKDOWN.md`.
+
 ## Layout
 
 ```

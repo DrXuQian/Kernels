@@ -9,7 +9,7 @@ from vLLM.
 Source
 ------
 - vLLM tree used for extraction:
-  `/root/autodl-tmp/awesome-cute/Vibe-CUTE/3rdparty/vllm`
+  local vLLM checkout
 - Source commit observed locally:
   `e3126cd107460444d7fd9a1445b8d4f4393a06b2`
 - Main extracted files:
