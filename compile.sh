@@ -13,8 +13,10 @@ BUILD_DIR_NAME="${BUILD_DIR_NAME:-build_cmake_release}"
 CUDA_ROOT="${CUDA_ROOT:-}"
 PPU_ROOT="${PPU_ROOT:-}"
 CUTLASS_DIR="${CUTLASS_DIR:-$ROOT_DIR/third_party/cutlass}"
+PPU_ELF_VERSION="${PPU_ELF_VERSION:-1.7}"
 DRY_RUN=0
 CHECK_ENV=1
+CHECK_ELF=1
 VERBOSE=0
 NVCC=""
 
@@ -73,6 +75,8 @@ Options:
   --cuda-root DIR          CUDA-compatible SDK root. Also accepted from CUDA_ROOT.
   --ppu-root DIR           Optional companion SDK root. Also accepted from PPU_ROOT.
   --cutlass-dir DIR        CUTLASS checkout. Default: third_party/cutlass.
+  --ppu-elf-version VER    Required PPU ELF version for post-build checks. Default: 1.7.
+  --no-elf-check           Skip post-build hgobjdump ELF version checks.
   --dry-run                Print commands without running them.
   --no-env-check           Skip environment validation.
   -v, --verbose            Print extra environment details.
@@ -171,6 +175,7 @@ print_env() {
   log "cutlass dir: $CUTLASS_DIR"
   log "cuda root: ${CUDA_ROOT:-<unset>}"
   log "companion sdk root: ${PPU_ROOT:-<unset>}"
+  log "required ppu elf version: $PPU_ELF_VERSION"
   log "nvcc: ${NVCC:-<not found>}"
 
   if [[ -n "$NVCC" && -x "$NVCC" ]]; then
@@ -259,10 +264,79 @@ make_common_args() {
   cccl="$(cccl_include_flag)"
 
   printf '%s\n' "NVCC=$NVCC"
+  printf '%s\n' "CUDACXX=$NVCC"
   printf '%s\n' "CUDA_ROOT=$CUDA_ROOT"
   printf '%s\n' "ARCH=-arch=$arch"
   if [[ -n "$cccl" ]]; then
     printf '%s\n' "CUDA_CCCL_INC=-I$cccl"
+  fi
+}
+
+find_hgobjdump() {
+  local candidate
+  for candidate in \
+    "${PPU_ROOT:+$PPU_ROOT/bin/hgobjdump}" \
+    "${CUDA_ROOT:+$CUDA_ROOT/bin/hgobjdump}" \
+    "${CUDA_ROOT:+$CUDA_ROOT/bin/cuobjdump}"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  candidate="$(command -v hgobjdump || true)"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  candidate="$(command -v cuobjdump || true)"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+verify_ppu_elf_version() {
+  local binary="$1"
+  local expected="${2:-$PPU_ELF_VERSION}"
+
+  if [[ "$CHECK_ELF" == 0 ]]; then
+    return
+  fi
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    log "skip ELF check in dry-run mode: $binary"
+    return
+  fi
+
+  [[ -x "$binary" ]] || die "ELF check target is missing or not executable: $binary"
+
+  local objdump output ppu_lines
+  if ! objdump="$(find_hgobjdump)"; then
+    warn "hgobjdump/cuobjdump not found; skip ELF check for $binary"
+    return
+  fi
+
+  log "checking PPU ELF version with $objdump: $binary"
+  output="$("$objdump" --list-elf "$binary" 2>&1 || true)"
+  ppu_lines="$(printf '%s\n' "$output" | grep -E "PPU|ELF FILE" || true)"
+  if [[ -n "$ppu_lines" ]]; then
+    printf '%s\n' "$ppu_lines" | sed 's/^/[compile] elf: /'
+  else
+    printf '%s\n' "$output" | tail -20 | sed 's/^/[compile] elf: /'
+  fi
+
+  if ! printf '%s\n' "$output" | grep -Fq "PPU"; then
+    warn "no PPU ELF entries found in $binary; skip PPU ELF version check."
+    return
+  fi
+
+  if ! printf '%s\n' "$output" | grep -Fq "PPU $expected"; then
+    die "expected $binary to contain PPU $expected ELF code. Rebuild with CUDA_ROOT/PPU_ROOT pointing to the matching SDK."
   fi
 }
 
@@ -285,6 +359,7 @@ build_linear_attention() {
   local -a vars
   mapfile -t vars < <(make_common_args "$LINEAR_ARCH")
   run_cmd make -C "$ROOT_DIR/linear_attention" -j "$JOBS" "${vars[@]}" "ARCH_SM90=-arch=$GPU_ARCH"
+  verify_ppu_elf_version "$ROOT_DIR/linear_attention/bench_gated_delta_net"
 }
 
 build_flashinfer_gdn() {
@@ -378,7 +453,8 @@ configure_target() {
 build_target() {
   case "$1" in
     default)
-      run_cmd make -C "$ROOT_DIR" -j "$JOBS" "NVCC=$NVCC" "CUDA_ROOT=$CUDA_ROOT" "ARCH=-arch=$LINEAR_ARCH" "ARCH_SM90=-arch=$GPU_ARCH"
+      run_cmd make -C "$ROOT_DIR" -j "$JOBS" "NVCC=$NVCC" "CUDACXX=$NVCC" "CUDA_ROOT=$CUDA_ROOT" "ARCH=-arch=$LINEAR_ARCH" "ARCH_SM90=-arch=$GPU_ARCH"
+      verify_ppu_elf_version "$ROOT_DIR/linear_attention/bench_gated_delta_net"
       ;;
     general)
       build_make_dir general "$LINEAR_ARCH"
@@ -647,6 +723,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cutlass-dir=*)
       CUTLASS_DIR="${1#*=}"
+      shift
+      ;;
+    --ppu-elf-version)
+      PPU_ELF_VERSION="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --ppu-elf-version=*)
+      PPU_ELF_VERSION="${1#*=}"
+      shift
+      ;;
+    --no-elf-check)
+      CHECK_ELF=0
       shift
       ;;
     --dry-run)
