@@ -16,7 +16,7 @@ topk_gating -> moe_align -> Marlin gate/up GEMM -> silu_and_mul -> Marlin down G
 The TensorRT-LLM path is now represented as standalone component kernels:
 
 ```
-custom_moe_routing -> moe_align -> expandInputRows -> CUTLASS grouped gate/up GEMM
+custom_moe_routing -> expert_map -> expandInputRows -> CUTLASS grouped gate/up GEMM
 -> gated activation -> CUTLASS grouped down GEMM -> finalizeMoeRouting
 ```
 
@@ -63,13 +63,13 @@ input buffers in the benchmark.
 | vLLM | moe_sum | 1 | 1.728 |
 | vLLM | total | 6 | 54.494 |
 | TRT-LLM | custom_moe_routing | 1 | 2.240 |
-| TRT-LLM | moe_align | 1 | 10.272 |
+| TRT-LLM | expert_map fused sort-first-token | 1 | 3.104 |
 | TRT-LLM | expandInputRows | 1 | 3.999 |
 | TRT-LLM | CUTLASS grouped gate/up GEMM | 1 | 20.607 |
 | TRT-LLM | gated activation | 1 | 6.560 |
 | TRT-LLM | CUTLASS grouped down GEMM | 1 | 27.455 |
 | TRT-LLM | finalizeMoeRouting | 1 | 11.360 |
-| TRT-LLM | component total | 7 | 82.493 |
+| TRT-LLM | component total | 7 | 75.325 |
 
 Decode GEMM-only:
 
@@ -93,14 +93,16 @@ make the component sum slower for batch=1.
 | vLLM | Marlin down GEMM | 1 | 1418.235 |
 | vLLM | moe_sum | 1 | 39.357 |
 | vLLM | total | 6 | 5107.345 |
-| TRT-LLM | custom_moe_routing | 1 | 6.656 |
-| TRT-LLM | moe_align generic count/sort | 2 | 165.945 |
-| TRT-LLM | expandInputRows | 1 | 281.428 |
-| TRT-LLM | CUTLASS grouped gate/up GEMM | 1 | 1327.658 |
-| TRT-LLM | gated activation | 1 | 391.216 |
-| TRT-LLM | CUTLASS grouped down GEMM | 1 | 681.477 |
-| TRT-LLM | finalizeMoeRouting | 1 | 99.164 |
-| TRT-LLM | component total | 8 | 2953.544 |
+| TRT-LLM | custom_moe_routing | 1 | 6.370 |
+| TRT-LLM | expert_map block prefix-sum | 1 | 6.403 |
+| TRT-LLM | expert_map global prefix-sum | 1 | 1.793 |
+| TRT-LLM | expert_map merge prefix-sum | 1 | 2.753 |
+| TRT-LLM | expandInputRows | 1 | 288.315 |
+| TRT-LLM | CUTLASS grouped gate/up GEMM | 1 | 1338.963 |
+| TRT-LLM | gated activation | 1 | 393.027 |
+| TRT-LLM | CUTLASS grouped down GEMM | 1 | 682.742 |
+| TRT-LLM | finalizeMoeRouting | 1 | 99.368 |
+| TRT-LLM | component total | 9 | 2819.734 |
 
 Prefill GEMM-only:
 
@@ -112,7 +114,7 @@ Prefill GEMM-only:
 For prefill, TRT-LLM's grouped CUTLASS GEMM is about 2.14x faster than the
 current vLLM Marlin standalone GEMM sum on these shapes. Including standalone
 expand, gated activation, and finalize helpers, the TRT-LLM component pipeline
-is about 1.73x faster than the vLLM standalone pipeline.
+is about 1.81x faster than the vLLM standalone pipeline.
 
 ## Kernel Differences
 
@@ -128,8 +130,11 @@ TensorRT-LLM path:
 
 - Routing uses TRT-LLM `customMoeRoutingKernel`, including optional
   softmax-before-topk support in the extracted source.
-- Alignment uses TRT-LLM `moe_align_block_size`; prefill selects the generic
-  count/sort path, which launches two kernels.
+- Expert-map construction uses the `runMoe` prologue from
+  `cutlass_kernels/moe_gemm/moe_kernels.cu`: decode-sized batches use
+  `fusedBuildExpertMapsSortFirstTokenKernel`, while prefill-sized batches use
+  `blockExpertPrefixSumKernel`, `globalExpertPrefixSumKernel`, and
+  `mergeExpertPrefixSumKernel`.
 - GEMM uses TRT-LLM's CUTLASS `MoeFCGemm` grouped-GEMM path with a tactic cache.
 - `expandInputRows` duplicates the input activation rows according to the
   permuted expert layout before the first grouped GEMM.
@@ -154,7 +159,7 @@ moe_w4a16/vllm/marlin/bench_marlin_moe 3823 64 8 3072 1024 --balanced --bench 0 
 moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 1024 --bench 0 1
 
 moe_w4a16/trtllm/auxiliary/bench_custom_moe_routing 3823 64 8 fp16 --bench 0 1
-moe_w4a16/trtllm/auxiliary/bench_moe_align 3823 64 8 16 auto --bench 0 1
+moe_w4a16/trtllm/auxiliary/bench_expert_map 3823 64 8 auto --bench 0 1
 moe_w4a16/trtllm/auxiliary/bench_expand_input_rows 3823 8 2048 fp16 --bench 0 1
 moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=3823 --n=3072 --k=2048 \

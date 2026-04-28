@@ -364,8 +364,8 @@ profile_case "moe_routing_prefill_trtllm" all 1 \
   "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
   --bench 0 1
 
-profile_case "moe_align_prefill_trtllm" all 2 \
-  "$MOE_TRTLLM_AUX_DIR/bench_moe_align" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 auto \
+profile_case "moe_expert_map_prefill_trtllm" all 3 \
+  "$MOE_TRTLLM_AUX_DIR/bench_expert_map" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" auto \
   --bench 0 1
 
 profile_case "moe_expand_prefill_trtllm" all 1 \

@@ -20,7 +20,7 @@ moe_w4a16/
 │   └── bench_python/ # older PyTorch extension benchmarks from vLLM
 └── trtllm/
     ├── moe_w4a16_standalone/ # TensorRT-LLM MoE grouped W4A16 GEMM
-    └── auxiliary/            # TensorRT-LLM routing and align helpers
+    └── auxiliary/            # TensorRT-LLM routing, expert-map, and pipeline helpers
 ```
 
 ## vLLM Pipeline
@@ -53,6 +53,14 @@ moe_w4a16/vllm/auxiliary/bench_moe_sum 1 8 5632
 extraction. It includes its own TRT-LLM-style tactic cache and does not share
 the vLLM Marlin/auxiliary kernel path.
 
+The extracted TensorRT-LLM component pipeline is:
+
+```
+custom_moe_routing -> expert_map -> expandInputRows -> grouped GEMM (gate/up)
+-> gated activation -> grouped GEMM (down) -> finalizeMoeRouting
+[auxiliary]          [auxiliary]  [auxiliary]        [moe_w4a16_standalone]
+```
+
 ```bash
 cmake -S moe_w4a16/trtllm/moe_w4a16_standalone \
   -B moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release \
@@ -73,5 +81,6 @@ Example commands:
 
 ```bash
 moe_w4a16/trtllm/auxiliary/bench_custom_moe_routing 1 64 8 fp16
-moe_w4a16/trtllm/auxiliary/bench_moe_align 1 64 8 16 auto
+moe_w4a16/trtllm/auxiliary/bench_expert_map 1 64 8 auto
+moe_w4a16/trtllm/auxiliary/bench_expert_map 3823 64 8 auto
 ```
