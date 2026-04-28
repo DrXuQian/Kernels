@@ -1,11 +1,19 @@
+CUDA_ROOT  ?=
+ifeq ($(origin NVCC), undefined)
+ifneq ($(CUDA_ROOT),)
+NVCC       := $(CUDA_ROOT)/bin/nvcc
+else
 NVCC       := nvcc
+endif
+endif
 CUTLASS    := ../third_party/cutlass
-CFLAGS     := -O2 -std=c++17 --expt-relaxed-constexpr -diag-suppress 3288
+CFLAGS     ?= -O2 -std=c++17 --expt-relaxed-constexpr -diag-suppress 3288
 
-ARCH       := -arch=sm_80
-ARCH_SM90  := -arch=sm_90a
+ARCH       ?= -arch=sm_80
+ARCH_SM90  ?= -arch=sm_90a
 
-INC        := -Isrc -Iinclude -I../include
+CUDA_CCCL_INC ?= $(if $(CUDA_ROOT),-I$(CUDA_ROOT)/targets/x86_64-linux/include/cccl,)
+INC        := $(CUDA_CCCL_INC) -Isrc -Iinclude -I../include
 INC_GDN    := $(INC) -Isrc/flashinfer_gdn -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include -DFLAT_SM90A_ENABLED
 
 BINS       := bench_conv1d_fwd bench_conv1d_update bench_gated_delta_net bench_fused_rms_norm_gate bench_gdn_prefill
