@@ -99,8 +99,24 @@ profile_case() {
   printf '[bench_all] command:'
   printf ' %q' "$@"
   echo
+  echo "[bench_all] log: $log"
+  echo "[bench_all] stats: $stats"
 
-  "$NSYS" "${nsys_args[@]}" "$@" >"$log" 2>&1
+  {
+    echo "label: $label"
+    echo "capture_mode: $capture_mode"
+    echo "expected_instances: $expected_instances"
+    printf 'command:'
+    printf ' %q' "$@"
+    echo
+    printf 'nsys_command:'
+    printf ' %q' "$NSYS" "${nsys_args[@]}" "$@"
+    echo
+    echo "started_at: $(date -Is)"
+    echo "---- output ----"
+  } >"$log"
+
+  "$NSYS" "${nsys_args[@]}" "$@" >>"$log" 2>&1
   "$NSYS" stats --report cuda_gpu_kern_sum --format csv --force-export=true "$out.nsys-rep" >"$stats"
 
   local instances total_ns avg_us
