@@ -13,7 +13,8 @@ moe_w4a16/
 │   ├── auxiliary/    # vLLM topk, align, silu_and_mul, sum
 │   └── bench_python/ # older PyTorch extension benchmarks from vLLM
 └── trtllm/
-    └── moe_w4a16_standalone/ # TensorRT-LLM MoE grouped W4A16 GEMM
+    ├── moe_w4a16_standalone/ # TensorRT-LLM MoE grouped W4A16 GEMM
+    └── auxiliary/            # TensorRT-LLM routing and align helpers
 ```
 
 ## vLLM Pipeline
@@ -54,4 +55,17 @@ cmake -S moe_w4a16/trtllm/moe_w4a16_standalone \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release \
   --target test_moe_w4a16_gemm -j$(nproc)
+```
+
+Build the TensorRT-LLM auxiliary kernels:
+
+```bash
+make -C moe_w4a16/trtllm/auxiliary
+```
+
+Example commands:
+
+```bash
+moe_w4a16/trtllm/auxiliary/bench_custom_moe_routing 1 64 8 fp16
+moe_w4a16/trtllm/auxiliary/bench_moe_align 1 64 8 16 auto
 ```

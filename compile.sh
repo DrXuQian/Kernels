@@ -53,6 +53,7 @@ Targets:
   moe-vllm-marlin      moe_w4a16/vllm/marlin/
   moe-vllm-auxiliary   moe_w4a16/vllm/auxiliary/
   moe-trtllm           moe_w4a16/trtllm/moe_w4a16_standalone/
+  moe-trtllm-auxiliary moe_w4a16/trtllm/auxiliary/
   moe                  moe-vllm + moe-trtllm
 
   w4a16-marlin         w4a16_gemm/marlin_standalone/
@@ -341,7 +342,7 @@ clean_w4a16_cublas() {
 
 configure_target() {
   case "$1" in
-    default|general|linear_attention|flashinfer-gdn|moe-vllm-marlin|moe-vllm-auxiliary|w4a16-marlin|w4a16-cublas)
+    default|general|linear_attention|flashinfer-gdn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
       log "$1 uses a Makefile or direct nvcc build; no CMake configure step."
       ;;
     moe-trtllm)
@@ -401,6 +402,9 @@ build_target() {
         cuda_arch_number \
         test_moe_w4a16_gemm
       ;;
+    moe-trtllm-auxiliary)
+      build_make_dir moe_w4a16/trtllm/auxiliary "$GPU_ARCH"
+      ;;
     w4a16-marlin)
       build_make_dir w4a16_gemm/marlin_standalone "$MARLIN_ARCH"
       ;;
@@ -457,6 +461,9 @@ clean_target() {
     moe-trtllm)
       clean_cmake_dir "moe_w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME"
       ;;
+    moe-trtllm-auxiliary)
+      clean_make_dir moe_w4a16/trtllm/auxiliary
+      ;;
     w4a16-marlin)
       clean_make_dir w4a16_gemm/marlin_standalone
       ;;
@@ -487,11 +494,11 @@ expand_one_target() {
     all)
       printf '%s\n' \
         general linear_attention flashinfer-gdn \
-        moe-vllm-marlin moe-vllm-auxiliary moe-trtllm \
+        moe-vllm-marlin moe-vllm-auxiliary moe-trtllm moe-trtllm-auxiliary \
         w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;
     moe)
-      printf '%s\n' moe-vllm-marlin moe-vllm-auxiliary moe-trtllm
+      printf '%s\n' moe-vllm-marlin moe-vllm-auxiliary moe-trtllm moe-trtllm-auxiliary
       ;;
     moe-vllm)
       printf '%s\n' moe-vllm-marlin moe-vllm-auxiliary
@@ -513,6 +520,9 @@ expand_one_target() {
       ;;
     trtllm-moe|moe_w4a16_standalone)
       printf '%s\n' moe-trtllm
+      ;;
+    trtllm-aux|trtllm-auxiliary|moe-trtllm-aux)
+      printf '%s\n' moe-trtllm-auxiliary
       ;;
     fpa|fpA_intB|fpA-intB|fpaintb)
       printf '%s\n' w4a16-fpa

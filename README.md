@@ -11,12 +11,14 @@ linear_attention/                DeltaNet layer
   src/causal_conv1d_*.cu         conv1d fwd/update (Dao-AILab)
   src/gated_delta_net.cu         GDN decode recurrent (llama.cpp CUDA)
   src/bench_gdn_decode.py        GDN decode recurrent (fla Triton, matches vLLM)
+flash_attn/                      Standard attention Python benchmarks
 general/                         General standalone CUDA kernels
   bench_layernorm.cu             LayerNorm benchmark (OneFlow)
 moe_w4a16/                       MoE FFN layer
   vllm/marlin/                   W4A16 Marlin GEMM (vLLM)
   vllm/auxiliary/                topk, align, silu_and_mul, sum (vLLM)
   trtllm/moe_w4a16_standalone/   TensorRT-LLM MoE grouped GEMM
+  trtllm/auxiliary/              routing and align helpers (TensorRT-LLM)
 w4a16_gemm/                      W4A16 GEMM standalone benches
   fpA_intB_standalone/           TensorRT-LLM fpA_intB dense GEMM
   machete_standalone/            vLLM Machete GEMM + CUTLASS55 backend
@@ -38,6 +40,7 @@ third_party/cutlass/             CUTLASS (git submodule)
 | `moe_w4a16/vllm/auxiliary/` | topk, align, silu, sum | vLLM | 删 torch/cub wrapper |
 | `w4a16_gemm/fpA_intB_standalone/` | fpA_intB dense W4A16 GEMM | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | standalone CMake, no TensorRT/Torch runtime |
 | `moe_w4a16/trtllm/moe_w4a16_standalone/` | MoE W4A16 grouped GEMM | TensorRT-LLM | standalone CMake, TRT-LLM-style tactic cache |
+| `moe_w4a16/trtllm/auxiliary/` | custom routing, MoE align | TensorRT-LLM | standalone CUDA benchmark harness |
 | `w4a16_gemm/machete_standalone/` | Machete W4A16 GEMM | vLLM | standalone CMake, includes vLLM heuristic/search |
 | `w4a16_gemm/cutlass55_standalone/` | Hopper mixed dtype GEMM | NVIDIA CUTLASS example 55 | standalone CMake wrapper |
 | `w4a16_gemm/marlin_standalone/` | Marlin W4A16 GEMM | IST-DASLab Marlin | standalone CUDA benchmark |
