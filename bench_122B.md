@@ -164,6 +164,8 @@ moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50
 # ── Full Attention (FlashAttn, Python) ──
 python3 flash_attn/bench_flash_attn.py decode 3823
 python3 flash_attn/bench_flash_attn.py prefill 3823
+python3 flash_attn/bench_flash_infer.py decode 3823
+python3 flash_attn/bench_flash_infer.py prefill 3823
 
 # ── nsys (纯 GPU kernel time) ──
 nsys profile --trace=cuda -o trace ./bench_xxx [args]
