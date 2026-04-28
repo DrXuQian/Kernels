@@ -252,11 +252,15 @@ run_case() {
     echo "---- output ----"
   } >"$log"
 
-  if (cd "$RUN_DIR" && "${cmd[@]}") >>"$log" 2>&1; then
+  set +e
+  (cd "$RUN_DIR" && "${cmd[@]}") 2>&1 | tee -a "$log"
+  local status=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$status" == 0 ]]; then
     echo "finished_at: $(date -Is)" >>"$log"
     printf '[bench_all] %-34s ok\n' "$label"
   else
-    local status=$?
     echo "failed_at: $(date -Is)" >>"$log"
     echo "exit_status: $status" >>"$log"
     printf '[bench_all] %-34s failed exit_status=%s\n' "$label" "$status" >&2
