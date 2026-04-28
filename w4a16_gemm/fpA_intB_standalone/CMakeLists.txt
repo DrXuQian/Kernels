@@ -31,6 +31,22 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
+set(_CUDA_CCCL_INCLUDE_CANDIDATES
+    "${CUDAToolkit_TARGET_DIR}/include/cccl"
+    "$ENV{CUDA_ROOT}/targets/x86_64-linux/include/cccl"
+)
+set(CUDA_CCCL_INCLUDE_DIR "" CACHE PATH "Path to CUDA CCCL include directory")
+foreach(_candidate IN LISTS _CUDA_CCCL_INCLUDE_CANDIDATES)
+    if(NOT CUDA_CCCL_INCLUDE_DIR AND EXISTS "${_candidate}/cuda/std/utility")
+        set(CUDA_CCCL_INCLUDE_DIR "${_candidate}" CACHE PATH "Path to CUDA CCCL include directory" FORCE)
+    endif()
+endforeach()
+if(CUDA_CCCL_INCLUDE_DIR)
+    message(STATUS "CUDA CCCL include: ${CUDA_CCCL_INCLUDE_DIR}")
+else()
+    message(WARNING "CUDA CCCL include directory was not found; CUTLASS C++ sources may fail to include cuda/std headers.")
+endif()
+
 set(_FPA_INTB_CUTLASS_CANDIDATES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/cutlass"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/cutlass"
@@ -81,6 +97,7 @@ target_include_directories(fpA_intB_gemm PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tensorrt_llm
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tensorrt_llm/cutlass_extensions/include
     ${CUTLASS_DIR}/include
+    ${CUDA_CCCL_INCLUDE_DIR}
 )
 
 target_compile_definitions(fpA_intB_gemm PUBLIC ${FPA_INTB_COMPILE_DEFS})
