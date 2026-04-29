@@ -86,6 +86,8 @@ cd moe_w4a16/vllm/auxiliary && make
 
 ## Benchmark
 
+Single-case benchmark usage is documented in [`SINGLE_BENCHMARK.md`](SINGLE_BENCHMARK.md).
+
 所有 bench 支持两种模式：
 
 ```bash
