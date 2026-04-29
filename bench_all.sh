@@ -318,10 +318,11 @@ run_perfrawlog_postprocess() {
     return
   fi
 
-  local report_dir log perfrawlog_arg
+  local report_dir log_dir log perfrawlog_arg
   report_dir="$(perfstatistics_report_dir "$label")"
-  mkdir -p "$report_dir"
-  log="$report_dir/perf_statistics_gen.log"
+  log_dir="$OUT_DIR/perfstatistics_logs"
+  mkdir -p "$log_dir"
+  log="$log_dir/$(safe_name "$label").log"
   perfrawlog_arg="$perfrawlog_path"
   if [[ "$perfrawlog_path" == "$RUN_DIR/perfrawlog" ]]; then
     perfrawlog_arg="perfrawlog"
@@ -333,17 +334,6 @@ run_perfrawlog_postprocess() {
   echo "[bench_all] perfrawlog: $perfrawlog_path"
   echo "[bench_all] report_dir: $report_dir"
   echo "[bench_all] log: $log"
-
-  {
-    echo "label: $label"
-    echo "executable: ${cmd[0]:-}"
-    echo "run_dir: $RUN_DIR"
-    printf 'command:'
-    printf ' %q' "${cmd[@]}"
-    echo
-    echo "perfrawlog: $perfrawlog_path"
-    echo "report_dir: $report_dir"
-  } >"$report_dir/bench_metadata.txt"
 
   {
     echo "report_dir: $report_dir"
@@ -362,6 +352,20 @@ run_perfrawlog_postprocess() {
     . "$perfrawlog_arg") 2>&1 | tee -a "$log"
   local status=${PIPESTATUS[0]}
   set -e
+
+  mkdir -p "$report_dir"
+  {
+    echo "label: $label"
+    echo "executable: ${cmd[0]:-}"
+    echo "run_dir: $RUN_DIR"
+    printf 'command:'
+    printf ' %q' "${cmd[@]}"
+    echo
+    echo "perfrawlog: $perfrawlog_path"
+    echo "report_dir: $report_dir"
+    echo "perf_statistics_log: $log"
+  } >"$report_dir/bench_metadata.txt"
+
   return "$status"
 }
 
