@@ -15,33 +15,33 @@ List all case labels:
 Run one exact case:
 
 ```bash
-./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
+./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 Equivalent aliases:
 
 ```bash
-./bench_all.sh --kernel w4a16_decode_linear_qkv_fpA_intB
-./bench_all.sh --only w4a16_decode_linear_qkv_fpA_intB
+./bench_all.sh --kernel w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
+./bench_all.sh --only w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 Positional arguments are also accepted:
 
 ```bash
-./bench_all.sh w4a16_decode_linear_qkv_fpA_intB
+./bench_all.sh w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
-Case matching accepts substrings. This runs every case whose label contains `w4a16_decode_linear`:
+Case matching accepts substrings. This runs every case whose label contains `w4a16_decode_linear_attn`:
 
 ```bash
-./bench_all.sh w4a16_decode_linear
+./bench_all.sh w4a16_decode_linear_attn
 ```
 
 Run several filters in one command:
 
 ```bash
-./bench_all.sh w4a16_prefill_linear w4a16_decode_linear
-./bench_all.sh --case w4a16_prefill_linear,w4a16_decode_linear
+./bench_all.sh w4a16_prefill_linear_attn w4a16_decode_linear_attn
+./bench_all.sh --case w4a16_prefill_linear_attn,w4a16_decode_linear_attn
 ```
 
 ## Logs And Run IDs
@@ -51,13 +51,13 @@ By default, each selected case writes a log under `.bench_logs/bench_<timestamp>
 Set a stable run id:
 
 ```bash
-BENCH_RUN_ID=my_single_case ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
+BENCH_RUN_ID=my_single_case ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 Set an explicit output directory:
 
 ```bash
-OUT_DIR=$PWD/.bench_logs/my_single_case ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
+OUT_DIR=$PWD/.bench_logs/my_single_case ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 The script prints benchmark output to the terminal and writes the same output to the per-case log.
@@ -67,7 +67,7 @@ The script prints benchmark output to the terminal and writes the same output to
 For GPU kernel-time measurement on H800, skip perfrawlog post-processing and wrap one case with `nsys`:
 
 ```bash
-RUN_ID=w4a16_decode_linear_qkv_fpA_intB_$(date +%Y%m%d_%H%M%S)
+RUN_ID=w4a16_decode_linear_attn_in_proj_qkv_fpA_intB_$(date +%Y%m%d_%H%M%S)
 
 BENCH_RUN_ID="$RUN_ID" \
 OUT_DIR="$PWD/.bench_logs/$RUN_ID" \
@@ -78,7 +78,7 @@ nsys profile \
   --sample=none \
   --cpuctxsw=none \
   --output="$PWD/.bench_profiles/$RUN_ID" \
-  ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
+  ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 Export the ordered CUDA trace:
@@ -104,13 +104,13 @@ nsys stats ".bench_profiles/$RUN_ID.nsys-rep" \
 When the runtime requires a separate perf-model working directory, run the benchmark with that directory as `RUN_DIR` while keeping the executable path in this repo:
 
 ```bash
-RUN_DIR=<PERF_MODEL_DIR> ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
+RUN_DIR=<PERF_MODEL_DIR> ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 Equivalent:
 
 ```bash
-PERF_MODEL_DIR=<PERF_MODEL_DIR> ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
+PERF_MODEL_DIR=<PERF_MODEL_DIR> ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 When `RUN_DIR/perfrawlog` exists, `bench_all.sh` runs:
@@ -127,10 +127,10 @@ It then prints a summary table from the generated per-case `perfstatistics.log`.
 Useful knobs:
 
 ```bash
-PERFRAWLOG_POSTPROCESS=0 ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
-PERF_STATISTICS_MP=16 ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
-PERF_STATISTICS_GHZ=1.5 ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
-PERF_STATISTICS_SUMMARY=0 ./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB
+PERFRAWLOG_POSTPROCESS=0 ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
+PERF_STATISTICS_MP=16 ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
+PERF_STATISTICS_GHZ=1.5 ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
+PERF_STATISTICS_SUMMARY=0 ./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
 ```
 
 ## Case Labels
@@ -143,12 +143,20 @@ Every label below can be passed to `--case`, `--kernel`, `--only`, or as a posit
 | linear decode | `linear_decode_gdn` |
 | linear prefill | `linear_prefill_conv1d_fwd` |
 | linear prefill | `linear_prefill_flashinfer_gdn` |
-| dense W4A16 Qwen | `w4a16_prefill_linear_qkv_cutlass55` |
-| dense W4A16 Qwen | `w4a16_prefill_linear_z_cutlass55` |
-| dense W4A16 Qwen | `w4a16_prefill_linear_out_cutlass55` |
-| dense W4A16 Qwen | `w4a16_decode_linear_qkv_fpA_intB` |
-| dense W4A16 Qwen | `w4a16_decode_linear_z_fpA_intB` |
-| dense W4A16 Qwen | `w4a16_decode_linear_out_fpA_intB` |
+| dense W4A16 linear attention | `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` |
+| dense W4A16 linear attention | `w4a16_prefill_linear_attn_in_proj_z_cutlass55` |
+| dense W4A16 linear attention | `w4a16_prefill_linear_attn_out_proj_cutlass55` |
+| dense W4A16 linear attention | `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` |
+| dense W4A16 linear attention | `w4a16_decode_linear_attn_in_proj_z_fpA_intB` |
+| dense W4A16 linear attention | `w4a16_decode_linear_attn_out_proj_fpA_intB` |
+| dense W4A16 full attention | `w4a16_prefill_full_attn_q_proj_gate_cutlass55` |
+| dense W4A16 full attention | `w4a16_prefill_full_attn_k_proj_cutlass55` |
+| dense W4A16 full attention | `w4a16_prefill_full_attn_v_proj_cutlass55` |
+| dense W4A16 full attention | `w4a16_prefill_full_attn_o_proj_cutlass55` |
+| dense W4A16 full attention | `w4a16_decode_full_attn_q_proj_gate_fpA_intB` |
+| dense W4A16 full attention | `w4a16_decode_full_attn_k_proj_fpA_intB` |
+| dense W4A16 full attention | `w4a16_decode_full_attn_v_proj_fpA_intB` |
+| dense W4A16 full attention | `w4a16_decode_full_attn_o_proj_fpA_intB` |
 | dense W4A16 consistent expert | `w4a16_prefill_consistent_expert_up_cutlass55` |
 | dense W4A16 consistent expert | `w4a16_prefill_consistent_expert_down_cutlass55` |
 | dense W4A16 consistent expert | `w4a16_decode_consistent_expert_up_fpA_intB` |

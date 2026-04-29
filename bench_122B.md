@@ -61,12 +61,12 @@ Run: `h800_nsys_w4a16_dense_20260429_091047`
 
 | Case | Shape (M,N,K) | Backend | Cached config | nsys GPU time (us) |
 |---|---:|---|---|---:|
-| `w4a16_prefill_linear_qkv_cutlass55` | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 |
-| `w4a16_prefill_linear_z_cutlass55` | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 |
-| `w4a16_prefill_linear_out_cutlass55` | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 391.321 |
-| `w4a16_decode_linear_qkv_fpA_intB` | 1,12288,3072 | fpA_intB | `cuda` | 9.376 |
-| `w4a16_decode_linear_z_fpA_intB` | 1,8192,3072 | fpA_intB | `cuda` | 6.976 |
-| `w4a16_decode_linear_out_fpA_intB` | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
+| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 |
+| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 |
+| `w4a16_prefill_linear_attn_out_proj_cutlass55` | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 391.321 |
+| `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` | 1,12288,3072 | fpA_intB | `cuda` | 9.376 |
+| `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | 1,8192,3072 | fpA_intB | `cuda` | 6.976 |
+| `w4a16_decode_linear_attn_out_proj_fpA_intB` | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
 
 Run: `h800_nsys_consistent_expert_20260429_094031`
 
@@ -76,6 +76,19 @@ Run: `h800_nsys_consistent_expert_20260429_094031`
 | `w4a16_prefill_consistent_expert_down_cutlass55` | 3823,1024,3072 | machete cutlass55 | `128x128x64_1x1x1` | 69.726 |
 | `w4a16_decode_consistent_expert_up_fpA_intB` | 1,3072,2048 | fpA_intB | `cuda` | 3.616 |
 | `w4a16_decode_consistent_expert_down_fpA_intB` | 1,1024,3072 | fpA_intB | `cuda` | 4.032 |
+
+Run: `h800_nsys_full_attn_proj_20260429_094647`
+
+| Case | Shape (M,N,K) | Backend | Cached config | nsys GPU time (us) |
+|---|---:|---|---|---:|
+| `w4a16_prefill_full_attn_q_proj_gate_cutlass55` | 3823,16384,3072 | machete cutlass55 | `128x256x64_2x1x1` | 694.155 |
+| `w4a16_prefill_full_attn_k_proj_cutlass55` | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.727 |
+| `w4a16_prefill_full_attn_v_proj_cutlass55` | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.343 |
+| `w4a16_prefill_full_attn_o_proj_cutlass55` | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 389.781 |
+| `w4a16_decode_full_attn_q_proj_gate_fpA_intB` | 1,16384,3072 | fpA_intB | `cuda` | 12.960 |
+| `w4a16_decode_full_attn_k_proj_fpA_intB` | 1,512,3072 | fpA_intB | `cuda` | 3.936 |
+| `w4a16_decode_full_attn_v_proj_fpA_intB` | 1,512,3072 | fpA_intB | `cuda` | 3.935 |
+| `w4a16_decode_full_attn_o_proj_fpA_intB` | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
 
 ## 模型参数
 
@@ -104,25 +117,25 @@ Run: `h800_nsys_consistent_expert_20260429_094031`
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
 | 1 | RMSNorm | (1,3072)→(1,3072) | — | not in repo (generic) |
-| 2 | in_proj_qkv (W4A16) | (1,3072)→(1,12288) | **9.4 μs** | `./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB` |
-| 3 | in_proj_z (W4A16) | (1,3072)→(1,8192) | **7.0 μs** | `./bench_all.sh --case w4a16_decode_linear_z_fpA_intB` |
+| 2 | in_proj_qkv (W4A16) | (1,3072)→(1,12288) | **9.4 μs** | `./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` |
+| 3 | in_proj_z (W4A16) | (1,3072)→(1,8192) | **7.0 μs** | `./bench_all.sh --case w4a16_decode_linear_attn_in_proj_z_fpA_intB` |
 | 4 | in_proj_b (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 5 | in_proj_a (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 6 | **conv1d decode** | dim=12288, w=4 | **5.4 μs** | `./bench_conv1d_update 12288 4 1 --bench 20 100` |
 | 7 | **GDN decode** (llama.cpp CUDA) | Q,K,V:(1,64,128) state:(64,128,128) | **5.4 μs** | `./bench_gated_delta_net 1 64 128 1 --bench 20 100` |
 | 8 | **FusedRMSNormGated** | (64,128)→(64,128) | **5.3 μs** | `./bench_fused_rms_norm_gate 64 128 --bench 20 100` |
-| 9 | out_proj (W4A16) | (1,8192)→(1,3072) | **8.7 μs** | `./bench_all.sh --case w4a16_decode_linear_out_fpA_intB` |
+| 9 | out_proj (W4A16) | (1,8192)→(1,3072) | **8.7 μs** | `./bench_all.sh --case w4a16_decode_linear_attn_out_proj_fpA_intB` |
 
 ### Prefill (seq=3823)
 
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
-| 1 | in_proj_qkv (W4A16) | (3823,3072)→(3823,12288) | **528.3 μs** | `./bench_all.sh --case w4a16_prefill_linear_qkv_cutlass55` |
-| 2 | in_proj_z (W4A16) | (3823,3072)→(3823,8192) | **365.9 μs** | `./bench_all.sh --case w4a16_prefill_linear_z_cutlass55` |
+| 1 | in_proj_qkv (W4A16) | (3823,3072)→(3823,12288) | **528.3 μs** | `./bench_all.sh --case w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` |
+| 2 | in_proj_z (W4A16) | (3823,3072)→(3823,8192) | **365.9 μs** | `./bench_all.sh --case w4a16_prefill_linear_attn_in_proj_z_cutlass55` |
 | 3 | **conv1d prefill** | (1,12288,3823) | **134.0 μs** | `./bench_conv1d_fwd 3823 12288 4 1 --bench 10 50` |
 | 4 | **FlashInfer GDN prefill** (CUTLASS SM90) | Q:(3823,16,128) K:(3823,16,128) V:(3823,64,128) | **525.9 μs** | `./bench_gdn_prefill 3823 16 64 128 1 --bench 10 50` |
 | 5 | **FusedRMSNormGated** | (3823×64,128)→(3823×64,128) | — | `./bench_fused_rms_norm_gate 245472 128 --bench 10 50` |
-| 6 | out_proj (W4A16) | (3823,8192)→(3823,3072) | **391.3 μs** | `./bench_all.sh --case w4a16_prefill_linear_out_cutlass55` |
+| 6 | out_proj (W4A16) | (3823,8192)→(3823,3072) | **391.3 μs** | `./bench_all.sh --case w4a16_prefill_linear_attn_out_proj_cutlass55` |
 
 ## MoE FFN (×48 layers, 256 experts, topk=8)
 
@@ -163,21 +176,25 @@ Run: `h800_nsys_consistent_expert_20260429_094031`
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
 | 1 | RMSNorm | (1,3072)→(1,3072) | — | not in repo (generic) |
-| 2 | q_proj (W4A16) | (1,3072)→(1,16384) | — | not in repo (Marlin GEMV, ×2 for gate) |
-| 3 | k_proj (W4A16) | (1,3072)→(1,512) | — | not in repo (Marlin GEMV) |
-| 4 | v_proj (W4A16) | (1,3072)→(1,512) | — | not in repo (Marlin GEMV) |
+| 2 | q_proj + gate (W4A16) | (1,3072)→(1,16384) | **13.0 μs** | `./bench_all.sh --case w4a16_decode_full_attn_q_proj_gate_fpA_intB` |
+| 3 | k_proj (W4A16) | (1,3072)→(1,512) | **3.9 μs** | `./bench_all.sh --case w4a16_decode_full_attn_k_proj_fpA_intB` |
+| 4 | v_proj (W4A16) | (1,3072)→(1,512) | **3.9 μs** | `./bench_all.sh --case w4a16_decode_full_attn_v_proj_fpA_intB` |
 | 5 | q/k RMSNorm | (1,32,256) / (1,2,256) | — | not in repo (generic) |
 | 6 | MRoPE | Q:(1,32,256) K:(1,2,256) | — | not in repo (generic) |
 | 7 | **FlashAttention v3 decode** | Q:(1,32,256) KV:(ctx,2,256) | — | `python3 bench_flash_attn.py decode 3823` |
 | 8 | output gate | sigmoid × (1,8192) | — | elementwise |
-| 9 | o_proj (W4A16) | (1,8192)→(1,3072) | — | not in repo (Marlin GEMV) |
+| 9 | o_proj (W4A16) | (1,8192)→(1,3072) | **8.7 μs** | `./bench_all.sh --case w4a16_decode_full_attn_o_proj_fpA_intB` |
 | + | MoE FFN (same as above) | | | |
 
 ### Prefill (seq=3823)
 
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
+| 2 | q_proj + gate (W4A16) | (3823,3072)→(3823,16384) | **694.2 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_q_proj_gate_cutlass55` |
+| 3 | k_proj (W4A16) | (3823,3072)→(3823,512) | **37.7 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_k_proj_cutlass55` |
+| 4 | v_proj (W4A16) | (3823,3072)→(3823,512) | **37.3 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_v_proj_cutlass55` |
 | 7 | **FlashAttention v3 prefill** | Q:(3823,32,256) KV:(3823,2,256) | — | `python3 bench_flash_attn.py prefill 3823` |
+| 9 | o_proj (W4A16) | (3823,8192)→(3823,3072) | **389.8 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_o_proj_cutlass55` |
 
 > FlashAttention bench 使用 `flash_attn` 库（需 pip install flash-attn），如未安装自动 fallback 到 torch SDPA。
 

@@ -36,6 +36,14 @@ W4A16_LINEAR_Z_N=8192
 W4A16_LINEAR_Z_K=3072
 W4A16_LINEAR_OUT_N=3072
 W4A16_LINEAR_OUT_K=8192
+W4A16_FULL_ATTN_Q_PROJ_GATE_N=16384
+W4A16_FULL_ATTN_Q_PROJ_GATE_K=3072
+W4A16_FULL_ATTN_K_PROJ_N=512
+W4A16_FULL_ATTN_K_PROJ_K=3072
+W4A16_FULL_ATTN_V_PROJ_N=512
+W4A16_FULL_ATTN_V_PROJ_K=3072
+W4A16_FULL_ATTN_O_PROJ_N=3072
+W4A16_FULL_ATTN_O_PROJ_K=8192
 W4A16_CONSISTENT_EXPERT_UP_N=3072
 W4A16_CONSISTENT_EXPERT_UP_K=2048
 W4A16_CONSISTENT_EXPERT_DOWN_N=1024
@@ -78,7 +86,7 @@ Usage:
   ./bench_all.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings. Examples:
-  ./bench_all.sh w4a16_decode_linear_qkv_fpA_intB
+  ./bench_all.sh w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
   ./bench_all.sh --case moe_gate_up_decode_vllm
   ./bench_all.sh decode_vllm
 
@@ -502,23 +510,47 @@ run_case "linear_prefill_conv1d_fwd" \
 run_case "linear_prefill_flashinfer_gdn" \
   linear_attention/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
-run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_qkv_cutlass55" \
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_attn_in_proj_qkv_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"
 
-run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_z_cutlass55" \
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_attn_in_proj_z_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_Z_N" "$W4A16_LINEAR_Z_K"
 
-run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_out_cutlass55" \
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_attn_out_proj_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_OUT_N" "$W4A16_LINEAR_OUT_K"
 
-run_w4a16_decode_fpa_case "w4a16_decode_linear_qkv_fpA_intB" \
+run_w4a16_decode_fpa_case "w4a16_decode_linear_attn_in_proj_qkv_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"
 
-run_w4a16_decode_fpa_case "w4a16_decode_linear_z_fpA_intB" \
+run_w4a16_decode_fpa_case "w4a16_decode_linear_attn_in_proj_z_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_LINEAR_Z_N" "$W4A16_LINEAR_Z_K"
 
-run_w4a16_decode_fpa_case "w4a16_decode_linear_out_fpA_intB" \
+run_w4a16_decode_fpa_case "w4a16_decode_linear_attn_out_proj_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_LINEAR_OUT_N" "$W4A16_LINEAR_OUT_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_full_attn_q_proj_gate_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_FULL_ATTN_Q_PROJ_GATE_N" "$W4A16_FULL_ATTN_Q_PROJ_GATE_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_full_attn_k_proj_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_FULL_ATTN_K_PROJ_N" "$W4A16_FULL_ATTN_K_PROJ_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_full_attn_v_proj_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_FULL_ATTN_V_PROJ_N" "$W4A16_FULL_ATTN_V_PROJ_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_full_attn_o_proj_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_full_attn_q_proj_gate_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_FULL_ATTN_Q_PROJ_GATE_N" "$W4A16_FULL_ATTN_Q_PROJ_GATE_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_full_attn_k_proj_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_FULL_ATTN_K_PROJ_N" "$W4A16_FULL_ATTN_K_PROJ_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_full_attn_v_proj_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_FULL_ATTN_V_PROJ_N" "$W4A16_FULL_ATTN_V_PROJ_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_full_attn_o_proj_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"
 
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_consistent_expert_up_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_UP_N" "$W4A16_CONSISTENT_EXPERT_UP_K"
