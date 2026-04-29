@@ -33,6 +33,12 @@ W4A16_M=4096
 W4A16_N=4096
 W4A16_K=4096
 W4A16_GROUP=128
+W4A16_LINEAR_QKV_N=12288
+W4A16_LINEAR_QKV_K=3072
+W4A16_LINEAR_Z_N=8192
+W4A16_LINEAR_Z_K=3072
+W4A16_LINEAR_OUT_N=3072
+W4A16_LINEAR_OUT_K=8192
 
 repo_path() {
   local path="$1"
@@ -165,6 +171,20 @@ require_file() {
   local path="$1"
   if [[ ! -f "$path" ]]; then
     echo "[bench_all][error] missing file: $path" >&2
+    exit 1
+  fi
+}
+
+require_tactic_entry() {
+  local path="$1"
+  local key="$2"
+  if [[ ! -f "$path" ]]; then
+    echo "[bench_all][error] missing tactic cache: $path" >&2
+    exit 1
+  fi
+  if ! grep -qF "$key" "$path"; then
+    echo "[bench_all][error] tactic cache missing shape: $key" >&2
+    echo "[bench_all][error] cache file: $path" >&2
     exit 1
   fi
 }
@@ -321,7 +341,7 @@ run_perfrawlog_postprocess() {
   local report_dir log_dir log perfrawlog_arg
   report_dir="$(perfstatistics_report_dir "$label")"
   log_dir="$OUT_DIR/perfstatistics_logs"
-  mkdir -p "$log_dir"
+  mkdir -p "$log_dir" "$(dirname "$report_dir")"
   log="$log_dir/$(safe_name "$label").log"
   perfrawlog_arg="$perfrawlog_path"
   if [[ "$perfrawlog_path" == "$RUN_DIR/perfrawlog" ]]; then
@@ -397,6 +417,45 @@ summarize_perfstatistics() {
   echo "[bench_all] perfstatistics summary: $summary_log"
 }
 
+run_w4a16_prefill_cutlass55_case() {
+  local label="$1"
+  local m="$2"
+  local n="$3"
+  local k="$4"
+
+  if [[ "$LIST_CASES" != 1 ]] && case_selected "$label"; then
+    require_tactic_entry "$MACHETE_TACTIC" "$m,$n,$k,$W4A16_GROUP,fp16|"
+  fi
+
+  run_case "$label" \
+    --require-file "$MACHETE_TACTIC" \
+    "$MACHETE_BIN" \
+    --backend=cutlass55 \
+    --cutlass55_tactic="$MACHETE_TACTIC" \
+    --m="$m" --n="$n" --k="$k" --group_size="$W4A16_GROUP" \
+    --act=fp16 --quant=cutlass_s4 \
+    --offline_prepack --profile_gemm_only --no_checksum \
+    --warmup=0 --iters=1
+}
+
+run_w4a16_decode_fpa_case() {
+  local label="$1"
+  local m="$2"
+  local n="$3"
+  local k="$4"
+
+  if [[ "$LIST_CASES" != 1 ]] && case_selected "$label"; then
+    require_tactic_entry "$FPA_TACTIC" "$m,$n,$k,$W4A16_GROUP|"
+  fi
+
+  run_case "$label" \
+    --require-file "$FPA_TACTIC" \
+    "$FPA_BIN" \
+    --m="$m" --n="$n" --k="$k" --group_size="$W4A16_GROUP" \
+    --tactic="$FPA_TACTIC" \
+    --warmup=0 --iters=1
+}
+
 if [[ "$LIST_CASES" != 1 ]]; then
   if [[ ! -d "$RUN_DIR" ]]; then
     echo "[bench_all][error] run dir does not exist: $RUN_DIR" >&2
@@ -442,22 +501,29 @@ run_case "linear_prefill_conv1d_fwd" \
 run_case "linear_prefill_flashinfer_gdn" \
   linear_attention/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
-run_case "w4a16_prefill_cutlass55" \
-  --require-file "$MACHETE_TACTIC" \
-  "$MACHETE_BIN" \
-  --backend=cutlass55 \
-  --cutlass55_tactic="$MACHETE_TACTIC" \
-  --m="$W4A16_M" --n="$W4A16_N" --k="$W4A16_K" --group_size="$W4A16_GROUP" \
-  --act=fp16 --quant=cutlass_s4 \
-  --offline_prepack --profile_gemm_only --no_checksum \
-  --warmup=0 --iters=1
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_cutlass55" \
+  "$W4A16_M" "$W4A16_N" "$W4A16_K"
 
-run_case "w4a16_decode_fpA_intB" \
-  --require-file "$FPA_TACTIC" \
-  "$FPA_BIN" \
-  --m="$DECODE_TOKENS" --n="$W4A16_N" --k="$W4A16_K" --group_size="$W4A16_GROUP" \
-  --tactic="$FPA_TACTIC" \
-  --warmup=0 --iters=1
+run_w4a16_decode_fpa_case "w4a16_decode_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_N" "$W4A16_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_qkv_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_z_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_LINEAR_Z_N" "$W4A16_LINEAR_Z_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_out_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_LINEAR_OUT_N" "$W4A16_LINEAR_OUT_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_linear_qkv_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_linear_z_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_LINEAR_Z_N" "$W4A16_LINEAR_Z_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_linear_out_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_LINEAR_OUT_N" "$W4A16_LINEAR_OUT_K"
 
 run_case "moe_routing_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \

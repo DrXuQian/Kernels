@@ -59,6 +59,19 @@ Subtotals from these rows:
 | MoE prefill | TRT-LLM routing + expert map + expand + gate_up + gated + down + finalize | 2780.126 |
 | MoE decode | vLLM routing + align + gate_up + gated + down + finalize | 54.531 |
 
+Additional dense W4A16 projection cases were added after the full `bench_all.sh` run above. They are guarded by tactic-cache checks, so a missing shape fails early instead of falling back to a default config.
+
+Run: `h800_nsys_w4a16_dense_20260429_091047`
+
+| Case | Shape (M,N,K) | Backend | Cached config | nsys GPU time (us) |
+|---|---:|---|---|---:|
+| `w4a16_prefill_linear_qkv_cutlass55` | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 |
+| `w4a16_prefill_linear_z_cutlass55` | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 |
+| `w4a16_prefill_linear_out_cutlass55` | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 391.321 |
+| `w4a16_decode_linear_qkv_fpA_intB` | 1,12288,3072 | fpA_intB | `cuda` | 9.376 |
+| `w4a16_decode_linear_z_fpA_intB` | 1,8192,3072 | fpA_intB | `cuda` | 6.976 |
+| `w4a16_decode_linear_out_fpA_intB` | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
+
 ## 模型参数
 
 | 参数 | 值 |
@@ -86,25 +99,25 @@ Subtotals from these rows:
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
 | 1 | RMSNorm | (1,3072)→(1,3072) | — | not in repo (generic) |
-| 2 | in_proj_qkv (W4A16) | (1,3072)→(1,12288) | — | not in repo (Marlin GEMV) |
-| 3 | in_proj_z (W4A16) | (1,3072)→(1,8192) | — | not in repo (Marlin GEMV) |
+| 2 | in_proj_qkv (W4A16) | (1,3072)→(1,12288) | **9.4 μs** | `./bench_all.sh --case w4a16_decode_linear_qkv_fpA_intB` |
+| 3 | in_proj_z (W4A16) | (1,3072)→(1,8192) | **7.0 μs** | `./bench_all.sh --case w4a16_decode_linear_z_fpA_intB` |
 | 4 | in_proj_b (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 5 | in_proj_a (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
 | 6 | **conv1d decode** | dim=12288, w=4 | **5.4 μs** | `./bench_conv1d_update 12288 4 1 --bench 20 100` |
 | 7 | **GDN decode** (llama.cpp CUDA) | Q,K,V:(1,64,128) state:(64,128,128) | **5.4 μs** | `./bench_gated_delta_net 1 64 128 1 --bench 20 100` |
 | 8 | **FusedRMSNormGated** | (64,128)→(64,128) | **5.3 μs** | `./bench_fused_rms_norm_gate 64 128 --bench 20 100` |
-| 9 | out_proj (W4A16) | (1,8192)→(1,3072) | — | not in repo (Marlin GEMV) |
+| 9 | out_proj (W4A16) | (1,8192)→(1,3072) | **8.7 μs** | `./bench_all.sh --case w4a16_decode_linear_out_fpA_intB` |
 
 ### Prefill (seq=3823)
 
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
-| 1 | in_proj_qkv (W4A16) | (3823,3072)→(3823,12288) | — | not in repo (Marlin GEMM) |
-| 2 | in_proj_z (W4A16) | (3823,3072)→(3823,8192) | — | not in repo (Marlin GEMM) |
+| 1 | in_proj_qkv (W4A16) | (3823,3072)→(3823,12288) | **528.3 μs** | `./bench_all.sh --case w4a16_prefill_linear_qkv_cutlass55` |
+| 2 | in_proj_z (W4A16) | (3823,3072)→(3823,8192) | **365.9 μs** | `./bench_all.sh --case w4a16_prefill_linear_z_cutlass55` |
 | 3 | **conv1d prefill** | (1,12288,3823) | **134.0 μs** | `./bench_conv1d_fwd 3823 12288 4 1 --bench 10 50` |
 | 4 | **FlashInfer GDN prefill** (CUTLASS SM90) | Q:(3823,16,128) K:(3823,16,128) V:(3823,64,128) | **525.9 μs** | `./bench_gdn_prefill 3823 16 64 128 1 --bench 10 50` |
 | 5 | **FusedRMSNormGated** | (3823×64,128)→(3823×64,128) | — | `./bench_fused_rms_norm_gate 245472 128 --bench 10 50` |
-| 6 | out_proj (W4A16) | (3823,8192)→(3823,3072) | — | not in repo (Marlin GEMM) |
+| 6 | out_proj (W4A16) | (3823,8192)→(3823,3072) | **391.3 μs** | `./bench_all.sh --case w4a16_prefill_linear_out_cutlass55` |
 
 ## MoE FFN (×48 layers, 256 experts, topk=8)
 
