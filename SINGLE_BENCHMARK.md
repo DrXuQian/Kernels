@@ -149,6 +149,10 @@ Every label below can be passed to `--case`, `--kernel`, `--only`, or as a posit
 | dense W4A16 Qwen | `w4a16_decode_linear_qkv_fpA_intB` |
 | dense W4A16 Qwen | `w4a16_decode_linear_z_fpA_intB` |
 | dense W4A16 Qwen | `w4a16_decode_linear_out_fpA_intB` |
+| dense W4A16 consistent expert | `w4a16_prefill_consistent_expert_up_cutlass55` |
+| dense W4A16 consistent expert | `w4a16_prefill_consistent_expert_down_cutlass55` |
+| dense W4A16 consistent expert | `w4a16_decode_consistent_expert_up_fpA_intB` |
+| dense W4A16 consistent expert | `w4a16_decode_consistent_expert_down_fpA_intB` |
 | MoE prefill TRT-LLM | `moe_routing_prefill_trtllm` |
 | MoE prefill TRT-LLM | `moe_expert_map_prefill_trtllm` |
 | MoE prefill TRT-LLM | `moe_expand_prefill_trtllm` |

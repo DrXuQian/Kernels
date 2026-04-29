@@ -36,6 +36,10 @@ W4A16_LINEAR_Z_N=8192
 W4A16_LINEAR_Z_K=3072
 W4A16_LINEAR_OUT_N=3072
 W4A16_LINEAR_OUT_K=8192
+W4A16_CONSISTENT_EXPERT_UP_N=3072
+W4A16_CONSISTENT_EXPERT_UP_K=2048
+W4A16_CONSISTENT_EXPERT_DOWN_N=1024
+W4A16_CONSISTENT_EXPERT_DOWN_K=3072
 
 repo_path() {
   local path="$1"
@@ -515,6 +519,18 @@ run_w4a16_decode_fpa_case "w4a16_decode_linear_z_fpA_intB" \
 
 run_w4a16_decode_fpa_case "w4a16_decode_linear_out_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_LINEAR_OUT_N" "$W4A16_LINEAR_OUT_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_consistent_expert_up_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_UP_N" "$W4A16_CONSISTENT_EXPERT_UP_K"
+
+run_w4a16_prefill_cutlass55_case "w4a16_prefill_consistent_expert_down_cutlass55" \
+  "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_consistent_expert_up_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_UP_N" "$W4A16_CONSISTENT_EXPERT_UP_K"
+
+run_w4a16_decode_fpa_case "w4a16_decode_consistent_expert_down_fpA_intB" \
+  "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
 
 run_case "moe_routing_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \

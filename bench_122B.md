@@ -68,6 +68,15 @@ Run: `h800_nsys_w4a16_dense_20260429_091047`
 | `w4a16_decode_linear_z_fpA_intB` | 1,8192,3072 | fpA_intB | `cuda` | 6.976 |
 | `w4a16_decode_linear_out_fpA_intB` | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
 
+Run: `h800_nsys_consistent_expert_20260429_094031`
+
+| Case | Shape (M,N,K) | Backend | Cached config | nsys GPU time (us) |
+|---|---:|---|---|---:|
+| `w4a16_prefill_consistent_expert_up_cutlass55` | 3823,3072,2048 | machete cutlass55 | `128x128x64_1x1x1` | 111.613 |
+| `w4a16_prefill_consistent_expert_down_cutlass55` | 3823,1024,3072 | machete cutlass55 | `128x128x64_1x1x1` | 69.726 |
+| `w4a16_decode_consistent_expert_up_fpA_intB` | 1,3072,2048 | fpA_intB | `cuda` | 3.616 |
+| `w4a16_decode_consistent_expert_down_fpA_intB` | 1,1024,3072 | fpA_intB | `cuda` | 4.032 |
+
 ## 模型参数
 
 | 参数 | 值 |
@@ -129,9 +138,9 @@ Run: `h800_nsys_w4a16_dense_20260429_091047`
 | 6 | **silu_and_mul** | (8,1,2048)→(8,1,1024) | **5.0 μs** | `moe_w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100` |
 | 7 | **Marlin MoE down** (W4A16) | (8,1,1024)→(8,1,3072) | **12.3 μs** | `moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100` |
 | 8 | **moe_sum** | (8,1,3072)→(1,3072) | **5.4 μs** | `moe_w4a16/vllm/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100` |
-| 9 | Shared gate_up (W4A16) | (1,3072)→(1,2048) | — | not in repo (Marlin GEMV) |
+| 9 | Shared/consistent gate_up (W4A16) | (1,2048)→(1,3072) | **3.6 μs** | `./bench_all.sh --case w4a16_decode_consistent_expert_up_fpA_intB` |
 | 10 | Shared SwiGLU | (1,2048)→(1,1024) | — | not in repo |
-| 11 | Shared down (W4A16) | (1,1024)→(1,3072) | — | not in repo (Marlin GEMV) |
+| 11 | Shared/consistent down (W4A16) | (1,3072)→(1,1024) | **4.0 μs** | `./bench_all.sh --case w4a16_decode_consistent_expert_down_fpA_intB` |
 
 ### Prefill (seq=3823)
 
@@ -143,6 +152,9 @@ Run: `h800_nsys_w4a16_dense_20260429_091047`
 | 6 | **silu_and_mul** | (8,3823,2048)→(8,3823,1024) | — | `moe_w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50` |
 | 7 | **Marlin MoE down** (W4A16) | (8,3823,1024)→(8,3823,3072) | — | `moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50` |
 | 8 | **moe_sum** | (8,3823,3072)→(3823,3072) | — | `moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50` |
+| 9 | Shared/consistent gate_up (W4A16) | (3823,2048)→(3823,3072) | **111.6 μs** | `./bench_all.sh --case w4a16_prefill_consistent_expert_up_cutlass55` |
+| 10 | Shared SwiGLU | (3823,2048)→(3823,1024) | — | not in repo |
+| 11 | Shared/consistent down (W4A16) | (3823,3072)→(3823,1024) | **69.7 μs** | `./bench_all.sh --case w4a16_prefill_consistent_expert_down_cutlass55` |
 
 ## Full Attention (×12 layers)
 
