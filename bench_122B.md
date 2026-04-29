@@ -2,6 +2,63 @@
 
 H800 PCIe (SM 9.0, HBM 2.0 TB/s)
 
+## H800 `bench_all.sh` nsys reference
+
+Run: `h800_nsys_all_20260429_084402`
+
+```bash
+RUN_ID=h800_nsys_all_$(date +%Y%m%d_%H%M%S)
+BENCH_RUN_ID="$RUN_ID" \
+PERFRAWLOG_POSTPROCESS=0 \
+nsys profile \
+  --force-overwrite=true \
+  --trace=cuda \
+  --sample=none \
+  --cpuctxsw=none \
+  --output=".bench_profiles/$RUN_ID" \
+  ./bench_all.sh
+
+nsys stats ".bench_profiles/$RUN_ID.nsys-rep" \
+  --report cuda_gpu_trace \
+  --format csv \
+  --output ".bench_profiles/${RUN_ID}_trace"
+```
+
+The table below is from `cuda_gpu_trace` and sums only CUDA kernel rows. The whole-process nsys report also contains setup H2D/memset rows, which are intentionally excluded here. All benchmark commands used `warmup=0` and `iters=1`; every case maps to one benchmark kernel except `moe_expert_map_prefill_trtllm`, which is the TRT-LLM three-kernel prefix-sum path.
+
+| Case | Impl | Phase | Kernel(s) | nsys kernels | GPU time (us) | cycles @1.5GHz |
+|---|---:|---:|---|---:|---:|---:|
+| `linear_decode_conv1d_update` | linear | decode | conv1d_update | 1 | 2.528 | 3792 |
+| `linear_decode_gdn` | linear | decode | gated_delta_net | 1 | 4.480 | 6720 |
+| `linear_prefill_conv1d_fwd` | linear | prefill | conv1d_fwd | 1 | 127.208 | 190812 |
+| `linear_prefill_flashinfer_gdn` | linear | prefill | flashinfer_gdn | 1 | 520.926 | 781389 |
+| `w4a16_prefill_cutlass55` | w4a16 | prefill | machete backend=cutlass55, tactic=256x128x64_1x1x1 | 1 | 257.231 | 385846 |
+| `w4a16_decode_fpA_intB` | w4a16 | decode | fpA_intB tactic=cuda | 1 | 6.144 | 9216 |
+| `moe_routing_prefill_trtllm` | moe/trtllm | prefill | custom_moe_routing | 1 | 5.824 | 8736 |
+| `moe_expert_map_prefill_trtllm` | moe/trtllm | prefill | block/global/merge expert prefix sum | 3 | 10.657 | 15986 |
+| `moe_expand_prefill_trtllm` | moe/trtllm | prefill | expand_input_rows | 1 | 284.848 | 427272 |
+| `moe_gate_up_prefill_trtllm` | moe/trtllm | prefill | MoeFCGemm gate_up | 1 | 1314.123 | 1971184 |
+| `moe_gated_prefill_trtllm` | moe/trtllm | prefill | gated_activation | 1 | 390.486 | 585729 |
+| `moe_down_prefill_trtllm` | moe/trtllm | prefill | MoeFCGemm down | 1 | 675.654 | 1013481 |
+| `moe_finalize_prefill_trtllm` | moe/trtllm | prefill | finalize_moe_routing | 1 | 98.534 | 147801 |
+| `moe_routing_decode_vllm` | moe/vllm | decode | topk_gating | 1 | 4.352 | 6528 |
+| `moe_align_decode_vllm` | moe/vllm | decode | moe_align small batch | 1 | 10.017 | 15026 |
+| `moe_gate_up_decode_vllm` | moe/vllm | decode | Marlin MoE gate_up | 1 | 21.185 | 31777 |
+| `moe_gated_decode_vllm` | moe/vllm | decode | silu_and_mul | 1 | 2.720 | 4080 |
+| `moe_down_decode_vllm` | moe/vllm | decode | Marlin MoE down | 1 | 14.561 | 21842 |
+| `moe_finalize_decode_vllm` | moe/vllm | decode | moe_sum | 1 | 1.696 | 2544 |
+
+Subtotals from these rows:
+
+| Group | Included rows | GPU time (us) |
+|---|---|---:|
+| Linear attention decode in-repo | conv1d_update + GDN | 7.008 |
+| Linear attention prefill in-repo | conv1d_fwd + FlashInfer GDN | 648.134 |
+| W4A16 GEMM prefill | cutlass55 backend | 257.231 |
+| W4A16 GEMM decode | fpA_intB cuda tactic | 6.144 |
+| MoE prefill | TRT-LLM routing + expert map + expand + gate_up + gated + down + finalize | 2780.126 |
+| MoE decode | vLLM routing + align + gate_up + gated + down + finalize | 54.531 |
+
 ## 模型参数
 
 | 参数 | 值 |
