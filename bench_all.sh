@@ -75,16 +75,20 @@ Case matching accepts exact labels or substrings. Examples:
   ./bench_all.sh --case moe_gate_up_decode_vllm
   ./bench_all.sh decode_vllm
 
-After the selected cases finish, if ./perfrawlog exists, the script runs:
-  python -m perf_model.perf_statistics_gen --report_dir_path <unique-dir> --mp 16 . perfrawlog
+After each selected case, if RUN_DIR/perfrawlog exists, the script runs:
+  python -m perf_model.perf_statistics_gen --report_dir_path <out>/perfstatistics/<case> --mp 16 . perfrawlog
+Then it prints a compute_cycles/latency summary across per-case reports.
 
 Environment variables:
   RUN_DIR                 Benchmark working directory. Default: PERF_MODEL_DIR or repo root.
   PERF_MODEL_DIR          Alias/default source for RUN_DIR.
   OUT_DIR                  Log output directory. Default: .bench_logs/bench_<timestamp>
   BENCH_RUN_ID             Timestamp/name used when OUT_DIR is not set.
-  PERF_STATISTICS_DIR      Override perf statistics report directory.
+  PERF_STATISTICS_DIR      Root directory for per-case perf statistics reports.
   PERF_STATISTICS_MP       perf_statistics_gen --mp value. Default: 16
+  PERF_STATISTICS_GHZ      Clock used for latency summary. Default: 1.5.
+  PERF_STATISTICS_SUMMARY  Set to 0 to skip the final perfstatistics table.
+  PERFRAWLOG_CLEAR         Set to 0 to keep an existing perfrawlog before each case.
   PERFRAWLOG_POSTPROCESS   Set to 0 to skip perfrawlog post-processing.
 EOF
 }
@@ -195,6 +199,26 @@ selection_name() {
   safe_name "$name"
 }
 
+perfstatistics_base_dir() {
+  printf '%s\n' "${PERF_STATISTICS_DIR:-$OUT_DIR/perfstatistics}"
+}
+
+perfstatistics_report_dir() {
+  local label="$1"
+  printf '%s/%s\n' "$(perfstatistics_base_dir)" "$(safe_name "$label")"
+}
+
+clear_perfrawlog_for_case() {
+  if [[ "${PERFRAWLOG_POSTPROCESS:-1}" == 0 || "${PERFRAWLOG_CLEAR:-1}" == 0 ]]; then
+    return
+  fi
+
+  local perfrawlog_path="${PERFRAWLOG_PATH:-$RUN_DIR/perfrawlog}"
+  if [[ "$perfrawlog_path" == "$RUN_DIR/perfrawlog" && -e "$perfrawlog_path" ]]; then
+    rm -rf "$perfrawlog_path"
+  fi
+}
+
 run_case() {
   local label="$1"
   shift 1
@@ -252,6 +276,8 @@ run_case() {
     echo "---- output ----"
   } >"$log"
 
+  clear_perfrawlog_for_case
+
   set +e
   (cd "$RUN_DIR" && "${cmd[@]}") 2>&1 | tee -a "$log"
   local status=${PIPESTATUS[0]}
@@ -259,7 +285,13 @@ run_case() {
 
   if [[ "$status" == 0 ]]; then
     echo "finished_at: $(date -Is)" >>"$log"
-    printf '[bench_all] %-34s ok\n' "$label"
+    if run_perfrawlog_postprocess "$label" "${cmd[@]}"; then
+      printf '[bench_all] %-34s ok\n' "$label"
+    else
+      local post_status=$?
+      printf '[bench_all] %-34s failed perfstatistics_status=%s\n' "$label" "$post_status" >&2
+      FAILED=1
+    fi
   else
     echo "failed_at: $(date -Is)" >>"$log"
     echo "exit_status: $status" >>"$log"
@@ -271,6 +303,10 @@ run_case() {
 }
 
 run_perfrawlog_postprocess() {
+  local label="$1"
+  shift 1
+  local -a cmd=("$@")
+
   if [[ "${PERFRAWLOG_POSTPROCESS:-1}" == 0 ]]; then
     echo "[bench_all] PERFRAWLOG_POSTPROCESS=0, skip perfrawlog post-processing."
     return
@@ -282,10 +318,10 @@ run_perfrawlog_postprocess() {
     return
   fi
 
-  local out_base report_dir log perfrawlog_arg
-  out_base="$(safe_name "$(basename "$OUT_DIR")")"
-  report_dir="${PERF_STATISTICS_DIR:-perfstatistics_$(selection_name)_$out_base}"
-  log="$OUT_DIR/perf_statistics_gen.log"
+  local report_dir log perfrawlog_arg
+  report_dir="$(perfstatistics_report_dir "$label")"
+  mkdir -p "$report_dir"
+  log="$report_dir/perf_statistics_gen.log"
   perfrawlog_arg="$perfrawlog_path"
   if [[ "$perfrawlog_path" == "$RUN_DIR/perfrawlog" ]]; then
     perfrawlog_arg="perfrawlog"
@@ -299,6 +335,17 @@ run_perfrawlog_postprocess() {
   echo "[bench_all] log: $log"
 
   {
+    echo "label: $label"
+    echo "executable: ${cmd[0]:-}"
+    echo "run_dir: $RUN_DIR"
+    printf 'command:'
+    printf ' %q' "${cmd[@]}"
+    echo
+    echo "perfrawlog: $perfrawlog_path"
+    echo "report_dir: $report_dir"
+  } >"$report_dir/bench_metadata.txt"
+
+  {
     echo "report_dir: $report_dir"
     echo "mp: ${PERF_STATISTICS_MP:-16}"
     echo "run_dir: $RUN_DIR"
@@ -308,10 +355,42 @@ run_perfrawlog_postprocess() {
     echo "---- output ----"
   } >"$log"
 
+  set +e
   (cd "$RUN_DIR" && python -m perf_model.perf_statistics_gen \
     --report_dir_path "$report_dir" \
     --mp "${PERF_STATISTICS_MP:-16}" \
     . "$perfrawlog_arg") 2>&1 | tee -a "$log"
+  local status=${PIPESTATUS[0]}
+  set -e
+  return "$status"
+}
+
+summarize_perfstatistics() {
+  if [[ "${PERFRAWLOG_POSTPROCESS:-1}" == 0 || "${PERF_STATISTICS_SUMMARY:-1}" == 0 ]]; then
+    return
+  fi
+
+  local report_base summary_log
+  report_base="$(perfstatistics_base_dir)"
+  if [[ ! -d "$report_base" ]]; then
+    echo "[bench_all] no per-case perfstatistics directory found, skip summary."
+    return
+  fi
+
+  summary_log="$OUT_DIR/perfstatistics_summary.txt"
+  echo
+  echo "=== perfstatistics summary ==="
+  set +e
+  python "$ROOT_DIR/helpers/summarize_perfstatistics.py" \
+    "$report_base" \
+    --ghz "${PERF_STATISTICS_GHZ:-1.5}" 2>&1 | tee "$summary_log"
+  local status=${PIPESTATUS[0]}
+  set -e
+  if [[ "$status" != 0 ]]; then
+    echo "[bench_all][warn] perfstatistics summary did not find any compute_cycles."
+    return
+  fi
+  echo "[bench_all] perfstatistics summary: $summary_log"
 }
 
 if [[ "$LIST_CASES" != 1 ]]; then
@@ -320,6 +399,12 @@ if [[ "$LIST_CASES" != 1 ]]; then
     exit 1
   fi
   RUN_DIR="$(cd "$RUN_DIR" && pwd)"
+  if [[ "$OUT_DIR" != /* ]]; then
+    OUT_DIR="$ROOT_DIR/$OUT_DIR"
+  fi
+  if [[ -n "${PERF_STATISTICS_DIR:-}" && "$PERF_STATISTICS_DIR" != /* ]]; then
+    PERF_STATISTICS_DIR="$ROOT_DIR/$PERF_STATISTICS_DIR"
+  fi
   mkdir -p "$OUT_DIR"
 fi
 
@@ -451,6 +536,6 @@ else
 fi
 echo "============================================================"
 
-run_perfrawlog_postprocess
+summarize_perfstatistics
 
 exit "$FAILED"
