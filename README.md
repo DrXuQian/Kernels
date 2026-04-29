@@ -104,36 +104,6 @@ nsys stats trace.nsys-rep --report cuda_gpu_kern_sum
 
 ## Benchmark 结果 (H800 PCIe, nsys GPU kernel time)
 
-### Qwen3.5-122B-A10B Dense W4A16 GEMM 主表
-
-这些 case 都由根目录 `bench_all.sh` 直接调度。Prefill dense GEMM 默认走
-`test_machete_gemm --backend=cutlass55 --offline_prepack --profile_gemm_only`，
-decode dense GEMM 默认走 TensorRT-LLM `fpA_intB` standalone。所有 shape 均为
-`(M,N,K)`，group size 为 128。
-
-| Case | Stage | Logical op | Shape (M,N,K) | Backend | Cached config | H800 nsys GPU time (us) |
-|---|---|---|---:|---|---|---:|
-| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | prefill | linear-attn in_proj QKV | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 |
-| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | prefill | linear-attn in_proj z | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 |
-| `w4a16_prefill_linear_attn_out_proj_cutlass55` | prefill | linear-attn out_proj | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 391.321 |
-| `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` | decode | linear-attn in_proj QKV | 1,12288,3072 | fpA_intB | `cuda` | 9.376 |
-| `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | decode | linear-attn in_proj z | 1,8192,3072 | fpA_intB | `cuda` | 6.976 |
-| `w4a16_decode_linear_attn_out_proj_fpA_intB` | decode | linear-attn out_proj | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
-| `w4a16_prefill_full_attn_q_proj_gate_cutlass55` | prefill | full-attn q_proj + gate | 3823,16384,3072 | machete cutlass55 | `128x256x64_2x1x1` | 694.155 |
-| `w4a16_prefill_full_attn_k_proj_cutlass55` | prefill | full-attn k_proj | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.727 |
-| `w4a16_prefill_full_attn_v_proj_cutlass55` | prefill | full-attn v_proj | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.343 |
-| `w4a16_prefill_full_attn_o_proj_cutlass55` | prefill | full-attn o_proj | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 389.781 |
-| `w4a16_decode_full_attn_q_proj_gate_fpA_intB` | decode | full-attn q_proj + gate | 1,16384,3072 | fpA_intB | `cuda` | 12.960 |
-| `w4a16_decode_full_attn_k_proj_fpA_intB` | decode | full-attn k_proj | 1,512,3072 | fpA_intB | `cuda` | 3.936 |
-| `w4a16_decode_full_attn_v_proj_fpA_intB` | decode | full-attn v_proj | 1,512,3072 | fpA_intB | `cuda` | 3.935 |
-| `w4a16_decode_full_attn_o_proj_fpA_intB` | decode | full-attn o_proj | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
-| `w4a16_prefill_consistent_expert_up_cutlass55` | prefill | consistent expert gate_up | 3823,3072,2048 | machete cutlass55 | `128x128x64_1x1x1` | 111.613 |
-| `w4a16_prefill_consistent_expert_down_cutlass55` | prefill | consistent expert down | 3823,1024,3072 | machete cutlass55 | `128x128x64_1x1x1` | 69.726 |
-| `w4a16_decode_consistent_expert_up_fpA_intB` | decode | consistent expert gate_up | 1,3072,2048 | fpA_intB | `cuda` | 3.616 |
-| `w4a16_decode_consistent_expert_down_fpA_intB` | decode | consistent expert down | 1,1024,3072 | fpA_intB | `cuda` | 4.032 |
-
-完整 per-layer breakdown 和 run id 记录见 [`bench_122B.md`](bench_122B.md)。
-
 ### Standalone vs vLLM 对比验证
 
 使用 nsys 测量纯 GPU kernel 执行时间（不含 host launch overhead），验证提取的 standalone kernel 与 vLLM production 运行一致。
