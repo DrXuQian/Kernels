@@ -74,6 +74,9 @@ LIST_CASES=0
 MATCHED_CASES=0
 RAN_CASES=0
 CASE_FILTERS=()
+RESUME_FROM=""
+RESUME_SEEN=1
+RESUME_FOUND=0
 
 usage() {
   cat <<'EOF'
@@ -82,6 +85,7 @@ Usage:
   ./bench_all.sh --list                  # list available case labels
   ./bench_all.sh --case LABEL            # run one case
   ./bench_all.sh --kernel LABEL          # alias for --case
+  ./bench_all.sh --resume-from LABEL     # skip cases before LABEL, then continue
   ./bench_all.sh --run-dir DIR           # run every benchmark with DIR as cwd
   ./bench_all.sh LABEL [LABEL ...]       # run selected cases
 
@@ -89,6 +93,9 @@ Case matching accepts exact labels or substrings. Examples:
   ./bench_all.sh w4a16_decode_linear_attn_in_proj_qkv_fpA_intB
   ./bench_all.sh --case moe_gate_up_decode_vllm
   ./bench_all.sh decode_vllm
+  ./bench_all.sh --resume-from w4a16_prefill_linear_attn_out_proj_cutlass55
+
+Resume matching accepts an exact label or its sanitized form from --list.
 
 After each selected case, if RUN_DIR/perfrawlog exists, the script runs:
   python -m perf_model.perf_statistics_gen --report_dir_path <out>/perfstatistics/<case> --mp 16 . perfrawlog
@@ -131,6 +138,14 @@ while [[ $# -gt 0 ]]; do
       add_case_filter "${1#*=}"
       shift
       ;;
+    --resume|--resume-from)
+      RESUME_FROM="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --resume=*|--resume-from=*)
+      RESUME_FROM="${1#*=}"
+      shift
+      ;;
     --list)
       LIST_CASES=1
       shift
@@ -165,6 +180,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$RESUME_FROM" ]]; then
+  RESUME_SEEN=0
+fi
 
 require_bin() {
   local path="$1"
@@ -202,20 +221,54 @@ safe_name() {
   echo "$1" | tr ' /:' '___' | tr -cd '[:alnum:]_.-'
 }
 
+label_matches_filter() {
+  local label="$1"
+  local filter="$2"
+  local safe_label
+  safe_label="$(safe_name "$label")"
+
+  [[ "$label" == "$filter" || "$safe_label" == "$filter" || "$label" == *"$filter"* ]]
+}
+
+label_matches_exact() {
+  local label="$1"
+  local query="$2"
+  local safe_label safe_query
+  safe_label="$(safe_name "$label")"
+  safe_query="$(safe_name "$query")"
+
+  [[ "$label" == "$query" || "$safe_label" == "$query" || "$safe_label" == "$safe_query" ]]
+}
+
 case_selected() {
   local label="$1"
-  local safe_label filter
+  local filter
 
   if [[ ${#CASE_FILTERS[@]} -eq 0 ]]; then
     return 0
   fi
 
-  safe_label="$(safe_name "$label")"
   for filter in "${CASE_FILTERS[@]}"; do
-    if [[ "$label" == "$filter" || "$safe_label" == "$filter" || "$label" == *"$filter"* ]]; then
+    if label_matches_filter "$label" "$filter"; then
       return 0
     fi
   done
+
+  return 1
+}
+
+case_after_resume_point() {
+  local label="$1"
+
+  if [[ -z "$RESUME_FROM" || "$RESUME_SEEN" == 1 ]]; then
+    return 0
+  fi
+
+  if label_matches_exact "$label" "$RESUME_FROM"; then
+    RESUME_SEEN=1
+    RESUME_FOUND=1
+    return 0
+  fi
 
   return 1
 }
@@ -257,6 +310,10 @@ run_case() {
     return
   fi
 
+  if ! case_after_resume_point "$label"; then
+    return
+  fi
+
   if ! case_selected "$label"; then
     return
   fi
@@ -264,9 +321,23 @@ run_case() {
   MATCHED_CASES=$((MATCHED_CASES + 1))
 
   local required_files=()
-  while [[ $# -gt 0 && "$1" == "--require-file" ]]; do
-    required_files+=("${2:?missing file after --require-file}")
-    shift 2
+  local required_tactic_files=()
+  local required_tactic_keys=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --require-file)
+        required_files+=("${2:?missing file after --require-file}")
+        shift 2
+        ;;
+      --require-tactic-entry)
+        required_tactic_files+=("${2:?missing tactic file after --require-tactic-entry}")
+        required_tactic_keys+=("${3:?missing tactic key after --require-tactic-entry}")
+        shift 3
+        ;;
+      *)
+        break
+        ;;
+    esac
   done
 
   local -a cmd=("$@")
@@ -278,6 +349,10 @@ run_case() {
   local required_file
   for required_file in "${required_files[@]}"; do
     require_file "$required_file"
+  done
+  local i
+  for i in "${!required_tactic_files[@]}"; do
+    require_tactic_entry "${required_tactic_files[$i]}" "${required_tactic_keys[$i]}"
   done
 
   RAN_CASES=$((RAN_CASES + 1))
@@ -432,12 +507,9 @@ run_w4a16_prefill_cutlass55_case() {
   local n="$3"
   local k="$4"
 
-  if [[ "$LIST_CASES" != 1 ]] && case_selected "$label"; then
-    require_tactic_entry "$MACHETE_TACTIC" "$m,$n,$k,$W4A16_GROUP,fp16|"
-  fi
-
   run_case "$label" \
     --require-file "$MACHETE_TACTIC" \
+    --require-tactic-entry "$MACHETE_TACTIC" "$m,$n,$k,$W4A16_GROUP,fp16|" \
     "$MACHETE_BIN" \
     --backend=cutlass55 \
     --cutlass55_tactic="$MACHETE_TACTIC" \
@@ -453,12 +525,9 @@ run_w4a16_decode_fpa_case() {
   local n="$3"
   local k="$4"
 
-  if [[ "$LIST_CASES" != 1 ]] && case_selected "$label"; then
-    require_tactic_entry "$FPA_TACTIC" "$m,$n,$k,$W4A16_GROUP|"
-  fi
-
   run_case "$label" \
     --require-file "$FPA_TACTIC" \
+    --require-tactic-entry "$FPA_TACTIC" "$m,$n,$k,$W4A16_GROUP|" \
     "$FPA_BIN" \
     --m="$m" --n="$n" --k="$k" --group_size="$W4A16_GROUP" \
     --tactic="$FPA_TACTIC" \
@@ -494,6 +563,9 @@ else
   echo "moe decode:     vLLM components"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
     echo "case filters:   ${CASE_FILTERS[*]}"
+  fi
+  if [[ -n "$RESUME_FROM" ]]; then
+    echo "resume from:    $RESUME_FROM"
   fi
   echo "============================================================"
 fi
@@ -626,6 +698,12 @@ run_case "moe_finalize_decode_vllm" \
 
 if [[ "$LIST_CASES" == 1 ]]; then
   exit 0
+fi
+
+if [[ -n "$RESUME_FROM" && "$RESUME_FOUND" == 0 ]]; then
+  echo "[bench_all][error] resume label was not found: $RESUME_FROM" >&2
+  echo "[bench_all][hint] run ./bench_all.sh --list to see available labels." >&2
+  exit 1
 fi
 
 if [[ ${#CASE_FILTERS[@]} -gt 0 && "$MATCHED_CASES" == 0 ]]; then
