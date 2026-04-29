@@ -29,9 +29,6 @@ MOE_GATE_K=2048
 MOE_DOWN_N=1024
 MOE_DOWN_K=3072
 
-W4A16_M=4096
-W4A16_N=4096
-W4A16_K=4096
 W4A16_GROUP=128
 W4A16_LINEAR_QKV_N=12288
 W4A16_LINEAR_QKV_K=3072
@@ -77,7 +74,7 @@ Usage:
   ./bench_all.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings. Examples:
-  ./bench_all.sh w4a16_decode_fpA_intB
+  ./bench_all.sh w4a16_decode_linear_qkv_fpA_intB
   ./bench_all.sh --case moe_gate_up_decode_vllm
   ./bench_all.sh decode_vllm
 
@@ -500,12 +497,6 @@ run_case "linear_prefill_conv1d_fwd" \
 
 run_case "linear_prefill_flashinfer_gdn" \
   linear_attention/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
-
-run_w4a16_prefill_cutlass55_case "w4a16_prefill_cutlass55" \
-  "$W4A16_M" "$W4A16_N" "$W4A16_K"
-
-run_w4a16_decode_fpa_case "w4a16_decode_fpA_intB" \
-  "$DECODE_TOKENS" "$W4A16_N" "$W4A16_K"
 
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_qkv_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"

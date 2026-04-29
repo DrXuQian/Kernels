@@ -32,8 +32,6 @@ The table below is from `cuda_gpu_trace` and sums only CUDA kernel rows. The who
 | `linear_decode_gdn` | linear | decode | gated_delta_net | 1 | 4.480 | 6720 |
 | `linear_prefill_conv1d_fwd` | linear | prefill | conv1d_fwd | 1 | 127.208 | 190812 |
 | `linear_prefill_flashinfer_gdn` | linear | prefill | flashinfer_gdn | 1 | 520.926 | 781389 |
-| `w4a16_prefill_cutlass55` | w4a16 | prefill | machete backend=cutlass55, tactic=256x128x64_1x1x1 | 1 | 257.231 | 385846 |
-| `w4a16_decode_fpA_intB` | w4a16 | decode | fpA_intB tactic=cuda | 1 | 6.144 | 9216 |
 | `moe_routing_prefill_trtllm` | moe/trtllm | prefill | custom_moe_routing | 1 | 5.824 | 8736 |
 | `moe_expert_map_prefill_trtllm` | moe/trtllm | prefill | block/global/merge expert prefix sum | 3 | 10.657 | 15986 |
 | `moe_expand_prefill_trtllm` | moe/trtllm | prefill | expand_input_rows | 1 | 284.848 | 427272 |
@@ -54,8 +52,6 @@ Subtotals from these rows:
 |---|---|---:|
 | Linear attention decode in-repo | conv1d_update + GDN | 7.008 |
 | Linear attention prefill in-repo | conv1d_fwd + FlashInfer GDN | 648.134 |
-| W4A16 GEMM prefill | cutlass55 backend | 257.231 |
-| W4A16 GEMM decode | fpA_intB cuda tactic | 6.144 |
 | MoE prefill | TRT-LLM routing + expert map + expand + gate_up + gated + down + finalize | 2780.126 |
 | MoE decode | vLLM routing + align + gate_up + gated + down + finalize | 54.531 |
 
