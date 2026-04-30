@@ -39,6 +39,7 @@ LIST_CASES=0
 MATCHED_CASES=0
 RAN_CASES=0
 CASE_FILTERS=()
+EXACT_CASE_MATCH=0
 RESUME_FROM=""
 RESUME_SEEN=1
 RESUME_FOUND=0
@@ -58,6 +59,7 @@ Usage:
   ./bench_attention_inference.sh                    # run all attention inference cases
   ./bench_attention_inference.sh --list             # list available case labels
   ./bench_attention_inference.sh --case LABEL       # run one case
+  ./bench_attention_inference.sh --exact-case LABEL # run exactly one case label
   ./bench_attention_inference.sh LABEL [LABEL ...]  # run selected cases
   ./bench_attention_inference.sh --resume-from LABEL
   ./bench_attention_inference.sh --run-dir DIR
@@ -117,6 +119,16 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --case=*|--kernel=*|--only=*)
+      add_case_filter "${1#*=}"
+      shift
+      ;;
+    --exact-case)
+      EXACT_CASE_MATCH=1
+      add_case_filter "${2:?missing value for $1}"
+      shift 2
+      ;;
+    --exact-case=*)
+      EXACT_CASE_MATCH=1
       add_case_filter "${1#*=}"
       shift
       ;;
@@ -220,7 +232,11 @@ case_selected() {
   fi
 
   for filter in "${CASE_FILTERS[@]}"; do
-    if label_matches_filter "$label" "$filter"; then
+    if [[ "$EXACT_CASE_MATCH" == 1 ]]; then
+      if label_matches_exact "$label" "$filter"; then
+        return 0
+      fi
+    elif label_matches_filter "$label" "$filter"; then
       return 0
     fi
   done

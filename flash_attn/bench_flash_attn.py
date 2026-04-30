@@ -70,10 +70,24 @@ if mode == "decode":
 else:
     kernel = lambda: flash_attn_func(q, k, v, causal=True)
 
+def profiler_start():
+    try:
+        torch.cuda.cudart().cudaProfilerStart()
+    except Exception:
+        pass
+
+def profiler_stop():
+    try:
+        torch.cuda.cudart().cudaProfilerStop()
+    except Exception:
+        pass
+
 if not bench_mode:
     # Single run for ncu/nsys
+    profiler_start()
     kernel()
     torch.cuda.synchronize()
+    profiler_stop()
 else:
     # Warmup + timed iterations
     for _ in range(warmup):
@@ -82,11 +96,13 @@ else:
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+    profiler_start()
     for i in range(repeat):
         starts[i].record()
         kernel()
         ends[i].record()
     torch.cuda.synchronize()
+    profiler_stop()
 
     times = np.array([s.elapsed_time(e) * 1000 for s, e in zip(starts, ends)])
     print(f"  Kernel time: median={np.median(times):.1f} μs, min={np.min(times):.1f} μs (warmup={warmup}, iters={repeat})")

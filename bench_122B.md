@@ -209,7 +209,7 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 | 4 | v_proj (W4A16) | (1,3072)→(1,512) | **3.9 μs** | `./bench_all.sh --case w4a16_decode_full_attn_v_proj_fpA_intB` |
 | 5 | q/k RMSNorm | (1,32,256) / (1,2,256) | — | not in repo (generic) |
 | 6 | MRoPE | Q:(1,32,256) K:(1,2,256) | — | not in repo (generic) |
-| 7 | **FlashAttention v3 decode** | Q:(1,32,256) KV:(ctx,2,256) | — | `python3 bench_flash_attn.py decode 3823` |
+| 7 | **FlashAttention v3 decode** | Q:(1,32,256) KV:(ctx,2,256) | **H800 24.7 μs / PPU 46.4 μs** | `./bench_attention_inference.sh --case flash_attn_decode_full_attn` |
 | 8 | output gate | sigmoid × (1,8192) | — | elementwise |
 | 9 | o_proj (W4A16) | (1,8192)→(1,3072) | **8.7 μs** | `./bench_all.sh --case w4a16_decode_full_attn_o_proj_fpA_intB` |
 | + | MoE FFN (same as above) | | | |
@@ -221,10 +221,25 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 | 2 | q_proj + gate (W4A16) | (3823,3072)→(3823,16384) | **694.2 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_q_proj_gate_cutlass55` |
 | 3 | k_proj (W4A16) | (3823,3072)→(3823,512) | **37.7 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_k_proj_cutlass55` |
 | 4 | v_proj (W4A16) | (3823,3072)→(3823,512) | **37.3 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_v_proj_cutlass55` |
-| 7 | **FlashAttention v3 prefill** | Q:(3823,32,256) KV:(3823,2,256) | — | `python3 bench_flash_attn.py prefill 3823` |
+| 7 | **FlashAttention v3 prefill** | Q:(3823,32,256) KV:(3823,2,256) | **H800 1061.6 μs / PPU 768.2 μs** | `./bench_attention_inference.sh --case flash_attn_prefill_full_attn` |
 | 9 | o_proj (W4A16) | (3823,8192)→(3823,3072) | **389.8 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_o_proj_cutlass55` |
 
-> FlashAttention bench 使用 `flash_attn` 库（需 pip install flash-attn），如未安装自动 fallback 到 torch SDPA。
+> FlashAttention bench 使用 `flash_attn` 库（需 pip install flash-attn）。H800 数字来自 nsys `cuda_gpu_trace`，只汇总 captured range 内 CUDA kernel rows；PPU 数字来自 `perfstatistics`，按 1.5 GHz 换算。
+
+### Attention Python/JIT inference nsys 对比
+
+H800 run: `attention_nsys_20260430_165220`, command pattern:
+`nsys profile --trace=cuda --capture-range=cudaProfilerApi --capture-range-end=stop ... ./bench_attention_inference.sh --exact-case <case>` with `BENCH_WARMUP=1 BENCH_ITERS=1`. H800 latency is the sum of captured CUDA kernel rows.
+
+| Case | Shape | H800 nsys kernels | H800 nsys latency (us) | PPU latency (us) | PPU cycles | PPU/H800 |
+|---|---|---:|---:|---:|---:|---:|
+| `linear_triton_decode_gdn` | B=1, q=16, v=64, d=128 | 1 | 6.560 | - | - | - |
+| `linear_triton_prefill_gdn` | seq=3823, q=16, v=64, d=128 | 8 | 938.595 | - | - | - |
+| `linear_triton_prefill_gdn_core_only` | seq=3823, q=16, v=64, d=128 | 7 | 831.561 | - | - | - |
+| `flashinfer_decode_full_attn` | Q:(1,32,256), KV:(3823,2,256) | 2 | 12.577 | - | - | - |
+| `flashinfer_prefill_full_attn` | Q:(3823,32,256), KV:(3823,2,256) | 1 | 572.283 | - | - | - |
+| `flash_attn_decode_full_attn` | Q:(1,32,256), KV:(3823,2,256) | 2 | 24.738 | 46.405 | 69608 | 1.88x |
+| `flash_attn_prefill_full_attn` | Q:(3823,32,256), KV:(3823,2,256) | 1 | 1061.617 | 768.187 | 1152280 | 0.72x |
 
 ## Decode 单层时间估算
 
