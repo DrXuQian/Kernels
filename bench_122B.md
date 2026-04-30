@@ -24,36 +24,36 @@ nsys stats ".bench_profiles/$RUN_ID.nsys-rep" \
   --output ".bench_profiles/${RUN_ID}_trace"
 ```
 
-The table below is from `cuda_gpu_trace` and sums only CUDA kernel rows. The whole-process nsys report also contains setup H2D/memset rows, which are intentionally excluded here. All benchmark commands used `warmup=0` and `iters=1`; every case maps to one benchmark kernel except `moe_expert_map_prefill_trtllm`, which is the TRT-LLM three-kernel prefix-sum path.
+The table below is from `cuda_gpu_trace` and sums only CUDA kernel rows. The whole-process nsys report also contains setup H2D/memset rows, which are intentionally excluded here. All benchmark commands used `warmup=0` and `iters=1`; every case maps to one benchmark kernel except `moe_expert_map_prefill_trtllm`, which is the TRT-LLM three-kernel prefix-sum path. PPU rows are from `perfstatistics` reports; `PPU latency` is converted with a 1.5 GHz clock (`compute_cycles / 1500`).
 
-| Case | Impl | Phase | Kernel(s) | nsys kernels | GPU time (us) | cycles @1.5GHz |
-|---|---:|---:|---|---:|---:|---:|
-| `linear_decode_conv1d_update` | linear | decode | conv1d_update | 1 | 2.528 | 3792 |
-| `linear_decode_gdn` | linear | decode | gated_delta_net | 1 | 4.480 | 6720 |
-| `linear_prefill_conv1d_fwd` | linear | prefill | conv1d_fwd | 1 | 127.208 | 190812 |
-| `linear_prefill_flashinfer_gdn` | linear | prefill | flashinfer_gdn | 1 | 520.926 | 781389 |
-| `moe_routing_prefill_trtllm` | moe/trtllm | prefill | custom_moe_routing | 1 | 5.824 | 8736 |
-| `moe_expert_map_prefill_trtllm` | moe/trtllm | prefill | block/global/merge expert prefix sum | 3 | 10.657 | 15986 |
-| `moe_expand_prefill_trtllm` | moe/trtllm | prefill | expand_input_rows | 1 | 284.848 | 427272 |
-| `moe_gate_up_prefill_trtllm` | moe/trtllm | prefill | MoeFCGemm gate_up | 1 | 1314.123 | 1971184 |
-| `moe_gated_prefill_trtllm` | moe/trtllm | prefill | gated_activation | 1 | 390.486 | 585729 |
-| `moe_down_prefill_trtllm` | moe/trtllm | prefill | MoeFCGemm down | 1 | 675.654 | 1013481 |
-| `moe_finalize_prefill_trtllm` | moe/trtllm | prefill | finalize_moe_routing | 1 | 98.534 | 147801 |
-| `moe_routing_decode_vllm` | moe/vllm | decode | topk_gating | 1 | 4.352 | 6528 |
-| `moe_align_decode_vllm` | moe/vllm | decode | moe_align small batch | 1 | 10.017 | 15026 |
-| `moe_gate_up_decode_vllm` | moe/vllm | decode | Marlin MoE gate_up | 1 | 21.185 | 31777 |
-| `moe_gated_decode_vllm` | moe/vllm | decode | silu_and_mul | 1 | 2.720 | 4080 |
-| `moe_down_decode_vllm` | moe/vllm | decode | Marlin MoE down | 1 | 14.561 | 21842 |
-| `moe_finalize_decode_vllm` | moe/vllm | decode | moe_sum | 1 | 1.696 | 2544 |
+| Case | Impl | Phase | Kernel(s) | nsys kernels | H800 GPU time (us) | H800 cycles @1.5GHz | PPU latency (us) | PPU cycles |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| `linear_decode_conv1d_update` | linear | decode | conv1d_update | 1 | 2.528 | 3792 | - | - |
+| `linear_decode_gdn` | linear | decode | gated_delta_net | 1 | 4.480 | 6720 | - | - |
+| `linear_prefill_conv1d_fwd` | linear | prefill | conv1d_fwd | 1 | 127.208 | 190812 | - | - |
+| `linear_prefill_flashinfer_gdn` | linear | prefill | flashinfer_gdn | 1 | 520.926 | 781389 | - | - |
+| `moe_routing_prefill_trtllm` | moe/trtllm | prefill | custom_moe_routing | 1 | 5.824 | 8736 | 3.443 | 5164 |
+| `moe_expert_map_prefill_trtllm` | moe/trtllm | prefill | block/global/merge expert prefix sum | 3 | 10.657 | 15986 | 10.815 | 16222 |
+| `moe_expand_prefill_trtllm` | moe/trtllm | prefill | expand_input_rows | 1 | 284.848 | 427272 | 188.691 | 283036 |
+| `moe_gate_up_prefill_trtllm` | moe/trtllm | prefill | MoeFCGemm gate_up | 1 | 1314.123 | 1971184 | 963.023 | 1444534 |
+| `moe_gated_prefill_trtllm` | moe/trtllm | prefill | gated_activation | 1 | 390.486 | 585729 | 523.552 | 785328 |
+| `moe_down_prefill_trtllm` | moe/trtllm | prefill | MoeFCGemm down | 1 | 675.654 | 1013481 | 491.889 | 737833 |
+| `moe_finalize_prefill_trtllm` | moe/trtllm | prefill | finalize_moe_routing | 1 | 98.534 | 147801 | 172.975 | 259463 |
+| `moe_routing_decode_vllm` | moe/vllm | decode | topk_gating | 1 | 4.352 | 6528 | 5.867 | 8801 |
+| `moe_align_decode_vllm` | moe/vllm | decode | moe_align small batch | 1 | 10.017 | 15026 | 10.299 | 15449 |
+| `moe_gate_up_decode_vllm` | moe/vllm | decode | Marlin MoE gate_up | 1 | 21.185 | 31777 | 31.368 | 47052 |
+| `moe_gated_decode_vllm` | moe/vllm | decode | silu_and_mul | 1 | 2.720 | 4080 | 2.943 | 4414 |
+| `moe_down_decode_vllm` | moe/vllm | decode | Marlin MoE down | 1 | 14.561 | 21842 | 20.510 | 30765 |
+| `moe_finalize_decode_vllm` | moe/vllm | decode | moe_sum | 1 | 1.696 | 2544 | 1.772 | 2658 |
 
 Subtotals from these rows:
 
-| Group | Included rows | GPU time (us) |
-|---|---|---:|
-| Linear attention decode in-repo | conv1d_update + GDN | 7.008 |
-| Linear attention prefill in-repo | conv1d_fwd + FlashInfer GDN | 648.134 |
-| MoE prefill | TRT-LLM routing + expert map + expand + gate_up + gated + down + finalize | 2780.126 |
-| MoE decode | vLLM routing + align + gate_up + gated + down + finalize | 54.531 |
+| Group | Included rows | H800 GPU time (us) | PPU latency (us) |
+|---|---|---:|---:|
+| Linear attention decode in-repo | conv1d_update + GDN | 7.008 | - |
+| Linear attention prefill in-repo | conv1d_fwd + FlashInfer GDN | 648.134 | - |
+| MoE prefill | TRT-LLM routing + expert map + expand + gate_up + gated + down + finalize | 2780.126 | 2354.388 |
+| MoE decode | vLLM routing + align + gate_up + gated + down + finalize | 54.531 | 72.759 |
 
 ### Dense W4A16 GEMM 主表
 
@@ -62,26 +62,26 @@ Subtotals from these rows:
 decode dense GEMM 默认走 TensorRT-LLM `fpA_intB` standalone。所有 shape 均为
 `(M,N,K)`，group size 为 128。
 
-| Case | Stage | Logical op | Shape (M,N,K) | Backend | Cached config | H800 nsys GPU time (us) |
-|---|---|---|---:|---|---|---:|
-| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | prefill | linear-attn in_proj QKV | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 |
-| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | prefill | linear-attn in_proj z | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 |
-| `w4a16_prefill_linear_attn_out_proj_cutlass55` | prefill | linear-attn out_proj | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 391.321 |
-| `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` | decode | linear-attn in_proj QKV | 1,12288,3072 | fpA_intB | `cuda` | 9.376 |
-| `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | decode | linear-attn in_proj z | 1,8192,3072 | fpA_intB | `cuda` | 6.976 |
-| `w4a16_decode_linear_attn_out_proj_fpA_intB` | decode | linear-attn out_proj | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
-| `w4a16_prefill_full_attn_q_proj_gate_cutlass55` | prefill | full-attn q_proj + gate | 3823,16384,3072 | machete cutlass55 | `128x256x64_2x1x1` | 694.155 |
-| `w4a16_prefill_full_attn_k_proj_cutlass55` | prefill | full-attn k_proj | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.727 |
-| `w4a16_prefill_full_attn_v_proj_cutlass55` | prefill | full-attn v_proj | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.343 |
-| `w4a16_prefill_full_attn_o_proj_cutlass55` | prefill | full-attn o_proj | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 389.781 |
-| `w4a16_decode_full_attn_q_proj_gate_fpA_intB` | decode | full-attn q_proj + gate | 1,16384,3072 | fpA_intB | `cuda` | 12.960 |
-| `w4a16_decode_full_attn_k_proj_fpA_intB` | decode | full-attn k_proj | 1,512,3072 | fpA_intB | `cuda` | 3.936 |
-| `w4a16_decode_full_attn_v_proj_fpA_intB` | decode | full-attn v_proj | 1,512,3072 | fpA_intB | `cuda` | 3.935 |
-| `w4a16_decode_full_attn_o_proj_fpA_intB` | decode | full-attn o_proj | 1,3072,8192 | fpA_intB | `cuda` | 8.672 |
-| `w4a16_prefill_consistent_expert_up_cutlass55` | prefill | consistent expert gate_up | 3823,3072,2048 | machete cutlass55 | `128x128x64_1x1x1` | 111.613 |
-| `w4a16_prefill_consistent_expert_down_cutlass55` | prefill | consistent expert down | 3823,1024,3072 | machete cutlass55 | `128x128x64_1x1x1` | 69.726 |
-| `w4a16_decode_consistent_expert_up_fpA_intB` | decode | consistent expert gate_up | 1,3072,2048 | fpA_intB | `cuda` | 3.616 |
-| `w4a16_decode_consistent_expert_down_fpA_intB` | decode | consistent expert down | 1,1024,3072 | fpA_intB | `cuda` | 4.032 |
+| Case | Stage | Logical op | Shape (M,N,K) | Backend | Cached config | H800 nsys GPU time (us) | PPU latency (us) | PPU cycles |
+|---|---|---|---:|---|---|---:|---:|---:|
+| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | prefill | linear-attn in_proj QKV | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 | - | - |
+| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | prefill | linear-attn in_proj z | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 | - | - |
+| `w4a16_prefill_linear_attn_out_proj_cutlass55` | prefill | linear-attn out_proj | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 391.321 | 327.592 | 491388 |
+| `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` | decode | linear-attn in_proj QKV | 1,12288,3072 | fpA_intB | `cuda` | 9.376 | 15.254 | 22881 |
+| `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | decode | linear-attn in_proj z | 1,8192,3072 | fpA_intB | `cuda` | 6.976 | 9.091 | 13637 |
+| `w4a16_decode_linear_attn_out_proj_fpA_intB` | decode | linear-attn out_proj | 1,3072,8192 | fpA_intB | `cuda` | 8.672 | 14.235 | 21352 |
+| `w4a16_prefill_full_attn_q_proj_gate_cutlass55` | prefill | full-attn q_proj + gate | 3823,16384,3072 | machete cutlass55 | `128x256x64_2x1x1` | 694.155 | 599.523 | 899284 |
+| `w4a16_prefill_full_attn_k_proj_cutlass55` | prefill | full-attn k_proj | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.727 | 42.915 | 64373 |
+| `w4a16_prefill_full_attn_v_proj_cutlass55` | prefill | full-attn v_proj | 3823,512,3072 | machete cutlass55 | `128x256x64_2x1x1` | 37.343 | 43.018 | 64527 |
+| `w4a16_prefill_full_attn_o_proj_cutlass55` | prefill | full-attn o_proj | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 389.781 | 327.592 | 491388 |
+| `w4a16_decode_full_attn_q_proj_gate_fpA_intB` | decode | full-attn q_proj + gate | 1,16384,3072 | fpA_intB | `cuda` | 12.960 | 15.875 | 23813 |
+| `w4a16_decode_full_attn_k_proj_fpA_intB` | decode | full-attn k_proj | 1,512,3072 | fpA_intB | `cuda` | 3.936 | 5.347 | 8020 |
+| `w4a16_decode_full_attn_v_proj_fpA_intB` | decode | full-attn v_proj | 1,512,3072 | fpA_intB | `cuda` | 3.935 | 5.285 | 7927 |
+| `w4a16_decode_full_attn_o_proj_fpA_intB` | decode | full-attn o_proj | 1,3072,8192 | fpA_intB | `cuda` | 8.672 | 14.235 | 21352 |
+| `w4a16_prefill_consistent_expert_up_cutlass55` | prefill | consistent expert gate_up | 3823,3072,2048 | machete cutlass55 | `128x128x64_1x1x1` | 111.613 | 113.129 | 169694 |
+| `w4a16_prefill_consistent_expert_down_cutlass55` | prefill | consistent expert down | 3823,1024,3072 | machete cutlass55 | `128x128x64_1x1x1` | 69.726 | 57.661 | 86491 |
+| `w4a16_decode_consistent_expert_up_fpA_intB` | decode | consistent expert gate_up | 1,3072,2048 | fpA_intB | `cuda` | 3.616 | 5.028 | 7542 |
+| `w4a16_decode_consistent_expert_down_fpA_intB` | decode | consistent expert down | 1,1024,3072 | fpA_intB | `cuda` | 4.032 | 5.349 | 8023 |
 
 Additional dense W4A16 projection cases were added after the full `bench_all.sh` run above. They are guarded by tactic-cache checks, so a missing shape fails early instead of falling back to a default config.
 
