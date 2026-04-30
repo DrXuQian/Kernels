@@ -28,10 +28,10 @@ The table below is from `cuda_gpu_trace` and sums only CUDA kernel rows. The who
 
 | Case | Impl | Phase | Kernel(s) | nsys kernels | H800 GPU time (us) | H800 cycles @1.5GHz | PPU latency (us) | PPU cycles |
 |---|---:|---:|---|---:|---:|---:|---:|---:|
-| `linear_decode_conv1d_update` | linear | decode | conv1d_update | 1 | 2.528 | 3792 | - | - |
-| `linear_decode_gdn` | linear | decode | gated_delta_net | 1 | 4.480 | 6720 | - | - |
-| `linear_prefill_conv1d_fwd` | linear | prefill | conv1d_fwd | 1 | 127.208 | 190812 | - | - |
-| `linear_prefill_flashinfer_gdn` | linear | prefill | flashinfer_gdn | 1 | 520.926 | 781389 | - | - |
+| `linear_decode_conv1d_update` | linear | decode | conv1d_update | 1 | 2.528 | 3792 | 2.948 | 4422 |
+| `linear_decode_gdn` | linear | decode | gated_delta_net | 1 | 4.480 | 6720 | 4.661 | 6991 |
+| `linear_prefill_conv1d_fwd` | linear | prefill | conv1d_fwd | 1 | 127.208 | 190812 | 118.904 | 178356 |
+| `linear_prefill_flashinfer_gdn` | linear | prefill | flashinfer_gdn | 1 | 520.926 | 781389 | 1212.643 | 1818965 |
 | `moe_routing_prefill_trtllm` | moe/trtllm | prefill | custom_moe_routing | 1 | 5.824 | 8736 | 3.443 | 5164 |
 | `moe_expert_map_prefill_trtllm` | moe/trtllm | prefill | block/global/merge expert prefix sum | 3 | 10.657 | 15986 | 10.815 | 16222 |
 | `moe_expand_prefill_trtllm` | moe/trtllm | prefill | expand_input_rows | 1 | 284.848 | 427272 | 188.691 | 283036 |
@@ -50,8 +50,8 @@ Subtotals from these rows:
 
 | Group | Included rows | H800 GPU time (us) | PPU latency (us) |
 |---|---|---:|---:|
-| Linear attention decode in-repo | conv1d_update + GDN | 7.008 | - |
-| Linear attention prefill in-repo | conv1d_fwd + FlashInfer GDN | 648.134 | - |
+| Linear attention decode in-repo | conv1d_update + GDN | 7.008 | 7.609 |
+| Linear attention prefill in-repo | conv1d_fwd + FlashInfer GDN | 648.134 | 1331.547 |
 | MoE prefill | TRT-LLM routing + expert map + expand + gate_up + gated + down + finalize | 2780.126 | 2354.388 |
 | MoE decode | vLLM routing + align + gate_up + gated + down + finalize | 54.531 | 72.759 |
 
@@ -64,8 +64,8 @@ decode dense GEMM 默认走 TensorRT-LLM `fpA_intB` standalone。所有 shape �
 
 | Case | Stage | Logical op | Shape (M,N,K) | Backend | Cached config | H800 nsys GPU time (us) | PPU latency (us) | PPU cycles |
 |---|---|---|---:|---|---|---:|---:|---:|
-| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | prefill | linear-attn in_proj QKV | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 | - | - |
-| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | prefill | linear-attn in_proj z | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 | - | - |
+| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | prefill | linear-attn in_proj QKV | 3823,12288,3072 | machete cutlass55 | `128x256x64_2x1x1` | 528.311 | 440.939 | 661408 |
+| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | prefill | linear-attn in_proj z | 3823,8192,3072 | machete cutlass55 | `128x256x64_2x1x1` | 365.882 | 321.688 | 482532 |
 | `w4a16_prefill_linear_attn_out_proj_cutlass55` | prefill | linear-attn out_proj | 3823,3072,8192 | machete cutlass55 | `256x128x64_1x1x1` | 391.321 | 327.592 | 491388 |
 | `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` | decode | linear-attn in_proj QKV | 1,12288,3072 | fpA_intB | `cuda` | 9.376 | 15.254 | 22881 |
 | `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | decode | linear-attn in_proj z | 1,8192,3072 | fpA_intB | `cuda` | 6.976 | 9.091 | 13637 |
