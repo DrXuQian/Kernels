@@ -5,6 +5,8 @@ Standalone CUDA kernel bench for Qwen3.5 inference profiling.
 ## 目录
 
 ```
+bench_all.sh                      Qwen3.5 122B standalone kernel suite
+bench_attention_inference.sh      Triton linear attention + FlashAttention inference suite
 linear_attention/                DeltaNet layer
   src/flashinfer_gdn/            GDN chunked prefill (FlashInfer CUTLASS SM90, GVA)
   src/kda/                       KDA chunked prefill (cuLA CUTLASS SM90)
@@ -87,6 +89,19 @@ cd moe_w4a16/vllm/auxiliary && make
 ## Benchmark
 
 Single-case benchmark usage is documented in [`SINGLE_BENCHMARK.md`](SINGLE_BENCHMARK.md).
+
+Full-suite helpers:
+
+```bash
+./bench_all.sh --list
+./bench_all.sh --case moe_gate_up_decode_vllm
+
+# Python/JIT attention paths: vLLM Triton GDN and FlashAttention inference
+# Requires PyTorch/Triton plus flash-attn/flashinfer in the active Python env.
+./bench_attention_inference.sh --list
+./bench_attention_inference.sh --case linear_triton_prefill_gdn
+./bench_attention_inference.sh flashinfer
+```
 
 所有 bench 支持两种模式：
 

@@ -12,6 +12,14 @@ Default: single run (for ncu/nsys). Add --bench W I for timing.
 All data allocated on CPU, only FlashAttn kernel runs on GPU.
 """
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path = [
+    path for path in sys.path
+    if Path(path or ".").resolve() != REPO_ROOT
+]
+
 import torch
 import numpy as np
 from flash_attn import flash_attn_func
