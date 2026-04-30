@@ -241,6 +241,37 @@ H800 run: `attention_nsys_20260430_165220`, command pattern:
 | `flash_attn_decode_full_attn` | Q:(1,32,256), KV:(3823,2,256) | 2 | 24.738 | 46.405 | 69608 | 1.88x |
 | `flash_attn_prefill_full_attn` | Q:(3823,32,256), KV:(3823,2,256) | 1 | 1061.617 | 768.187 | 1152280 | 0.72x |
 
+### PPU/H800 对比解读
+
+硬件前提：PPU 的 FP16 tensor 算力按 H800 同级理解，但 CUDA core / scalar
+计算吞吐约为 H800 的一半；PPU HBM 带宽约 6 TB/s，高于 H800 PCIe 的约
+2 TB/s。因此，large prefill GEMM / attention 这类 tensor core + HBM 占比高的
+case 应该更容易在 PPU 上变快；decode、小 M GEMV、softmax/reduction、elementwise、
+scatter/gather 这类 CUDA core / latency / synchronization 占比高的 case 则可能在
+PPU 上变慢。下表 `PPU/H800 > 1` 表示 PPU 更慢，`< 1` 表示 PPU 更快。
+
+| Group | Cases | PPU/H800 | Interpretation |
+|---|---|---:|---|
+| Linear decode CUDA kernels | `linear_decode_conv1d_update`, `linear_decode_gdn` | 1.17x, 1.04x | 符合预期。decode 是小 batch / latency-sensitive，CUDA core 和调度开销占比高，PPU 没有带宽优势可发挥。 |
+| Linear prefill conv1d | `linear_prefill_conv1d_fwd` | 0.93x | 符合预期。序列长后访存规模更大，PPU 带宽优势能抵消部分 scalar 开销。 |
+| Linear prefill FlashInfer GDN | `linear_prefill_flashinfer_gdn` | 2.33x | **[issue]** 不符合“tensor 算力相同 + 带宽更高”的直觉。这个 kernel 更像 persistent / pipeline-heavy kernel，之前 PPU metrics 也看到 sleep、memory dependency、sync stall。需要继续看 block/warp latency balance、pipeline wait、SM/CE occupancy 和具体指令 mix。 |
+| MoE prefill routing/expand | `moe_routing_prefill_trtllm`, `moe_expand_prefill_trtllm` | 0.59x, 0.66x | 基本符合预期。这类 prefill routing/expand 更偏大规模 gather/scatter/copy，PPU 带宽高会有收益。 |
+| MoE prefill expert map | `moe_expert_map_prefill_trtllm` | 1.01x | 中性结果。该路径是三个 prefix-sum/merge 小 kernel，launch/同步/整数控制开销占比高，硬件带宽差异不明显。 |
+| MoE prefill W4A16 GEMM | `moe_gate_up_prefill_trtllm`, `moe_down_prefill_trtllm` | 0.73x, 0.73x | 符合预期。大 M grouped GEMM 有较高 tensor core 和 HBM 占比，PPU 更快但不到 3x，因为地址计算、scale/dequant、调度和非 tensor 指令仍然存在。 |
+| MoE prefill activation/finalize | `moe_gated_prefill_trtllm`, `moe_finalize_prefill_trtllm` | 1.34x, 1.76x | `gated_activation` 偏 elementwise/SFU/CUDA core，PPU 变慢可以解释；`finalize_moe_routing` 更慢较多，属于 **[issue]**，可能是 irregular scatter/reduction/sync 对 PPU 不友好，需要 metrics 确认。 |
+| MoE decode vLLM pipeline | routing, align, Marlin gate/up/down, silu, sum | 1.03x-1.48x | 符合预期。decode M=1/topk=8，Marlin MoE 和 auxiliary kernels 都很小，tensor core 利用率有限，CUDA core / launch / memory latency 占比高，所以 PPU 普遍慢一些。 |
+| Dense W4A16 prefill, large N/K | linear qkv/z/out, full q/o, consistent down | 0.83x-0.88x | 符合预期。prefill GEMM 规模足够大，PPU tensor 算力不吃亏且带宽更高，因此整体更快。 |
+| Dense W4A16 prefill, small N | full-attn k/v proj `(N=512)`, consistent expert up | 1.01x-1.15x | **[caveat]** 小 N/较小输出维度降低并行度和 tensor core 饱和度，CUDA core/调度/epilogue 开销占比上升，PPU 带宽优势不明显。 |
+| Dense W4A16 decode fpA_intB | all M=1 projection GEMMs | 1.22x-1.64x | 符合预期。M=1 更接近 GEMV，tensor core 很难充分利用，scale/dequant/address/epilogue 和 latency 开销主导，PPU CUDA core 半吞吐会体现为更慢。 |
+| FlashAttention decode | `flash_attn_decode_full_attn` | 1.88x | 符合预期。单 token attention 主要是 KV scan、online softmax/reduction 和 split-KV combine，tensor core 占比低；PPU CUDA core 半吞吐和同步/latency 更敏感。 |
+| FlashAttention prefill | `flash_attn_prefill_full_attn` | 0.72x | 符合预期。prefill 有大 QK/PV tensor core 计算和较大 HBM 流量，PPU 带宽优势能体现；没有达到 3x 是因为 online softmax、shared memory、同步、mask/bounds 和地址计算仍占不少比例。 |
+
+需要继续确认的重点：
+
+- **[issue] `linear_prefill_flashinfer_gdn`**：PPU 2.33x 慢，和硬件预期相反，应优先看 pipeline/sleep/sync stall、persistent kernel 占用、CE/SM latency balance。
+- **[issue] `moe_finalize_prefill_trtllm`**：PPU 1.76x 慢，可能是 finalize 的 irregular scatter/reduction 或同步结构导致，需要 kernel-level metrics。
+- **[caveat] 小 N prefill GEMM**：`full_attn_k/v_proj` 等小输出维度 case 不应按大 GEMM 预期解读，PPU 略慢或接近 H800 不一定代表 GEMM 主路径有问题。
+
 ## Decode 单层时间估算
 
 ### DeltaNet 层 (per layer)
