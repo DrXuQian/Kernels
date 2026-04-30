@@ -475,6 +475,7 @@ if [[ "$LIST_CASES" != 1 ]]; then
     PERF_STATISTICS_DIR="$ROOT_DIR/$PERF_STATISTICS_DIR"
   fi
   mkdir -p "$OUT_DIR" "$TRITON_CACHE_DIR"
+  cd "$RUN_DIR"
 fi
 
 if [[ "$LIST_CASES" == 1 ]]; then
