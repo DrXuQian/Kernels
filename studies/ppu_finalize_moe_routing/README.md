@@ -53,11 +53,19 @@ Run one implementation only:
 ./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 20 100
 ```
 
+Run exactly one timed optimized launch:
+
+```bash
+./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 0 1
+```
+
 Other options:
 
 ```text
 --no-scales       Use SCALE=false template path.
---no-check        Skip baseline-vs-optimized correctness check.
+--check           Force baseline-vs-optimized correctness check.
+--no-check        Skip baseline-vs-optimized correctness check. By default,
+                  check is enabled only for --mode both.
 --mode MODE       baseline, optimized, or both.
 ```
 
@@ -65,7 +73,7 @@ Other options:
 
 ```bash
 nsys profile --trace=cuda -o finalize_study \
-  ./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 20 100
+  ./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 0 1
 nsys stats finalize_study.nsys-rep --report cuda_gpu_trace
 ```
 

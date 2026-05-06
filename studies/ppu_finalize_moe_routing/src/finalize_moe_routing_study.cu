@@ -271,7 +271,7 @@ int run_finalize(int tokens, int topk, int hidden, bool use_scales, bool check, 
         d_unperm_to_perm, h_unperm_to_perm.data(), h_unperm_to_perm.size() * sizeof(int), cudaMemcpyHostToDevice));
     TRTLLM_AUX_CUDA_CHECK(cudaMemcpy(d_experts, h_experts.data(), h_experts.size() * sizeof(int), cudaMemcpyHostToDevice));
 
-    if (check || mode == Mode::kBoth)
+    if (check)
     {
         finalize_baseline_launch<T>(
             d_input, d_baseline, d_scales, d_unperm_to_perm, d_experts, tokens, hidden, topk, topk, use_scales, 0);
@@ -342,7 +342,8 @@ int main(int argc, char** argv)
     int hidden = (argc > 3) ? std::atoi(argv[3]) : 1024;
     std::string dtype = (argc > 4) ? argv[4] : "fp16";
     bool use_scales = true;
-    bool check = true;
+    bool check = false;
+    bool check_set = false;
     finalize_study::Mode mode = finalize_study::Mode::kBoth;
 
     for (int i = 5; i < argc; ++i)
@@ -354,6 +355,12 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--no-check") == 0)
         {
             check = false;
+            check_set = true;
+        }
+        else if (std::strcmp(argv[i], "--check") == 0)
+        {
+            check = true;
+            check_set = true;
         }
         else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
         {
@@ -378,8 +385,15 @@ int main(int argc, char** argv)
         }
     }
 
-    std::printf("bench finalize_moe_routing study: tokens=%d topk=%d hidden=%d dtype=%s scales=%d check=%d\n",
-        tokens, topk, hidden, dtype.c_str(), static_cast<int>(use_scales), static_cast<int>(check));
+    if (!check_set)
+    {
+        check = (mode == finalize_study::Mode::kBoth);
+    }
+
+    std::printf("bench finalize_moe_routing study: tokens=%d topk=%d hidden=%d dtype=%s scales=%d mode=%s check=%d\n",
+        tokens, topk, hidden, dtype.c_str(), static_cast<int>(use_scales),
+        mode == finalize_study::Mode::kBaseline ? "baseline" : mode == finalize_study::Mode::kOptimized ? "optimized" : "both",
+        static_cast<int>(check));
     std::printf("  optimized dynamic_smem=%zu bytes\n", finalize_study::optimized_smem_bytes(topk));
 
     if (dtype == "fp16" || dtype == "half")
