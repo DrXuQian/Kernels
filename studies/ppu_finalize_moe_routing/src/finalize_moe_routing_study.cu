@@ -68,6 +68,7 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
     int64_t num_rows, int64_t hidden_size, int64_t topk, int64_t num_experts_per_node, int start_expert_id)
 {
     static_assert(sizeof(T) == 2, "optimized finalize study expects 16-bit element types");
+    using Pack = uint2;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -82,8 +83,8 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
     extern __shared__ unsigned char smem_raw[];
     float* s_scale = reinterpret_cast<float*>(smem_raw);
     uintptr_t base_addr = reinterpret_cast<uintptr_t>(s_scale + topk);
-    base_addr = (base_addr + alignof(T const*) - 1) & ~(static_cast<uintptr_t>(alignof(T const*) - 1));
-    T const** s_base = reinterpret_cast<T const**>(base_addr);
+    base_addr = (base_addr + alignof(Pack const*) - 1) & ~(static_cast<uintptr_t>(alignof(Pack const*) - 1));
+    Pack const** s_base_vec = reinterpret_cast<Pack const**>(base_addr);
 
     for (int64_t k = threadIdx.x; k < topk; k += blockDim.x)
     {
@@ -92,7 +93,7 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
         bool const valid = (expert_id >= 0 && expert_id < num_experts_per_node);
         int64_t const expanded_original_row = row + k * num_rows;
         int64_t const expanded_permuted_row = valid ? unpermuted_row_to_permuted_row[expanded_original_row] : 0;
-        s_base[k] = expanded_permuted_rows + expanded_permuted_row * hidden_size;
+        s_base_vec[k] = reinterpret_cast<Pack const*>(expanded_permuted_rows + expanded_permuted_row * hidden_size);
         s_scale[k] = valid ? (SCALE ? scales[k_offset] : 1.0f) : 0.0f;
     }
     __syncthreads();
@@ -106,7 +107,7 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
     {
         for (int64_t v = threadIdx.x; v < vec_count; v += blockDim.x)
         {
-            uint2 pack_data[TOPK_MAX_UNROLL];
+            Pack pack_data[TOPK_MAX_UNROLL];
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 #pragma unroll
@@ -116,7 +117,7 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
                 {
                     break;
                 }
-                pack_data[k] = *reinterpret_cast<uint2 const*>(s_base[k] + v * 4);
+                pack_data[k] = s_base_vec[k][v];
             }
 
 #pragma unroll
@@ -136,7 +137,8 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
 
             for (int64_t k = TOPK_MAX_UNROLL; k < topk; ++k)
             {
-                T const* lane = s_base[k] + v * 4;
+                Pack const pack = s_base_vec[k][v];
+                T const* lane = reinterpret_cast<T const*>(&pack);
                 float const s = s_scale[k];
                 acc[0] += s * trtllm_aux_to_float(lane[0]);
                 acc[1] += s * trtllm_aux_to_float(lane[1]);
@@ -144,13 +146,13 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
                 acc[3] += s * trtllm_aux_to_float(lane[3]);
             }
 
-            uint2 out_pack;
+            Pack out_pack;
             T* out_lane = reinterpret_cast<T*>(&out_pack);
             out_lane[0] = trtllm_aux_from_float<T>(acc[0]);
             out_lane[1] = trtllm_aux_from_float<T>(acc[1]);
             out_lane[2] = trtllm_aux_from_float<T>(acc[2]);
             out_lane[3] = trtllm_aux_from_float<T>(acc[3]);
-            *reinterpret_cast<uint2*>(out + v * 4) = out_pack;
+            *reinterpret_cast<Pack*>(out + v * 4) = out_pack;
         }
     }
 
@@ -164,11 +166,13 @@ __global__ void finalizeMoeRoutingOptimizedKernel(T const* __restrict__ expanded
             {
                 break;
             }
-            acc += s_scale[k] * trtllm_aux_to_float(s_base[k][col]);
+            T const* base = reinterpret_cast<T const*>(s_base_vec[k]);
+            acc += s_scale[k] * trtllm_aux_to_float(base[col]);
         }
         for (int64_t k = TOPK_MAX_UNROLL; k < topk; ++k)
         {
-            acc += s_scale[k] * trtllm_aux_to_float(s_base[k][col]);
+            T const* base = reinterpret_cast<T const*>(s_base_vec[k]);
+            acc += s_scale[k] * trtllm_aux_to_float(base[col]);
         }
         out[col] = trtllm_aux_from_float<T>(acc);
     }
