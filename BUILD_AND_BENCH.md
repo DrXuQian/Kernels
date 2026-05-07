@@ -40,7 +40,7 @@ Common options:
 | `--ppu-root DIR` | Optional companion SDK root. Also read from `PPU_ROOT`. | unset |
 | `--cutlass-dir DIR` | CUTLASS checkout. | `third_party/cutlass` |
 | `--arch ARCH` | Main CUDA architecture. | `sm_90a` |
-| `--linear-arch ARCH` | Arch for `general` and `linear_attention` Makefile targets. | same as `--arch` |
+| `--linear-arch ARCH` | Arch for `general` and `linear_attn` Makefile targets. | same as `--arch` |
 | `--marlin-arch ARCH` | Arch for legacy standalone Marlin. | `sm_80` |
 | `--build-type TYPE` | CMake build type. | `Release` |
 | `--build-dir-name NAME` | CMake build directory basename. | `build_cmake_release` |
@@ -72,7 +72,9 @@ Build a specific target:
 ./compile.sh build w4a16-fpa
 ./compile.sh build w4a16-machete
 ./compile.sh build moe-trtllm
-./compile.sh build linear_attention
+./compile.sh build linear_attn
+./compile.sh build flash_attn
+./compile.sh build sampling
 ```
 
 Configure without building, for CMake targets:
@@ -92,7 +94,7 @@ Clean and rebuild one target:
 Build several targets:
 
 ```bash
-./compile.sh build linear_attention w4a16-machete w4a16-fpa moe-trtllm moe-trtllm-auxiliary moe-vllm
+./compile.sh build linear_attn flash_attn sampling w4a16-machete w4a16-fpa moe-trtllm moe-ffn
 ```
 
 Build with explicit SDK and arch:
@@ -116,19 +118,22 @@ Dry-run the same build to inspect commands:
 | Target | Builds |
 |---|---|
 | `general` | `general/` |
-| `linear_attention` | `linear_attention/` |
-| `flashinfer-gdn` | `linear_attention/src/flashinfer_gdn/` |
-| `moe-vllm-marlin` | `moe_w4a16/vllm/marlin/` |
-| `moe-vllm-auxiliary` | `moe_w4a16/vllm/auxiliary/` |
+| `linear_attn` | `linear_attn/` |
+| `flash_attn` | `flash_attn/` category-local shared attention ops |
+| `sampling` | `sampling/` decode sampling stages |
+| `flashinfer-gdn` | `linear_attn/src/flashinfer_gdn/` |
+| `moe-ffn` | `moe_ffn/` category-local shared FFN ops + CUDA MoE pieces |
+| `moe-vllm-marlin` | `moe_ffn/w4a16/vllm/marlin/` |
+| `moe-vllm-auxiliary` | `moe_ffn/w4a16/vllm/auxiliary/` |
 | `moe-vllm` | `moe-vllm-marlin` + `moe-vllm-auxiliary` |
-| `moe-trtllm` | `moe_w4a16/trtllm/moe_w4a16_standalone/` |
-| `moe-trtllm-auxiliary` | `moe_w4a16/trtllm/auxiliary/` |
-| `moe` | all vLLM and TRT-LLM MoE targets |
-| `w4a16-marlin` | `w4a16_gemm/marlin_standalone/` |
-| `w4a16-fpa` | `w4a16_gemm/fpA_intB_standalone/` |
-| `w4a16-machete` | `w4a16_gemm/machete_standalone/` |
-| `w4a16-cutlass55` | `w4a16_gemm/cutlass55_standalone/` |
-| `w4a16-cublas` | `w4a16_gemm/cublas_bf16_bench.cu` |
+| `moe-trtllm` | `moe_ffn/w4a16/trtllm/moe_w4a16_standalone/` |
+| `moe-trtllm-auxiliary` | `moe_ffn/w4a16/trtllm/auxiliary/` |
+| `moe` | `moe-ffn` + `moe-trtllm` |
+| `w4a16-marlin` | `general/w4a16_gemm/marlin_standalone/` |
+| `w4a16-fpa` | `general/w4a16_gemm/fpA_intB_standalone/` |
+| `w4a16-machete` | `general/w4a16_gemm/machete_standalone/` |
+| `w4a16-cutlass55` | `general/w4a16_gemm/cutlass55_standalone/` |
+| `w4a16-cublas` | `general/w4a16_gemm/cublas_bf16_bench.cu` |
 | `w4a16` | all W4A16 targets |
 | `all` | every target above |
 
@@ -142,7 +147,9 @@ Useful aliases accepted by `compile.sh`:
 | `marlin` | `w4a16-marlin` |
 | `trtllm-moe`, `moe_w4a16_standalone` | `moe-trtllm` |
 | `trtllm-aux`, `trtllm-auxiliary` | `moe-trtllm-auxiliary` |
-| `linear`, `linear-attention` | `linear_attention` |
+| `linear`, `linear-attention` | `linear_attn` |
+| `flash`, `flash-attn`, `flash_attention` | `flash_attn` |
+| `sample`, `sampling` | `sampling` |
 | `flashinfer`, `gdn`, `flashinfer_gdn` | `flashinfer-gdn` |
 
 ## Benchmark Runner
@@ -170,6 +177,9 @@ suite. Every case uses single-run settings (`--bench 0 1` or
 | `--resume-from LABEL` | Skip cases before `LABEL`, then continue. |
 | `--run-dir DIR` | Run every benchmark with `DIR` as current working directory. |
 | `--perf-model-dir DIR` | Alias for `--run-dir`. |
+| `--ncu-cycles` | Run selected cases under Nsight Compute and summarize cycles. |
+| `--ncu-launch-skip N` | Forward `--launch-skip N` to Nsight Compute. |
+| `--ncu-launch-count N` | Forward `--launch-count N` to Nsight Compute. |
 
 Case matching accepts exact labels, sanitized labels, or substrings.
 
@@ -204,6 +214,23 @@ Run from a separate runtime directory:
 ./bench_all.sh --run-dir <RUNTIME_WORKDIR> --case moe_gate_up_prefill_trtllm
 ```
 
+Collect H800 cycles with Nsight Compute:
+
+```bash
+./bench_all.sh --ncu-cycles --case sampling_lm_head_gemm
+
+# If setup kernels are captured before the target kernel, rerun the selected
+# case with explicit launch skip/count.
+./bench_all.sh --ncu-cycles --ncu-launch-skip 1 --ncu-launch-count 1 \
+  --case sampling_topk_mask_logits
+```
+
+The per-case Nsight Compute CSV logs are written to
+`.bench_logs/bench_<id>/ncu/`. The final table is written to
+`.bench_logs/bench_<id>/ncu_cycles_summary.md`. This mode disables
+`perfrawlog` post-processing for that run. The machine must allow access to
+NVIDIA performance counters; otherwise `ncu` exits with `ERR_NVGPUCTRPERM`.
+
 ## Benchmark Output Options
 
 By default logs are written to `.bench_logs/bench_<timestamp>/`, and the same
@@ -224,6 +251,9 @@ Useful environment variables:
 | `PERF_STATISTICS_MP` | `perf_statistics_gen --mp` value. | `16` |
 | `PERF_STATISTICS_GHZ` | Clock used for latency summary. | `1.5` |
 | `PERF_STATISTICS_SUMMARY` | Set `0` to skip the final summary table. | `1` |
+| `NCU_METRICS` | Metrics used by `--ncu-cycles`. | `sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum` |
+| `NCU_LAUNCH_SKIP` | Optional Nsight Compute launch skip. | unset |
+| `NCU_LAUNCH_COUNT` | Optional Nsight Compute launch count. | unset |
 
 Example with a stable output directory:
 
@@ -264,9 +294,12 @@ Build the target on the left before running matching cases on the right.
 
 | Compile target | Benchmark cases |
 |---|---|
-| `linear_attention` | `linear_decode_*`, `linear_prefill_*` |
+| `linear_attn` | `linear_attn_*`, `linear_decode_*`, `linear_prefill_*` |
+| `flash_attn` | `flash_attn_*_rmsnorm` |
+| `sampling` | `sampling_*` |
 | `w4a16-machete` | `w4a16_prefill_*_cutlass55` |
 | `w4a16-fpa` | `w4a16_decode_*_fpA_intB` |
+| `moe-ffn` | `moe_ffn_*_rmsnorm`, `moe_shared_expert_*`, plus vLLM/TRT-LLM auxiliary Makefile cases |
 | `moe-trtllm` | `moe_gate_up_prefill_trtllm`, `moe_down_prefill_trtllm` |
 | `moe-trtllm-auxiliary` | `moe_*_prefill_trtllm` auxiliary cases |
 | `moe-vllm-marlin` | `moe_gate_up_decode_vllm`, `moe_down_decode_vllm` |
@@ -275,7 +308,7 @@ Build the target on the left before running matching cases on the right.
 To build everything needed by `bench_all.sh`:
 
 ```bash
-./compile.sh build linear_attention w4a16-machete w4a16-fpa moe-trtllm moe-trtllm-auxiliary moe-vllm
+./compile.sh build linear_attn flash_attn sampling w4a16-machete w4a16-fpa moe-trtllm moe-ffn
 ```
 
 ## Direct Benchmark Commands
@@ -286,9 +319,9 @@ outside `bench_all.sh`.
 W4A16 prefill, Machete CUTLASS55 backend:
 
 ```bash
-w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
+general/w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --backend=cutlass55 \
-  --cutlass55_tactic=w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
+  --cutlass55_tactic=general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
   --m=3823 --n=12288 --k=3072 --group_size=128 \
   --act=fp16 --quant=cutlass_s4 \
   --offline_prepack --profile_gemm_only --no_checksum \
@@ -298,26 +331,26 @@ w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
 W4A16 decode, fpA_intB backend:
 
 ```bash
-w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
+general/w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
   --m=1 --n=12288 --k=3072 --group_size=128 \
-  --tactic=w4a16_gemm/fpA_intB_standalone/tactics_h800.cache \
+  --tactic=general/w4a16_gemm/fpA_intB_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
 ```
 
 TRT-LLM MoE prefill GEMM:
 
 ```bash
-moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=3823 \
   --n=3072 --k=2048 --group_size=128 \
-  --tactic=moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
+  --tactic=moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
 ```
 
 vLLM Marlin MoE decode GEMM:
 
 ```bash
-moe_w4a16/vllm/marlin/bench_marlin_moe \
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe \
   1 64 8 2048 3072 \
   --balanced --no-topk-weights --bench 0 1
 ```
@@ -325,20 +358,20 @@ moe_w4a16/vllm/marlin/bench_marlin_moe \
 Linear attention decode GDN:
 
 ```bash
-linear_attention/bench_gated_delta_net 1 64 128 1 --bench 0 1
+linear_attn/bench_gated_delta_net 1 64 128 1 --bench 0 1
 ```
 
 TRT-LLM MoE finalize auxiliary:
 
 ```bash
-moe_w4a16/trtllm/auxiliary/bench_finalize_moe_routing \
+moe_ffn/w4a16/trtllm/auxiliary/bench_finalize_moe_routing \
   3823 8 1024 fp16 --bench 0 1
 ```
 
 vLLM MoE top-k gating auxiliary:
 
 ```bash
-moe_w4a16/vllm/auxiliary/bench_topk_gating \
+moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating \
   1 64 8 --bench 0 1
 ```
 
@@ -351,13 +384,12 @@ Machete CUTLASS55 prefill cache key format:
 
 ```bash
 grep -F "3823,12288,3072,128,fp16|" \
-  w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache
+  general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache
 ```
 
 fpA_intB decode cache key format:
 
 ```bash
 grep -F "1,12288,3072,128|" \
-  w4a16_gemm/fpA_intB_standalone/tactics_h800.cache
+  general/w4a16_gemm/fpA_intB_standalone/tactics_h800.cache
 ```
-

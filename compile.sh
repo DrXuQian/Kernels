@@ -57,32 +57,35 @@ Common examples:
   ./compile.sh list
   ./compile.sh env
   ./compile.sh build
-  ./compile.sh build general linear_attention
+  ./compile.sh build general linear_attn flash_attn sampling
   ./compile.sh build w4a16-fpa w4a16-machete
   ./compile.sh configure w4a16-fpa
   ./compile.sh rebuild moe-vllm
   ./compile.sh clean all
 
 Targets:
-  default              Root Makefile targets: general, linear_attention, vLLM MoE CUDA pieces
+  default              Root Makefile targets: general, linear_attn, flash_attn, moe_ffn, sampling
   all                  Every target listed below
 
   general              general/
-  linear_attention     linear_attention/
-  flashinfer-gdn       linear_attention/src/flashinfer_gdn/
+  linear_attn          linear_attn/
+  flash_attn           flash_attn/ category-local shared attention ops
+  sampling             sampling/ decode sampling stages
+  flashinfer-gdn       linear_attn/src/flashinfer_gdn/
 
-  moe-vllm             moe-w4a16 vLLM marlin + auxiliary
-  moe-vllm-marlin      moe_w4a16/vllm/marlin/
-  moe-vllm-auxiliary   moe_w4a16/vllm/auxiliary/
-  moe-trtllm           moe_w4a16/trtllm/moe_w4a16_standalone/
-  moe-trtllm-auxiliary moe_w4a16/trtllm/auxiliary/
-  moe                  moe-vllm + moe-trtllm
+  moe-ffn              moe_ffn/ category-local shared FFN ops + CUDA MoE pieces
+  moe-vllm             moe_ffn/w4a16 vLLM marlin + auxiliary
+  moe-vllm-marlin      moe_ffn/w4a16/vllm/marlin/
+  moe-vllm-auxiliary   moe_ffn/w4a16/vllm/auxiliary/
+  moe-trtllm           moe_ffn/w4a16/trtllm/moe_w4a16_standalone/
+  moe-trtllm-auxiliary moe_ffn/w4a16/trtllm/auxiliary/
+  moe                  moe-ffn + moe-trtllm
 
-  w4a16-marlin         w4a16_gemm/marlin_standalone/
-  w4a16-fpa            w4a16_gemm/fpA_intB_standalone/
-  w4a16-machete        w4a16_gemm/machete_standalone/
-  w4a16-cutlass55      w4a16_gemm/cutlass55_standalone/
-  w4a16-cublas         w4a16_gemm/cublas_bf16_bench.cu
+  w4a16-marlin         general/w4a16_gemm/marlin_standalone/
+  w4a16-fpa            general/w4a16_gemm/fpA_intB_standalone/
+  w4a16-machete        general/w4a16_gemm/machete_standalone/
+  w4a16-cutlass55      general/w4a16_gemm/cutlass55_standalone/
+  w4a16-cublas         general/w4a16_gemm/cublas_bf16_bench.cu
   w4a16                all w4a16 targets above
 
 Options:
@@ -434,17 +437,17 @@ clean_make_dir() {
   run_cmd make -C "$ROOT_DIR/$dir" clean
 }
 
-build_linear_attention() {
+build_linear_attn() {
   local -a vars
   mapfile -t vars < <(make_common_args "$LINEAR_ARCH")
-  run_cmd make -C "$ROOT_DIR/linear_attention" -j "$JOBS" "${vars[@]}" "ARCH_SM90=-arch=$GPU_ARCH"
-  verify_ppu_elf_version "$ROOT_DIR/linear_attention/bench_gated_delta_net"
+  run_cmd make -C "$ROOT_DIR/linear_attn" -j "$JOBS" "${vars[@]}" "ARCH_SM90=-arch=$GPU_ARCH"
+  verify_ppu_elf_version "$ROOT_DIR/linear_attn/bench_gated_delta_net"
 }
 
 build_flashinfer_gdn() {
   local -a vars
   mapfile -t vars < <(make_common_args "$GPU_ARCH")
-  run_cmd make -C "$ROOT_DIR/linear_attention/src/flashinfer_gdn" -j "$JOBS" "${vars[@]}"
+  run_cmd make -C "$ROOT_DIR/linear_attn/src/flashinfer_gdn" -j "$JOBS" "${vars[@]}"
 }
 
 configure_cmake_target() {
@@ -486,41 +489,41 @@ clean_cmake_dir() {
 
 build_w4a16_cublas() {
   run_cmd "$NVCC" -O3 -std=c++17 "-arch=$GPU_ARCH" \
-    "$ROOT_DIR/w4a16_gemm/cublas_bf16_bench.cu" \
-    -o "$ROOT_DIR/w4a16_gemm/cublas_bf16_bench" -lcublas
+    "$ROOT_DIR/general/w4a16_gemm/cublas_bf16_bench.cu" \
+    -o "$ROOT_DIR/general/w4a16_gemm/cublas_bf16_bench" -lcublas
 }
 
 clean_w4a16_cublas() {
-  run_cmd rm -f "$ROOT_DIR/w4a16_gemm/cublas_bf16_bench"
+  run_cmd rm -f "$ROOT_DIR/general/w4a16_gemm/cublas_bf16_bench"
 }
 
 configure_target() {
   case "$1" in
-    default|general|linear_attention|flashinfer-gdn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
+    default|general|linear_attn|flash_attn|sampling|flashinfer-gdn|moe-ffn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
       log "$1 uses a Makefile or direct nvcc build; no CMake configure step."
       ;;
     moe-trtllm)
       configure_cmake_target \
-        moe_w4a16/trtllm/moe_w4a16_standalone \
-        "moe_w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME" \
+        moe_ffn/w4a16/trtllm/moe_w4a16_standalone \
+        "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME" \
         cuda_arch_number
       ;;
     w4a16-fpa)
       configure_cmake_target \
-        w4a16_gemm/fpA_intB_standalone \
-        "w4a16_gemm/fpA_intB_standalone/$BUILD_DIR_NAME" \
+        general/w4a16_gemm/fpA_intB_standalone \
+        "general/w4a16_gemm/fpA_intB_standalone/$BUILD_DIR_NAME" \
         gpu_arch
       ;;
     w4a16-machete)
       configure_cmake_target \
-        w4a16_gemm/machete_standalone \
-        "w4a16_gemm/machete_standalone/$BUILD_DIR_NAME" \
+        general/w4a16_gemm/machete_standalone \
+        "general/w4a16_gemm/machete_standalone/$BUILD_DIR_NAME" \
         gpu_arch
       ;;
     w4a16-cutlass55)
       configure_cmake_target \
-        w4a16_gemm/cutlass55_standalone \
-        "w4a16_gemm/cutlass55_standalone/$BUILD_DIR_NAME" \
+        general/w4a16_gemm/cutlass55_standalone \
+        "general/w4a16_gemm/cutlass55_standalone/$BUILD_DIR_NAME" \
         gpu_arch
       ;;
     *)
@@ -533,54 +536,64 @@ build_target() {
   case "$1" in
     default)
       run_cmd make -C "$ROOT_DIR" -j "$JOBS" "NVCC=$NVCC" "CUDACXX=$NVCC" "CUDA_ROOT=$CUDA_ROOT" "ARCH=-arch=$LINEAR_ARCH" "ARCH_SM90=-arch=$GPU_ARCH"
-      verify_ppu_elf_version "$ROOT_DIR/linear_attention/bench_gated_delta_net"
+      verify_ppu_elf_version "$ROOT_DIR/linear_attn/bench_gated_delta_net"
       ;;
     general)
       build_make_dir general "$LINEAR_ARCH"
       ;;
-    linear_attention)
-      build_linear_attention
+    linear_attn)
+      build_linear_attn
+      ;;
+    flash_attn)
+      build_make_dir flash_attn "$LINEAR_ARCH"
+      ;;
+    sampling)
+      build_make_dir sampling "$GPU_ARCH"
+      verify_ppu_elf_version "$ROOT_DIR/sampling/bench_sampling"
       ;;
     flashinfer-gdn)
       build_flashinfer_gdn
       ;;
+    moe-ffn)
+      build_make_dir moe_ffn "$GPU_ARCH"
+      ;;
     moe-vllm-marlin)
-      build_make_dir moe_w4a16/vllm/marlin "$GPU_ARCH"
+      build_make_dir moe_ffn/w4a16/vllm/marlin "$GPU_ARCH"
       ;;
     moe-vllm-auxiliary)
-      build_make_dir moe_w4a16/vllm/auxiliary "$GPU_ARCH"
+      build_make_dir moe_ffn/w4a16/vllm/auxiliary "$GPU_ARCH"
       ;;
     moe-trtllm)
       build_cmake_target \
-        moe_w4a16/trtllm/moe_w4a16_standalone \
-        "moe_w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME" \
+        moe_ffn/w4a16/trtllm/moe_w4a16_standalone \
+        "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME" \
         cuda_arch_number \
         test_moe_w4a16_gemm
       ;;
     moe-trtllm-auxiliary)
-      build_make_dir moe_w4a16/trtllm/auxiliary "$GPU_ARCH"
+      build_make_dir moe_ffn/w4a16/trtllm/auxiliary "$GPU_ARCH"
       ;;
     w4a16-marlin)
-      build_make_dir w4a16_gemm/marlin_standalone "$MARLIN_ARCH"
+      build_make_dir general/w4a16_gemm/marlin_standalone "$MARLIN_ARCH"
       ;;
     w4a16-fpa)
       build_cmake_target \
-        w4a16_gemm/fpA_intB_standalone \
-        "w4a16_gemm/fpA_intB_standalone/$BUILD_DIR_NAME" \
+        general/w4a16_gemm/fpA_intB_standalone \
+        "general/w4a16_gemm/fpA_intB_standalone/$BUILD_DIR_NAME" \
         gpu_arch \
         test_fpA_intB_gemm
       ;;
     w4a16-machete)
       build_cmake_target \
-        w4a16_gemm/machete_standalone \
-        "w4a16_gemm/machete_standalone/$BUILD_DIR_NAME" \
+        general/w4a16_gemm/machete_standalone \
+        "general/w4a16_gemm/machete_standalone/$BUILD_DIR_NAME" \
         gpu_arch \
         test_machete_gemm
       ;;
     w4a16-cutlass55)
       build_cmake_target \
-        w4a16_gemm/cutlass55_standalone \
-        "w4a16_gemm/cutlass55_standalone/$BUILD_DIR_NAME" \
+        general/w4a16_gemm/cutlass55_standalone \
+        "general/w4a16_gemm/cutlass55_standalone/$BUILD_DIR_NAME" \
         gpu_arch \
         cutlass55_fp16_gemm cutlass55_bf16_gemm
       ;;
@@ -601,35 +614,44 @@ clean_target() {
     general)
       clean_make_dir general
       ;;
-    linear_attention)
-      clean_make_dir linear_attention
+    linear_attn)
+      clean_make_dir linear_attn
+      ;;
+    flash_attn)
+      clean_make_dir flash_attn
+      ;;
+    sampling)
+      clean_make_dir sampling
       ;;
     flashinfer-gdn)
-      clean_make_dir linear_attention/src/flashinfer_gdn
+      clean_make_dir linear_attn/src/flashinfer_gdn
+      ;;
+    moe-ffn)
+      clean_make_dir moe_ffn
       ;;
     moe-vllm-marlin)
-      clean_make_dir moe_w4a16/vllm/marlin
+      clean_make_dir moe_ffn/w4a16/vllm/marlin
       ;;
     moe-vllm-auxiliary)
-      clean_make_dir moe_w4a16/vllm/auxiliary
+      clean_make_dir moe_ffn/w4a16/vllm/auxiliary
       ;;
     moe-trtllm)
-      clean_cmake_dir "moe_w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME"
+      clean_cmake_dir "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME"
       ;;
     moe-trtllm-auxiliary)
-      clean_make_dir moe_w4a16/trtllm/auxiliary
+      clean_make_dir moe_ffn/w4a16/trtllm/auxiliary
       ;;
     w4a16-marlin)
-      clean_make_dir w4a16_gemm/marlin_standalone
+      clean_make_dir general/w4a16_gemm/marlin_standalone
       ;;
     w4a16-fpa)
-      clean_cmake_dir "w4a16_gemm/fpA_intB_standalone/$BUILD_DIR_NAME"
+      clean_cmake_dir "general/w4a16_gemm/fpA_intB_standalone/$BUILD_DIR_NAME"
       ;;
     w4a16-machete)
-      clean_cmake_dir "w4a16_gemm/machete_standalone/$BUILD_DIR_NAME"
+      clean_cmake_dir "general/w4a16_gemm/machete_standalone/$BUILD_DIR_NAME"
       ;;
     w4a16-cutlass55)
-      clean_cmake_dir "w4a16_gemm/cutlass55_standalone/$BUILD_DIR_NAME"
+      clean_cmake_dir "general/w4a16_gemm/cutlass55_standalone/$BUILD_DIR_NAME"
       ;;
     w4a16-cublas)
       clean_w4a16_cublas
@@ -648,12 +670,12 @@ expand_one_target() {
   case "$1" in
     all)
       printf '%s\n' \
-        general linear_attention flashinfer-gdn \
-        moe-vllm-marlin moe-vllm-auxiliary moe-trtllm moe-trtllm-auxiliary \
+        general linear_attn flash_attn sampling flashinfer-gdn \
+        moe-ffn moe-trtllm \
         w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;
     moe)
-      printf '%s\n' moe-vllm-marlin moe-vllm-auxiliary moe-trtllm moe-trtllm-auxiliary
+      printf '%s\n' moe-ffn moe-trtllm
       ;;
     moe-vllm)
       printf '%s\n' moe-vllm-marlin moe-vllm-auxiliary
@@ -661,14 +683,23 @@ expand_one_target() {
     w4a16)
       printf '%s\n' w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;
-    linear|linear-attention)
-      printf '%s\n' linear_attention
+    linear|linear-attention|linear_attention)
+      printf '%s\n' linear_attn
+      ;;
+    flash|flash-attn|flash_attention|flash-attention)
+      printf '%s\n' flash_attn
+      ;;
+    sample|sampling)
+      printf '%s\n' sampling
       ;;
     flashinfer|gdn|flashinfer_gdn)
       printf '%s\n' flashinfer-gdn
       ;;
     moe-marlin|marlin-moe)
       printf '%s\n' moe-vllm-marlin
+      ;;
+    moe-ffn|moe_ffn)
+      printf '%s\n' moe-ffn
       ;;
     moe-aux|moe-auxiliary)
       printf '%s\n' moe-vllm-auxiliary

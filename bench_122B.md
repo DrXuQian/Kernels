@@ -136,7 +136,7 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 | num_experts_per_tok | 8 |
 | moe_intermediate_size | 1024 |
 | shared_expert_intermediate_size | 1024 |
-| layers | 48 (36 linear_attention + 12 full_attention) |
+| layers | 48 (36 linear_attn + 12 full_attention) |
 
 ## DeltaNet Linear Attention (×36 layers)
 
@@ -144,7 +144,7 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
-| 1 | RMSNorm | (1,3072)→(1,3072) | — | not in repo (generic) |
+| 1 | RMSNorm | (1,3072)→(1,3072) | — | `./bench_all.sh --case flash_attn_decode_rmsnorm` |
 | 2 | in_proj_qkv (W4A16) | (1,3072)→(1,12288) | **9.4 μs** | `./bench_all.sh --case w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` |
 | 3 | in_proj_z (W4A16) | (1,3072)→(1,8192) | **7.0 μs** | `./bench_all.sh --case w4a16_decode_linear_attn_in_proj_z_fpA_intB` |
 | 4 | in_proj_b (FP16) | (1,3072)→(1,64) | — | not in repo (cuBLAS GEMV) |
@@ -173,12 +173,12 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 |---|--------|-------|---------|---------|
 | 1 | RMSNorm | (1,3072)→(1,3072) | — | not in repo (generic) |
 | 2 | Router gate (FP16) | (1,3072)→(1,256) | — | not in repo (cuBLAS GEMV) |
-| 3 | **topk_gating** | (1,256)→w:(1,8) idx:(1,8) | **8.4 μs** | `moe_w4a16/vllm/auxiliary/bench_topk_gating 1 256 8 --bench 20 100` |
-| 4 | **moe_align** | (1,8)→sorted_ids, expert_ids | **3.3 μs** | `moe_w4a16/vllm/auxiliary/bench_moe_align 1 256 8 16 --bench 20 100` |
-| 5 | **Marlin MoE gate_up** (W4A16) | (8,1,3072)→(8,1,2048) | **11.5 μs** | `moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100` |
-| 6 | **silu_and_mul** | (8,1,2048)→(8,1,1024) | **5.0 μs** | `moe_w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100` |
-| 7 | **Marlin MoE down** (W4A16) | (8,1,1024)→(8,1,3072) | **12.3 μs** | `moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100` |
-| 8 | **moe_sum** | (8,1,3072)→(1,3072) | **5.4 μs** | `moe_w4a16/vllm/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100` |
+| 3 | **topk_gating** | (1,256)→w:(1,8) idx:(1,8) | **8.4 μs** | `moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating 1 256 8 --bench 20 100` |
+| 4 | **moe_align** | (1,8)→sorted_ids, expert_ids | **3.3 μs** | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_align 1 256 8 16 --bench 20 100` |
+| 5 | **Marlin MoE gate_up** (W4A16) | (8,1,3072)→(8,1,2048) | **11.5 μs** | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100` |
+| 6 | **silu_and_mul** | (8,1,2048)→(8,1,1024) | **5.0 μs** | `moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100` |
+| 7 | **Marlin MoE down** (W4A16) | (8,1,1024)→(8,1,3072) | **12.3 μs** | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100` |
+| 8 | **moe_sum** | (8,1,3072)→(1,3072) | **5.4 μs** | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100` |
 | 9 | Shared/consistent gate_up (W4A16) | (1,2048)→(1,3072) | **3.6 μs** | `./bench_all.sh --case w4a16_decode_consistent_expert_up_fpA_intB` |
 | 10 | Shared SwiGLU | (1,2048)→(1,1024) | — | not in repo |
 | 11 | Shared/consistent down (W4A16) | (1,3072)→(1,1024) | **4.0 μs** | `./bench_all.sh --case w4a16_decode_consistent_expert_down_fpA_intB` |
@@ -187,12 +187,12 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
-| 3 | **topk_gating** | (3823,256)→... | — | `moe_w4a16/vllm/auxiliary/bench_topk_gating 3823 256 8 --bench 10 50` |
-| 4 | **moe_align** | (3823,8)→... | — | `moe_w4a16/vllm/auxiliary/bench_moe_align 3823 256 8 16 --bench 10 50` |
-| 5 | **Marlin MoE gate_up** (W4A16) | (8,3823,3072)→(8,3823,2048) | — | `moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50` |
-| 6 | **silu_and_mul** | (8,3823,2048)→(8,3823,1024) | — | `moe_w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50` |
-| 7 | **Marlin MoE down** (W4A16) | (8,3823,1024)→(8,3823,3072) | — | `moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50` |
-| 8 | **moe_sum** | (8,3823,3072)→(3823,3072) | — | `moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50` |
+| 3 | **topk_gating** | (3823,256)→... | — | `moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating 3823 256 8 --bench 10 50` |
+| 4 | **moe_align** | (3823,8)→... | — | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_align 3823 256 8 16 --bench 10 50` |
+| 5 | **Marlin MoE gate_up** (W4A16) | (8,3823,3072)→(8,3823,2048) | — | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50` |
+| 6 | **silu_and_mul** | (8,3823,2048)→(8,3823,1024) | — | `moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50` |
+| 7 | **Marlin MoE down** (W4A16) | (8,3823,1024)→(8,3823,3072) | — | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50` |
+| 8 | **moe_sum** | (8,3823,3072)→(3823,3072) | — | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50` |
 | 9 | Shared/consistent gate_up (W4A16) | (3823,2048)→(3823,3072) | **111.6 μs** | `./bench_all.sh --case w4a16_prefill_consistent_expert_up_cutlass55` |
 | 10 | Shared SwiGLU | (3823,2048)→(3823,1024) | — | not in repo |
 | 11 | Shared/consistent down (W4A16) | (3823,3072)→(3823,1024) | **69.7 μs** | `./bench_all.sh --case w4a16_prefill_consistent_expert_down_cutlass55` |
@@ -207,10 +207,10 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 | 2 | q_proj + gate (W4A16) | (1,3072)→(1,16384) | **13.0 μs** | `./bench_all.sh --case w4a16_decode_full_attn_q_proj_gate_fpA_intB` |
 | 3 | k_proj (W4A16) | (1,3072)→(1,512) | **3.9 μs** | `./bench_all.sh --case w4a16_decode_full_attn_k_proj_fpA_intB` |
 | 4 | v_proj (W4A16) | (1,3072)→(1,512) | **3.9 μs** | `./bench_all.sh --case w4a16_decode_full_attn_v_proj_fpA_intB` |
-| 5 | q/k RMSNorm | (1,32,256) / (1,2,256) | — | not in repo (generic) |
-| 6 | MRoPE | Q:(1,32,256) K:(1,2,256) | — | not in repo (generic) |
-| 7 | **FlashAttention v3 decode** | Q:(1,32,256) KV:(ctx,2,256) | **H800 24.7 μs / PPU 46.4 μs** | `./bench_attention_inference.sh --case flash_attn_decode_full_attn` |
-| 8 | output gate | sigmoid × (1,8192) | — | elementwise |
+| 5 | q/k RMSNorm | Q:(32,256), K:(2,256) | — | `./bench_all.sh --case flash_attn_decode_q_norm,flash_attn_decode_k_norm` |
+| 6 | MRoPE | Q:(1,32,256) K:(1,2,256) | — | not in repo (vLLM has Triton; no standalone CUDA / local TRT-LLM CUDA source found) |
+| 7 | **FlashAttention v3 decode** | Q:(1,32,256) KV:(ctx,2,256) | **H800 24.7 μs / PPU 46.4 μs** | `./bench_all.sh --case flash_attn_decode_full_attn` |
+| 8 | output gate | attn,gate:(1,8192)→(1,8192) | — | not in repo (vLLM/TRT-LLM use Torch elementwise; no standalone CUDA source found) |
 | 9 | o_proj (W4A16) | (1,8192)→(1,3072) | **8.7 μs** | `./bench_all.sh --case w4a16_decode_full_attn_o_proj_fpA_intB` |
 | + | MoE FFN (same as above) | | | |
 
@@ -218,10 +218,14 @@ Run: `h800_nsys_full_attn_proj_20260429_094647`
 
 | # | Kernel | Shape | Latency | Command |
 |---|--------|-------|---------|---------|
+| 1 | RMSNorm | (3823,3072)→(3823,3072) | — | `./bench_all.sh --case flash_attn_prefill_rmsnorm` |
 | 2 | q_proj + gate (W4A16) | (3823,3072)→(3823,16384) | **694.2 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_q_proj_gate_cutlass55` |
 | 3 | k_proj (W4A16) | (3823,3072)→(3823,512) | **37.7 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_k_proj_cutlass55` |
 | 4 | v_proj (W4A16) | (3823,3072)→(3823,512) | **37.3 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_v_proj_cutlass55` |
-| 7 | **FlashAttention v3 prefill** | Q:(3823,32,256) KV:(3823,2,256) | **H800 1061.6 μs / PPU 768.2 μs** | `./bench_attention_inference.sh --case flash_attn_prefill_full_attn` |
+| 5 | q/k RMSNorm | Q:(3823×32,256), K:(3823×2,256) | — | `./bench_all.sh --case flash_attn_prefill_q_norm,flash_attn_prefill_k_norm` |
+| 6 | MRoPE | Q:(3823,32,256) K:(3823,2,256) | — | not in repo (vLLM has Triton; no standalone CUDA / local TRT-LLM CUDA source found) |
+| 7 | **FlashAttention v3 prefill** | Q:(3823,32,256) KV:(3823,2,256) | **H800 1061.6 μs / PPU 768.2 μs** | `./bench_all.sh --case flash_attn_prefill_full_attn` |
+| 8 | output gate | attn,gate:(3823,8192)→(3823,8192) | — | not in repo (vLLM/TRT-LLM use Torch elementwise; no standalone CUDA source found) |
 | 9 | o_proj (W4A16) | (3823,8192)→(3823,3072) | **389.8 μs** | `./bench_all.sh --case w4a16_prefill_full_attn_o_proj_cutlass55` |
 
 > FlashAttention bench 使用 `flash_attn` 库（需 pip install flash-attn）。H800 数字来自 nsys `cuda_gpu_trace`，只汇总 captured range 内 CUDA kernel rows；PPU 数字来自 `perfstatistics`，按 1.5 GHz 换算。
@@ -306,29 +310,29 @@ PPU 上变慢。下表 `PPU/H800 > 1` 表示 PPU 更慢，`< 1` 表示 PPU 更�
 cd Kernels
 
 # ── DeltaNet Decode ──
-linear_attention/bench_conv1d_update 12288 4 1 --bench 20 100
-linear_attention/bench_gated_delta_net 1 64 128 1 --bench 20 100
-linear_attention/bench_fused_rms_norm_gate 64 128 --bench 20 100
+linear_attn/bench_conv1d_update 12288 4 1 --bench 20 100
+linear_attn/bench_gated_delta_net 1 64 128 1 --bench 20 100
+linear_attn/bench_fused_rms_norm_gate 64 128 --bench 20 100
 
 # ── DeltaNet Prefill (seq=3823) ──
-linear_attention/bench_conv1d_fwd 3823 12288 4 1 --bench 10 50
-linear_attention/bench_gdn_prefill 3823 16 64 128 1 --bench 10 50
+linear_attn/bench_conv1d_fwd 3823 12288 4 1 --bench 10 50
+linear_attn/bench_gdn_prefill 3823 16 64 128 1 --bench 10 50
 
 # ── MoE FFN Decode ──
-moe_w4a16/vllm/auxiliary/bench_topk_gating 1 256 8 --bench 20 100
-moe_w4a16/vllm/auxiliary/bench_moe_align 1 256 8 16 --bench 20 100
-moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100
-moe_w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100
-moe_w4a16/vllm/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100
-moe_w4a16/vllm/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100
+moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating 1 256 8 --bench 20 100
+moe_ffn/w4a16/vllm/auxiliary/bench_moe_align 1 256 8 16 --bench 20 100
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 1 256 8 3072 1024 --bench 20 100
+moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul 1 8 1024 --bench 20 100
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 1 256 8 1024 3072 --bench 20 100
+moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum 1 8 3072 --bench 20 100
 
 # ── MoE FFN Prefill (seq=3823) ──
-moe_w4a16/vllm/auxiliary/bench_topk_gating 3823 256 8 --bench 10 50
-moe_w4a16/vllm/auxiliary/bench_moe_align 3823 256 8 16 --bench 10 50
-moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50
-moe_w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50
-moe_w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
-moe_w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50
+moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating 3823 256 8 --bench 10 50
+moe_ffn/w4a16/vllm/auxiliary/bench_moe_align 3823 256 8 16 --bench 10 50
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 3072 1024 --bench 10 50
+moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 10 50
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --bench 10 50
+moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 10 50
 
 # ── Full Attention (FlashAttn, Python) ──
 python3 flash_attn/bench_flash_attn.py decode 3823

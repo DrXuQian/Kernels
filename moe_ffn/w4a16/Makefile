@@ -1,4 +1,4 @@
-SUBDIRS := general linear_attn flash_attn moe_ffn sampling
+SUBDIRS := vllm/marlin vllm/auxiliary trtllm/auxiliary
 
 .PHONY: all clean $(SUBDIRS)
 

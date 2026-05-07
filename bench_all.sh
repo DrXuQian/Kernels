@@ -11,23 +11,30 @@ RUN_DIR="${RUN_DIR:-${PERF_MODEL_DIR:-$ROOT_DIR}}"
 
 BENCH_RUN_ID="${BENCH_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_logs/bench_$BENCH_RUN_ID}"
+PYTHON_BIN="${PYTHON:-$(command -v python3 || true)}"
+ATTN_BENCH_WARMUP="${ATTN_BENCH_WARMUP:-0}"
+ATTN_BENCH_ITERS="${ATTN_BENCH_ITERS:-1}"
 
 PREFILL_TOKENS=3823
 DECODE_TOKENS=1
+CTX_LEN="${CTX_LEN:-3823}"
 LINEAR_DIM=12288
+HIDDEN_DIM=3072
 CONV_WIDTH=4
 LINEAR_Q_HEADS=16
 LINEAR_V_HEADS=64
 LINEAR_HEAD_DIM=128
+LINEAR_SMALL_PROJ_N=64
 
 MOE_EXPERTS=8
-MOE_ROUTER_EXPERTS=64
+MOE_ROUTER_EXPERTS=256
 MOE_TOPK=8
 MOE_GROUP=128
 MOE_GATE_N=3072
 MOE_GATE_K=2048
 MOE_DOWN_N=1024
 MOE_DOWN_K=3072
+MOE_SHARED_HIDDEN=3072
 
 W4A16_GROUP=128
 W4A16_LINEAR_QKV_N=12288
@@ -44,10 +51,17 @@ W4A16_FULL_ATTN_V_PROJ_N=512
 W4A16_FULL_ATTN_V_PROJ_K=3072
 W4A16_FULL_ATTN_O_PROJ_N=3072
 W4A16_FULL_ATTN_O_PROJ_K=8192
+FULL_ATTN_Q_HEADS=32
+FULL_ATTN_KV_HEADS=2
+FULL_ATTN_HEAD_DIM=256
 W4A16_CONSISTENT_EXPERT_UP_N=3072
 W4A16_CONSISTENT_EXPERT_UP_K=2048
 W4A16_CONSISTENT_EXPERT_DOWN_N=1024
 W4A16_CONSISTENT_EXPERT_DOWN_K=3072
+
+SAMPLING_VOCAB=248320
+SAMPLING_TOPK=50
+SAMPLING_TOPP=0.9
 
 repo_path() {
   local path="$1"
@@ -58,16 +72,24 @@ repo_path() {
   fi
 }
 
-MACHETE_BIN="$(repo_path "w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm")"
-FPA_BIN="$(repo_path "w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm")"
-MOE_TRTLLM_BIN="$(repo_path "moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
-MOE_TRTLLM_AUX_DIR="$(repo_path "moe_w4a16/trtllm/auxiliary")"
-MOE_VLLM_MARLIN_BIN="$(repo_path "moe_w4a16/vllm/marlin/bench_marlin_moe")"
-MOE_VLLM_AUX_DIR="$(repo_path "moe_w4a16/vllm/auxiliary")"
+MACHETE_BIN="$(repo_path "general/w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm")"
+FPA_BIN="$(repo_path "general/w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm")"
+CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
+MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
+MOE_TRTLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/trtllm/auxiliary")"
+MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
+MOE_VLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/vllm/auxiliary")"
+LINEAR_RMSNORM_BIN="$(repo_path "linear_attn/bench_rmsnorm")"
+LINEAR_OPS_BIN="$(repo_path "linear_attn/bench_linear_ops")"
+FLASH_RMSNORM_BIN="$(repo_path "flash_attn/bench_rmsnorm")"
+FLASH_ATTN_SCRIPT="$(repo_path "flash_attn/bench_flash_attn.py")"
+MOE_RMSNORM_BIN="$(repo_path "moe_ffn/bench_rmsnorm")"
+MOE_SHARED_EXPERT_BIN="$(repo_path "moe_ffn/bench_shared_expert")"
+SAMPLING_BIN="$(repo_path "sampling/bench_sampling")"
 
-MACHETE_TACTIC="$(repo_path "w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache")"
-FPA_TACTIC="$(repo_path "w4a16_gemm/fpA_intB_standalone/tactics_h800.cache")"
-MOE_TRTLLM_TACTIC="$(repo_path "moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache")"
+MACHETE_TACTIC="$(repo_path "general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache")"
+FPA_TACTIC="$(repo_path "general/w4a16_gemm/fpA_intB_standalone/tactics_h800.cache")"
+MOE_TRTLLM_TACTIC="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache")"
 
 FAILED=0
 LIST_CASES=0
@@ -77,6 +99,10 @@ CASE_FILTERS=()
 RESUME_FROM=""
 RESUME_SEEN=1
 RESUME_FOUND=0
+NCU_CYCLES=0
+NCU_METRICS="${NCU_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum}"
+NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-}"
+NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 
 usage() {
   cat <<'EOF'
@@ -87,6 +113,7 @@ Usage:
   ./bench_all.sh --kernel LABEL          # alias for --case
   ./bench_all.sh --resume-from LABEL     # skip cases before LABEL, then continue
   ./bench_all.sh --run-dir DIR           # run every benchmark with DIR as cwd
+  ./bench_all.sh --ncu-cycles            # run selected cases under Nsight Compute
   ./bench_all.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings. Examples:
@@ -112,6 +139,13 @@ Environment variables:
   PERF_STATISTICS_SUMMARY  Set to 0 to skip the final perfstatistics table.
   PERFRAWLOG_CLEAR         Set to 0 to keep an existing perfrawlog before each case.
   PERFRAWLOG_POSTPROCESS   Set to 0 to skip perfrawlog post-processing.
+  PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
+  ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
+  ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
+  NCU_METRICS              Nsight Compute metrics for --ncu-cycles.
+                           Default: sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum
+  NCU_LAUNCH_SKIP          Optional Nsight Compute --launch-skip value.
+  NCU_LAUNCH_COUNT         Optional Nsight Compute --launch-count value.
 EOF
 }
 
@@ -148,6 +182,27 @@ while [[ $# -gt 0 ]]; do
       ;;
     --list)
       LIST_CASES=1
+      shift
+      ;;
+    --ncu-cycles|--ncu)
+      NCU_CYCLES=1
+      PERFRAWLOG_POSTPROCESS=0
+      shift
+      ;;
+    --ncu-launch-skip)
+      NCU_LAUNCH_SKIP="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --ncu-launch-skip=*)
+      NCU_LAUNCH_SKIP="${1#*=}"
+      shift
+      ;;
+    --ncu-launch-count)
+      NCU_LAUNCH_COUNT="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --ncu-launch-count=*)
+      NCU_LAUNCH_COUNT="${1#*=}"
       shift
       ;;
     --run-dir|--perf-model-dir)
@@ -190,7 +245,7 @@ require_bin() {
   if [[ ! -x "$path" ]]; then
     echo "[bench_all][error] missing executable: $path" >&2
     echo "[bench_all][hint] build required targets first, for example:" >&2
-    echo "  ./compile.sh build linear_attention w4a16-machete w4a16-fpa moe-trtllm moe-trtllm-auxiliary moe-vllm" >&2
+    echo "  ./compile.sh build linear_attn flash_attn sampling moe-ffn moe-trtllm w4a16-machete w4a16-fpa" >&2
     exit 1
   fi
 }
@@ -346,6 +401,10 @@ run_case() {
   fi
 
   require_bin "${cmd[0]}"
+  if [[ "$NCU_CYCLES" == 1 ]] && ! command -v ncu >/dev/null 2>&1; then
+    echo "[bench_all][error] --ncu-cycles requested but ncu is not in PATH" >&2
+    exit 1
+  fi
   local required_file
   for required_file in "${required_files[@]}"; do
     require_file "$required_file"
@@ -382,9 +441,39 @@ run_case() {
 
   clear_perfrawlog_for_case
 
+  local status
   set +e
-  (cd "$RUN_DIR" && "${cmd[@]}") 2>&1 | tee -a "$log"
-  local status=${PIPESTATUS[0]}
+  if [[ "$NCU_CYCLES" == 1 ]]; then
+    local ncu_dir ncu_log
+    local -a ncu_cmd
+    ncu_dir="$OUT_DIR/ncu"
+    ncu_log="$ncu_dir/$safe.csv"
+    mkdir -p "$ncu_dir"
+    ncu_cmd=(ncu --target-processes all --kernel-name-base demangled --page raw --csv --metrics "$NCU_METRICS")
+    if [[ -n "$NCU_LAUNCH_SKIP" ]]; then
+      ncu_cmd+=(--launch-skip "$NCU_LAUNCH_SKIP")
+    fi
+    if [[ -n "$NCU_LAUNCH_COUNT" ]]; then
+      ncu_cmd+=(--launch-count "$NCU_LAUNCH_COUNT")
+    fi
+
+    echo "[bench_all] ncu log: $ncu_log"
+    printf '[bench_all] ncu command:'
+    printf ' %q' "${ncu_cmd[@]}" "${cmd[@]}"
+    echo
+    {
+      echo "ncu_log: $ncu_log"
+      printf 'ncu_command:'
+      printf ' %q' "${ncu_cmd[@]}" "${cmd[@]}"
+      echo
+    } >>"$log"
+
+    (cd "$RUN_DIR" && "${ncu_cmd[@]}" "${cmd[@]}") 2>&1 | tee -a "$log" | tee "$ncu_log"
+    status=${PIPESTATUS[0]}
+  else
+    (cd "$RUN_DIR" && "${cmd[@]}") 2>&1 | tee -a "$log"
+    status=${PIPESTATUS[0]}
+  fi
   set -e
 
   if [[ "$status" == 0 ]]; then
@@ -501,6 +590,32 @@ summarize_perfstatistics() {
   echo "[bench_all] perfstatistics summary: $summary_log"
 }
 
+summarize_ncu_cycles() {
+  if [[ "$NCU_CYCLES" != 1 ]]; then
+    return
+  fi
+
+  local ncu_dir summary_log
+  ncu_dir="$OUT_DIR/ncu"
+  if [[ ! -d "$ncu_dir" ]]; then
+    echo "[bench_all] no Nsight Compute output directory found, skip ncu summary."
+    return
+  fi
+
+  summary_log="$OUT_DIR/ncu_cycles_summary.md"
+  echo
+  echo "=== Nsight Compute cycles summary ==="
+  set +e
+  python "$ROOT_DIR/helpers/summarize_ncu_cycles.py" "$ncu_dir" --detail 2>&1 | tee "$summary_log"
+  local status=${PIPESTATUS[0]}
+  set -e
+  if [[ "$status" != 0 ]]; then
+    echo "[bench_all][warn] ncu cycles summary did not find any metric rows."
+    return
+  fi
+  echo "[bench_all] ncu cycles summary: $summary_log"
+}
+
 run_w4a16_prefill_cutlass55_case() {
   local label="$1"
   local m="$2"
@@ -534,6 +649,93 @@ run_w4a16_decode_fpa_case() {
     --warmup=0 --iters=1
 }
 
+run_rmsnorm_case() {
+  local label="$1"
+  local bin="$2"
+  local tokens="$3"
+
+  run_rmsnorm_shape_case "$label" "$bin" "$tokens" "$HIDDEN_DIM"
+}
+
+run_rmsnorm_shape_case() {
+  local label="$1"
+  local bin="$2"
+  local batch="$3"
+  local embed="$4"
+
+  run_case "$label" \
+    "$bin" \
+    --batch "$batch" --embed "$embed" --dtype fp16 --no-check \
+    --bench 0 1
+}
+
+run_flash_attn_core_case() {
+  local label="$1"
+  local mode="$2"
+  local seq_len="$3"
+
+  run_case "$label" \
+    --require-file "$FLASH_ATTN_SCRIPT" \
+    "$PYTHON_BIN" "$FLASH_ATTN_SCRIPT" \
+    "$mode" "$seq_len" "$FULL_ATTN_Q_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
+    --bench "$ATTN_BENCH_WARMUP" "$ATTN_BENCH_ITERS"
+}
+
+run_sampling_case() {
+  local label="$1"
+  local op="$2"
+
+  run_case "$label" \
+    "$SAMPLING_BIN" \
+    --op="$op" --hidden="$HIDDEN_DIM" --vocab="$SAMPLING_VOCAB" \
+    --top-k="$SAMPLING_TOPK" --top-p="$SAMPLING_TOPP" \
+    --bench 0 1
+}
+
+run_cublas_gemm_case() {
+  local label="$1"
+  local m="$2"
+  local n="$3"
+  local k="$4"
+  local out_dtype="${5:-fp16}"
+
+  run_case "$label" \
+    "$CUBLAS_GEMM_BIN" \
+    --m="$m" --n="$n" --k="$k" --dtype fp16 --out-dtype "$out_dtype" \
+    --bench 0 1
+}
+
+run_moe_shared_expert_case() {
+  local label="$1"
+  local op="$2"
+  local tokens="$3"
+  local out_dim="${4:-1}"
+
+  run_case "$label" \
+    "$MOE_SHARED_EXPERT_BIN" \
+    --op="$op" --tokens="$tokens" --hidden="$MOE_SHARED_HIDDEN" --out-dim="$out_dim" --dtype fp16 \
+    --bench 0 1
+}
+
+run_linear_dense_case() {
+  local label="$1"
+  local op="$2"
+  local tokens="$3"
+  local out_dim="$4"
+
+  run_cublas_gemm_case "$label" "$tokens" "$out_dim" "$HIDDEN_DIM" fp16
+}
+
+run_residual_add_case() {
+  local label="$1"
+  local tokens="$2"
+
+  run_case "$label" \
+    "$LINEAR_OPS_BIN" \
+    --op=residual_add --tokens="$tokens" --hidden="$HIDDEN_DIM" --dtype fp16 \
+    --bench 0 1
+}
+
 if [[ "$LIST_CASES" != 1 ]]; then
   if [[ ! -d "$RUN_DIR" ]]; then
     echo "[bench_all][error] run dir does not exist: $RUN_DIR" >&2
@@ -559,6 +761,7 @@ else
   echo "logs: $OUT_DIR"
   echo "prefill tokens: $PREFILL_TOKENS"
   echo "decode tokens:  $DECODE_TOKENS"
+  echo "ctx len:        $CTX_LEN"
   echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     vLLM components"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
@@ -567,20 +770,48 @@ else
   if [[ -n "$RESUME_FROM" ]]; then
     echo "resume from:    $RESUME_FROM"
   fi
+  if [[ "$NCU_CYCLES" == 1 ]]; then
+    echo "ncu cycles:     enabled"
+    echo "ncu metrics:    $NCU_METRICS"
+    if [[ -n "$NCU_LAUNCH_SKIP" ]]; then
+      echo "ncu skip:       $NCU_LAUNCH_SKIP"
+    fi
+    if [[ -n "$NCU_LAUNCH_COUNT" ]]; then
+      echo "ncu count:      $NCU_LAUNCH_COUNT"
+    fi
+  fi
   echo "============================================================"
 fi
 
+run_rmsnorm_case "linear_attn_decode_rmsnorm" "$LINEAR_RMSNORM_BIN" "$DECODE_TOKENS"
+run_rmsnorm_case "linear_attn_prefill_rmsnorm" "$LINEAR_RMSNORM_BIN" "$PREFILL_TOKENS"
+
+run_linear_dense_case "linear_attn_decode_in_proj_a_cublas" "in_proj_a" "$DECODE_TOKENS" "$LINEAR_SMALL_PROJ_N"
+run_linear_dense_case "linear_attn_decode_in_proj_b_cublas" "in_proj_b" "$DECODE_TOKENS" "$LINEAR_SMALL_PROJ_N"
+
+run_linear_dense_case "linear_attn_prefill_in_proj_a_cublas" "in_proj_a" "$PREFILL_TOKENS" "$LINEAR_SMALL_PROJ_N"
+run_linear_dense_case "linear_attn_prefill_in_proj_b_cublas" "in_proj_b" "$PREFILL_TOKENS" "$LINEAR_SMALL_PROJ_N"
+
 run_case "linear_decode_conv1d_update" \
-  linear_attention/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --bench 0 1
+  linear_attn/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --bench 0 1
 
 run_case "linear_decode_gdn" \
-  linear_attention/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+  linear_attn/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
 run_case "linear_prefill_conv1d_fwd" \
-  linear_attention/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --bench 0 1
+  linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --bench 0 1
 
 run_case "linear_prefill_flashinfer_gdn" \
-  linear_attention/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+  linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+
+run_residual_add_case "linear_attn_decode_residual_add" "$DECODE_TOKENS"
+run_residual_add_case "linear_attn_prefill_residual_add" "$PREFILL_TOKENS"
+
+run_rmsnorm_case "flash_attn_decode_rmsnorm" "$FLASH_RMSNORM_BIN" "$DECODE_TOKENS"
+run_rmsnorm_case "flash_attn_prefill_rmsnorm" "$FLASH_RMSNORM_BIN" "$PREFILL_TOKENS"
+
+run_residual_add_case "flash_attn_decode_residual_add" "$DECODE_TOKENS"
+run_residual_add_case "flash_attn_prefill_residual_add" "$PREFILL_TOKENS"
 
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_linear_attn_in_proj_qkv_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"
@@ -609,6 +840,15 @@ run_w4a16_prefill_cutlass55_case "w4a16_prefill_full_attn_k_proj_cutlass55" \
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_full_attn_v_proj_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_FULL_ATTN_V_PROJ_N" "$W4A16_FULL_ATTN_V_PROJ_K"
 
+run_rmsnorm_shape_case "flash_attn_prefill_q_norm" \
+  "$FLASH_RMSNORM_BIN" "$((PREFILL_TOKENS * FULL_ATTN_Q_HEADS))" "$FULL_ATTN_HEAD_DIM"
+
+run_rmsnorm_shape_case "flash_attn_prefill_k_norm" \
+  "$FLASH_RMSNORM_BIN" "$((PREFILL_TOKENS * FULL_ATTN_KV_HEADS))" "$FULL_ATTN_HEAD_DIM"
+
+run_flash_attn_core_case "flash_attn_prefill_full_attn" \
+  prefill "$PREFILL_TOKENS"
+
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_full_attn_o_proj_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"
 
@@ -621,6 +861,15 @@ run_w4a16_decode_fpa_case "w4a16_decode_full_attn_k_proj_fpA_intB" \
 run_w4a16_decode_fpa_case "w4a16_decode_full_attn_v_proj_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_FULL_ATTN_V_PROJ_N" "$W4A16_FULL_ATTN_V_PROJ_K"
 
+run_rmsnorm_shape_case "flash_attn_decode_q_norm" \
+  "$FLASH_RMSNORM_BIN" "$((DECODE_TOKENS * FULL_ATTN_Q_HEADS))" "$FULL_ATTN_HEAD_DIM"
+
+run_rmsnorm_shape_case "flash_attn_decode_k_norm" \
+  "$FLASH_RMSNORM_BIN" "$((DECODE_TOKENS * FULL_ATTN_KV_HEADS))" "$FULL_ATTN_HEAD_DIM"
+
+run_flash_attn_core_case "flash_attn_decode_full_attn" \
+  decode "$CTX_LEN"
+
 run_w4a16_decode_fpa_case "w4a16_decode_full_attn_o_proj_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"
 
@@ -630,11 +879,33 @@ run_w4a16_prefill_cutlass55_case "w4a16_prefill_consistent_expert_up_cutlass55" 
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_consistent_expert_down_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
 
+run_cublas_gemm_case "moe_router_gate_prefill_cublas" \
+  "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$HIDDEN_DIM" fp16
+
+run_cublas_gemm_case "moe_shared_expert_gate_prefill_cublas" \
+  "$PREFILL_TOKENS" 1 "$HIDDEN_DIM" fp16
+
+run_moe_shared_expert_case "moe_shared_expert_fusion_prefill" "sigmoid_mul_add" "$PREFILL_TOKENS"
+
 run_w4a16_decode_fpa_case "w4a16_decode_consistent_expert_up_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_UP_N" "$W4A16_CONSISTENT_EXPERT_UP_K"
 
 run_w4a16_decode_fpa_case "w4a16_decode_consistent_expert_down_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
+
+run_cublas_gemm_case "moe_router_gate_decode_cublas" \
+  "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$HIDDEN_DIM" fp16
+
+run_cublas_gemm_case "moe_shared_expert_gate_decode_cublas" \
+  "$DECODE_TOKENS" 1 "$HIDDEN_DIM" fp16
+
+run_moe_shared_expert_case "moe_shared_expert_fusion_decode" "sigmoid_mul_add" "$DECODE_TOKENS"
+
+run_rmsnorm_case "moe_ffn_decode_rmsnorm" "$MOE_RMSNORM_BIN" "$DECODE_TOKENS"
+run_rmsnorm_case "moe_ffn_prefill_rmsnorm" "$MOE_RMSNORM_BIN" "$PREFILL_TOKENS"
+
+run_residual_add_case "moe_ffn_decode_residual_add" "$DECODE_TOKENS"
+run_residual_add_case "moe_ffn_prefill_residual_add" "$PREFILL_TOKENS"
 
 run_case "moe_routing_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
@@ -696,6 +967,12 @@ run_case "moe_finalize_decode_vllm" \
   "$MOE_VLLM_AUX_DIR/bench_moe_sum" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" \
   --bench 0 1
 
+run_cublas_gemm_case "sampling_lm_head_gemm" \
+  "$DECODE_TOKENS" "$SAMPLING_VOCAB" "$HIDDEN_DIM" fp32
+run_sampling_case "sampling_topk_mask_logits" "topk_mask"
+run_sampling_case "sampling_softmax" "softmax"
+run_sampling_case "sampling_top_p" "top_p"
+
 if [[ "$LIST_CASES" == 1 ]]; then
   exit 0
 fi
@@ -724,5 +1001,6 @@ fi
 echo "============================================================"
 
 summarize_perfstatistics
+summarize_ncu_cycles
 
 exit "$FAILED"

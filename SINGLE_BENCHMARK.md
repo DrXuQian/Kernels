@@ -99,6 +99,29 @@ nsys stats ".bench_profiles/$RUN_ID.nsys-rep" \
   --output ".bench_profiles/${RUN_ID}_kern_sum"
 ```
 
+## H800 / ncu Cycles Mode
+
+For SM cycle counters on H800, use the built-in `bench_all.sh` Nsight Compute
+mode:
+
+```bash
+./bench_all.sh --ncu-cycles --case sampling_lm_head_gemm
+```
+
+The per-case CSV logs are written under `.bench_logs/bench_<timestamp>/ncu/`,
+and the final Markdown table is written to
+`.bench_logs/bench_<timestamp>/ncu_cycles_summary.md`. This mode disables
+`perfrawlog` post-processing for that run. The machine must allow access to
+NVIDIA performance counters; otherwise `ncu` exits with `ERR_NVGPUCTRPERM`.
+
+If setup kernels are captured before the target kernel, rerun that single case
+with explicit launch control:
+
+```bash
+./bench_all.sh --ncu-cycles --ncu-launch-skip 1 --ncu-launch-count 1 \
+  --case sampling_topk_mask_logits
+```
+
 ## perfrawlog Mode
 
 When the runtime requires a separate perf-model working directory, run the benchmark with that directory as `RUN_DIR` while keeping the executable path in this repo:
@@ -139,10 +162,26 @@ Every label below can be passed to `--case`, `--kernel`, `--only`, or as a posit
 
 | Group | Case |
 |---|---|
+| linear norm | `linear_attn_decode_rmsnorm` |
+| linear norm | `linear_attn_prefill_rmsnorm` |
+| linear dense FP16 | `linear_attn_decode_in_proj_a_cublas` |
+| linear dense FP16 | `linear_attn_decode_in_proj_b_cublas` |
+| linear dense FP16 | `linear_attn_prefill_in_proj_a_cublas` |
+| linear dense FP16 | `linear_attn_prefill_in_proj_b_cublas` |
 | linear decode | `linear_decode_conv1d_update` |
 | linear decode | `linear_decode_gdn` |
 | linear prefill | `linear_prefill_conv1d_fwd` |
 | linear prefill | `linear_prefill_flashinfer_gdn` |
+| residual add | `linear_attn_decode_residual_add` |
+| residual add | `linear_attn_prefill_residual_add` |
+| flash norm | `flash_attn_decode_rmsnorm` |
+| flash norm | `flash_attn_prefill_rmsnorm` |
+| flash q/k norm | `flash_attn_decode_q_norm` |
+| flash q/k norm | `flash_attn_decode_k_norm` |
+| flash q/k norm | `flash_attn_prefill_q_norm` |
+| flash q/k norm | `flash_attn_prefill_k_norm` |
+| residual add | `flash_attn_decode_residual_add` |
+| residual add | `flash_attn_prefill_residual_add` |
 | dense W4A16 linear attention | `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` |
 | dense W4A16 linear attention | `w4a16_prefill_linear_attn_in_proj_z_cutlass55` |
 | dense W4A16 linear attention | `w4a16_prefill_linear_attn_out_proj_cutlass55` |
@@ -159,8 +198,18 @@ Every label below can be passed to `--case`, `--kernel`, `--only`, or as a posit
 | dense W4A16 full attention | `w4a16_decode_full_attn_o_proj_fpA_intB` |
 | dense W4A16 consistent expert | `w4a16_prefill_consistent_expert_up_cutlass55` |
 | dense W4A16 consistent expert | `w4a16_prefill_consistent_expert_down_cutlass55` |
+| MoE router gate | `moe_router_gate_prefill_cublas` |
+| MoE shared expert | `moe_shared_expert_gate_prefill_cublas` |
+| MoE shared expert | `moe_shared_expert_fusion_prefill` |
 | dense W4A16 consistent expert | `w4a16_decode_consistent_expert_up_fpA_intB` |
 | dense W4A16 consistent expert | `w4a16_decode_consistent_expert_down_fpA_intB` |
+| MoE router gate | `moe_router_gate_decode_cublas` |
+| MoE shared expert | `moe_shared_expert_gate_decode_cublas` |
+| MoE shared expert | `moe_shared_expert_fusion_decode` |
+| MoE/FFN norm | `moe_ffn_decode_rmsnorm` |
+| MoE/FFN norm | `moe_ffn_prefill_rmsnorm` |
+| residual add | `moe_ffn_decode_residual_add` |
+| residual add | `moe_ffn_prefill_residual_add` |
 | MoE prefill TRT-LLM | `moe_routing_prefill_trtllm` |
 | MoE prefill TRT-LLM | `moe_expert_map_prefill_trtllm` |
 | MoE prefill TRT-LLM | `moe_expand_prefill_trtllm` |
@@ -174,6 +223,10 @@ Every label below can be passed to `--case`, `--kernel`, `--only`, or as a posit
 | MoE decode vLLM | `moe_gated_decode_vllm` |
 | MoE decode vLLM | `moe_down_decode_vllm` |
 | MoE decode vLLM | `moe_finalize_decode_vllm` |
+| sampling | `sampling_lm_head_gemm` |
+| sampling | `sampling_topk_mask_logits` |
+| sampling | `sampling_softmax` |
+| sampling | `sampling_top_p` |
 
 ## Direct Executable Mode
 
@@ -182,9 +235,9 @@ Use direct executable mode when you want full control over arguments or want to 
 Dense W4A16 prefill through Machete CUTLASS55:
 
 ```bash
-w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
+general/w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --backend=cutlass55 \
-  --cutlass55_tactic=w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
+  --cutlass55_tactic=general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
   --m=3823 --n=12288 --k=3072 --group_size=128 \
   --act=fp16 --quant=cutlass_s4 \
   --offline_prepack --profile_gemm_only --no_checksum \
@@ -194,26 +247,26 @@ w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
 Dense W4A16 decode through fpA_intB:
 
 ```bash
-w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
+general/w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
   --m=1 --n=12288 --k=3072 --group_size=128 \
-  --tactic=w4a16_gemm/fpA_intB_standalone/tactics_h800.cache \
+  --tactic=general/w4a16_gemm/fpA_intB_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
 ```
 
 TRT-LLM MoE prefill GEMM:
 
 ```bash
-moe_w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=3823 \
   --n=3072 --k=2048 --group_size=128 \
-  --tactic=moe_w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
+  --tactic=moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
 ```
 
 vLLM Marlin MoE decode GEMM:
 
 ```bash
-moe_w4a16/vllm/marlin/bench_marlin_moe \
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe \
   1 64 8 2048 3072 \
   --balanced --no-topk-weights --bench 0 1
 ```
@@ -221,13 +274,28 @@ moe_w4a16/vllm/marlin/bench_marlin_moe \
 Linear-attention standalone kernel:
 
 ```bash
-linear_attention/bench_gated_delta_net 1 64 128 1 --bench 0 1
+linear_attn/bench_gated_delta_net 1 64 128 1 --bench 0 1
+general/bench_cublas_gemm --m=3823 --n=64 --k=3072 --dtype fp16 --bench 0 1
+linear_attn/bench_linear_ops --op=residual_add --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
 ```
 
 Auxiliary MoE kernel:
 
 ```bash
-moe_w4a16/vllm/auxiliary/bench_topk_gating 1 64 8 --bench 0 1
+moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating 1 64 8 --bench 0 1
+```
+
+Sampling stages:
+
+```bash
+general/bench_cublas_gemm --m=1 --n=248320 --k=3072 --dtype fp16 --out-dtype fp32 --bench 0 1
+sampling/bench_sampling --op=topk_mask --vocab=248320 --top-k=50 --bench 0 1
+sampling/bench_sampling --op=softmax --vocab=248320 --bench 0 1
+sampling/bench_sampling --op=top_p --vocab=248320 --top-k=50 --top-p=0.9 --bench 0 1
+
+general/bench_cublas_gemm --m=3823 --n=256 --k=3072 --dtype fp16 --bench 0 1
+general/bench_cublas_gemm --m=3823 --n=1 --k=3072 --dtype fp16 --bench 0 1
+moe_ffn/bench_shared_expert --op=sigmoid_mul_add --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
 ```
 
 ## Tactic Cache Requirement
@@ -238,25 +306,25 @@ Check a CUTLASS55 tactic entry:
 
 ```bash
 grep -F "3823,12288,3072,128,fp16|" \
-  w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache
+  general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache
 ```
 
 Check an fpA_intB tactic entry:
 
 ```bash
 grep -F "1,12288,3072,128|" \
-  w4a16_gemm/fpA_intB_standalone/tactics_h800.cache
+  general/w4a16_gemm/fpA_intB_standalone/tactics_h800.cache
 ```
 
 Search and save one missing CUTLASS55 tactic:
 
 ```bash
-w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
+general/w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm \
   --backend=cutlass55 \
   --m=3823 --n=12288 --k=3072 --group_size=128 \
   --act=fp16 --quant=cutlass_s4 \
   --offline_prepack --profile_gemm_only --no_checksum \
   --search_cutlass55_configs \
-  --save_cutlass55_tactic=w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
+  --save_cutlass55_tactic=general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache \
   --warmup=20 --iters=100
 ```

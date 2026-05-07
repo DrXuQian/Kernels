@@ -518,17 +518,17 @@ else
 fi
 
 run_python_case "linear_triton_decode_gdn" \
-  "linear_attention/src/bench_vllm_triton_gdn_decode.py" \
+  "linear_attn/src/bench_vllm_triton_gdn_decode.py" \
   "$DECODE_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" \
   --dtype "$TRITON_DTYPE" --bench "$BENCH_WARMUP" "$BENCH_ITERS"
 
 run_python_case "linear_triton_prefill_gdn" \
-  "linear_attention/src/bench_vllm_triton_gdn_prefill.py" \
+  "linear_attn/src/bench_vllm_triton_gdn_prefill.py" \
   "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 \
   --dtype "$TRITON_DTYPE" --bench "$BENCH_WARMUP" "$BENCH_ITERS"
 
 run_python_case "linear_triton_prefill_gdn_core_only" \
-  "linear_attention/src/bench_vllm_triton_gdn_prefill.py" \
+  "linear_attn/src/bench_vllm_triton_gdn_prefill.py" \
   "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 \
   --dtype "$TRITON_DTYPE" --core-only --bench "$BENCH_WARMUP" "$BENCH_ITERS"
 

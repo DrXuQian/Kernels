@@ -7,25 +7,33 @@ Standalone CUDA kernel bench for Qwen3.5 inference profiling.
 ```
 bench_all.sh                      Qwen3.5 122B standalone kernel suite
 bench_attention_inference.sh      Triton linear attention + FlashAttention inference suite
-linear_attention/                DeltaNet layer
+linear_attn/                      Linear-Attn / DeltaNet layer
   src/flashinfer_gdn/            GDN chunked prefill (FlashInfer CUTLASS SM90, GVA)
   src/kda/                       KDA chunked prefill (cuLA CUTLASS SM90)
   src/causal_conv1d_*.cu         conv1d fwd/update (Dao-AILab)
   src/gated_delta_net.cu         GDN decode recurrent (llama.cpp CUDA)
   src/bench_gdn_decode.py        GDN decode recurrent (fla Triton, matches vLLM)
-flash_attn/                      Standard attention Python benchmarks
+  bench_linear_ops               fp16/bf16 in_proj_a/b GEMM and residual add
+flash_attn/                      Flash-Attn / standard attention benchmarks
+  bench_rmsnorm                  category-local RMSNorm executable
 general/                         General standalone CUDA kernels
   bench_layernorm.cu             LayerNorm benchmark (OneFlow)
-moe_w4a16/                       MoE FFN layer
+  bench_rmsnorm.cu               RMSNorm benchmark (TensorRT-LLM)
+moe_ffn/                         MoE-FFN layer components
+  bench_rmsnorm                  category-local RMSNorm executable
+  bench_shared_expert            shared expert gate GEMV and sigmoid fusion
+moe_ffn/w4a16/
   vllm/marlin/                   W4A16 Marlin GEMM (vLLM)
   vllm/auxiliary/                topk, align, silu_and_mul, sum (vLLM)
   trtllm/moe_w4a16_standalone/   TensorRT-LLM MoE grouped GEMM
   trtllm/auxiliary/              routing and align helpers (TensorRT-LLM)
-w4a16_gemm/                      W4A16 GEMM standalone benches
+general/w4a16_gemm/                      W4A16 GEMM standalone benches
   fpA_intB_standalone/           TensorRT-LLM fpA_intB dense GEMM
   machete_standalone/            vLLM Machete GEMM + CUTLASS55 backend
   cutlass55_standalone/          CUTLASS example 55 standalone
   marlin_standalone/             Marlin W4A16 standalone
+sampling/                        Decode sampling stages
+  bench_sampling.cu              lm_head, FlashInfer top-k mask, softmax, top-p sample
 third_party/cutlass/             CUTLASS (git submodule)
 ```
 
@@ -33,19 +41,24 @@ third_party/cutlass/             CUTLASS (git submodule)
 
 | 目录 | Kernel | 来源 | 提取方式 |
 |------|--------|------|---------|
-| `linear_attention/src/flashinfer_gdn/` | GDN chunked prefill (GVA) | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | 删 TVM-FFI/PyTorch, C++20→C++17 fix |
-| `linear_attention/src/kda/` | KDA chunked prefill | [cuLA](https://github.com/inclusionAI/cuLA) | 零修改复制 |
-| `linear_attention/` | causal_conv1d fwd/update | [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) | 删 c10 include |
-| `linear_attention/` | gated_delta_net decode | [llama.cpp](https://github.com/ggml-org/llama.cpp) | 删 ggml wrapper |
+| `linear_attn/src/flashinfer_gdn/` | GDN chunked prefill (GVA) | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | 删 TVM-FFI/PyTorch, C++20→C++17 fix |
+| `linear_attn/src/kda/` | KDA chunked prefill | [cuLA](https://github.com/inclusionAI/cuLA) | 零修改复制 |
+| `linear_attn/` | causal_conv1d fwd/update | [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) | 删 c10 include |
+| `linear_attn/` | gated_delta_net decode | [llama.cpp](https://github.com/ggml-org/llama.cpp) | 删 ggml wrapper |
+| `linear_attn/src/bench_linear_ops.cu` | in_proj_a/b FP16 GEMM, residual add | cuBLAS + standalone CUDA | category-local dense adjuncts |
 | `general/bench_layernorm.cu` | LayerNorm | [OneFlow](https://github.com/Oneflow-Inc/oneflow) | standalone benchmark harness |
-| `moe_w4a16/vllm/marlin/` | Marlin MoE GEMM | [vLLM](https://github.com/vllm-project/vllm) | 删 PyTorch wrapper |
-| `moe_w4a16/vllm/auxiliary/` | topk, align, silu, sum | vLLM | 删 torch/cub wrapper |
-| `w4a16_gemm/fpA_intB_standalone/` | fpA_intB dense W4A16 GEMM | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | standalone CMake, no TensorRT/Torch runtime |
-| `moe_w4a16/trtllm/moe_w4a16_standalone/` | MoE W4A16 grouped GEMM | TensorRT-LLM | standalone CMake, TRT-LLM-style tactic cache |
-| `moe_w4a16/trtllm/auxiliary/` | custom routing, MoE align | TensorRT-LLM | standalone CUDA benchmark harness |
-| `w4a16_gemm/machete_standalone/` | Machete W4A16 GEMM | vLLM | standalone CMake, includes vLLM heuristic/search |
-| `w4a16_gemm/cutlass55_standalone/` | Hopper mixed dtype GEMM | NVIDIA CUTLASS example 55 | standalone CMake wrapper |
-| `w4a16_gemm/marlin_standalone/` | Marlin W4A16 GEMM | IST-DASLab Marlin | standalone CUDA benchmark |
+| `general/bench_rmsnorm.cu` | RMSNorm | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | standalone non-quantized `generalRmsNorm` path |
+| `linear_attn/bench_rmsnorm`, `flash_attn/bench_rmsnorm`, `moe_ffn/bench_rmsnorm` | RMSNorm category-local executables | shared `general/bench_rmsnorm.cu` | compiled into each large folder when needed |
+| `moe_ffn/bench_shared_expert.cu` | shared expert gate GEMV and `sigmoid(gate) * shared + routed` | TensorRT-LLM/vLLM Qwen3-Next model path | cuBLAS dense gate projection + standalone fusion kernel |
+| `moe_ffn/w4a16/vllm/marlin/` | Marlin MoE GEMM | [vLLM](https://github.com/vllm-project/vllm) | 删 PyTorch wrapper |
+| `moe_ffn/w4a16/vllm/auxiliary/` | topk, align, silu, sum | vLLM | 删 torch/cub wrapper |
+| `general/w4a16_gemm/fpA_intB_standalone/` | fpA_intB dense W4A16 GEMM | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | standalone CMake, no TensorRT/Torch runtime |
+| `moe_ffn/w4a16/trtllm/moe_w4a16_standalone/` | MoE W4A16 grouped GEMM | TensorRT-LLM | standalone CMake, TRT-LLM-style tactic cache |
+| `moe_ffn/w4a16/trtllm/auxiliary/` | custom routing, MoE align | TensorRT-LLM | standalone CUDA benchmark harness |
+| `general/w4a16_gemm/machete_standalone/` | Machete W4A16 GEMM | vLLM | standalone CMake, includes vLLM heuristic/search |
+| `general/w4a16_gemm/cutlass55_standalone/` | Hopper mixed dtype GEMM | NVIDIA CUTLASS example 55 | standalone CMake wrapper |
+| `general/w4a16_gemm/marlin_standalone/` | Marlin W4A16 GEMM | IST-DASLab Marlin | standalone CUDA benchmark |
+| `sampling/bench_sampling.cu` | lm_head GEMM, top-k mask, softmax, top-p sample | FlashInfer sampling kernels + cuBLAS GEMM | direct FlashInfer header calls for single-row decode profiling |
 | `third_party/cutlass/` | CUTLASS | [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) | kept as git submodule |
 
 ## Qwen3.5 DeltaNet 参数
@@ -73,28 +86,38 @@ cd Kernels
 ./compile.sh env
 ./compile.sh list
 ./compile.sh build
-./compile.sh build general linear_attention
+./compile.sh build general linear_attn flash_attn sampling
 ./compile.sh build moe-vllm w4a16-fpa
 ./compile.sh configure w4a16-fpa
 ./compile.sh clean all
 
 # 也可以进入子目录单独编译
 cd general && make
-cd linear_attention && make
-cd linear_attention/src/flashinfer_gdn && make    # FlashInfer GDN prefill (~5min)
-cd moe_w4a16/vllm/marlin && make
-cd moe_w4a16/vllm/auxiliary && make
+cd linear_attn && make
+cd flash_attn && make
+cd sampling && make
+cd moe_ffn && make
+cd linear_attn/src/flashinfer_gdn && make    # FlashInfer GDN prefill (~5min)
+cd moe_ffn/w4a16/vllm/marlin && make
+cd moe_ffn/w4a16/vllm/auxiliary && make
 ```
 
 ## Benchmark
 
 Single-case benchmark usage is documented in [`SINGLE_BENCHMARK.md`](SINGLE_BENCHMARK.md).
+Per-folder operator coverage is documented in [`OPERATOR_COVERAGE.md`](OPERATOR_COVERAGE.md).
 
 Full-suite helpers:
 
 ```bash
 ./bench_all.sh --list
 ./bench_all.sh --case moe_gate_up_decode_vllm
+./bench_all.sh --case sampling_lm_head_gemm
+
+# H800 Nsight Compute cycles collection. Logs and summary are written under
+# .bench_logs/bench_<timestamp>/ncu/.
+./bench_all.sh --ncu-cycles --case sampling_lm_head_gemm
+./bench_all.sh --ncu-cycles --ncu-launch-skip 1 --ncu-launch-count 1 --case sampling_topk_mask_logits
 
 # Python/JIT attention paths: vLLM Triton GDN and FlashAttention inference
 # Requires PyTorch/Triton plus flash-attn/flashinfer in the active Python env.
@@ -200,14 +223,14 @@ FlashInfer CUTLASS 将以上全部 fuse 成 **1 个 kernel**：527 μs。
 
 ```bash
 # FlashInfer GDN prefill
-cd linear_attention/src/flashinfer_gdn
+cd linear_attn/src/flashinfer_gdn
 ncu --set full ./bench_gdn_prefill 3823 16 64 128
 
 # Conv1d prefill
-cd linear_attention
+cd linear_attn
 ncu --set full --kernel-name "causal_conv1d_fwd" ./bench_conv1d_fwd 3823 12288 4 1
 
 # MoE Marlin GEMM decode
-cd moe_w4a16/vllm/marlin
+cd moe_ffn/w4a16/vllm/marlin
 ncu --set full --kernel-name "Marlin" ./bench_marlin_moe 1 64 8 2048 5632
 ```

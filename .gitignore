@@ -18,6 +18,11 @@ bench_fused_rms_norm_gate
 bench_gdn_prefill
 bench_kda_prefill
 bench_layernorm
+bench_rmsnorm
+bench_cublas_gemm
+bench_sampling
+bench_linear_ops
+bench_shared_expert
 bench_marlin_moe
 bench_topk_gating
 bench_moe_align
@@ -30,5 +35,9 @@ bench_moe_sum
 cublas_bf16_bench
 cutlass_w4a16_bench
 w4a16_gemm/marlin_standalone/marlin_standalone
+general/w4a16_gemm/marlin_standalone/marlin_standalone
 .bench_profiles/
 .bench_logs/
+profiles/
+bench_expert_map
+general/w4a16_gemm/fpA_intB/

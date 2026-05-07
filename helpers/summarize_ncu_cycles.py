@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import math
+from pathlib import Path
+
+
+def parse_number(value):
+    value = value.strip().replace(",", "")
+    if not value or value.lower() in {"n/a", "nan"}:
+        return math.nan
+    try:
+        return float(value)
+    except ValueError:
+        return math.nan
+
+
+def parse_case(path):
+    rows = []
+    header = None
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return rows
+
+    for parsed in csv.reader(lines):
+        if not parsed:
+            continue
+        if "Metric Name" in parsed and "Metric Value" in parsed:
+            header = parsed
+            continue
+        if header is None or len(parsed) < len(header):
+            continue
+
+        record = {header[i]: parsed[i] for i in range(min(len(header), len(parsed)))}
+        metric = record.get("Metric Name", "")
+        if metric not in {"sm__cycles_elapsed.avg", "sm__cycles_elapsed.max", "gpu__time_duration.sum"}:
+            continue
+
+        kernel = record.get("Kernel Name", record.get("Name", ""))
+        kernel_id = record.get("ID", "")
+        value = parse_number(record.get("Metric Value", ""))
+        if math.isnan(value):
+            continue
+
+        key = (kernel_id, kernel)
+        existing = None
+        for row in rows:
+            if (row["kernel_id"], row["kernel_name"]) == key:
+                existing = row
+                break
+        if existing is None:
+            existing = {
+                "case": path.stem,
+                "kernel_id": kernel_id,
+                "kernel_name": kernel,
+                "cycles_avg": math.nan,
+                "cycles_max": math.nan,
+                "duration_ns": math.nan,
+            }
+            rows.append(existing)
+
+        if metric == "sm__cycles_elapsed.avg":
+            existing["cycles_avg"] = value
+        elif metric == "sm__cycles_elapsed.max":
+            existing["cycles_max"] = value
+        elif metric == "gpu__time_duration.sum":
+            existing["duration_ns"] = value
+
+    return rows
+
+
+def fmt_number(value):
+    if value is None or math.isnan(value):
+        return ""
+    if abs(value - round(value)) < 1e-6:
+        return f"{int(round(value))}"
+    return f"{value:.3f}"
+
+
+def sanitize_kernel(name, max_len=96):
+    name = name.replace("\n", " ")
+    if len(name) <= max_len:
+        return name
+    return name[: max_len - 3] + "..."
+
+
+def print_table(rows, title):
+    print(title)
+    print("| case | kernel_id | cycles_avg | cycles_max | duration_ns | kernel |")
+    print("|---|---:|---:|---:|---:|---|")
+    for row in rows:
+        print(
+            f"| `{row['case']}` | {row['kernel_id']} | {fmt_number(row['cycles_avg'])} | "
+            f"{fmt_number(row['cycles_max'])} | {fmt_number(row['duration_ns'])} | "
+            f"`{sanitize_kernel(row['kernel_name'])}` |"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Summarize Nsight Compute cycle CSV logs.")
+    parser.add_argument("ncu_dir", type=Path)
+    parser.add_argument("--detail", action="store_true", help="Print every profiled kernel row.")
+    args = parser.parse_args()
+
+    all_rows = []
+    for path in sorted(args.ncu_dir.glob("*.csv")):
+        all_rows.extend(parse_case(path))
+
+    if not all_rows:
+        raise SystemExit(f"no Nsight Compute metric rows found under {args.ncu_dir}")
+
+    summary = []
+    for case in sorted({row["case"] for row in all_rows}):
+        case_rows = [row for row in all_rows if row["case"] == case]
+        case_rows.sort(
+            key=lambda row: (
+                -1 if math.isnan(row["cycles_avg"]) else row["cycles_avg"],
+                -1 if math.isnan(row["cycles_max"]) else row["cycles_max"],
+            ),
+            reverse=True,
+        )
+        summary.append(case_rows[0])
+
+    print_table(summary, "## Nsight Compute Cycles Summary")
+    if args.detail:
+        print()
+        print_table(all_rows, "## Nsight Compute Cycles Detail")
+
+
+if __name__ == "__main__":
+    main()
