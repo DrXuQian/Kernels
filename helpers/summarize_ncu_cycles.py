@@ -5,6 +5,28 @@ import math
 from pathlib import Path
 
 
+LONG_METRICS = {
+    "sm__cycles_elapsed.avg",
+    "sm__cycles_elapsed.max",
+    "gpu__time_duration.sum",
+}
+
+CYCLES_AVG_COLUMNS = ("sm__cycles_elapsed.avg", "sm_cycles_elapsed.avg")
+CYCLES_MAX_COLUMNS = ("sm__cycles_elapsed.max", "sm_cycles_elapsed.max")
+# In Nsight Compute's wide per-kernel CSV, gpu_time_duration.sum can be a
+# reduction over sub-partitions/SMs. Prefer avg, which matches the visible
+# kernel duration column, and keep sum only as a fallback for raw metric CSVs.
+DURATION_COLUMNS = (
+    "gpu_time_duration.avg",
+    "gpu__time_duration.avg",
+    "gpu__time_duration.sum",
+    "gpu_time_duration.sum",
+)
+WIDE_METRIC_COLUMNS = set(CYCLES_AVG_COLUMNS + CYCLES_MAX_COLUMNS + DURATION_COLUMNS)
+KERNEL_NAME_COLUMNS = ("Kernel Name", "kernel_name", "launch_kernel_name", "Name", "name")
+KERNEL_ID_COLUMNS = ("ID", "id", "Kernel ID", "kernel_id", "launch_id")
+
+
 def parse_number(value):
     value = value.strip().replace(",", "")
     if not value or value.lower() in {"n/a", "nan"}:
@@ -15,15 +37,40 @@ def parse_number(value):
         return math.nan
 
 
-def parse_case(path):
+def first_value(record, names, default=""):
+    for name in names:
+        value = record.get(name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def first_number(record, names):
+    for name in names:
+        if name not in record:
+            continue
+        value = parse_number(record[name])
+        if not math.isnan(value):
+            return value
+    return math.nan
+
+
+def make_row(path, kernel_id, kernel_name):
+    return {
+        "case": path.stem,
+        "kernel_id": kernel_id,
+        "kernel_name": kernel_name,
+        "cycles_avg": math.nan,
+        "cycles_max": math.nan,
+        "duration_ns": math.nan,
+    }
+
+
+def parse_long_metric_csv(path, parsed_rows):
     rows = []
     header = None
-    try:
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return rows
 
-    for parsed in csv.reader(lines):
+    for parsed in parsed_rows:
         if not parsed:
             continue
         if "Metric Name" in parsed and "Metric Value" in parsed:
@@ -34,11 +81,11 @@ def parse_case(path):
 
         record = {header[i]: parsed[i] for i in range(min(len(header), len(parsed)))}
         metric = record.get("Metric Name", "")
-        if metric not in {"sm__cycles_elapsed.avg", "sm__cycles_elapsed.max", "gpu__time_duration.sum"}:
+        if metric not in LONG_METRICS:
             continue
 
-        kernel = record.get("Kernel Name", record.get("Name", ""))
-        kernel_id = record.get("ID", "")
+        kernel = first_value(record, KERNEL_NAME_COLUMNS)
+        kernel_id = first_value(record, KERNEL_ID_COLUMNS)
         value = parse_number(record.get("Metric Value", ""))
         if math.isnan(value):
             continue
@@ -50,14 +97,7 @@ def parse_case(path):
                 existing = row
                 break
         if existing is None:
-            existing = {
-                "case": path.stem,
-                "kernel_id": kernel_id,
-                "kernel_name": kernel,
-                "cycles_avg": math.nan,
-                "cycles_max": math.nan,
-                "duration_ns": math.nan,
-            }
+            existing = make_row(path, kernel_id, kernel)
             rows.append(existing)
 
         if metric == "sm__cycles_elapsed.avg":
@@ -67,6 +107,48 @@ def parse_case(path):
         elif metric == "gpu__time_duration.sum":
             existing["duration_ns"] = value
 
+    return rows
+
+
+def parse_wide_kernel_csv(path, parsed_rows):
+    rows = []
+    header = None
+
+    for parsed in parsed_rows:
+        if not parsed:
+            continue
+        if any(column in parsed for column in WIDE_METRIC_COLUMNS):
+            header = parsed
+            continue
+        if header is None or len(parsed) < len(header):
+            continue
+
+        record = {header[i]: parsed[i] for i in range(min(len(header), len(parsed)))}
+        cycles_avg = first_number(record, CYCLES_AVG_COLUMNS)
+        cycles_max = first_number(record, CYCLES_MAX_COLUMNS)
+        duration_ns = first_number(record, DURATION_COLUMNS)
+        if math.isnan(cycles_avg) and math.isnan(cycles_max) and math.isnan(duration_ns):
+            continue
+
+        kernel = first_value(record, KERNEL_NAME_COLUMNS)
+        kernel_id = first_value(record, KERNEL_ID_COLUMNS)
+        row = make_row(path, kernel_id, kernel)
+        row["cycles_avg"] = cycles_avg
+        row["cycles_max"] = cycles_max
+        row["duration_ns"] = duration_ns
+        rows.append(row)
+
+    return rows
+
+
+def parse_case(path):
+    try:
+        parsed_rows = list(csv.reader(path.read_text(errors="replace").splitlines()))
+    except OSError:
+        return []
+
+    rows = parse_long_metric_csv(path, parsed_rows)
+    rows.extend(parse_wide_kernel_csv(path, parsed_rows))
     return rows
 
 
@@ -98,7 +180,7 @@ def file_diagnostic(path):
 
     if interesting:
         return " | ".join(interesting)
-    if "Metric Name" not in text:
+    if "Metric Name" not in text and not any(column in text for column in WIDE_METRIC_COLUMNS):
         return "no Nsight Compute metric header; inspect the case log for target program output"
     return "metric header found, but requested metrics were absent or non-numeric"
 
