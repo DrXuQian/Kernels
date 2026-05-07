@@ -12,9 +12,10 @@ Standalone sampling-stage benchmarks for Qwen3.5 decode.
 | `top_p` | FlashInfer top-p sampling from probabilities (`TopPSamplingFromProb`) | `(1,248320) -> (1,)` |
 
 FP16 GEMM stages use cuBLAS. Sampling stages call FlashInfer CUDA header kernels
-directly from the installed FlashInfer package. The benchmark keeps only the
-single-row profiling setup; it does not model higher-level request state,
-finished flags, or tokenizer/runtime control flow.
+vendored under `sampling/third_party/flashinfer/include`, so building this
+folder does not require installing the FlashInfer Python package. The benchmark
+keeps only the single-row profiling setup; it does not model higher-level
+request state, finished flags, or tokenizer/runtime control flow.
 
 ## Build
 
