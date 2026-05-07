@@ -150,6 +150,28 @@ def print_table(rows, title):
         )
 
 
+def print_aggregate_table(rows):
+    print("## Nsight Compute Case Aggregate")
+    print("| case | kernels | sum_cycles_avg | sum_cycles_max | sum_duration_ns | slowest_kernel |")
+    print("|---|---:|---:|---:|---:|---|")
+    for row in rows:
+        print(
+            f"| `{row['case']}` | {row['kernels']} | {fmt_number(row['sum_cycles_avg'])} | "
+            f"{fmt_number(row['sum_cycles_max'])} | {fmt_number(row['sum_duration_ns'])} | "
+            f"`{sanitize_kernel(row['slowest_kernel'])}` |"
+        )
+
+
+def nan_sum(values):
+    total = 0.0
+    saw_value = False
+    for value in values:
+        if not math.isnan(value):
+            total += value
+            saw_value = True
+    return total if saw_value else math.nan
+
+
 def main():
     parser = argparse.ArgumentParser(description="Summarize Nsight Compute cycle CSV logs.")
     parser.add_argument("ncu_dir", type=Path)
@@ -173,7 +195,8 @@ def main():
             print_empty_dir_diagnostic(args.ncu_dir)
         raise SystemExit(f"no Nsight Compute metric rows found under {args.ncu_dir}")
 
-    summary = []
+    aggregate = []
+    slowest = []
     for case in sorted({row["case"] for row in all_rows}):
         case_rows = [row for row in all_rows if row["case"] == case]
         case_rows.sort(
@@ -183,9 +206,21 @@ def main():
             ),
             reverse=True,
         )
-        summary.append(case_rows[0])
+        slowest.append(case_rows[0])
+        aggregate.append(
+            {
+                "case": case,
+                "kernels": len(case_rows),
+                "sum_cycles_avg": nan_sum(row["cycles_avg"] for row in case_rows),
+                "sum_cycles_max": nan_sum(row["cycles_max"] for row in case_rows),
+                "sum_duration_ns": nan_sum(row["duration_ns"] for row in case_rows),
+                "slowest_kernel": case_rows[0]["kernel_name"],
+            }
+        )
 
-    print_table(summary, "## Nsight Compute Cycles Summary")
+    print_aggregate_table(aggregate)
+    print()
+    print_table(slowest, "## Nsight Compute Slowest Kernel Per Case")
     if args.detail:
         print()
         print_table(all_rows, "## Nsight Compute Cycles Detail")

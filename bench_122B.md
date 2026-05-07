@@ -37,6 +37,11 @@ sum only CUDA kernel rows. PPU values are from per-case `perfstatistics.log`.
 All benchmark cases use single-run settings (`warmup=0`, `iters=1`, or
 `--bench 0 1`).
 
+`moe_align_decode_vllm` was corrected on 2026-05-07. Earlier notes mixed in a
+64-expert smoke shape; the Qwen3.5-122B decode shape is
+`tokens=1, experts=256, topk=8, block=16` and follows vLLM's general two-kernel
+path.
+
 Some late-added smoke results are CUDA-event single-run numbers rather than
 nsys traces; those rows are marked in the `Method` column.
 
@@ -170,7 +175,7 @@ Build and run:
 | `moe_ffn_decode_rmsnorm` | `(1,3072)` | not tested by nsys | not tested | not tested | not tested |
 | `moe_router_gate_decode_cublas` | `(1,256,3072)` | not tested by nsys | not tested | not tested | not tested |
 | `moe_routing_decode_vllm` | `(1,256)->topk` | nsys | 4.352 | 5.867 | 8801 |
-| `moe_align_decode_vllm` | topk/expert metadata | nsys | 10.017 | 10.299 | 15449 |
+| `moe_align_decode_vllm` | `(1,256,topk=8,block=16)` | nsys, 2 kernels | 4.928 | needs rerun | needs rerun |
 | `moe_gate_up_decode_vllm` | routed `(8,1,2048,3072)` | nsys | 21.185 | 31.368 | 47052 |
 | `moe_gated_decode_vllm` | `(8,1,2048)->(8,1,1024)` | nsys | 2.720 | 2.943 | 4414 |
 | `moe_down_decode_vllm` | routed `(8,1,1024,3072)` | nsys | 14.561 | 20.510 | 30765 |
@@ -240,7 +245,7 @@ Sampling caveat:
 |---|---:|---:|---|
 | Linear-Attn decode in-repo core | 7.008 | 7.609 | conv1d update + GDN only |
 | Linear-Attn prefill in-repo core | 648.134 | 1331.547 | conv1d fwd + FlashInfer GDN |
-| MoE-FFN decode vLLM path | 54.531 | 72.759 | routing + align + Marlin + activation + sum |
+| MoE-FFN decode vLLM path | 49.442 | needs rerun | routing + align + Marlin + activation + sum; PPU align needs rerun after vLLM general-path fix |
 | MoE-FFN prefill TRT-LLM path | 2780.126 | 2354.388 | routing + expert map + expand + gate/up + activation + down + finalize |
 
 Hardware interpretation:

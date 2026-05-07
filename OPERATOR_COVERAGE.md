@@ -115,7 +115,7 @@ Module order:
 | 1 | RMSNorm | `(1,3072)` | covered | `moe_ffn/bench_rmsnorm` | `moe_ffn_decode_rmsnorm` |
 | 2 | Router gate FP16 GEMM | `(1,3072)->(1,256)` | covered | `general/bench_cublas_gemm` | `moe_router_gate_decode_cublas` |
 | 3 | Routing top-k | `(1,256)->topk` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating` | `moe_routing_decode_vllm` |
-| 4 | MoE align metadata | topk/expert metadata | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_align` | `moe_align_decode_vllm` |
+| 4 | MoE align metadata | `(1,256,topk=8,block=16)` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_align`; vLLM general two-kernel path | `moe_align_decode_vllm` |
 | 5 | MoE gate/up W4A16 GEMM | routed `(8,1,3072)->(8,1,2048)` | covered | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe` | `moe_gate_up_decode_vllm` |
 | 6 | Gated activation | `(8,1,2048)->(8,1,1024)` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul` | `moe_gated_decode_vllm` |
 | 7 | MoE down W4A16 GEMM | routed `(8,1,1024)->(8,1,3072)` | covered | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe` | `moe_down_decode_vllm` |
