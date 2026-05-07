@@ -234,13 +234,12 @@ def print_table(rows, title):
 
 def print_aggregate_table(rows):
     print("## Nsight Compute Case Aggregate")
-    print("| case | kernels | sum_cycles_avg | sum_cycles_max | sum_duration_ns | slowest_kernel |")
-    print("|---|---:|---:|---:|---:|---|")
+    print("| case | kernels | sum_cycles_avg | sum_cycles_max | sum_duration_ns |")
+    print("|---|---:|---:|---:|---:|")
     for row in rows:
         print(
             f"| `{row['case']}` | {row['kernels']} | {fmt_number(row['sum_cycles_avg'])} | "
-            f"{fmt_number(row['sum_cycles_max'])} | {fmt_number(row['sum_duration_ns'])} | "
-            f"`{sanitize_kernel(row['slowest_kernel'])}` |"
+            f"{fmt_number(row['sum_cycles_max'])} | {fmt_number(row['sum_duration_ns'])} |"
         )
 
 
@@ -296,7 +295,6 @@ def main():
                 "sum_cycles_avg": nan_sum(row["cycles_avg"] for row in case_rows),
                 "sum_cycles_max": nan_sum(row["cycles_max"] for row in case_rows),
                 "sum_duration_ns": nan_sum(row["duration_ns"] for row in case_rows),
-                "slowest_kernel": case_rows[0]["kernel_name"],
             }
         )
 
