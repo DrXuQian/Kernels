@@ -25,6 +25,11 @@ DURATION_COLUMNS = (
 WIDE_METRIC_COLUMNS = set(CYCLES_AVG_COLUMNS + CYCLES_MAX_COLUMNS + DURATION_COLUMNS)
 KERNEL_NAME_COLUMNS = ("Kernel Name", "kernel_name", "launch_kernel_name", "Name", "name")
 KERNEL_ID_COLUMNS = ("ID", "id", "Kernel ID", "kernel_id", "launch_id")
+FILTERED_KERNEL_SUBSTRINGS = (
+    "init_",
+    "initialize_tensor",
+    "fill_half_kernel",
+)
 
 
 def parse_number(value):
@@ -66,6 +71,11 @@ def make_row(path, kernel_id, kernel_name):
     }
 
 
+def should_filter_kernel(kernel_name):
+    lower_name = kernel_name.lower()
+    return any(pattern in lower_name for pattern in FILTERED_KERNEL_SUBSTRINGS)
+
+
 def parse_long_metric_csv(path, parsed_rows):
     rows = []
     header = None
@@ -86,6 +96,9 @@ def parse_long_metric_csv(path, parsed_rows):
 
         kernel = first_value(record, KERNEL_NAME_COLUMNS)
         kernel_id = first_value(record, KERNEL_ID_COLUMNS)
+        if should_filter_kernel(kernel):
+            continue
+
         value = parse_number(record.get("Metric Value", ""))
         if math.isnan(value):
             continue
@@ -132,6 +145,9 @@ def parse_wide_kernel_csv(path, parsed_rows):
 
         kernel = first_value(record, KERNEL_NAME_COLUMNS)
         kernel_id = first_value(record, KERNEL_ID_COLUMNS)
+        if should_filter_kernel(kernel):
+            continue
+
         row = make_row(path, kernel_id, kernel)
         row["cycles_avg"] = cycles_avg
         row["cycles_max"] = cycles_max

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -167,6 +168,21 @@ __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float value)
 }
 
 template <typename T>
+T host_from_float(float value);
+
+template <>
+half host_from_float<half>(float value)
+{
+    return __float2half(value);
+}
+
+template <>
+__nv_bfloat16 host_from_float<__nv_bfloat16>(float value)
+{
+    return __float2bfloat16(value);
+}
+
+template <typename T>
 __device__ __forceinline__ float to_float(T value);
 
 template <>
@@ -182,14 +198,12 @@ __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 value)
 }
 
 template <typename T>
-__global__ void init_tensor_kernel(T* ptr, long long n, float scale)
+void fill_tensor_host(std::vector<T>& data, float scale)
 {
-    long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
-    for (long long i = idx; i < n; i += stride)
+    for (size_t i = 0; i < data.size(); ++i)
     {
         float v = static_cast<float>((i * 13 + 7) & 1023) * (scale / 1024.0f);
-        ptr[i] = from_float<T>(v);
+        data[i] = host_from_float<T>(v);
     }
 }
 
@@ -233,11 +247,13 @@ int run_gemm(Options const& opt, BenchTimer& timer)
     CHECK_CUDA(cudaMalloc(&d_hidden, hidden_elems * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_weight, weight_elems * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_out, out_elems * sizeof(T)));
-    init_tensor_kernel<T><<<std::min(4096LL, (static_cast<long long>(hidden_elems) + 255) / 256), 256>>>(
-        d_hidden, hidden_elems, 0.25f);
-    init_tensor_kernel<T><<<std::min(4096LL, (static_cast<long long>(weight_elems) + 255) / 256), 256>>>(
-        d_weight, weight_elems, 0.03125f);
-    CHECK_CUDA(cudaDeviceSynchronize());
+
+    std::vector<T> h_hidden(hidden_elems);
+    std::vector<T> h_weight(weight_elems);
+    fill_tensor_host(h_hidden, 0.25f);
+    fill_tensor_host(h_weight, 0.03125f);
+    CHECK_CUDA(cudaMemcpy(d_hidden, h_hidden.data(), hidden_elems * sizeof(T), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_weight, h_weight.data(), weight_elems * sizeof(T), cudaMemcpyHostToDevice));
 
     cublasHandle_t handle = nullptr;
     CHECK_CUBLAS(cublasCreate(&handle));
@@ -268,9 +284,13 @@ int run_residual_add(Options const& opt, BenchTimer& timer)
     CHECK_CUDA(cudaMalloc(&d_a, elems * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_b, elems * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_out, elems * sizeof(T)));
-    init_tensor_kernel<T><<<std::min(4096LL, (elems + 255) / 256), 256>>>(d_a, elems, 0.25f);
-    init_tensor_kernel<T><<<std::min(4096LL, (elems + 255) / 256), 256>>>(d_b, elems, 0.125f);
-    CHECK_CUDA(cudaDeviceSynchronize());
+
+    std::vector<T> h_a(static_cast<size_t>(elems));
+    std::vector<T> h_b(static_cast<size_t>(elems));
+    fill_tensor_host(h_a, 0.25f);
+    fill_tensor_host(h_b, 0.125f);
+    CHECK_CUDA(cudaMemcpy(d_a, h_a.data(), elems * sizeof(T), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, h_b.data(), elems * sizeof(T), cudaMemcpyHostToDevice));
 
     int threads = 256;
     int blocks = static_cast<int>(std::min(4096LL, (elems + threads - 1) / threads));
