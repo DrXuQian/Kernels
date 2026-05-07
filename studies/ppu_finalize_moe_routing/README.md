@@ -1,8 +1,8 @@
-# PPU finalizeMoeRoutingKernel Study
+# MoE-FFN: PPU finalizeMoeRoutingKernel Study
 
-This folder is an isolated source-level compensation study for TensorRT-LLM's
-`finalizeMoeRoutingKernel`. It is intentionally not wired into the repository
-root `compile.sh` or `bench_all.sh`.
+This folder belongs to the MoE-FFN module. It is an isolated source-level
+compensation study for TensorRT-LLM's `finalizeMoeRoutingKernel` and is
+intentionally not wired into the repository root `compile.sh` or `bench_all.sh`.
 
 The study binary contains two implementations:
 
@@ -77,10 +77,11 @@ nsys profile --trace=cuda -o finalize_study \
 nsys stats finalize_study.nsys-rep --report cuda_gpu_trace
 ```
 
-## H800 sanity results
+## Benchmark Results
 
 Measured on H800 with CUDA event timing. These numbers are only a local sanity
-check before running the same study on PPU.
+check before running the same study on PPU. PPU results are not recorded in
+this Markdown yet.
 
 | Shape / mode | Baseline median | Optimized median | Speedup |
 |---|---:|---:|---:|
