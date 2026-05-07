@@ -164,6 +164,7 @@ void custom_moe_routing_launch(
     CASE_MAX_TOPK(64);
     CASE_MAX_TOPK(96);
     CASE_MAX_TOPK(128);
+    CASE_MAX_TOPK(256);
     default: kernelInstance = nullptr; break;
     }
 
