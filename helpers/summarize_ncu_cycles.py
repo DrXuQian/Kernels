@@ -70,6 +70,49 @@ def parse_case(path):
     return rows
 
 
+def file_diagnostic(path):
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        return f"read failed: {exc}"
+
+    interesting = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if (
+            "==error==" in lower
+            or "==warning==" in lower
+            or "err_" in lower
+            or "error:" in lower
+            or "failed" in lower
+            or "no kernels" in lower
+            or "permission" in lower
+            or "launch-skip" in lower
+        ):
+            interesting.append(stripped)
+        if len(interesting) >= 3:
+            break
+
+    if interesting:
+        return " | ".join(interesting)
+    if "Metric Name" not in text:
+        return "no Nsight Compute metric header; inspect the case log for target program output"
+    return "metric header found, but requested metrics were absent or non-numeric"
+
+
+def print_missing_rows(files):
+    if not files:
+        return
+    print("## Nsight Compute Files Without Metric Rows")
+    print("| case | diagnostic |")
+    print("|---|---|")
+    for path in files:
+        print(f"| `{path.stem}` | {file_diagnostic(path)} |")
+
+
 def fmt_number(value):
     if value is None or math.isnan(value):
         return ""
@@ -104,10 +147,16 @@ def main():
     args = parser.parse_args()
 
     all_rows = []
+    files_without_rows = []
     for path in sorted(args.ncu_dir.glob("*.csv")):
-        all_rows.extend(parse_case(path))
+        rows = parse_case(path)
+        if rows:
+            all_rows.extend(rows)
+        else:
+            files_without_rows.append(path)
 
     if not all_rows:
+        print_missing_rows(files_without_rows)
         raise SystemExit(f"no Nsight Compute metric rows found under {args.ncu_dir}")
 
     summary = []
@@ -126,6 +175,9 @@ def main():
     if args.detail:
         print()
         print_table(all_rows, "## Nsight Compute Cycles Detail")
+        if files_without_rows:
+            print()
+            print_missing_rows(files_without_rows)
 
 
 if __name__ == "__main__":
