@@ -113,6 +113,16 @@ def print_missing_rows(files):
         print(f"| `{path.stem}` | {file_diagnostic(path)} |")
 
 
+def print_empty_dir_diagnostic(ncu_dir):
+    print("## Nsight Compute Files Without Metric Rows")
+    print("| case | diagnostic |")
+    print("|---|---|")
+    print(
+        f"| `(none)` | no `.csv` files found under `{ncu_dir}`; selected cases likely failed before `ncu` "
+        "launched, all selected cases were skipped, or `OUT_DIR` points at a different run |"
+    )
+
+
 def fmt_number(value):
     if value is None or math.isnan(value):
         return ""
@@ -148,7 +158,8 @@ def main():
 
     all_rows = []
     files_without_rows = []
-    for path in sorted(args.ncu_dir.glob("*.csv")):
+    csv_files = sorted(args.ncu_dir.glob("*.csv"))
+    for path in csv_files:
         rows = parse_case(path)
         if rows:
             all_rows.extend(rows)
@@ -156,7 +167,10 @@ def main():
             files_without_rows.append(path)
 
     if not all_rows:
-        print_missing_rows(files_without_rows)
+        if csv_files:
+            print_missing_rows(files_without_rows)
+        else:
+            print_empty_dir_diagnostic(args.ncu_dir)
         raise SystemExit(f"no Nsight Compute metric rows found under {args.ncu_dir}")
 
     summary = []
