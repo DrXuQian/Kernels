@@ -95,6 +95,7 @@ FAILED=0
 LIST_CASES=0
 MATCHED_CASES=0
 RAN_CASES=0
+SKIPPED_CASES=0
 CASE_FILTERS=()
 RESUME_FROM=""
 RESUME_SEEN=1
@@ -103,6 +104,10 @@ NCU_CYCLES=0
 NCU_METRICS="${NCU_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum}"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
+BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
+
+declare -A DEDUPE_LABEL_BY_KEY=()
+declare -A DEDUPE_LOG_BY_KEY=()
 
 usage() {
   cat <<'EOF'
@@ -139,6 +144,9 @@ Environment variables:
   PERF_STATISTICS_SUMMARY  Set to 0 to skip the final perfstatistics table.
   PERFRAWLOG_CLEAR         Set to 0 to keep an existing perfrawlog before each case.
   PERFRAWLOG_POSTPROCESS   Set to 0 to skip perfrawlog post-processing.
+  BENCH_DEDUPE             Set to 0 to rerun duplicate benchmark commands/shapes.
+                           Default: 1. Duplicate case logs point at the first
+                           case that measured the same key.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
@@ -276,6 +284,19 @@ safe_name() {
   echo "$1" | tr ' /:' '___' | tr -cd '[:alnum:]_.-'
 }
 
+quote_command() {
+  local arg
+  printf 'cd %q &&' "$RUN_DIR"
+  for arg in "$@"; do
+    printf ' %q' "$arg"
+  done
+}
+
+command_dedupe_key() {
+  printf 'cmd:'
+  quote_command "$@"
+}
+
 label_matches_filter() {
   local label="$1"
   local filter="$2"
@@ -359,6 +380,7 @@ clear_perfrawlog_for_case() {
 run_case() {
   local label="$1"
   shift 1
+  local dedupe_key=""
 
   if [[ "$LIST_CASES" == 1 ]]; then
     echo "$label"
@@ -380,6 +402,10 @@ run_case() {
   local required_tactic_keys=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --dedupe-key)
+        dedupe_key="${2:?missing key after --dedupe-key}"
+        shift 2
+        ;;
       --require-file)
         required_files+=("${2:?missing file after --require-file}")
         shift 2
@@ -414,11 +440,45 @@ run_case() {
     require_tactic_entry "${required_tactic_files[$i]}" "${required_tactic_keys[$i]}"
   done
 
-  RAN_CASES=$((RAN_CASES + 1))
-
   local safe
   safe="$(safe_name "$label")"
   local log="$OUT_DIR/$safe.log"
+
+  if [[ -z "$dedupe_key" ]]; then
+    dedupe_key="$(command_dedupe_key "${cmd[@]}")"
+  fi
+
+  if [[ "$BENCH_DEDUPE" != 0 && -n "${DEDUPE_LABEL_BY_KEY[$dedupe_key]:-}" ]]; then
+    local first_label first_log
+    first_label="${DEDUPE_LABEL_BY_KEY[$dedupe_key]}"
+    first_log="${DEDUPE_LOG_BY_KEY[$dedupe_key]}"
+    SKIPPED_CASES=$((SKIPPED_CASES + 1))
+
+    echo
+    echo "=== $label ==="
+    echo "[bench_all] skipped duplicate of: $first_label"
+    echo "[bench_all] first log: $first_log"
+    echo "[bench_all] log: $log"
+
+    {
+      echo "label: $label"
+      echo "run_dir: $RUN_DIR"
+      echo "status: skipped_duplicate"
+      echo "duplicate_of: $first_label"
+      echo "duplicate_log: $first_log"
+      echo "dedupe_key: $dedupe_key"
+      printf 'command:'
+      printf ' cd %q &&' "$RUN_DIR"
+      printf ' %q' "${cmd[@]}"
+      echo
+      echo "started_at: $(date -Is)"
+      echo "finished_at: $(date -Is)"
+    } >"$log"
+    printf '[bench_all] %-34s skipped duplicate\n' "$label"
+    return
+  fi
+
+  RAN_CASES=$((RAN_CASES + 1))
 
   echo
   echo "=== $label ==="
@@ -479,6 +539,10 @@ run_case() {
   if [[ "$status" == 0 ]]; then
     echo "finished_at: $(date -Is)" >>"$log"
     if run_perfrawlog_postprocess "$label" "${cmd[@]}"; then
+      if [[ "$BENCH_DEDUPE" != 0 ]]; then
+        DEDUPE_LABEL_BY_KEY["$dedupe_key"]="$label"
+        DEDUPE_LOG_BY_KEY["$dedupe_key"]="$log"
+      fi
       printf '[bench_all] %-34s ok\n' "$label"
     else
       local post_status=$?
@@ -625,6 +689,7 @@ run_w4a16_prefill_cutlass55_case() {
   run_case "$label" \
     --require-file "$MACHETE_TACTIC" \
     --require-tactic-entry "$MACHETE_TACTIC" "$m,$n,$k,$W4A16_GROUP,fp16|" \
+    --dedupe-key "w4a16-cutlass55:$m,$n,$k,$W4A16_GROUP,fp16,cutlass_s4" \
     "$MACHETE_BIN" \
     --backend=cutlass55 \
     --cutlass55_tactic="$MACHETE_TACTIC" \
@@ -643,6 +708,7 @@ run_w4a16_decode_fpa_case() {
   run_case "$label" \
     --require-file "$FPA_TACTIC" \
     --require-tactic-entry "$FPA_TACTIC" "$m,$n,$k,$W4A16_GROUP|" \
+    --dedupe-key "w4a16-fpa:$m,$n,$k,$W4A16_GROUP,fp16,int4" \
     "$FPA_BIN" \
     --m="$m" --n="$n" --k="$k" --group_size="$W4A16_GROUP" \
     --tactic="$FPA_TACTIC" \
@@ -664,6 +730,7 @@ run_rmsnorm_shape_case() {
   local embed="$4"
 
   run_case "$label" \
+    --dedupe-key "rmsnorm:$batch,$embed,fp16" \
     "$bin" \
     --batch "$batch" --embed "$embed" --dtype fp16 --no-check \
     --bench 0 1
@@ -676,6 +743,7 @@ run_flash_attn_core_case() {
 
   run_case "$label" \
     --require-file "$FLASH_ATTN_SCRIPT" \
+    --dedupe-key "flash-attn-core:$mode,$seq_len,$FULL_ATTN_Q_HEADS,$FULL_ATTN_KV_HEADS,$FULL_ATTN_HEAD_DIM" \
     "$PYTHON_BIN" "$FLASH_ATTN_SCRIPT" \
     "$mode" "$seq_len" "$FULL_ATTN_Q_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
     --bench "$ATTN_BENCH_WARMUP" "$ATTN_BENCH_ITERS"
@@ -686,6 +754,7 @@ run_sampling_case() {
   local op="$2"
 
   run_case "$label" \
+    --dedupe-key "sampling:$op,$HIDDEN_DIM,$SAMPLING_VOCAB,$SAMPLING_TOPK,$SAMPLING_TOPP" \
     "$SAMPLING_BIN" \
     --op="$op" --hidden="$HIDDEN_DIM" --vocab="$SAMPLING_VOCAB" \
     --top-k="$SAMPLING_TOPK" --top-p="$SAMPLING_TOPP" \
@@ -700,6 +769,7 @@ run_cublas_gemm_case() {
   local out_dtype="${5:-fp16}"
 
   run_case "$label" \
+    --dedupe-key "cublas-gemm:$m,$n,$k,fp16,$out_dtype" \
     "$CUBLAS_GEMM_BIN" \
     --m="$m" --n="$n" --k="$k" --dtype fp16 --out-dtype "$out_dtype" \
     --bench 0 1
@@ -712,6 +782,7 @@ run_moe_shared_expert_case() {
   local out_dim="${4:-1}"
 
   run_case "$label" \
+    --dedupe-key "moe-shared-expert:$op,$tokens,$MOE_SHARED_HIDDEN,$out_dim,fp16" \
     "$MOE_SHARED_EXPERT_BIN" \
     --op="$op" --tokens="$tokens" --hidden="$MOE_SHARED_HIDDEN" --out-dim="$out_dim" --dtype fp16 \
     --bench 0 1
@@ -731,6 +802,7 @@ run_residual_add_case() {
   local tokens="$2"
 
   run_case "$label" \
+    --dedupe-key "residual-add:$tokens,$HIDDEN_DIM,fp16" \
     "$LINEAR_OPS_BIN" \
     --op=residual_add --tokens="$tokens" --hidden="$HIDDEN_DIM" --dtype fp16 \
     --bench 0 1
@@ -779,6 +851,11 @@ else
     if [[ -n "$NCU_LAUNCH_COUNT" ]]; then
       echo "ncu count:      $NCU_LAUNCH_COUNT"
     fi
+  fi
+  if [[ "$BENCH_DEDUPE" != 0 ]]; then
+    echo "dedupe:         enabled"
+  else
+    echo "dedupe:         disabled"
   fi
   echo "============================================================"
 fi
@@ -993,6 +1070,7 @@ echo
 echo "============================================================"
 echo "benchmark logs are under: $OUT_DIR"
 echo "ran cases: $RAN_CASES"
+echo "skipped duplicates: $SKIPPED_CASES"
 if [[ "$FAILED" == 0 ]]; then
   echo "All selected cases completed successfully."
 else
