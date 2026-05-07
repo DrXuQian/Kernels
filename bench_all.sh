@@ -789,6 +789,16 @@ run_moe_shared_expert_case() {
     --bench 0 1
 }
 
+run_moe_shared_expert_activation_case() {
+  local label="$1"
+  local tokens="$2"
+
+  run_case "$label" \
+    --dedupe-key "trtllm-shared-expert-activation:$tokens,$MOE_DOWN_N,fp16" \
+    "$MOE_TRTLLM_AUX_DIR/bench_shared_expert_activation" "$tokens" "$MOE_DOWN_N" fp16 \
+    --bench 0 1
+}
+
 run_linear_dense_case() {
   local label="$1"
   local op="$2"
@@ -966,6 +976,8 @@ run_w4a16_decode_fpa_case "w4a16_decode_full_attn_o_proj_fpA_intB" \
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_consistent_expert_up_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_UP_N" "$W4A16_CONSISTENT_EXPERT_UP_K"
 
+run_moe_shared_expert_activation_case "moe_shared_expert_activation_prefill_trtllm" "$PREFILL_TOKENS"
+
 run_w4a16_prefill_cutlass55_case "w4a16_prefill_consistent_expert_down_cutlass55" \
   "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
 
@@ -979,6 +991,8 @@ run_moe_shared_expert_case "moe_shared_expert_fusion_prefill" "sigmoid_mul_add" 
 
 run_w4a16_decode_fpa_case "w4a16_decode_consistent_expert_up_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_UP_N" "$W4A16_CONSISTENT_EXPERT_UP_K"
+
+run_moe_shared_expert_activation_case "moe_shared_expert_activation_decode_trtllm" "$DECODE_TOKENS"
 
 run_w4a16_decode_fpa_case "w4a16_decode_consistent_expert_down_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"

@@ -164,6 +164,8 @@ Run selected single cases:
 ./bench_all.sh --case moe_down_prefill_trtllm
 ./bench_all.sh --case moe_gate_up_decode_vllm
 ./bench_all.sh --case moe_finalize_prefill_trtllm
+./bench_all.sh --case moe_shared_expert_activation_prefill_trtllm
+./bench_all.sh --case moe_shared_expert_activation_decode_trtllm
 ```
 
 Direct MoE commands when bypassing `bench_all.sh`:
@@ -177,6 +179,12 @@ moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gem
 
 moe_ffn/w4a16/vllm/marlin/bench_marlin_moe \
   1 256 8 2048 3072 --balanced --no-topk-weights --bench 0 1
+
+moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation \
+  3823 1024 fp16 --bench 0 1
+
+moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation \
+  1 1024 fp16 --bench 0 1
 ```
 
 The isolated MoE finalize study is separate from default builds:

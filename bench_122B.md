@@ -176,6 +176,7 @@ Build and run:
 | `moe_down_decode_vllm` | routed `(8,1,1024,3072)` | nsys | 14.561 | 20.510 | 30765 |
 | `moe_finalize_decode_vllm` | `(8,1,3072)->(1,3072)` | nsys | 1.696 | 1.772 | 2658 |
 | `w4a16_decode_consistent_expert_up_fpA_intB` | `(1,3072,2048)` | nsys | 3.616 | 5.028 | 7542 |
+| `moe_shared_expert_activation_decode_trtllm` | `(1,2048)->(1,1024)` | nsys, warmed average | 2.492 | not tested | not tested |
 | `w4a16_decode_consistent_expert_down_fpA_intB` | `(1,1024,3072)` | nsys | 4.032 | 5.349 | 8023 |
 | `moe_shared_expert_gate_decode_cublas` | `(1,1,3072)` | not tested by nsys | not tested | not tested | not tested |
 | `moe_shared_expert_fusion_decode` | `(1,3072)` | CUDA event single-run | 20.3 | not tested | not tested |
@@ -195,6 +196,7 @@ Build and run:
 | `moe_down_prefill_trtllm` | per expert `(3823,1024)->(3823,3072)` | nsys | 675.654 | 491.889 | 737833 |
 | `moe_finalize_prefill_trtllm` | `(3823*8,3072)->(3823,3072)` | nsys | 98.534 | 172.975 | 259463 |
 | `w4a16_prefill_consistent_expert_up_cutlass55` | `(3823,3072,2048)` | nsys | 111.613 | 113.129 | 169694 |
+| `moe_shared_expert_activation_prefill_trtllm` | `(3823,2048)->(3823,1024)` | nsys, warmed average | 13.017 | not tested | not tested |
 | `w4a16_prefill_consistent_expert_down_cutlass55` | `(3823,1024,3072)` | nsys | 69.726 | 57.661 | 86491 |
 | `moe_shared_expert_gate_prefill_cublas` | `(3823,1,3072)` | not tested by nsys | not tested | not tested | not tested |
 | `moe_shared_expert_fusion_prefill` | `(3823,3072)` | CUDA event single-run | 89.5 | not tested | not tested |

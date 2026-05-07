@@ -103,7 +103,7 @@ Module order:
 | 9 | Finalize routing | `(3823*8,3072)->(3823,3072)` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_finalize_moe_routing` | `moe_finalize_prefill_trtllm` |
 | 10 | Shared expert gate FP16 GEMM | `(3823,3072)->(3823,1)` | covered | `general/bench_cublas_gemm` | `moe_shared_expert_gate_prefill_cublas` |
 | 11 | Shared/consistent expert up W4A16 GEMM | `(3823,2048)->(3823,3072)` | covered | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | `w4a16_prefill_consistent_expert_up_cutlass55` |
-| 12 | Shared expert activation | `(3823,2048)->(3823,1024)` | missing | none | missing: no CUDA standalone in repo |
+| 12 | Shared expert activation, `SiLU(gate) * up` | `(3823,2048)->(3823,1024)` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation` | `moe_shared_expert_activation_prefill_trtllm` |
 | 13 | Shared/consistent expert down W4A16 GEMM | `(3823,3072)->(3823,1024)` | covered | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | `w4a16_prefill_consistent_expert_down_cutlass55` |
 | 14 | Shared expert fusion, `routed + sigmoid(gate) * shared` | `(3823,3072)` | covered | `moe_ffn/bench_shared_expert` | `moe_shared_expert_fusion_prefill` |
 | 15 | Residual add | `(3823,3072)+(3823,3072)` | covered | `linear_attn/bench_linear_ops` | `moe_ffn_prefill_residual_add` |
@@ -122,7 +122,7 @@ Module order:
 | 8 | Finalize / sum experts | `(8,1,3072)->(1,3072)` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum` | `moe_finalize_decode_vllm` |
 | 9 | Shared expert gate FP16 GEMM | `(1,3072)->(1,1)` | covered | `general/bench_cublas_gemm` | `moe_shared_expert_gate_decode_cublas` |
 | 10 | Shared/consistent expert up W4A16 GEMM | `(1,2048)->(1,3072)` | covered | `general/w4a16_gemm/fpA_intB_standalone` | `w4a16_decode_consistent_expert_up_fpA_intB` |
-| 11 | Shared expert activation | `(1,2048)->(1,1024)` | missing | none | missing: no CUDA standalone in repo |
+| 11 | Shared expert activation, `SiLU(gate) * up` | `(1,2048)->(1,1024)` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation` | `moe_shared_expert_activation_decode_trtllm` |
 | 12 | Shared/consistent expert down W4A16 GEMM | `(1,3072)->(1,1024)` | covered | `general/w4a16_gemm/fpA_intB_standalone` | `w4a16_decode_consistent_expert_down_fpA_intB` |
 | 13 | Shared expert fusion, `routed + sigmoid(gate) * shared` | `(1,3072)` | covered | `moe_ffn/bench_shared_expert` | `moe_shared_expert_fusion_decode` |
 | 14 | Residual add | `(1,3072)+(1,3072)` | covered | `linear_attn/bench_linear_ops` | `moe_ffn_decode_residual_add` |

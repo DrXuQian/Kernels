@@ -305,6 +305,61 @@ int main(int argc, char** argv)
 }
 #endif
 
+#ifdef BENCH_SHARED_ACTIVATION
+#include "bench_timer.h"
+
+template <typename T>
+int run_shared_activation(int tokens, int inter_size, BenchTimer& timer)
+{
+    std::vector<T> h_input(static_cast<size_t>(tokens) * inter_size * 2);
+    std::vector<int64_t> h_offsets(2);
+    for (int64_t i = 0; i < static_cast<int64_t>(h_input.size()); ++i)
+    {
+        h_input[i] = trtllm_aux_from_float<T>(static_cast<float>((i * 23 + 11) % 101) * 0.001f);
+    }
+    h_offsets[0] = 0;
+    h_offsets[1] = tokens;
+
+    T* d_input = nullptr;
+    T* d_output = nullptr;
+    int64_t* d_offsets = nullptr;
+    TRTLLM_AUX_CUDA_CHECK(cudaMalloc(&d_input, h_input.size() * sizeof(T)));
+    TRTLLM_AUX_CUDA_CHECK(cudaMalloc(&d_output, static_cast<size_t>(tokens) * inter_size * sizeof(T)));
+    TRTLLM_AUX_CUDA_CHECK(cudaMalloc(&d_offsets, h_offsets.size() * sizeof(int64_t)));
+    TRTLLM_AUX_CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T), cudaMemcpyHostToDevice));
+    TRTLLM_AUX_CUDA_CHECK(cudaMemcpy(d_offsets, h_offsets.data(), h_offsets.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+
+    timer.run([&]() {
+        trtllm_aux::gated_activation_launch<T>(d_output, d_input, d_offsets, inter_size, tokens, 1, 0);
+    });
+    TRTLLM_AUX_CUDA_CHECK(cudaGetLastError());
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_offsets);
+    return 0;
+}
+
+int main(int argc, char** argv)
+{
+    BenchTimer timer;
+    timer.parse(argc, argv);
+    argc = BenchTimer::strip_bench_args(argc, argv);
+    int tokens = (argc > 1) ? std::atoi(argv[1]) : 1;
+    int inter_size = (argc > 2) ? std::atoi(argv[2]) : 1024;
+    std::string dtype = (argc > 3) ? argv[3] : "fp16";
+    std::printf("bench trtllm shared_expert_activation: tokens=%d rows=%d inter=%d dtype=%s\n", tokens, tokens,
+        inter_size, dtype.c_str());
+    if (dtype == "fp16" || dtype == "half")
+        return run_shared_activation<half>(tokens, inter_size, timer);
+#if ENABLE_BF16
+    if (dtype == "bf16")
+        return run_shared_activation<__nv_bfloat16>(tokens, inter_size, timer);
+#endif
+    std::fprintf(stderr, "unsupported dtype: %s\n", dtype.c_str());
+    return 1;
+}
+#endif
+
 #ifdef BENCH_FINALIZE
 #include "bench_timer.h"
 
