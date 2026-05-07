@@ -125,6 +125,8 @@ Run selected single cases:
 ```bash
 ./bench_all.sh --case linear_prefill_flashinfer_gdn
 ./bench_all.sh --case linear_decode_gdn
+./bench_all.sh --case linear_attn_prefill_fused_rms_norm_gate
+./bench_all.sh --case linear_attn_decode_fused_rms_norm_gate
 ./bench_all.sh --case w4a16_prefill_linear_attn_in_proj_qkv_cutlass55
 ./bench_all.sh --case w4a16_decode_linear_attn_out_proj_fpA_intB
 ```
@@ -134,6 +136,8 @@ Direct GDN commands when bypassing `bench_all.sh`:
 ```bash
 linear_attn/bench_gated_delta_net 1 64 128 1 --bench 0 1
 linear_attn/bench_gdn_prefill 3823 16 64 128 1 --bench 0 1
+linear_attn/bench_fused_rms_norm_gate 64 128 --bench 0 1
+linear_attn/bench_fused_rms_norm_gate $((3823 * 64)) 128 --bench 0 1
 ```
 
 ## MoE-FFN

@@ -126,6 +126,7 @@ Build and run:
 | `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | `(1,8192,3072)` | nsys | 6.976 | 9.091 | 13637 |
 | `linear_decode_conv1d_update` | `(1,12288)` | nsys | 2.528 | 2.948 | 4422 |
 | `linear_decode_gdn` | `Q,K,V:(1,64,128)` | nsys | 4.480 | 4.661 | 6991 |
+| `linear_attn_decode_fused_rms_norm_gate` | `(64,128)` | CUDA event single-run | 185.6 | not tested | not tested |
 | `w4a16_decode_linear_attn_out_proj_fpA_intB` | `(1,3072,8192)` | nsys | 8.672 | 14.235 | 21352 |
 | `linear_attn_decode_residual_add` | `(1,3072)` | CUDA event single-run | 17.4 | not tested | not tested |
 
@@ -140,6 +141,7 @@ Build and run:
 | `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | `(3823,8192,3072)` | nsys | 365.882 | 321.688 | 482532 |
 | `linear_prefill_conv1d_fwd` | `(3823,12288)` | nsys | 127.208 | 118.904 | 178356 |
 | `linear_prefill_flashinfer_gdn` | `tokens=3823, q=16, v=64, d=128` | nsys | 520.926 | 1212.643 | 1818965 |
+| `linear_attn_prefill_fused_rms_norm_gate` | `(3823*64,128)` | CUDA event single-run | 752.1 | not tested | not tested |
 | `w4a16_prefill_linear_attn_out_proj_cutlass55` | `(3823,3072,8192)` | nsys | 391.321 | 327.592 | 491388 |
 | `linear_attn_prefill_residual_add` | `(3823,3072)` | CUDA event single-run | 64.8 | not tested | not tested |
 

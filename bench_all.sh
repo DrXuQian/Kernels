@@ -81,6 +81,7 @@ MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
 MOE_VLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/vllm/auxiliary")"
 LINEAR_RMSNORM_BIN="$(repo_path "linear_attn/bench_rmsnorm")"
 LINEAR_OPS_BIN="$(repo_path "linear_attn/bench_linear_ops")"
+LINEAR_FUSED_RMS_GATE_BIN="$(repo_path "linear_attn/bench_fused_rms_norm_gate")"
 FLASH_RMSNORM_BIN="$(repo_path "flash_attn/bench_rmsnorm")"
 FLASH_ATTN_SCRIPT="$(repo_path "flash_attn/bench_flash_attn.py")"
 MOE_RMSNORM_BIN="$(repo_path "moe_ffn/bench_rmsnorm")"
@@ -808,6 +809,15 @@ run_residual_add_case() {
     --bench 0 1
 }
 
+run_linear_fused_rms_gate_case() {
+  local label="$1"
+  local rows="$2"
+
+  run_case "$label" \
+    --dedupe-key "linear-fused-rms-gate:$rows,$LINEAR_HEAD_DIM,bf16" \
+    "$LINEAR_FUSED_RMS_GATE_BIN" "$rows" "$LINEAR_HEAD_DIM" --bench 0 1
+}
+
 if [[ "$LIST_CASES" != 1 ]]; then
   if [[ ! -d "$RUN_DIR" ]]; then
     echo "[bench_all][error] run dir does not exist: $RUN_DIR" >&2
@@ -880,6 +890,9 @@ run_case "linear_prefill_conv1d_fwd" \
 
 run_case "linear_prefill_flashinfer_gdn" \
   linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+
+run_linear_fused_rms_gate_case "linear_attn_decode_fused_rms_norm_gate" "$LINEAR_V_HEADS"
+run_linear_fused_rms_gate_case "linear_attn_prefill_fused_rms_norm_gate" "$((PREFILL_TOKENS * LINEAR_V_HEADS))"
 
 run_residual_add_case "linear_attn_decode_residual_add" "$DECODE_TOKENS"
 run_residual_add_case "linear_attn_prefill_residual_add" "$PREFILL_TOKENS"

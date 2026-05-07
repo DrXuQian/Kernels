@@ -9,7 +9,6 @@ Coverage status meanings:
 | Status | Meaning |
 |---|---|
 | `covered` | A standalone CUDA/Python benchmark exists in this repo and is wired into `bench_all.sh`. |
-| `standalone-only` | A standalone binary/script exists, but it is not currently wired into `bench_all.sh`. |
 | `missing` | The model needs this kernel, but this repo does not currently have a CUDA standalone benchmark for it. |
 
 Module order:
@@ -67,7 +66,7 @@ Module order:
 | 6 | Gate prep, `g = -exp(A) * softplus(a + dt_bias)` | `(3823,64)` | missing | none | missing: no CUDA standalone in repo |
 | 7 | Conv1d forward | `(3823,12288)` | covered | `linear_attn/bench_conv1d_fwd` | `linear_prefill_conv1d_fwd` |
 | 8 | Gated Delta Net prefill | `tokens=3823, q_heads=16, v_heads=64, head_dim=128` | covered | `linear_attn/bench_gdn_prefill` | `linear_prefill_flashinfer_gdn` |
-| 9 | Fused RMSNorm gate | `(3823*64,128)` | standalone-only | `linear_attn/bench_fused_rms_norm_gate` | not wired into `bench_all.sh` |
+| 9 | Fused RMSNorm gate | `(3823*64,128)` | covered | `linear_attn/bench_fused_rms_norm_gate` | `linear_attn_prefill_fused_rms_norm_gate` |
 | 10 | Output projection W4A16 GEMM | `(3823,8192)->(3823,3072)` | covered | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | `w4a16_prefill_linear_attn_out_proj_cutlass55` |
 | 11 | Residual add | `(3823,3072)+(3823,3072)` | covered | `linear_attn/bench_linear_ops` | `linear_attn_prefill_residual_add` |
 
@@ -83,7 +82,7 @@ Module order:
 | 6 | Gate prep, `g = -exp(A) * softplus(a + dt_bias)` | `(1,64)` | missing | none | missing: no CUDA standalone in repo |
 | 7 | Conv1d update | `(1,12288)` | covered | `linear_attn/bench_conv1d_update` | `linear_decode_conv1d_update` |
 | 8 | Gated Delta Net decode | `Q,K,V:(1,64,128)` | covered | `linear_attn/bench_gated_delta_net` | `linear_decode_gdn` |
-| 9 | Fused RMSNorm gate | `(64,128)` | standalone-only | `linear_attn/bench_fused_rms_norm_gate` | not wired into `bench_all.sh` |
+| 9 | Fused RMSNorm gate | `(64,128)` | covered | `linear_attn/bench_fused_rms_norm_gate` | `linear_attn_decode_fused_rms_norm_gate` |
 | 10 | Output projection W4A16 GEMM | `(1,8192)->(1,3072)` | covered | `general/w4a16_gemm/fpA_intB_standalone` | `w4a16_decode_linear_attn_out_proj_fpA_intB` |
 | 11 | Residual add | `(1,3072)+(1,3072)` | covered | `linear_attn/bench_linear_ops` | `linear_attn_decode_residual_add` |
 
