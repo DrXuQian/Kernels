@@ -506,7 +506,7 @@ def pie_rows_with_other(rows: list[tuple[str, float, str]], limit: int = 12) -> 
 
 def write_pie_chart(path: Path, title: str, rows: list[tuple[str, float, str]], limit: int = 12) -> None:
     rows = pie_rows_with_other(rows, limit=limit)
-    fig, ax = plt.subplots(figsize=(9.5, 6.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(10.5, 6.6), constrained_layout=True)
     if not rows:
         ax.set_title(title)
         ax.axis("off")
@@ -518,26 +518,28 @@ def write_pie_chart(path: Path, title: str, rows: list[tuple[str, float, str]], 
     values = [row[1] for row in rows]
     colors = [row[2] for row in rows]
     total = sum(values)
+    label_threshold_pct = 5.0
+    pie_labels = [
+        f"{label}\n{value / total * 100.0:.1f}%" if total > 0.0 and value / total * 100.0 >= label_threshold_pct else ""
+        for label, value in zip(labels, values)
+    ]
 
-    def pct_label(pct: float) -> str:
-        value = total * pct / 100.0
-        return f"{pct:.1f}%\n{value:.1f} us"
-
-    wedges, _, autotexts = ax.pie(
+    wedges, label_texts = ax.pie(
         values,
+        labels=pie_labels,
         colors=colors,
         startangle=90,
         counterclock=False,
-        autopct=pct_label,
-        pctdistance=0.72,
+        labeldistance=0.66,
         wedgeprops={"edgecolor": "white", "linewidth": 1.0},
-        textprops={"fontsize": 8},
+        textprops={"fontsize": 8, "color": "#202020"},
     )
-    for autotext in autotexts:
-        autotext.set_color("#222222")
+    for text in label_texts:
+        text.set_horizontalalignment("center")
+        text.set_verticalalignment("center")
     ax.legend(
         wedges,
-        [f"{label}: {fmt_us(value)} us" for label, value in zip(labels, values)],
+        [f"{label}: {fmt_us(value)} us ({value / total * 100.0:.1f}%)" for label, value in zip(labels, values)],
         loc="center left",
         bbox_to_anchor=(1.0, 0.5),
         fontsize=8,
