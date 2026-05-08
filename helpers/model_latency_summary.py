@@ -8,6 +8,11 @@ import math
 from pathlib import Path
 from typing import Iterable
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 
 MODULES = ("Flash-Attn", "Linear-Attn", "MoE-FFN", "Sampling", "Other")
 PHASES = ("prefill", "decode", "unknown")
@@ -18,6 +23,32 @@ MODULE_COLORS = {
     "MoE-FFN": "#59A14F",
     "Sampling": "#E15759",
     "Other": "#9C755F",
+}
+
+OPERATOR_COLORS = {
+    "W4A16 GEMM (cutlass55)": "#4E79A7",
+    "W4A16 GEMM (fpA_intB)": "#76B7B2",
+    "MoE grouped GEMM (TRT-LLM)": "#59A14F",
+    "MoE GEMM (vLLM Marlin)": "#8CD17D",
+    "FP16 GEMM (cuBLAS)": "#B07AA1",
+    "LM head GEMM (cuBLAS)": "#FF9DA7",
+    "RMSNorm": "#9C755F",
+    "Q/K RMSNorm": "#BAB0AC",
+    "FlashAttention core": "#EDC948",
+    "Gated Delta Net": "#F28E2B",
+    "Causal Conv1d": "#FFBE7D",
+    "Residual add": "#E15759",
+    "Fused RMSNorm gate": "#A0CBE8",
+    "MoE routing/topk": "#86BCB6",
+    "MoE expert metadata/align": "#B6992D",
+    "MoE expand rows": "#499894",
+    "MoE gated activation": "#D37295",
+    "MoE finalize/sum": "#FABFD2",
+    "Shared expert activation": "#79706E",
+    "Shared expert fusion": "#D4A6C8",
+    "Sampling softmax": "#D7B5A6",
+    "Sampling top-k mask": "#E15759",
+    "Sampling top-p": "#FF9D9A",
 }
 
 DEFAULT_MODEL_CONFIG = {
@@ -54,6 +85,72 @@ def classify_module(case: str) -> str:
     return "Other"
 
 
+def classify_operator(case: str) -> str:
+    lower = case.lower()
+    base = lower
+    if base.endswith("__prefill"):
+        base = base[: -len("__prefill")]
+    elif base.endswith("__decode"):
+        base = base[: -len("__decode")]
+
+    if "cutlass55" in base:
+        return "W4A16 GEMM (cutlass55)"
+    if "fpa_intb" in base:
+        return "W4A16 GEMM (fpA_intB)"
+    if base in {"moe_gate_up_prefill_trtllm", "moe_down_prefill_trtllm"}:
+        return "MoE grouped GEMM (TRT-LLM)"
+    if base in {"moe_gate_up_decode_vllm", "moe_down_decode_vllm"}:
+        return "MoE GEMM (vLLM Marlin)"
+    if base == "sampling_lm_head_gemm":
+        return "LM head GEMM (cuBLAS)"
+    if base.endswith("_cublas"):
+        return "FP16 GEMM (cuBLAS)"
+    if base.endswith("_q_norm") or base.endswith("_k_norm"):
+        return "Q/K RMSNorm"
+    if base.endswith("_rmsnorm"):
+        return "RMSNorm"
+    if base.endswith("_residual_add"):
+        return "Residual add"
+    if base.startswith("flash_attn_") and base.endswith("_full_attn"):
+        return "FlashAttention core"
+    if base in {"linear_decode_gdn", "linear_prefill_flashinfer_gdn"}:
+        return "Gated Delta Net"
+    if base in {"linear_decode_conv1d_update", "linear_prefill_conv1d_fwd"}:
+        return "Causal Conv1d"
+    if "fused_rms_norm_gate" in base:
+        return "Fused RMSNorm gate"
+    if base in {"moe_routing_prefill_trtllm", "moe_routing_decode_vllm"}:
+        return "MoE routing/topk"
+    if base in {"moe_expert_map_prefill_trtllm", "moe_align_decode_vllm"}:
+        return "MoE expert metadata/align"
+    if base == "moe_expand_prefill_trtllm":
+        return "MoE expand rows"
+    if base in {"moe_gated_prefill_trtllm", "moe_gated_decode_vllm"}:
+        return "MoE gated activation"
+    if base in {"moe_finalize_prefill_trtllm", "moe_finalize_decode_vllm"}:
+        return "MoE finalize/sum"
+    if "shared_expert_activation" in base:
+        return "Shared expert activation"
+    if "shared_expert_fusion" in base:
+        return "Shared expert fusion"
+    if base == "sampling_topk_mask_logits":
+        return "Sampling top-k mask"
+    if base == "sampling_softmax":
+        return "Sampling softmax"
+    if base == "sampling_top_p":
+        return "Sampling top-p"
+    return display_label(case)
+
+
+def operator_color(operator: str) -> str:
+    if operator in OPERATOR_COLORS:
+        return OPERATOR_COLORS[operator]
+    palette = list(plt.get_cmap("tab20").colors)
+    idx = sum(ord(ch) for ch in operator) % len(palette)
+    rgb = palette[idx]
+    return "#{:02x}{:02x}{:02x}".format(*(int(channel * 255) for channel in rgb[:3]))
+
+
 def finite(value: object) -> bool:
     try:
         return not math.isnan(float(value))
@@ -71,6 +168,17 @@ def fmt_pct(value: float) -> str:
 
 def sanitize_svg_text(value: object) -> str:
     return html.escape(str(value), quote=True)
+
+
+def display_label(label: object, max_len: int = 72) -> str:
+    text = str(label)
+    if text.endswith("__prefill"):
+        text = text[: -len("__prefill")]
+    elif text.endswith("__decode"):
+        text = text[: -len("__decode")]
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
 
 
 def parse_case_log_metadata(path: Path) -> dict[str, str]:
@@ -354,6 +462,92 @@ def write_pie_svg(path: Path, title: str, rows: list[tuple[str, float, str]]) ->
     path.write_text("\n".join(parts) + "\n")
 
 
+def write_bar_chart(path: Path, title: str, rows: list[tuple[str, float, str]], x_label: str = "Latency (us)") -> None:
+    rows = [(display_label(label), value, color) for label, value, color in rows if value > 0.0]
+    rows.sort(key=lambda row: row[1])
+    height = max(3.4, 0.34 * len(rows) + 1.4)
+    width = 12.5
+    fig, ax = plt.subplots(figsize=(width, height), constrained_layout=True)
+    if not rows:
+        ax.set_title(title)
+        ax.axis("off")
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        return
+
+    labels = [row[0] for row in rows]
+    values = [row[1] for row in rows]
+    colors = [row[2] for row in rows]
+    ax.barh(labels, values, color=colors, edgecolor="white", linewidth=0.8)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_xlabel(x_label)
+    ax.grid(axis="x", alpha=0.25)
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    max_value = max(values)
+    pad = max_value * 0.012 if max_value > 0 else 0.1
+    for idx, value in enumerate(values):
+        ax.text(value + pad, idx, fmt_us(value), va="center", fontsize=8)
+    ax.set_xlim(0, max_value * 1.16 if max_value > 0 else 1.0)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def pie_rows_with_other(rows: list[tuple[str, float, str]], limit: int = 12) -> list[tuple[str, float, str]]:
+    rows = [(display_label(label, 42), value, color) for label, value, color in rows if value > 0.0]
+    rows.sort(key=lambda row: row[1], reverse=True)
+    if len(rows) <= limit:
+        return rows
+    kept = rows[:limit]
+    other = sum(value for _, value, _ in rows[limit:])
+    if other > 0.0:
+        kept.append(("Other", other, "#B0B0B0"))
+    return kept
+
+
+def write_pie_chart(path: Path, title: str, rows: list[tuple[str, float, str]], limit: int = 12) -> None:
+    rows = pie_rows_with_other(rows, limit=limit)
+    fig, ax = plt.subplots(figsize=(9.5, 6.2), constrained_layout=True)
+    if not rows:
+        ax.set_title(title)
+        ax.axis("off")
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        return
+
+    labels = [row[0] for row in rows]
+    values = [row[1] for row in rows]
+    colors = [row[2] for row in rows]
+    total = sum(values)
+
+    def pct_label(pct: float) -> str:
+        value = total * pct / 100.0
+        return f"{pct:.1f}%\n{value:.1f} us"
+
+    wedges, _, autotexts = ax.pie(
+        values,
+        colors=colors,
+        startangle=90,
+        counterclock=False,
+        autopct=pct_label,
+        pctdistance=0.72,
+        wedgeprops={"edgecolor": "white", "linewidth": 1.0},
+        textprops={"fontsize": 8},
+    )
+    for autotext in autotexts:
+        autotext.set_color("#222222")
+    ax.legend(
+        wedges,
+        [f"{label}: {fmt_us(value)} us" for label, value in zip(labels, values)],
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize=8,
+        frameon=False,
+    )
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def module_rows(summary: dict[str, object], phase: str | None = None) -> list[tuple[str, float, str]]:
     if phase is None:
         rows = summary["module_totals"]  # type: ignore[index]
@@ -370,6 +564,49 @@ def case_rows(summary: dict[str, object], phase: str, limit: int = 18) -> list[t
     return [
         (str(row["case"]), float(row["latency_us"]), MODULE_COLORS.get(str(row["module"]), "#999"))
         for row in selected
+    ]
+
+
+def all_case_rows(summary: dict[str, object], phase: str) -> list[tuple[str, float, str]]:
+    rows = [row for row in summary["cases"] if str(row["phase"]) == phase]  # type: ignore[index]
+    rows.sort(key=lambda row: float(row["latency_us"]), reverse=True)
+    return [
+        (str(row["case"]), float(row["latency_us"]), MODULE_COLORS.get(str(row["module"]), "#999"))
+        for row in rows
+    ]
+
+
+def operator_groups(summary: dict[str, object], phase: str | None = None) -> list[dict[str, object]]:
+    groups: dict[str, dict[str, object]] = {}
+    for row in summary["cases"]:  # type: ignore[index]
+        if phase is not None and str(row["phase"]) != phase:
+            continue
+        operator = classify_operator(str(row["case"]))
+        entry = groups.setdefault(
+            operator,
+            {
+                "operator": operator,
+                "latency_us": 0.0,
+                "cases": 0,
+                "modules": set(),
+            },
+        )
+        entry["latency_us"] = float(entry["latency_us"]) + float(row["latency_us"])
+        entry["cases"] = int(entry["cases"]) + 1
+        entry["modules"].add(str(row["module"]))  # type: ignore[union-attr]
+
+    rows = list(groups.values())
+    rows.sort(key=lambda row: float(row["latency_us"]), reverse=True)
+    return rows
+
+
+def operator_rows(summary: dict[str, object], phase: str | None = None, limit: int | None = None) -> list[tuple[str, float, str]]:
+    rows = operator_groups(summary, phase)
+    if limit is not None:
+        rows = rows[:limit]
+    return [
+        (str(row["operator"]), float(row["latency_us"]), operator_color(str(row["operator"])))
+        for row in rows
     ]
 
 
@@ -423,10 +660,34 @@ def write_markdown_report(
         "",
         "## Charts",
         "",
+        "Charts are generated with matplotlib. Operator charts aggregate same-source benchmark cases such as "
+        "cutlass55 W4A16 GEMMs, fpA_intB GEMMs, TRT-LLM MoE grouped GEMMs, and vLLM Marlin MoE GEMMs. "
+        "Pie charts merge the long tail into `Other`.",
+        "",
     ]
     for chart in chart_files:
         lines.append(f"![{chart.stem}]({chart.name})")
         lines.append("")
+
+    operator_table_rows = []
+    for row in operator_groups(model_summary)[:24]:
+        modules = ", ".join(sorted(row["modules"]))  # type: ignore[arg-type]
+        operator_table_rows.append(
+            [
+                str(row["operator"]),
+                modules,
+                str(row["cases"]),
+                fmt_us(float(row["latency_us"])),
+            ]
+        )
+    lines.extend(
+        [
+            "## Top Operator Contributions",
+            "",
+            markdown_table(["operator", "modules", "logical_cases", "model_latency_us"], operator_table_rows),
+            "",
+        ]
+    )
 
     top_rows = []
     cases = list(model_summary["cases"])  # type: ignore[arg-type]
@@ -491,16 +752,18 @@ def write_model_latency_summary(
     model_summary = aggregate_cases(model_cases)
 
     chart_files = [
-        out_dir / "model_latency_phase_bar.svg",
-        out_dir / "model_latency_module_bar.svg",
-        out_dir / "model_latency_prefill_modules_pie.svg",
-        out_dir / "model_latency_decode_modules_pie.svg",
-        out_dir / "model_latency_prefill_cases_bar.svg",
-        out_dir / "model_latency_decode_cases_bar.svg",
+        out_dir / "model_latency_phase_bar.png",
+        out_dir / "model_latency_module_bar.png",
+        out_dir / "model_latency_prefill_modules_pie.png",
+        out_dir / "model_latency_decode_modules_pie.png",
+        out_dir / "model_latency_prefill_operators_bar.png",
+        out_dir / "model_latency_prefill_operators_pie.png",
+        out_dir / "model_latency_decode_operators_bar.png",
+        out_dir / "model_latency_decode_operators_pie.png",
     ]
 
     phase_totals: dict[str, float] = model_summary["phase_totals"]  # type: ignore[assignment]
-    write_bar_svg(
+    write_bar_chart(
         chart_files[0],
         "Model Latency By Phase",
         [
@@ -508,11 +771,13 @@ def write_model_latency_summary(
             ("decode", phase_totals.get("decode", 0.0), "#D67C4E"),
         ],
     )
-    write_bar_svg(chart_files[1], "Model Latency By Module", module_rows(model_summary))
-    write_pie_svg(chart_files[2], "Prefill Module Share", module_rows(model_summary, "prefill"))
-    write_pie_svg(chart_files[3], "Decode Module Share", module_rows(model_summary, "decode"))
-    write_bar_svg(chart_files[4], "Prefill Top Case Latencies", case_rows(model_summary, "prefill"), "Latency (us)")
-    write_bar_svg(chart_files[5], "Decode Top Case Latencies", case_rows(model_summary, "decode"), "Latency (us)")
+    write_bar_chart(chart_files[1], "Model Latency By Module", module_rows(model_summary))
+    write_pie_chart(chart_files[2], "Prefill Module Share", module_rows(model_summary, "prefill"), limit=8)
+    write_pie_chart(chart_files[3], "Decode Module Share", module_rows(model_summary, "decode"), limit=8)
+    write_bar_chart(chart_files[4], "Prefill Operator Latencies", operator_rows(model_summary, "prefill", limit=30), "Latency (us)")
+    write_pie_chart(chart_files[5], "Prefill Operator Share", operator_rows(model_summary, "prefill"), limit=14)
+    write_bar_chart(chart_files[6], "Decode Operator Latencies", operator_rows(model_summary, "decode", limit=30), "Latency (us)")
+    write_pie_chart(chart_files[7], "Decode Operator Share", operator_rows(model_summary, "decode"), limit=14)
 
     report_path = out_dir / "model_latency_summary.md"
     write_markdown_report(report_path, title, source_name, model_summary, covered_summary, effective_config, duplicates, chart_files)
