@@ -1060,6 +1060,7 @@ run_case "moe_expand_prefill_trtllm" \
 
 run_case "moe_gate_up_prefill_trtllm" \
   --require-file "$MOE_TRTLLM_TACTIC" \
+  --require-tactic-entry "$MOE_TRTLLM_TACTIC" "fp16,$MOE_EXPERTS,$PREFILL_TOKENS,$MOE_GATE_N,$MOE_GATE_K,$MOE_GROUP|" \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
   --n="$MOE_GATE_N" --k="$MOE_GATE_K" --group_size="$MOE_GROUP" \
@@ -1072,6 +1073,7 @@ run_case "moe_gated_prefill_trtllm" \
 
 run_case "moe_down_prefill_trtllm" \
   --require-file "$MOE_TRTLLM_TACTIC" \
+  --require-tactic-entry "$MOE_TRTLLM_TACTIC" "fp16,$MOE_EXPERTS,$PREFILL_TOKENS,$MOE_DOWN_N,$MOE_DOWN_K,$MOE_GROUP|" \
   "$MOE_TRTLLM_BIN" \
   --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
   --n="$MOE_DOWN_N" --k="$MOE_DOWN_K" --group_size="$MOE_GROUP" \
