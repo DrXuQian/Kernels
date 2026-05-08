@@ -30,10 +30,11 @@ MOE_EXPERTS=8
 MOE_ROUTER_EXPERTS=256
 MOE_TOPK=8
 MOE_GROUP=128
-MOE_GATE_N=3072
-MOE_GATE_K=2048
-MOE_DOWN_N=1024
-MOE_DOWN_K=3072
+MOE_INTERMEDIATE=1024
+MOE_GATE_N=2048
+MOE_GATE_K=3072
+MOE_DOWN_N=3072
+MOE_DOWN_K=1024
 MOE_SHARED_HIDDEN=3072
 
 W4A16_GROUP=128
@@ -54,14 +55,30 @@ W4A16_FULL_ATTN_O_PROJ_K=8192
 FULL_ATTN_Q_HEADS=32
 FULL_ATTN_KV_HEADS=2
 FULL_ATTN_HEAD_DIM=256
-W4A16_CONSISTENT_EXPERT_UP_N=3072
-W4A16_CONSISTENT_EXPERT_UP_K=2048
-W4A16_CONSISTENT_EXPERT_DOWN_N=1024
-W4A16_CONSISTENT_EXPERT_DOWN_K=3072
+W4A16_CONSISTENT_EXPERT_UP_N=2048
+W4A16_CONSISTENT_EXPERT_UP_K=3072
+W4A16_CONSISTENT_EXPERT_DOWN_N=3072
+W4A16_CONSISTENT_EXPERT_DOWN_K=1024
 
 SAMPLING_VOCAB=248320
 SAMPLING_TOPK=50
 SAMPLING_TOPP=0.9
+
+MODEL_LAYERS="${MODEL_LAYERS:-48}"
+MODEL_FULL_ATTN_LAYERS="${MODEL_FULL_ATTN_LAYERS:-12}"
+MODEL_LINEAR_ATTN_LAYERS="${MODEL_LINEAR_ATTN_LAYERS:-36}"
+MODEL_MOE_FFN_LAYERS="${MODEL_MOE_FFN_LAYERS:-48}"
+MODEL_SAMPLING_PREFILL_COUNT="${MODEL_SAMPLING_PREFILL_COUNT:-1}"
+MODEL_SAMPLING_DECODE_COUNT="${MODEL_SAMPLING_DECODE_COUNT:-1}"
+
+MODEL_SUMMARY_ARGS=(
+  --model-layers "$MODEL_LAYERS"
+  --full-attn-layers "$MODEL_FULL_ATTN_LAYERS"
+  --linear-attn-layers "$MODEL_LINEAR_ATTN_LAYERS"
+  --moe-ffn-layers "$MODEL_MOE_FFN_LAYERS"
+  --sampling-prefill-count "$MODEL_SAMPLING_PREFILL_COUNT"
+  --sampling-decode-count "$MODEL_SAMPLING_DECODE_COUNT"
+)
 
 repo_path() {
   local path="$1"
@@ -151,6 +168,11 @@ Environment variables:
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
+  MODEL_FULL_ATTN_LAYERS   Model summary full-attention multiplier. Default: 12.
+  MODEL_LINEAR_ATTN_LAYERS Model summary linear-attention multiplier. Default: 36.
+  MODEL_MOE_FFN_LAYERS     Model summary MoE-FFN multiplier. Default: 48.
+  MODEL_SAMPLING_PREFILL_COUNT Model summary prefill sampling count. Default: 1.
+  MODEL_SAMPLING_DECODE_COUNT  Model summary decode sampling count. Default: 1.
   NCU_METRICS              Nsight Compute metrics for --ncu-cycles.
                            Default: sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum
   NCU_LAUNCH_SKIP          Optional Nsight Compute --launch-skip value.
@@ -648,7 +670,8 @@ summarize_perfstatistics() {
     "$report_base" \
     --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
     --bench-out-dir "$OUT_DIR" \
-    --model-summary-dir "$model_summary_dir" 2>&1 | tee "$summary_log"
+    --model-summary-dir "$model_summary_dir" \
+    "${MODEL_SUMMARY_ARGS[@]}" 2>&1 | tee "$summary_log"
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
@@ -680,7 +703,8 @@ summarize_ncu_cycles() {
     --detail \
     --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
     --bench-out-dir "$OUT_DIR" \
-    --model-summary-dir "$model_summary_dir" 2>&1 | tee "$summary_log"
+    --model-summary-dir "$model_summary_dir" \
+    "${MODEL_SUMMARY_ARGS[@]}" 2>&1 | tee "$summary_log"
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
@@ -804,8 +828,8 @@ run_moe_shared_expert_activation_case() {
   local tokens="$2"
 
   run_case "$label" \
-    --dedupe-key "trtllm-shared-expert-activation:$tokens,$MOE_DOWN_N,fp16" \
-    "$MOE_TRTLLM_AUX_DIR/bench_shared_expert_activation" "$tokens" "$MOE_DOWN_N" fp16 \
+    --dedupe-key "trtllm-shared-expert-activation:$tokens,$MOE_INTERMEDIATE,fp16" \
+    "$MOE_TRTLLM_AUX_DIR/bench_shared_expert_activation" "$tokens" "$MOE_INTERMEDIATE" fp16 \
     --bench 0 1
 }
 
@@ -866,6 +890,7 @@ else
   echo "ctx len:        $CTX_LEN"
   echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     vLLM components"
+  echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
     echo "case filters:   ${CASE_FILTERS[*]}"
   fi
@@ -1042,7 +1067,7 @@ run_case "moe_gate_up_prefill_trtllm" \
   --warmup=0 --iters=1
 
 run_case "moe_gated_prefill_trtllm" \
-  "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" fp16 \
+  "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_INTERMEDIATE" fp16 \
   --bench 0 1
 
 run_case "moe_down_prefill_trtllm" \
@@ -1070,7 +1095,7 @@ run_case "moe_gate_up_decode_vllm" \
   --balanced --no-topk-weights --bench 0 1
 
 run_case "moe_gated_decode_vllm" \
-  "$MOE_VLLM_AUX_DIR/bench_silu_and_mul" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_N" \
+  "$MOE_VLLM_AUX_DIR/bench_silu_and_mul" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_INTERMEDIATE" \
   --bench 0 1
 
 run_case "moe_down_decode_vllm" \

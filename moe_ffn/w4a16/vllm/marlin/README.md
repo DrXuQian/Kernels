@@ -20,6 +20,6 @@ make
 ## ncu Profile
 
 ```bash
-ncu --set full --kernel-name "Marlin" -o marlin_decode_gate_up  ./bench_marlin_moe 1 256 8 2048 3072 --balanced --no-topk-weights --bench 0 1
-ncu --set full --kernel-name "Marlin" -o marlin_decode_down     ./bench_marlin_moe 1 256 8 3072 1024 --balanced --bench 0 1
+ncu --set full --kernel-name "Marlin" -o marlin_decode_gate_up  ./bench_marlin_moe 1 256 8 3072 2048 --balanced --no-topk-weights --bench 0 1
+ncu --set full --kernel-name "Marlin" -o marlin_decode_down     ./bench_marlin_moe 1 256 8 1024 3072 --balanced --bench 0 1
 ```

@@ -42,6 +42,10 @@ All benchmark cases use single-run settings (`warmup=0`, `iters=1`, or
 `tokens=1, experts=256, topk=8, block=16` and follows vLLM's general two-kernel
 path.
 
+MoE routed/shared W4A16 GEMM `N/K` directions were corrected after an audit
+against `moe_intermediate_size=1024` and `hidden_size=3072`. Rows marked
+`needs rerun` should be regenerated with the current `bench_all.sh`.
+
 Some late-added smoke results are CUDA-event single-run numbers rather than
 nsys traces; those rows are marked in the `Method` column.
 
@@ -176,13 +180,13 @@ Build and run:
 | `moe_router_gate_decode_cublas` | `(1,256,3072)` | not tested by nsys | not tested | not tested | not tested |
 | `moe_routing_decode_vllm` | `(1,256)->topk` | nsys | 4.352 | 5.867 | 8801 |
 | `moe_align_decode_vllm` | `(1,256,topk=8,block=16)` | nsys, 2 kernels | 4.928 | needs rerun | needs rerun |
-| `moe_gate_up_decode_vllm` | routed `(8,1,2048,3072)` | nsys | 21.185 | 31.368 | 47052 |
-| `moe_gated_decode_vllm` | `(8,1,2048)->(8,1,1024)` | nsys | 2.720 | 2.943 | 4414 |
-| `moe_down_decode_vllm` | routed `(8,1,1024,3072)` | nsys | 14.561 | 20.510 | 30765 |
-| `moe_finalize_decode_vllm` | `(8,1,3072)->(1,3072)` | nsys | 1.696 | 1.772 | 2658 |
-| `w4a16_decode_consistent_expert_up_fpA_intB` | `(1,3072,2048)` | nsys | 3.616 | 5.028 | 7542 |
+| `moe_gate_up_decode_vllm` | routed `(8,1,3072)->(8,1,2048)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `moe_gated_decode_vllm` | `(8,1,2048)->(8,1,1024)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `moe_down_decode_vllm` | routed `(8,1,1024)->(8,1,3072)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `moe_finalize_decode_vllm` | `(8,1,3072)->(1,3072)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `w4a16_decode_consistent_expert_up_fpA_intB` | `(1,2048,3072)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
 | `moe_shared_expert_activation_decode_trtllm` | `(1,2048)->(1,1024)` | nsys, warmed average | 2.492 | not tested | not tested |
-| `w4a16_decode_consistent_expert_down_fpA_intB` | `(1,1024,3072)` | nsys | 4.032 | 5.349 | 8023 |
+| `w4a16_decode_consistent_expert_down_fpA_intB` | `(1,3072,1024)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
 | `moe_shared_expert_gate_decode_cublas` | `(1,1,3072)` | not tested by nsys | not tested | not tested | not tested |
 | `moe_shared_expert_fusion_decode` | `(1,3072)` | CUDA event single-run | 20.3 | not tested | not tested |
 | `moe_ffn_decode_residual_add` | `(1,3072)` | CUDA event single-run | 17.0 | not tested | not tested |
@@ -196,13 +200,13 @@ Build and run:
 | `moe_routing_prefill_trtllm` | `(3823,256)->topk` | nsys | 5.824 | 3.443 | 5164 |
 | `moe_expert_map_prefill_trtllm` | topk/expert metadata | nsys, 3 kernels | 10.657 | 10.815 | 16222 |
 | `moe_expand_prefill_trtllm` | `(3823,3072)->(3823*8,3072)` | nsys | 284.848 | 188.691 | 283036 |
-| `moe_gate_up_prefill_trtllm` | per expert `(3823,3072)->(3823,2048)` | nsys | 1314.123 | 963.023 | 1444534 |
-| `moe_gated_prefill_trtllm` | `(3823*8,2048)->(3823*8,1024)` | nsys | 390.486 | 523.552 | 785328 |
-| `moe_down_prefill_trtllm` | per expert `(3823,1024)->(3823,3072)` | nsys | 675.654 | 491.889 | 737833 |
-| `moe_finalize_prefill_trtllm` | `(3823*8,3072)->(3823,3072)` | nsys | 98.534 | 172.975 | 259463 |
-| `w4a16_prefill_consistent_expert_up_cutlass55` | `(3823,3072,2048)` | nsys | 111.613 | 113.129 | 169694 |
+| `moe_gate_up_prefill_trtllm` | per expert `(3823,3072)->(3823,2048)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `moe_gated_prefill_trtllm` | `(3823*8,2048)->(3823*8,1024)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `moe_down_prefill_trtllm` | per expert `(3823,1024)->(3823,3072)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `moe_finalize_prefill_trtllm` | `(3823*8,3072)->(3823,3072)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
+| `w4a16_prefill_consistent_expert_up_cutlass55` | `(3823,2048,3072)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
 | `moe_shared_expert_activation_prefill_trtllm` | `(3823,2048)->(3823,1024)` | nsys, warmed average | 13.017 | not tested | not tested |
-| `w4a16_prefill_consistent_expert_down_cutlass55` | `(3823,1024,3072)` | nsys | 69.726 | 57.661 | 86491 |
+| `w4a16_prefill_consistent_expert_down_cutlass55` | `(3823,3072,1024)` | needs rerun after N/K fix | needs rerun | needs rerun | needs rerun |
 | `moe_shared_expert_gate_prefill_cublas` | `(3823,1,3072)` | not tested by nsys | not tested | not tested | not tested |
 | `moe_shared_expert_fusion_prefill` | `(3823,3072)` | CUDA event single-run | 89.5 | not tested | not tested |
 | `moe_ffn_prefill_residual_add` | `(3823,3072)` | CUDA event single-run | 65.2 | not tested | not tested |

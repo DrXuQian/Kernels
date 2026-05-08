@@ -33,6 +33,33 @@ FILTERED_KERNEL_SUBSTRINGS = (
     "fill_half_kernel",
 )
 
+MODEL_CONFIG_ARGS = (
+    ("model_layers", "model_layers"),
+    ("full_attn_layers", "full_attn_layers"),
+    ("linear_attn_layers", "linear_attn_layers"),
+    ("moe_ffn_layers", "moe_ffn_layers"),
+    ("sampling_prefill_count", "sampling_prefill_count"),
+    ("sampling_decode_count", "sampling_decode_count"),
+)
+
+
+def add_model_config_args(parser):
+    parser.add_argument("--model-layers", dest="model_layers", type=int, help="Total transformer layers.")
+    parser.add_argument("--full-attn-layers", dest="full_attn_layers", type=int, help="Full-attention layer count.")
+    parser.add_argument("--linear-attn-layers", dest="linear_attn_layers", type=int, help="Linear-attention layer count.")
+    parser.add_argument("--moe-ffn-layers", dest="moe_ffn_layers", type=int, help="MoE-FFN layer count.")
+    parser.add_argument("--sampling-prefill-count", dest="sampling_prefill_count", type=int, help="Prefill sampling count.")
+    parser.add_argument("--sampling-decode-count", dest="sampling_decode_count", type=int, help="Decode sampling count.")
+
+
+def model_config_from_args(args):
+    config = {}
+    for attr, key in MODEL_CONFIG_ARGS:
+        value = getattr(args, attr)
+        if value is not None:
+            config[key] = value
+    return config or None
+
 
 def parse_number(value):
     value = value.strip().replace(",", "")
@@ -288,6 +315,7 @@ def main():
         type=Path,
         help="bench_all output directory used to expand deduped logical cases. Defaults to the ncu directory parent.",
     )
+    add_model_config_args(parser)
     args = parser.parse_args()
 
     all_rows = []
@@ -366,6 +394,7 @@ def main():
             title="Nsight Compute Model Latency Summary",
             source_name="ncu",
             bench_out_dir=args.bench_out_dir or args.ncu_dir.parent,
+            model_config=model_config_from_args(args),
         )
         print()
         print(summary_text)

@@ -20,6 +20,15 @@ MODULE_COLORS = {
     "Other": "#9C755F",
 }
 
+DEFAULT_MODEL_CONFIG = {
+    "model_layers": 48,
+    "full_attn_layers": 12,
+    "linear_attn_layers": 36,
+    "moe_ffn_layers": 48,
+    "sampling_prefill_count": 1,
+    "sampling_decode_count": 1,
+}
+
 
 def classify_phase(case: str) -> str:
     lower = case.lower()
@@ -124,8 +133,8 @@ def aggregate_cases(cases: Iterable[dict[str, object]]) -> dict[str, object]:
     for row in cases:
         latency = float(row["latency_us"])
         case = str(row["case"])
-        phase = classify_phase(case)
-        module = classify_module(case)
+        phase = str(row.get("phase") or classify_phase(case))
+        module = str(row.get("module") or classify_module(case))
         annotated = dict(row)
         annotated["phase"] = phase
         annotated["module"] = module
@@ -160,6 +169,59 @@ def aggregate_cases(cases: Iterable[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def model_multiplier(module: str, config: dict[str, int]) -> int:
+    if module == "Flash-Attn":
+        return config["full_attn_layers"]
+    if module == "Linear-Attn":
+        return config["linear_attn_layers"]
+    if module == "MoE-FFN":
+        return config["moe_ffn_layers"]
+    return 1
+
+
+def expand_to_model_estimate_cases(cases: list[dict[str, object]], config: dict[str, int]) -> list[dict[str, object]]:
+    model_cases: list[dict[str, object]] = []
+    for row in cases:
+        base_latency = float(row["latency_us"])
+        base_case = str(row["case"])
+        module = classify_module(base_case)
+        phase = classify_phase(base_case)
+
+        if module == "Sampling":
+            for sampling_phase, count_key in (
+                ("prefill", "sampling_prefill_count"),
+                ("decode", "sampling_decode_count"),
+            ):
+                multiplier = config[count_key]
+                if multiplier <= 0:
+                    continue
+                copied = dict(row)
+                copied["case"] = f"{base_case}__{sampling_phase}"
+                copied["base_case"] = base_case
+                copied["phase"] = sampling_phase
+                copied["module"] = module
+                copied["base_latency_us"] = base_latency
+                copied["multiplier"] = multiplier
+                copied["latency_us"] = base_latency * multiplier
+                model_cases.append(copied)
+            continue
+
+        multiplier = model_multiplier(module, config)
+        if multiplier <= 0:
+            continue
+        copied = dict(row)
+        copied["phase"] = phase
+        copied["module"] = module
+        copied["base_case"] = base_case
+        copied["base_latency_us"] = base_latency
+        copied["multiplier"] = multiplier
+        copied["latency_us"] = base_latency * multiplier
+        model_cases.append(copied)
+
+    model_cases.sort(key=lambda row: str(row["case"]))
+    return model_cases
+
+
 def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
     lines = [
         "| " + " | ".join(headers) + " |",
@@ -175,23 +237,20 @@ def console_summary(summary: dict[str, object]) -> str:
     phase_rows = []
     for phase in ("prefill", "decode"):
         value = phase_totals.get(phase, 0.0)
-        phase_rows.append([phase, fmt_us(value), fmt_pct(value / total * 100.0 if total else 0.0)])
+        phase_rows.append([phase, fmt_us(value)])
     if phase_totals.get("unknown", 0.0):
         value = phase_totals["unknown"]
-        phase_rows.append(["unknown", fmt_us(value), fmt_pct(value / total * 100.0 if total else 0.0)])
+        phase_rows.append(["unknown", fmt_us(value)])
 
     module_rows = []
     for row in summary["phase_module"]:  # type: ignore[index]
         latency = float(row["latency_us"])
-        phase_total = phase_totals.get(str(row["phase"]), 0.0)
         module_rows.append(
             [
                 str(row["phase"]),
                 str(row["module"]),
                 str(row["cases"]),
                 fmt_us(latency),
-                fmt_pct(latency / phase_total * 100.0 if phase_total else 0.0),
-                fmt_pct(latency / total * 100.0 if total else 0.0),
             ]
         )
 
@@ -199,12 +258,12 @@ def console_summary(summary: dict[str, object]) -> str:
         [
             "## Model Latency Totals",
             markdown_table(
-                ["scope", "latency_us", "percent_of_model"],
-                [["model_total", fmt_us(total), "100.00%"]] + phase_rows,
+                ["scope", "latency_us"],
+                [["model_estimate_total", fmt_us(total)]] + phase_rows,
             ),
             "## Module Latency By Phase",
             markdown_table(
-                ["phase", "module", "cases", "latency_us", "percent_of_phase", "percent_of_model"],
+                ["phase", "module", "logical_cases", "latency_us"],
                 module_rows,
             ),
         ]
@@ -318,22 +377,49 @@ def write_markdown_report(
     path: Path,
     title: str,
     source_name: str,
-    summary: dict[str, object],
+    model_summary: dict[str, object],
+    covered_summary: dict[str, object],
+    model_config: dict[str, int],
     duplicates: list[dict[str, str]],
     chart_files: list[Path],
 ) -> None:
-    total = float(summary["total_us"])
-    phase_totals: dict[str, float] = summary["phase_totals"]  # type: ignore[assignment]
+    total = float(model_summary["total_us"])
+    covered_total = float(covered_summary["total_us"])
 
     lines = [
         f"# {title}",
         "",
         f"Source: `{source_name}`.",
         "",
-        "This report sums the logical benchmark cases present in the run. It does not apply any extra layer-count "
-        "multipliers beyond the selected case list.",
+        "This report contains two views: the raw covered-case subtotal from the selected benchmark cases, and a "
+        "Qwen3.5-122B-A10B model estimate that applies layer-count multipliers.",
         "",
-        console_summary(summary),
+        "## Model Configuration",
+        "",
+        markdown_table(
+            ["item", "count"],
+            [
+                ["model_layers", str(model_config["model_layers"])],
+                ["full_attention_layers", str(model_config["full_attn_layers"])],
+                ["linear_attention_layers", str(model_config["linear_attn_layers"])],
+                ["moe_ffn_layers", str(model_config["moe_ffn_layers"])],
+                ["prefill_sampling", str(model_config["sampling_prefill_count"])],
+                ["decode_sampling", str(model_config["sampling_decode_count"])],
+            ],
+        ),
+        "",
+        console_summary(model_summary),
+        "",
+        "## Covered Case Subtotal",
+        "",
+        markdown_table(
+            ["scope", "latency_us"],
+            [
+                ["covered_case_total_before_layer_multipliers", fmt_us(covered_total)],
+                ["covered_case_prefill", fmt_us(covered_summary["phase_totals"].get("prefill", 0.0))],  # type: ignore[index]
+                ["covered_case_decode", fmt_us(covered_summary["phase_totals"].get("decode", 0.0))],  # type: ignore[index]
+            ],
+        ),
         "",
         "## Charts",
         "",
@@ -343,24 +429,27 @@ def write_markdown_report(
         lines.append("")
 
     top_rows = []
-    cases = list(summary["cases"])  # type: ignore[arg-type]
+    cases = list(model_summary["cases"])  # type: ignore[arg-type]
     cases.sort(key=lambda row: float(row["latency_us"]), reverse=True)
     for row in cases[:24]:
         latency = float(row["latency_us"])
+        base_latency = float(row.get("base_latency_us", latency))
+        multiplier = int(row.get("multiplier", 1))
         top_rows.append(
             [
                 str(row["phase"]),
                 str(row["module"]),
                 f"`{row['case']}`",
+                str(multiplier),
+                fmt_us(base_latency),
                 fmt_us(latency),
-                fmt_pct(latency / total * 100.0 if total else 0.0),
             ]
         )
     lines.extend(
         [
             "## Top Case Contributions",
             "",
-            markdown_table(["phase", "module", "case", "latency_us", "percent_of_model"], top_rows),
+            markdown_table(["phase", "module", "case", "multiplier", "base_latency_us", "model_latency_us"], top_rows),
             "",
         ]
     )
@@ -376,8 +465,8 @@ def write_markdown_report(
         lines.append(markdown_table(["case", "missing_source"], [[f"`{d['case']}`", f"`{d['duplicate_of']}`"] for d in missing]))
         lines.append("")
 
-    if phase_totals.get("unknown", 0.0):
-        lines.append("Unknown-phase cases are included in `model_total` but omitted from prefill/decode charts.")
+    if model_summary["phase_totals"].get("unknown", 0.0):  # type: ignore[index]
+        lines.append("Unknown-phase cases are included in `model_estimate_total` but omitted from prefill/decode charts.")
         lines.append("")
 
     path.write_text("\n".join(lines).rstrip() + "\n")
@@ -390,10 +479,16 @@ def write_model_latency_summary(
     title: str,
     source_name: str,
     bench_out_dir: Path | None = None,
+    model_config: dict[str, int] | None = None,
 ) -> tuple[Path, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     expanded, duplicates = expand_deduped_cases(cases, bench_out_dir)
-    summary = aggregate_cases(expanded)
+    effective_config = dict(DEFAULT_MODEL_CONFIG)
+    if model_config:
+        effective_config.update(model_config)
+    covered_summary = aggregate_cases(expanded)
+    model_cases = expand_to_model_estimate_cases(expanded, effective_config)
+    model_summary = aggregate_cases(model_cases)
 
     chart_files = [
         out_dir / "model_latency_phase_bar.svg",
@@ -404,7 +499,7 @@ def write_model_latency_summary(
         out_dir / "model_latency_decode_cases_bar.svg",
     ]
 
-    phase_totals: dict[str, float] = summary["phase_totals"]  # type: ignore[assignment]
+    phase_totals: dict[str, float] = model_summary["phase_totals"]  # type: ignore[assignment]
     write_bar_svg(
         chart_files[0],
         "Model Latency By Phase",
@@ -413,12 +508,12 @@ def write_model_latency_summary(
             ("decode", phase_totals.get("decode", 0.0), "#D67C4E"),
         ],
     )
-    write_bar_svg(chart_files[1], "Model Latency By Module", module_rows(summary))
-    write_pie_svg(chart_files[2], "Prefill Module Share", module_rows(summary, "prefill"))
-    write_pie_svg(chart_files[3], "Decode Module Share", module_rows(summary, "decode"))
-    write_bar_svg(chart_files[4], "Prefill Top Case Latencies", case_rows(summary, "prefill"), "Latency (us)")
-    write_bar_svg(chart_files[5], "Decode Top Case Latencies", case_rows(summary, "decode"), "Latency (us)")
+    write_bar_svg(chart_files[1], "Model Latency By Module", module_rows(model_summary))
+    write_pie_svg(chart_files[2], "Prefill Module Share", module_rows(model_summary, "prefill"))
+    write_pie_svg(chart_files[3], "Decode Module Share", module_rows(model_summary, "decode"))
+    write_bar_svg(chart_files[4], "Prefill Top Case Latencies", case_rows(model_summary, "prefill"), "Latency (us)")
+    write_bar_svg(chart_files[5], "Decode Top Case Latencies", case_rows(model_summary, "decode"), "Latency (us)")
 
     report_path = out_dir / "model_latency_summary.md"
-    write_markdown_report(report_path, title, source_name, summary, duplicates, chart_files)
-    return report_path, console_summary(summary)
+    write_markdown_report(report_path, title, source_name, model_summary, covered_summary, effective_config, duplicates, chart_files)
+    return report_path, console_summary(model_summary)

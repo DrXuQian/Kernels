@@ -173,12 +173,12 @@ Direct MoE commands when bypassing `bench_all.sh`:
 ```bash
 moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
   --dtype=fp16 --experts=8 --m_per_expert=3823 \
-  --n=3072 --k=2048 --group_size=128 \
+  --n=2048 --k=3072 --group_size=128 \
   --tactic=moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
 
 moe_ffn/w4a16/vllm/marlin/bench_marlin_moe \
-  1 256 8 2048 3072 --balanced --no-topk-weights --bench 0 1
+  1 256 8 3072 2048 --balanced --no-topk-weights --bench 0 1
 
 moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation \
   3823 1024 fp16 --bench 0 1

@@ -111,7 +111,7 @@ Sweep configs for one shape:
 
 ```
 moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
-  --dtype=fp16 --experts=8 --m_per_expert=1 --n=1024 --k=3072 \
+  --dtype=fp16 --experts=8 --m_per_expert=1 --n=3072 --k=1024 \
   --group_size=128 --warmup=100 --iters=1000 --sweep_configs
 ```
 
@@ -119,7 +119,7 @@ Use the H800 tactic cache:
 
 ```
 moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
-  --dtype=fp16 --experts=8 --m_per_expert=1 --n=1024 --k=3072 \
+  --dtype=fp16 --experts=8 --m_per_expert=1 --n=3072 --k=1024 \
   --group_size=128 --warmup=100 --iters=1000 \
   --tactic=moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache
 ```
@@ -128,10 +128,10 @@ Qwen MoE shapes in `tactics_h800.cache`
 ---------------------------------------
 The checked-in cache contains FP16 and BF16 tactics for these Qwen MoE GEMMs:
 
-- gate/up prefill: `experts=8, m_per_expert=3823, n=3072, k=2048`
-- down prefill: `experts=8, m_per_expert=3823, n=1024, k=3072`
-- gate/up decode: `experts=8, m_per_expert=1, n=3072, k=2048`
-- down decode: `experts=8, m_per_expert=1, n=1024, k=3072`
+- gate/up prefill: `experts=8, m_per_expert=3823, n=2048, k=3072`
+- down prefill: `experts=8, m_per_expert=3823, n=3072, k=1024`
+- gate/up decode: `experts=8, m_per_expert=1, n=2048, k=3072`
+- down decode: `experts=8, m_per_expert=1, n=3072, k=1024`
 
 Interpreting `--list_configs` output (`tile_enum/stages/split_k`)
 -----------------------------------------------------------------

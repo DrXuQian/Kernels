@@ -58,6 +58,6 @@ Examples:
 ./bench_expert_map 1 256 8 auto --bench 100 1000
 ./bench_expert_map 3823 256 8 auto --bench 100 1000
 ./bench_expand_input_rows 3823 8 2048 fp16 --bench 100 1000
-./bench_gated_activation 3823 8 3072 fp16 --bench 100 1000
-./bench_finalize_moe_routing 3823 8 1024 fp16 --bench 100 1000
+./bench_gated_activation 3823 8 1024 fp16 --bench 100 1000
+./bench_finalize_moe_routing 3823 8 3072 fp16 --bench 100 1000
 ```
