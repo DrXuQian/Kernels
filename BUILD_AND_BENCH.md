@@ -258,12 +258,30 @@ H800 Nsight Compute cycles:
   --case sampling_topk_mask_logits
 ```
 
+`--ncu-cycles` writes the raw per-case CSV files under `<OUT_DIR>/ncu/`, a
+case-level aggregate at `<OUT_DIR>/ncu_cycles_summary.md`, and a model-level
+latency report with SVG charts at
+`<OUT_DIR>/model_latency_ncu/model_latency_summary.md`.
+
 perfrawlog post-processing:
 
 ```bash
 RUN_DIR=<RUNTIME_WORKDIR> ./bench_all.sh --case moe_gate_up_prefill_trtllm
 python helpers/summarize_perfstatistics.py <OUT_DIR>/perfstatistics --ghz 1.5
+python helpers/summarize_perfstatistics.py <OUT_DIR>/perfstatistics --ghz 1.5 \
+  --bench-out-dir <OUT_DIR> \
+  --model-summary-dir <OUT_DIR>/model_latency_perfstatistics
+python helpers/summarize_ncu_cycles.py <OUT_DIR>/ncu --detail \
+  --bench-out-dir <OUT_DIR> \
+  --model-summary-dir <OUT_DIR>/model_latency_ncu
 ```
+
+The model-level reports split latency into prefill and decode, then into
+Flash-Attn, Linear-Attn, MoE-FFN, and Sampling. They also report total covered
+model latency and generate phase/module/operator pie and bar charts. When
+`BENCH_DEDUPE=1` skips an identical logical case, the model summary expands the
+skipped case by reusing the measured source-case latency so the model total is
+not undercounted.
 
 ## Tactic Cache Checks
 

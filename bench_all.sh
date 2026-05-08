@@ -632,7 +632,7 @@ summarize_perfstatistics() {
     return
   fi
 
-  local report_base summary_log
+  local report_base summary_log model_summary_dir
   report_base="$(perfstatistics_base_dir)"
   if [[ ! -d "$report_base" ]]; then
     echo "[bench_all] no per-case perfstatistics directory found, skip summary."
@@ -640,12 +640,15 @@ summarize_perfstatistics() {
   fi
 
   summary_log="$OUT_DIR/perfstatistics_summary.txt"
+  model_summary_dir="$OUT_DIR/model_latency_perfstatistics"
   echo
   echo "=== perfstatistics summary ==="
   set +e
   python "$ROOT_DIR/helpers/summarize_perfstatistics.py" \
     "$report_base" \
-    --ghz "${PERF_STATISTICS_GHZ:-1.5}" 2>&1 | tee "$summary_log"
+    --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
+    --bench-out-dir "$OUT_DIR" \
+    --model-summary-dir "$model_summary_dir" 2>&1 | tee "$summary_log"
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
@@ -653,6 +656,7 @@ summarize_perfstatistics() {
     return
   fi
   echo "[bench_all] perfstatistics summary: $summary_log"
+  echo "[bench_all] perfstatistics model latency summary: $model_summary_dir/model_latency_summary.md"
 }
 
 summarize_ncu_cycles() {
@@ -660,7 +664,7 @@ summarize_ncu_cycles() {
     return
   fi
 
-  local ncu_dir summary_log
+  local ncu_dir summary_log model_summary_dir
   ncu_dir="$OUT_DIR/ncu"
   if [[ ! -d "$ncu_dir" ]]; then
     echo "[bench_all] no Nsight Compute output directory found, skip ncu summary."
@@ -668,10 +672,15 @@ summarize_ncu_cycles() {
   fi
 
   summary_log="$OUT_DIR/ncu_cycles_summary.md"
+  model_summary_dir="$OUT_DIR/model_latency_ncu"
   echo
   echo "=== Nsight Compute cycles summary ==="
   set +e
-  python "$ROOT_DIR/helpers/summarize_ncu_cycles.py" "$ncu_dir" --detail 2>&1 | tee "$summary_log"
+  python "$ROOT_DIR/helpers/summarize_ncu_cycles.py" "$ncu_dir" \
+    --detail \
+    --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
+    --bench-out-dir "$OUT_DIR" \
+    --model-summary-dir "$model_summary_dir" 2>&1 | tee "$summary_log"
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
@@ -679,6 +688,7 @@ summarize_ncu_cycles() {
     return
   fi
   echo "[bench_all] ncu cycles summary: $summary_log"
+  echo "[bench_all] ncu model latency summary: $model_summary_dir/model_latency_summary.md"
 }
 
 run_w4a16_prefill_cutlass55_case() {

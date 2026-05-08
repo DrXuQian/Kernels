@@ -11,6 +11,8 @@ import argparse
 import re
 from pathlib import Path
 
+from model_latency_summary import write_model_latency_summary
+
 
 COMPUTE_CYCLES_RE = re.compile(r"\bcompute_cycles\s*=\s*([0-9][0-9,]*)")
 
@@ -84,6 +86,12 @@ def main() -> int:
     )
     parser.add_argument("--ghz", type=float, default=1.5, help="Clock frequency for latency conversion. Default: 1.5")
     parser.add_argument("--tsv", action="store_true", help="Print TSV instead of a padded table.")
+    parser.add_argument("--model-summary-dir", type=Path, help="Write model-level latency tables and SVG charts here.")
+    parser.add_argument(
+        "--bench-out-dir",
+        type=Path,
+        help="bench_all output directory used to expand deduped logical cases. Defaults to the perfstatistics parent.",
+    )
     args = parser.parse_args()
 
     roots = args.paths or [discover_default_root()]
@@ -97,9 +105,13 @@ def main() -> int:
             log_paths.extend(sorted(root.rglob("perfstatistics.log")))
 
     rows: list[dict[str, object]] = []
+    model_rows: list[dict[str, object]] = []
     latency_header = f"latency_us@{args.ghz:g}GHz"
+    bench_out_dir = args.bench_out_dir
     for log_path in sorted(set(log_paths)):
         report_dir = log_path.parent
+        if bench_out_dir is None and report_dir.parent.name == "perfstatistics":
+            bench_out_dir = report_dir.parent.parent
         cycles = parse_compute_cycles(log_path)
         if not cycles:
             continue
@@ -119,6 +131,14 @@ def main() -> int:
                 "report_dir": str(report_dir),
             }
         )
+        model_rows.append(
+            {
+                "case": label,
+                "latency_us": latency_us,
+                "cycles": selected_cycles,
+                "source": str(report_dir),
+            }
+        )
 
     if not rows:
         print("No perfstatistics.log with compute_cycles was found.")
@@ -133,6 +153,19 @@ def main() -> int:
             print("\t".join(str(row[header]) for header in headers))
     else:
         print(format_table(rows, latency_header))
+
+    if args.model_summary_dir:
+        report_path, summary_text = write_model_latency_summary(
+            model_rows,
+            args.model_summary_dir,
+            title="Perfstatistics Model Latency Summary",
+            source_name="perfstatistics",
+            bench_out_dir=bench_out_dir,
+        )
+        print()
+        print(summary_text)
+        print()
+        print(f"Model latency summary: {report_path}")
     return 0
 
 

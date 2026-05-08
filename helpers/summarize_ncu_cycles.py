@@ -4,6 +4,8 @@ import csv
 import math
 from pathlib import Path
 
+from model_latency_summary import write_model_latency_summary
+
 
 LONG_METRICS = {
     "sm__cycles_elapsed.avg",
@@ -250,12 +252,13 @@ def print_table(rows, title):
 
 def print_aggregate_table(rows):
     print("## Nsight Compute Case Aggregate")
-    print("| case | kernels | sum_cycles_avg | sum_cycles_max | sum_duration_ns |")
-    print("|---|---:|---:|---:|---:|")
+    print("| case | kernels | sum_cycles_avg | sum_cycles_max | sum_duration_ns | latency_us |")
+    print("|---|---:|---:|---:|---:|---:|")
     for row in rows:
         print(
             f"| `{row['case']}` | {row['kernels']} | {fmt_number(row['sum_cycles_avg'])} | "
-            f"{fmt_number(row['sum_cycles_max'])} | {fmt_number(row['sum_duration_ns'])} |"
+            f"{fmt_number(row['sum_cycles_max'])} | {fmt_number(row['sum_duration_ns'])} | "
+            f"{fmt_number(row['latency_us'])} |"
         )
 
 
@@ -273,6 +276,18 @@ def main():
     parser = argparse.ArgumentParser(description="Summarize Nsight Compute cycle CSV logs.")
     parser.add_argument("ncu_dir", type=Path)
     parser.add_argument("--detail", action="store_true", help="Print every profiled kernel row.")
+    parser.add_argument(
+        "--ghz",
+        type=float,
+        default=1.5,
+        help="Clock frequency used when duration_ns is unavailable and latency must be derived from cycles.",
+    )
+    parser.add_argument("--model-summary-dir", type=Path, help="Write model-level latency tables and SVG charts here.")
+    parser.add_argument(
+        "--bench-out-dir",
+        type=Path,
+        help="bench_all output directory used to expand deduped logical cases. Defaults to the ncu directory parent.",
+    )
     args = parser.parse_args()
 
     all_rows = []
@@ -293,6 +308,7 @@ def main():
         raise SystemExit(f"no Nsight Compute metric rows found under {args.ncu_dir}")
 
     aggregate = []
+    model_rows = []
     slowest = []
     for case in sorted({row["case"] for row in all_rows}):
         case_rows = [row for row in all_rows if row["case"] == case]
@@ -304,15 +320,34 @@ def main():
             reverse=True,
         )
         slowest.append(case_rows[0])
-        aggregate.append(
-            {
-                "case": case,
-                "kernels": len(case_rows),
-                "sum_cycles_avg": nan_sum(row["cycles_avg"] for row in case_rows),
-                "sum_cycles_max": nan_sum(row["cycles_max"] for row in case_rows),
-                "sum_duration_ns": nan_sum(row["duration_ns"] for row in case_rows),
-            }
-        )
+        sum_cycles_avg = nan_sum(row["cycles_avg"] for row in case_rows)
+        sum_cycles_max = nan_sum(row["cycles_max"] for row in case_rows)
+        sum_duration_ns = nan_sum(row["duration_ns"] for row in case_rows)
+        if not math.isnan(sum_duration_ns):
+            latency_us = sum_duration_ns / 1000.0
+        elif not math.isnan(sum_cycles_avg):
+            latency_us = sum_cycles_avg / (args.ghz * 1000.0)
+        else:
+            latency_us = math.nan
+        aggregate_row = {
+            "case": case,
+            "kernels": len(case_rows),
+            "sum_cycles_avg": sum_cycles_avg,
+            "sum_cycles_max": sum_cycles_max,
+            "sum_duration_ns": sum_duration_ns,
+            "latency_us": latency_us,
+        }
+        aggregate.append(aggregate_row)
+        if not math.isnan(latency_us):
+            model_rows.append(
+                {
+                    "case": case,
+                    "latency_us": latency_us,
+                    "cycles": sum_cycles_avg,
+                    "duration_ns": sum_duration_ns,
+                    "source": str(args.ncu_dir / f"{case}.csv"),
+                }
+            )
 
     print_aggregate_table(aggregate)
     print()
@@ -323,6 +358,19 @@ def main():
         if files_without_rows:
             print()
             print_missing_rows(files_without_rows)
+
+    if args.model_summary_dir:
+        report_path, summary_text = write_model_latency_summary(
+            model_rows,
+            args.model_summary_dir,
+            title="Nsight Compute Model Latency Summary",
+            source_name="ncu",
+            bench_out_dir=args.bench_out_dir or args.ncu_dir.parent,
+        )
+        print()
+        print(summary_text)
+        print()
+        print(f"Model latency summary: {report_path}")
 
 
 if __name__ == "__main__":
