@@ -367,6 +367,56 @@ the existing FlashInfer GDN kernel. It would need one of:
 - or a different prefix/state formulation that avoids a grid-wide sync inside
   the heavy GDN kernel.
 
+### Thread-Block Cluster Probe
+
+Hopper thread-block clusters have different residency semantics from a full-grid
+cooperative launch. A cluster only requires the blocks inside one cluster to be
+co-resident, so it could match the natural decomposition here: one cluster per
+V/output head, with one CTA per sequence segment inside that cluster.
+
+`bench_gdn_coop_probe --launch-cluster-dummy` launches a tiny
+`cooperative_groups::this_cluster().sync()` kernel using the same block size and
+dynamic shared-memory request as the GDN kernels. On the local H800 PCIe, it
+succeeds for all segment counts tested:
+
+| Cluster size | Grid | Result |
+|---:|---:|---|
+| 1 | 64 | ok |
+| 2 | 128 | ok |
+| 3 | 192 | ok |
+| 4 | 256 | ok |
+| 5 | 320 | ok |
+| 8 | 512 | ok |
+
+This is only a launch feasibility test; it does not prove that a full GDN
+cluster implementation is easy. The state exchanged between segment CTAs is
+large (`128x128` float per output/state head), and the current GDN CTA already
+uses 186 KB of shared memory, so a production version would probably need to
+write segment states to global memory and use cluster synchronization plus
+careful memory fencing, rather than keeping all prefix state in distributed
+shared memory.
+
+Still, this is the first synchronization mechanism tested that is mechanically
+compatible with both requirements:
+
+- large grid count (`segments * num_v_heads`, e.g. 192 or 320 CTAs);
+- local in-kernel ordering among the segments of one head.
+
+The concrete next implementation direction is therefore a cluster-per-head
+prototype:
+
+1. change the tile scheduler so blocks are ordered as
+   `(head, segment_in_cluster)`, with `clusterDim.x = segments`;
+2. run the per-segment state transition from zero in each CTA;
+3. store each segment's state and decay coefficient to a per-cluster/global
+   scratch buffer;
+4. use `this_cluster().sync()`;
+5. compose prefix states inside the cluster;
+6. compute the segment output with the composed prefix state.
+
+This would be a larger rewrite than the previous probes, but it is no longer
+blocked by CUDA launch constraints.
+
 ## Completion Audit
 
 Objective: use a FlashQLA-like or otherwise valid decomposition to raise the GDN
@@ -382,6 +432,7 @@ prefill grid enough to fill the GPU SMs.
 | Verify correctness of the best semantic paths | `scan_split --check: max_abs=0`; compute-sanitizer reports `ERROR SUMMARY: 0 errors` | Done |
 | Check cooperative in-kernel prefix feasibility | Actual GDN kernels use 512 threads and 186368 B SMEM, so cooperative resident grid is only one CTA per SM; dummy cooperative launch fails at 128+ CTAs on local H800 PCIe | Done, blocked |
 | Check zero-state output plus exact correction decomposition | `zero_split` is 0.1979 ms and exact `V=0` correction is 0.2072 ms at 1280-token segments, giving a lower-bound total around 0.431 ms with prefix compose | Done, not faster |
+| Check thread-block cluster feasibility | Dummy cluster launch with GDN-sized 512-thread/186368-byte CTA succeeds for cluster sizes 2/3/5/8, enabling a plausible cluster-per-head segment design | Done, feasible |
 | Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3660 ms vs original 0.2575 ms | Not achieved |
 
 Conclusion: grid count can be made large and correctness can be preserved, but

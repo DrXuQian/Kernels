@@ -144,6 +144,7 @@ Cooperative-launch feasibility probe:
 ```bash
 ./bench_gdn_coop_probe
 ./bench_gdn_coop_probe --launch-dummy
+./bench_gdn_coop_probe --launch-cluster-dummy
 ```
 
 Nsight Systems single-kernel check:
@@ -340,6 +341,25 @@ zero_split 0.1979 ms + prefix compose ~0.026 ms + correction_full 0.2072 ms
 That is slower than both the original `0.2575 ms` single kernel and the current
 `scan_both` result, so the exact correction decomposition is not a useful
 replacement path.
+
+Thread-block cluster launch is different from full-grid cooperative launch. A
+dummy cluster probe with the same 512-thread block and 186368-byte dynamic shared
+memory succeeds for the segment cluster sizes relevant to this problem:
+
+```text
+cluster=1 grid=64   ok
+cluster=2 grid=128  ok
+cluster=3 grid=192  ok
+cluster=5 grid=320  ok
+cluster=8 grid=512  ok
+```
+
+This does not implement GDN state exchange, but it changes the feasible design
+space. A future fused version could map one `num_v_heads` group to a thread-block
+cluster and put sequence segments inside that cluster. Cluster sync can then
+coordinate prefix state among the segment CTAs without requiring the entire grid
+to be resident. This is the only tested path so far that both keeps the larger
+192/320 CTA grid and has a plausible in-kernel synchronization primitive.
 
 Validation:
 

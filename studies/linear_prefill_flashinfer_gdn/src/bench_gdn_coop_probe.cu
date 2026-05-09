@@ -6,6 +6,8 @@
 // cooperative_groups::grid_group dummy kernel with the same block size and
 // dynamic shared-memory request. That answers whether a future fused
 // transition/prefix/output kernel could legally run enough CTAs concurrently.
+// It can also launch a tiny thread-block-cluster dummy kernel, which checks the
+// feasibility of a per-head segment cluster design.
 
 #include <algorithm>
 #include <cstdio>
@@ -89,6 +91,14 @@ __global__ void cooperative_probe_kernel(int* out) {
   }
 }
 
+__global__ void cluster_probe_kernel(int* out) {
+  cg::cluster_group cluster = cg::this_cluster();
+  cluster.sync();
+  if (threadIdx.x == 0) {
+    atomicAdd(out, 1);
+  }
+}
+
 void try_dummy_cooperative_launch(char const* name, int block_threads, int smem_size,
                                   int sm_count) {
   int max_active = 0;
@@ -140,8 +150,77 @@ void try_dummy_cooperative_launch(char const* name, int block_threads, int smem_
   printf("        it is not a real GDN kernel launch or a CUTLASS cluster launch.\n");
 }
 
+void try_dummy_cluster_launch(char const* name, int block_threads, int smem_size) {
+#if CUDART_VERSION >= 12000
+  cudaError_t err = cudaFuncSetAttribute(
+      cluster_probe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  if (err != cudaSuccess) {
+    printf("  dummy_cluster_set_smem=%s (%d)\n", cudaGetErrorString(err),
+           static_cast<int>(err));
+    cudaGetLastError();
+    return;
+  }
+
+  err = cudaFuncSetAttribute(cluster_probe_kernel,
+                             cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  if (err != cudaSuccess) {
+    printf("  dummy_cluster_nonportable_attr=%s (%d)\n", cudaGetErrorString(err),
+           static_cast<int>(err));
+    cudaGetLastError();
+  }
+
+  int* d_out = nullptr;
+  check(cudaMalloc(&d_out, sizeof(int)), "cudaMalloc cluster d_out");
+  int cluster_sizes[] = {1, 2, 3, 4, 5, 8};
+  printf("  dummy_cluster_launches:\n");
+  for (int cluster_size : cluster_sizes) {
+    int grid = 64 * cluster_size;
+    int zero = 0;
+    check(cudaMemcpy(d_out, &zero, sizeof(int), cudaMemcpyHostToDevice),
+          "cudaMemcpy cluster zero");
+
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(grid, 1, 1);
+    config.blockDim = dim3(block_threads, 1, 1);
+    config.dynamicSmemBytes = smem_size;
+
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = cluster_size;
+    attr.val.clusterDim.y = 1;
+    attr.val.clusterDim.z = 1;
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    err = cudaLaunchKernelEx(&config, cluster_probe_kernel, d_out);
+    if (err == cudaSuccess) {
+      err = cudaDeviceSynchronize();
+    }
+    if (err == cudaSuccess) {
+      int got = 0;
+      check(cudaMemcpy(&got, d_out, sizeof(int), cudaMemcpyDeviceToHost),
+            "cudaMemcpy cluster got");
+      printf("    cluster=%d grid=%-4d ok blocks_ran=%d\n", cluster_size, grid, got);
+    } else {
+      printf("    cluster=%d grid=%-4d failed: %s (%d)\n", cluster_size, grid,
+             cudaGetErrorString(err), static_cast<int>(err));
+      cudaGetLastError();
+    }
+  }
+  check(cudaFree(d_out), "cudaFree cluster d_out");
+  printf("  note: dummy cluster launch validates cluster residency for %s only;\n", name);
+  printf("        it does not implement GDN state exchange.\n");
+#else
+  (void)name;
+  (void)block_threads;
+  (void)smem_size;
+  printf("  dummy_cluster_launches: requires CUDART_VERSION >= 12000\n");
+#endif
+}
+
 template <typename Kernel>
-void report_kernel(char const* name, int sm_count, bool launch_dummy) {
+void report_kernel(char const* name, int sm_count, bool launch_dummy,
+                   bool launch_cluster_dummy) {
   constexpr int block_threads = Kernel::MaxThreadsPerBlock;
   constexpr int smem_size = Kernel::SharedStorageSize;
 
@@ -191,22 +270,30 @@ void report_kernel(char const* name, int sm_count, bool launch_dummy) {
   if (launch_dummy) {
     try_dummy_cooperative_launch(name, block_threads, smem_size, sm_count);
   }
+  if (launch_cluster_dummy) {
+    try_dummy_cluster_launch(name, block_threads, smem_size);
+  }
 }
 
 void usage(char const* argv0) {
-  printf("Usage: %s [--launch-dummy]\n", argv0);
+  printf("Usage: %s [--launch-dummy] [--launch-cluster-dummy]\n", argv0);
   printf("Reports real FlashInfer/CUTLASS GDN kernel resource usage. With "
          "--launch-dummy, also tests a tiny cooperative grid-sync kernel using the "
          "same block size and dynamic shared memory.\n");
+  printf("With --launch-cluster-dummy, tests tiny thread-block-cluster launches "
+         "using the same block size and dynamic shared memory.\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   bool launch_dummy = false;
+  bool launch_cluster_dummy = false;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--launch-dummy") == 0) {
       launch_dummy = true;
+    } else if (strcmp(argv[i], "--launch-cluster-dummy") == 0) {
+      launch_cluster_dummy = true;
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       usage(argv[0]);
       return 0;
@@ -239,16 +326,20 @@ int main(int argc, char** argv) {
          prop.major, prop.minor, sm_count, cooperative);
   printf("shared_memory: per_block=%d optin_per_block=%d\n", max_smem, optin_smem);
 
-  report_kernel<FullKernel<false, false>>("full_gdn_original", sm_count, launch_dummy);
+  report_kernel<FullKernel<false, false>>("full_gdn_original", sm_count, launch_dummy,
+                                          launch_cluster_dummy);
   report_kernel<FullKernel<false, false, 2, 2, 2>>("full_gdn_stage_222_k2", sm_count,
-                                                   launch_dummy);
+                                                   launch_dummy, launch_cluster_dummy);
   report_kernel<FullKernel<false, false, 1, 1, 1>>("full_gdn_stage_111_minimal", sm_count,
-                                                   launch_dummy);
-  report_kernel<FullKernel<false, true>>("full_gdn_checkpoint", sm_count, launch_dummy);
+                                                   launch_dummy, launch_cluster_dummy);
+  report_kernel<FullKernel<false, true>>("full_gdn_checkpoint", sm_count, launch_dummy,
+                                         launch_cluster_dummy);
   report_kernel<FullKernel<true, false>>("full_gdn_init_state_split", sm_count,
-                                         launch_dummy);
-  report_kernel<StateOnlyKernel<false>>("state_only_transition", sm_count, launch_dummy);
-  report_kernel<StateOnlyKernel<true>>("state_only_checkpoint", sm_count, launch_dummy);
+                                         launch_dummy, launch_cluster_dummy);
+  report_kernel<StateOnlyKernel<false>>("state_only_transition", sm_count, launch_dummy,
+                                        launch_cluster_dummy);
+  report_kernel<StateOnlyKernel<true>>("state_only_checkpoint", sm_count, launch_dummy,
+                                       launch_cluster_dummy);
 
   return 0;
 }
