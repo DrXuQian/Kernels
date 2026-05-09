@@ -68,6 +68,12 @@ Build the study-only checkpointed split-sequence prototype:
 make splitseq_single_tu -j
 ```
 
+Build the cooperative-launch feasibility probe:
+
+```bash
+make coop_probe -j
+```
+
 ## Run
 
 Single launch:
@@ -123,6 +129,13 @@ Checkpointed split-sequence prototype timing:
 # Compare the full-sequence checkpoint output against the split output.
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode scan_split --check
+```
+
+Cooperative-launch feasibility probe:
+
+```bash
+./bench_gdn_coop_probe
+./bench_gdn_coop_probe --launch-dummy
 ```
 
 Nsight Systems single-kernel check:
@@ -258,6 +271,37 @@ included. The 1280-token sweep point is the best measured multi-pass variant,
 but it is still slower than the original single kernel. A useful production
 direction would need to fuse the transition, prefix, and output phases or use a
 cooperative in-kernel prefix.
+
+Cooperative single-kernel prefix feasibility was checked with
+`bench_gdn_coop_probe`. On the local H800 PCIe, all relevant GDN variants have
+the same resource shape:
+
+```text
+max_threads_per_block=512
+shared_storage=186368 bytes
+occupancy: active_blocks_per_sm=1
+```
+
+That means a CUDA cooperative grid-sync kernel with the current GDN resource
+footprint can only make one block resident per SM. The local H800 PCIe has 114
+SMs, so the maximum cooperative resident grid is 114 CTAs. A dummy
+`cooperative_groups::this_grid().sync()` kernel with the same block size and
+dynamic shared-memory request confirms this directly:
+
+```text
+launch grid=64   ok
+launch grid=128  failed: too many blocks in cooperative launch
+launch grid=192  failed: too many blocks in cooperative launch
+launch grid=320  failed: too many blocks in cooperative launch
+```
+
+On any H800 variant the limit is still one resident block per SM unless the GDN
+shared-storage footprint is reduced below roughly half of opt-in SMEM. Therefore
+a straightforward cooperative grid-sync version cannot be used to raise this
+kernel to the 192/320 CTA grids that made the split output phase faster. A fused
+single-kernel replacement would need either a much smaller-SMEM kernel shape or a
+different algorithm that does not require all split CTAs to be resident at the
+same global synchronization point.
 
 Validation:
 

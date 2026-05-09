@@ -271,6 +271,58 @@ production-quality variant would need to fuse transition, prefix, and output, or
 use a cooperative kernel with an in-kernel prefix phase, rather than launching
 separate transition and output kernels.
 
+## Cooperative In-Kernel Prefix Feasibility
+
+The natural next question is whether transition, prefix, and output can be fused
+into one CUDA cooperative kernel with `cooperative_groups::this_grid().sync()`.
+`bench_gdn_coop_probe` was added to answer the mechanical launch constraint
+before attempting a much larger CUTLASS rewrite.
+
+The probe instantiates the real FlashInfer/CUTLASS GDN kernels and reports their
+resource usage:
+
+```bash
+make coop_probe -j
+./bench_gdn_coop_probe
+./bench_gdn_coop_probe --launch-dummy
+```
+
+Observed on the local H800 PCIe:
+
+| Kernel variant | Threads/block | Shared storage | Active blocks/SM | Max resident cooperative grid |
+|---|---:|---:|---:|---:|
+| full GDN original | 512 | 186368 B | 1 | 114 |
+| full GDN checkpoint | 512 | 186368 B | 1 | 114 |
+| full GDN init-state split | 512 | 186368 B | 1 | 114 |
+| state-only transition | 512 | 186368 B | 1 | 114 |
+| state-only checkpoint | 512 | 186368 B | 1 | 114 |
+
+The dummy cooperative launch uses the same block size and dynamic shared-memory
+request. It succeeds at 64 CTAs and fails at 128 CTAs and above:
+
+```text
+launch grid=64   ok
+launch grid=128  failed: too many blocks in cooperative launch
+launch grid=192  failed: too many blocks in cooperative launch
+launch grid=320  failed: too many blocks in cooperative launch
+```
+
+This blocks the simple fused cooperative-grid-sync approach. The split output
+phase becomes interesting at 192/256/320 CTAs, but a cooperative kernel with the
+current GDN shared-memory footprint can only resident-launch one CTA per SM. On a
+larger H800 the exact number changes with SM count, but the constraint remains:
+`max_grid = SM_count` while active blocks/SM is 1.
+
+Therefore the next viable fused design cannot simply add a global grid sync to
+the existing FlashInfer GDN kernel. It would need one of:
+
+- a materially smaller-SMEM kernel shape so at least two blocks per SM can be
+  resident under cooperative launch;
+- a persistent/work-queue algorithm that never requires all split CTAs to be
+  resident at the same barrier;
+- or a different prefix/state formulation that avoids a grid-wide sync inside
+  the heavy GDN kernel.
+
 ## Completion Audit
 
 Objective: use a FlashQLA-like or otherwise valid decomposition to raise the GDN
@@ -284,6 +336,7 @@ prefill grid enough to fill the GPU SMs.
 | Try sequence splitting without breaking recurrent state | Checkpointed split-seq path uses `EnableCheckpointing` + `InitStateFromInput`; target-shape `max_abs=0` | Done |
 | Increase grid beyond H800 SM count | split/scan paths reach 192, 256, 320, 384, 512, 640, and 960 CTA cases depending on segment size | Done |
 | Verify correctness of the best semantic paths | `scan_split --check: max_abs=0`; compute-sanitizer reports `ERROR SUMMARY: 0 errors` | Done |
+| Check cooperative in-kernel prefix feasibility | Actual GDN kernels use 512 threads and 186368 B SMEM, so cooperative resident grid is only one CTA per SM; dummy cooperative launch fails at 128+ CTAs on local H800 PCIe | Done, blocked |
 | Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3660 ms vs original 0.2575 ms | Not achieved |
 
 Conclusion: grid count can be made large and correctness can be preserved, but
@@ -308,4 +361,6 @@ kernel or one cooperative launch.
 5. The checkpointed split-sequence prototype shows a viable direction for the
    output pass. State-only and scan-style prepasses reduce the prefix cost but do
    not make the multi-pass design faster overall. The next useful implementation
-   would need to fuse the phases or use a cooperative in-kernel state prefix.
+   would need to fuse the phases, but a direct cooperative-grid-sync version is
+   blocked by the current 186 KB shared-memory footprint. Reducing SMEM enough to
+   allow at least two resident CTAs per SM is a prerequisite for that path.

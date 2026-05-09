@@ -21,12 +21,12 @@ INC := $(CCCL_INC) \
        -I../../include \
        -DFLAT_SM90A_ENABLED
 
-BINS := bench_gdn_tile_study bench_gdn_blockdv_study bench_gdn_splitseq_study
+BINS := bench_gdn_tile_study bench_gdn_blockdv_study bench_gdn_splitseq_study bench_gdn_coop_probe
 OBJS := bench_gdn_tile_study.o gdn_tile_study_dispatch.o
 BLOCKDV_OBJS := bench_gdn_blockdv_study.o gdn_blockdv_study_dispatch.o
 SPLITSEQ_OBJS := bench_gdn_splitseq_study.o gdn_splitseq_study_dispatch.o gdn_state_only_study_dispatch.o
 
-.PHONY: all single_tu blockdv_single_tu splitseq_single_tu clean
+.PHONY: all single_tu blockdv_single_tu splitseq_single_tu coop_probe clean
 
 all: $(BINS)
 
@@ -35,6 +35,8 @@ single_tu: bench_gdn_tile_study_single_tu
 blockdv_single_tu: bench_gdn_blockdv_study_single_tu
 
 splitseq_single_tu: bench_gdn_splitseq_study_single_tu
+
+coop_probe: bench_gdn_coop_probe
 
 bench_gdn_tile_study.o: src/bench_gdn_tile_study.cu
 	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
@@ -65,6 +67,9 @@ gdn_state_only_study_dispatch.o: src/gdn_state_only_study_dispatch.cu src/state_
 
 bench_gdn_splitseq_study: $(SPLITSEQ_OBJS)
 	$(NVCC) $(ARCH) $^ -o $@
+
+bench_gdn_coop_probe: src/bench_gdn_coop_probe.cu src/state_only/flat_kernel_builder_delta_rule_state_only.hpp src/state_only/flat_collective_tma_warpspecialized_delta_rule_state_only.hpp
+	$(NVCC) $(CFLAGS) $(INC) $< -o $@
 
 bench_gdn_tile_study_single_tu: src/bench_gdn_tile_study_single_tu.cu src/bench_gdn_tile_study.cu src/gdn_tile_study_dispatch.cu src/gdn_tile_study_kernel.cuh
 	$(NVCC) $(CFLAGS) $(INC) $< -o $@
