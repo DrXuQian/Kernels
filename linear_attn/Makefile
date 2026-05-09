@@ -59,13 +59,6 @@ bench_rmsnorm: ../general/bench_rmsnorm.cu ../include/bench_timer.h
 	$(NVCC) $(CFLAGS) $(ARCH) $(INC) $< -o $@
 
 # --- FlashInfer GDN prefill (SM90 only) ---
-#
-# The default bench_gdn_prefill target is built as one translation unit. This
-# preserves setmaxnreg for the SM90 warp-specialized CUTLASS kernel and avoids
-# WGMMA serialization seen with separable device compilation.
-bench_gdn_prefill: src/flashinfer_gdn/bench_gdn_prefill_single_tu.cu src/flashinfer_gdn/bench_gdn_prefill.cu src/flashinfer_gdn/dispatch.cu
-	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_GDN) $< -o $@
-
 gdn_kernel_inst.o: src/flashinfer_gdn/kernel_inst.cu
 	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_GDN) -dc $< -o $@
 
@@ -75,8 +68,8 @@ gdn_dispatch.o: src/flashinfer_gdn/dispatch.cu
 bench_gdn.o: src/flashinfer_gdn/bench_gdn_prefill.cu
 	$(NVCC) $(CFLAGS) $(ARCH_SM90) $(INC_GDN) -dc $< -o $@
 
-bench_gdn_prefill_separable: bench_gdn.o gdn_dispatch.o gdn_kernel_inst.o
+bench_gdn_prefill: bench_gdn.o gdn_dispatch.o gdn_kernel_inst.o
 	$(NVCC) $(ARCH_SM90) $^ -o $@
 
 clean:
-	rm -f *.o $(BINS) bench_gdn_prefill_separable
+	rm -f *.o $(BINS) bench_gdn_prefill

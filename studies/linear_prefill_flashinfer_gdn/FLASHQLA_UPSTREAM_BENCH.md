@@ -51,12 +51,20 @@ Correctness-relaxed CP proxy using the local CUDA/FlashInfer kernel:
 studies/linear_prefill_flashinfer_gdn/sweep_flashinfer_cp_proxy.sh
 ```
 
+Forced upstream FlashQLA sequence-CP diagnostic:
+
+```bash
+python3 studies/linear_prefill_flashinfer_gdn/bench_flashqla_force_cp.py \
+  --seqlen 3823 --h-qk 16 --h-v 64 --warmup 10 --repeats 50
+```
+
 ## H800 Results
 
 | Shape | Case | Time |
 |---|---|---:|
 | `T=3823,Hqk=16,Hv=64` | FlashQLA `auto_cp=True` | 0.455 ms |
 | `T=3823,Hqk=16,Hv=64` | FlashQLA `auto_cp=False` | 0.464 ms |
+| `T=3823,Hqk=16,Hv=64` | FlashQLA forced sequence-CP | 0.505 ms |
 | `T=3823,Hqk=16,Hv=64` | FlashInfer Python | 0.272 ms |
 | `T=3823,Hqk=16,Hv=64` | Local FlashInfer single-TU standalone | 0.263 ms |
 | `T=4096,Hqk=16,Hv=64` | FlashQLA `auto_cp=True` | 0.455 ms |
@@ -97,24 +105,37 @@ would need extra warmup and state-correction kernels, this suggests that a full
 FlashQLA-style CP CUDA port is unlikely to deliver a large gain for the target
 `Hqk=16,Hv=64,T≈4k` shape.
 
+The forced upstream sequence-CP run used FlashQLA's real warmup/correction path
+with `cp_cu_seqlens=[0,1024,2048,3072,3823]`. It measured `0.505 ms`, slower
+than FlashQLA's default path. This confirms that the sequence-CP part of
+FlashQLA is not the first mechanism to port for this repo's target shape.
+
 ## Interpretation
 
 For the repo's target TP1-like shape (`Hqk=16,Hv=64,T≈4k`), upstream FlashQLA is
 slower than FlashInfer. `auto_cp=True` and `auto_cp=False` are effectively the
-same because FlashQLA's heuristic does not enable intra-card CP at `Hv=64`.
+same because FlashQLA's heuristic does not enable sequence-CP at `Hv=64`.
 
 For the low-head TP8-like shape (`Hqk=2,Hv=8,T=4096`), FlashQLA is much faster
 than FlashInfer. In that regime the auto-CP path launches additional warmup and
 state-correction kernels and improves SM utilization.
 
-So the upstream claim is not universally false, but it does not hold for our
-primary `Hqk=16,Hv=64` usecase. For this repo, the useful ideas to borrow are:
+So the upstream claim is not universally false, but it does not hold if copied
+as sequence-CP for our primary `Hqk=16,Hv=64` usecase. The more useful idea to
+borrow is FlashQLA's V-dimension blocking heuristic: for `Hv=64` on H800, it
+chooses `block_DV=64`, so each V head is split into two CTAs and the launch has
+about `128` CTAs instead of `64`. That can improve SM occupancy without adding
+the recurrent state-correction kernels required by sequence-CP.
 
-1. keep the current FlashInfer GDN kernel in a single translation unit;
-2. consider sequence/context splitting only if we implement the warmup/correct
+For this repo, the useful ideas to borrow are:
+
+1. keep evaluating the FlashInfer GDN single-translation-unit build inside this study;
+2. implement a study-only `block_DV=64` CUDA path that slices the output/state V
+   dimension while keeping the Q/K dimension at 128;
+3. consider sequence/context splitting only if we implement the warmup/correct
    state path, because naive sequence splitting changes the recurrence;
-3. consider `DV` blocking like FlashQLA's `block_DV=64/32` only if it can be
-   added without losing the current CUTLASS kernel's lower fused-kernel time.
+4. keep the production benchmark unchanged until the study path is both faster
+   and validated.
 
 ## Nsight Snapshot
 

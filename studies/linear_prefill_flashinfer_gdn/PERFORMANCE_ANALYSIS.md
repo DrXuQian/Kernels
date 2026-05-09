@@ -140,8 +140,8 @@ best among tested variants:
 
 1. Build this FlashInfer GDN prefill kernel as one translation unit, or otherwise
    avoid separable compilation for the TU containing `cutlass::device_kernel`.
-   This is now the default `linear_attn/bench_gdn_prefill` build for the target
-   Qwen3.5 GVA path.
+   Keep this as an isolated study target unless the default benchmark semantics
+   are intentionally changed.
 2. Check production `linear_attn/bench_gdn_prefill` for the same ptxas warning.
    If present, it is the primary reason the current production standalone is slow.
 3. Keep tile `64x64x128`; the naive `128x128x128` GVA DeltaRule instantiation fails

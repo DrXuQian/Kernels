@@ -10,6 +10,7 @@ upstream FlashQLA speed check on the target shape.
 Optional helper scripts:
 
 - `bench_flashqla_upstream.py`: run the upstream FlashQLA Python/TileLang benchmark.
+- `bench_flashqla_force_cp.py`: force upstream FlashQLA's sequence-CP path for diagnosis.
 - `sweep_flashinfer_cp_proxy.sh`: sweep a local CUDA split-sequence performance proxy.
 
 The production kernel uses the extracted FlashInfer DeltaNet/GDN prefill path with

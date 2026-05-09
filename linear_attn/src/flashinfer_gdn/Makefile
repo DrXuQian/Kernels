@@ -19,12 +19,6 @@ BINS       := bench_gdn_prefill
 
 all: $(BINS)
 
-# The default bench_gdn_prefill target is built as one translation unit. This
-# preserves setmaxnreg for the SM90 warp-specialized CUTLASS kernel and avoids
-# WGMMA serialization seen with separable device compilation.
-bench_gdn_prefill: bench_gdn_prefill_single_tu.cu bench_gdn_prefill.cu dispatch.cu
-	$(NVCC) $(CFLAGS) $(INC) $< -o $@
-
 # Kernel template instantiation (bf16 GVA only, slow compile)
 kernel_inst.o: kernel_inst.cu
 	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
@@ -37,8 +31,8 @@ dispatch.o: dispatch.cu
 bench.o: bench_gdn_prefill.cu
 	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
 
-bench_gdn_prefill_separable: bench.o dispatch.o kernel_inst.o
+bench_gdn_prefill: bench.o dispatch.o kernel_inst.o
 	$(NVCC) $(ARCH) $^ -o $@
 
 clean:
-	rm -f *.o $(BINS) bench_gdn_prefill_separable
+	rm -f *.o $(BINS)
