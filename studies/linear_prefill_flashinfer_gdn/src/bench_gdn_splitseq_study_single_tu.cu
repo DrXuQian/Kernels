@@ -3,6 +3,7 @@
 // on some CUDA/PPU toolchains.
 
 #include "gdn_splitseq_study_dispatch.cu"
+#include "gdn_state_only_study_dispatch.cu"
 
 #define main gdn_splitseq_study_main_impl
 #include "bench_gdn_splitseq_study.cu"

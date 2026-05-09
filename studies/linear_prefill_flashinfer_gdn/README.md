@@ -112,9 +112,13 @@ Checkpointed split-sequence prototype timing:
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode both --bench 5 20
 
+# Time the two-pass prototype with a state-only checkpoint pass.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode state_both --bench 5 20
+
 # Compare the full-sequence checkpoint output against the split output.
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
-  --segment-tokens 768 --mode split --check
+  --segment-tokens 768 --mode state_split --check
 ```
 
 Nsight Systems single-kernel check:
@@ -206,6 +210,9 @@ Checkpointed split-sequence prototype:
 | split-only | 512 | 512 | 0.2356 | 0.2357 | too many short segments |
 | checkpoint-only | 768 | 64 | 0.2706 | 0.2704 | full GDN with checkpoint writes |
 | both | 768 | 64 + pack + 320 | 0.5097 | 0.5092 | current correct two-pass prototype |
+| state-checkpoint-only | 768 | 64 | 0.1774 | 0.1779 | skips Q/O path, writes states only |
+| state-split-only | 768 | 320 | 0.2066 | 0.2065 | state-only checkpoint prep, timed split pass |
+| state-both | 768 | 64 + pack + 320 | 0.4102 | 0.4105 | best correct two-pass prototype so far |
 
 `split-only` uses already prepared segment states, so it measures the useful
 second pass. With `segment_tokens=768`, nsys shows the checkpoint pass at
@@ -219,9 +226,11 @@ check: max_abs=0 max_rel=0 elements=31318016
 
 This is the first study path that raises the GDN grid above H800 SM count while
 preserving recurrent state semantics. It is still not a production replacement:
-the current checkpoint pass is a full GDN pass, so total time is slower than the
-original. The useful next step would be a state-only checkpoint/prefix pass that
-skips Q/O work and writes only segment boundary states.
+even with the state-only checkpoint pass, total time is still slower than the
+original single kernel. The state-only pass confirms that skipping Q/O helps
+(`0.2706 ms -> 0.1774 ms`), but a two-pass design still does too much total work.
+The useful next step would need to parallelize or fuse the state prefix step
+rather than simply running state checkpoint plus split output as separate passes.
 
 Validation:
 

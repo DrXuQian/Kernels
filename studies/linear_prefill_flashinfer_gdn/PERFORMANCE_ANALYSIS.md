@@ -190,6 +190,8 @@ measured split was `segment_tokens=768`, which produces 5 segments and 320 CTAs:
 | split-seq second pass, 768-token segments | 320 | 0.2074 ms |
 | checkpoint pass only | 64 | 0.2706 ms |
 | checkpoint + pack + split pass | 64 + 4096 + 320 | 0.5097 ms |
+| state-only checkpoint pass | 64 | 0.1774 ms |
+| state-only checkpoint + pack + split pass | 64 + 4096 + 320 | 0.4102 ms |
 
 The split second pass is about 20% faster than the original single kernel, and
 the target-shape output matches the full-sequence checkpoint output exactly in
@@ -201,11 +203,30 @@ bf16 storage (`max_abs=0`). nsys confirms the intended grid shape:
 | `pack_segment_input_states` | 4096 | 25.792 us |
 | split GDN | 320 | 211.458 us |
 
+The state-only checkpoint variant removes Q load, QK, Q@state, QK@V, and O store
+from the checkpoint pass. It remains a study-only copied collective under
+`src/state_only/` and does not change the production FlashInfer extraction. It is
+correct on the target shape:
+
+```text
+state_split --check: max_abs=0 max_rel=0 elements=31318016
+compute-sanitizer: ERROR SUMMARY: 0 errors
+```
+
+Its nsys breakdown for `state_both` is:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| state-only checkpoint GDN | 64 | 176.194 us |
+| `pack_segment_input_states` | 4096 | 23.104 us |
+| split GDN | 320 | 210.051 us |
+
 So sequence splitting is theoretically viable and is the first tested path that
 both increases grid count and preserves recurrent state semantics. It is not yet
-a usable replacement because the checkpoint pass duplicates the full GDN work.
-A production-quality variant would need a state-only prefix/checkpoint kernel
-that skips Q/O work and computes only the recurrent state at segment boundaries.
+a usable replacement: even after removing Q/O from checkpointing, the correct
+two-pass flow is still `0.4102 ms`, slower than the original `0.2575 ms`. A
+production-quality variant would need a parallel/fused state prefix mechanism,
+not just a separate checkpoint pass plus a split output pass.
 
 ## Practical Next Steps
 
@@ -220,6 +241,8 @@ that skips Q/O work and computes only the recurrent state at segment boundaries.
 4. Plain V-dimension blocking is not enough for this CUTLASS extraction because
    it duplicates the auxiliary path. A useful next attempt would need to share
    QK/KK/alpha-beta work across V slices or split auxiliary/state phases.
-5. The checkpointed split-sequence prototype shows a viable direction. The next
-   useful implementation is a state-only checkpoint/prefix pass; without that,
-   the two-pass correct prototype is slower overall despite a faster split pass.
+5. The checkpointed split-sequence prototype shows a viable direction for the
+   output pass. The state-only checkpoint pass reduces checkpoint cost but does
+   not make the two-pass design faster overall. The next useful implementation
+   would need a parallel prefix/scan of segment state transitions, or a fused
+   cooperative kernel with an in-kernel state prefix phase.
