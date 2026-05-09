@@ -31,6 +31,28 @@ CONFIG = {
 }
 
 DEVICE_COLORS = {"H800": "#4E79A7", "PPU": "#F28E2B"}
+PIE_COLORS = [
+    "#4E79A7",
+    "#F28E2B",
+    "#59A14F",
+    "#E15759",
+    "#B07AA1",
+    "#76B7B2",
+    "#EDC948",
+    "#9C755F",
+    "#FF9DA7",
+    "#499894",
+    "#D37295",
+    "#B6992D",
+    "#A0CBE8",
+    "#FFBE7D",
+    "#8CD17D",
+    "#FABFD2",
+    "#86BCB6",
+    "#79706E",
+    "#D4A6C8",
+]
+OTHER_COLOR = "#B8B8B8"
 
 ROW_RE = re.compile(
     r"^\| `(?P<case>[^`]+)` "
@@ -185,22 +207,37 @@ def top_with_other(items: list[tuple[str, float]], limit: int = 10) -> list[tupl
     return keep + [("Other", other)]
 
 
+def pie_colors(labels: list[str]) -> list[str]:
+    colors = []
+    color_idx = 0
+    for label in labels:
+        if label == "Other":
+            colors.append(OTHER_COLOR)
+        else:
+            colors.append(PIE_COLORS[color_idx % len(PIE_COLORS)])
+            color_idx += 1
+    return colors
+
+
 def plot_operator_pies(operator_totals: dict[tuple[str, str], dict[str, float]], phase: str, out: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(13.5, 6.2))
     for ax, device in zip(axes, ["H800", "PPU"]):
         items = [(op, vals[device]) for (ph, op), vals in operator_totals.items() if ph == phase]
         items = top_with_other(items, limit=11)
+        names = [name for name, _ in items]
         labels = [name if value / sum(v for _, v in items) >= 0.025 else "" for name, value in items]
         values = [value / 1000.0 for _, value in items]
         wedges, texts, autotexts = ax.pie(
             values,
             labels=labels,
+            colors=pie_colors(names),
             autopct=lambda pct: f"{pct:.1f}%" if pct >= 2.5 else "",
             startangle=90,
             counterclock=False,
             labeldistance=1.08,
             pctdistance=0.73,
             textprops={"fontsize": 8},
+            wedgeprops={"edgecolor": "white", "linewidth": 0.9},
         )
         ax.set_title(f"{device} {phase.capitalize()} Operator Share")
     fig.tight_layout()
@@ -248,17 +285,20 @@ def plot_case_pies(case_rows: dict[tuple[str, str], dict[str, object]], phase: s
         ]
         items = top_with_other(items, limit=12)
         total = sum(value for _, value in items)
+        names = [name for name, _ in items]
         labels = [short_case_label(name) if value / total >= 0.03 else "" for name, value in items]
         values = [value / 1000.0 for _, value in items]
         ax.pie(
             values,
             labels=labels,
+            colors=pie_colors(names),
             autopct=lambda pct: f"{pct:.1f}%" if pct >= 3.0 else "",
             startangle=90,
             counterclock=False,
             labeldistance=1.1,
             pctdistance=0.72,
             textprops={"fontsize": 7},
+            wedgeprops={"edgecolor": "white", "linewidth": 0.9},
         )
         ax.set_title(f"{device} {phase.capitalize()} Kernel Share")
     fig.tight_layout()
