@@ -3,6 +3,9 @@
 This is an isolated optimization study for `linear_prefill_flashinfer_gdn`.
 It is intentionally not wired into the top-level compile or benchmark scripts.
 
+See [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) for the deeper root-cause
+analysis.
+
 The production kernel uses the extracted FlashInfer DeltaNet/GDN prefill path with
 Qwen3.5-122B-A10B shape:
 
@@ -39,6 +42,12 @@ GPU_ARCH=sm_90a \
 make clean all -j
 ```
 
+Build the single-translation-unit diagnostic target:
+
+```bash
+make single_tu -j
+```
+
 ## Run
 
 Single launch:
@@ -59,11 +68,20 @@ CUDA-event timing:
 ./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant v3 --bench 20 100
 ```
 
+Single-TU timing:
+
+```bash
+./bench_gdn_tile_study_single_tu 3823 16 64 128 1 --tile 64 --variant default --bench 20 200
+```
+
 Nsight Systems single-kernel check:
 
 ```bash
 nsys profile -t cuda --force-overwrite=true -o gdn_tile64 \
   ./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant default
+
+nsys profile -t cuda --force-overwrite=true -o gdn_single_tu_default \
+  ./bench_gdn_tile_study_single_tu 3823 16 64 128 1 --tile 64 --variant default
 ```
 
 ## Notes
@@ -101,22 +119,36 @@ Shorter sweep with `--bench 10 50`:
 | q3 | 3/3/2 | 0.5476 | 0.5476 |
 | v3 | 2/3/3 | 0.5439 | 0.5439 |
 
-`k2` is consistently the best of the tested legal variants, but the gain is small:
-about 1.5% versus the production binary in the longer repeat. The larger tile idea
-does not apply cleanly to this extracted GVA DeltaRule collective because `128x128x128`
-fails compile-time MMA layout assertions.
+`k2` is the best of the tested separable-compilation variants, but the gain is
+small: about 1.5% versus the production binary in the longer repeat.
 
-Single-launch `nsys` check for `k2`:
+The bigger result is the single-translation-unit build:
+
+| Build | Variant | Median (ms) | Avg (ms) | Notes |
+|---|---|---:|---:|---|
+| separable | default | 0.5179 | 0.5160 | mirrors production-style `-dc` build |
+| separable | k2 | 0.5092 | 0.5123 | best separable variant |
+| single TU | default | 0.2617 | 0.2617 | avoids `setmaxnreg` loss |
+
+The larger tile idea does not apply cleanly to this extracted GVA DeltaRule
+collective because `128x128x128` fails compile-time MMA layout assertions.
+
+Single-launch `nsys` checks:
 
 ```bash
 nsys profile -t cuda --force-overwrite=true -o /tmp/gdn_prefill_k2_single \
   ./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant k2
 
+nsys profile -t cuda --force-overwrite=true -o /tmp/gdn_prefill_single_tu_default \
+  ./bench_gdn_tile_study_single_tu 3823 16 64 128 1 --tile 64 --variant default
+
 nsys stats --report cuda_gpu_kern_sum --format csv /tmp/gdn_prefill_k2_single.nsys-rep
+nsys stats --report cuda_gpu_kern_sum --format csv /tmp/gdn_prefill_single_tu_default.nsys-rep
 ```
 
 Observed CUDA kernel summary:
 
-| Variant | CUDA kernels | Kernel time |
-|---|---:|---:|
-| k2 | 1 | 515.494 us |
+| Build | Variant | CUDA kernels | Kernel time |
+|---|---|---:|---:|
+| separable | k2 | 1 | 515.494 us |
+| single TU | default | 1 | 262.810 us |

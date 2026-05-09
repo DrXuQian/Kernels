@@ -24,9 +24,11 @@ INC := $(CCCL_INC) \
 BINS := bench_gdn_tile_study
 OBJS := bench_gdn_tile_study.o gdn_tile_study_dispatch.o
 
-.PHONY: all clean
+.PHONY: all single_tu clean
 
 all: $(BINS)
+
+single_tu: bench_gdn_tile_study_single_tu
 
 bench_gdn_tile_study.o: src/bench_gdn_tile_study.cu
 	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
@@ -37,5 +39,8 @@ gdn_tile_study_dispatch.o: src/gdn_tile_study_dispatch.cu src/gdn_tile_study_ker
 bench_gdn_tile_study: $(OBJS)
 	$(NVCC) $(ARCH) $^ -o $@
 
+bench_gdn_tile_study_single_tu: src/bench_gdn_tile_study_single_tu.cu src/bench_gdn_tile_study.cu src/gdn_tile_study_dispatch.cu src/gdn_tile_study_kernel.cuh
+	$(NVCC) $(CFLAGS) $(INC) $< -o $@
+
 clean:
-	rm -f $(OBJS) $(BINS)
+	rm -f $(OBJS) $(BINS) bench_gdn_tile_study_single_tu

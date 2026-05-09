@@ -1,4 +1,5 @@
 bench_gdn_tile_study
+bench_gdn_tile_study_single_tu
 *.o
 *.nsys-rep
 *.sqlite
