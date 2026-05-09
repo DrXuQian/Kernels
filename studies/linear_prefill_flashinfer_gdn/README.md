@@ -145,6 +145,7 @@ Cooperative-launch feasibility probe:
 ./bench_gdn_coop_probe
 ./bench_gdn_coop_probe --launch-dummy
 ./bench_gdn_coop_probe --launch-cluster-dummy
+./bench_gdn_coop_probe --bench-cluster-prefix
 ```
 
 Nsight Systems single-kernel check:
@@ -360,6 +361,24 @@ cluster and put sequence segments inside that cluster. Cluster sync can then
 coordinate prefix state among the segment CTAs without requiring the entire grid
 to be resident. This is the only tested path so far that both keeps the larger
 192/320 CTA grid and has a plausible in-kernel synchronization primitive.
+
+The `--bench-cluster-prefix` microbenchmark writes one `128x128` float state per
+segment/head to global memory, synchronizes the cluster, and composes prefix
+states inside the same cluster-launched kernel. It uses the same 512-thread block
+and 186368-byte dynamic shared-memory request as the GDN kernel:
+
+| Segments | Grid | Median (ms) |
+|---:|---:|---:|
+| 2 | 128 | 0.0212 |
+| 3 | 192 | 0.0384 |
+| 5 | 320 | 0.0586 |
+| 8 | 512 | 0.1260 |
+
+This overhead is not prohibitive, but it is also not enough by itself. A cluster
+version that still runs a state-transition phase and a full output/correction
+phase would remain near the current multi-pass cost. To win, a cluster
+implementation would need to reuse work inside the GDN CTA or otherwise avoid
+the second full GDN-like pass.
 
 Validation:
 

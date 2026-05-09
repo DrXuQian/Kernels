@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <tuple>
+#include <vector>
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -99,6 +100,35 @@ __global__ void cluster_probe_kernel(int* out) {
   }
 }
 
+__global__ void cluster_prefix_state_probe_kernel(float* segment_states, float* prefix_states,
+                                                  int state_elems_per_head, int segments) {
+  extern __shared__ unsigned char smem[];
+  if (threadIdx.x == 0) {
+    smem[0] = 0;
+  }
+
+  cg::cluster_group cluster = cg::this_cluster();
+  int seg = cluster.block_rank();
+  int head = static_cast<int>(blockIdx.x) / segments;
+  int64_t state_stride = static_cast<int64_t>(state_elems_per_head);
+  int64_t base = (static_cast<int64_t>(head) * segments + seg) * state_stride;
+
+  for (int64_t i = threadIdx.x; i < state_stride; i += blockDim.x) {
+    segment_states[base + i] = static_cast<float>(seg + 1) + static_cast<float>(i & 255) * 0.001f;
+  }
+  __threadfence();
+  cluster.sync();
+
+  for (int64_t i = threadIdx.x; i < state_stride; i += blockDim.x) {
+    float running = 0.0f;
+    for (int j = 0; j < seg; ++j) {
+      int64_t off = (static_cast<int64_t>(head) * segments + j) * state_stride + i;
+      running = segment_states[off] + 0.5f * running;
+    }
+    prefix_states[base + i] = running;
+  }
+}
+
 void try_dummy_cooperative_launch(char const* name, int block_threads, int smem_size,
                                   int sm_count) {
   int max_active = 0;
@@ -150,6 +180,42 @@ void try_dummy_cooperative_launch(char const* name, int block_threads, int smem_
   printf("        it is not a real GDN kernel launch or a CUTLASS cluster launch.\n");
 }
 
+bool launch_cluster_kernel(void* kernel, int grid, int block_threads, int cluster_size,
+                           int smem_size, void** args) {
+#if CUDART_VERSION >= 12000
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(grid, 1, 1);
+  config.blockDim = dim3(block_threads, 1, 1);
+  config.dynamicSmemBytes = smem_size;
+
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeClusterDimension;
+  attr.val.clusterDim.x = cluster_size;
+  attr.val.clusterDim.y = 1;
+  attr.val.clusterDim.z = 1;
+  config.attrs = &attr;
+  config.numAttrs = 1;
+
+  cudaError_t err = cudaLaunchKernelExC(&config, kernel, args);
+  if (err != cudaSuccess) {
+    printf("    cluster launch failed: %s (%d)\n", cudaGetErrorString(err),
+           static_cast<int>(err));
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+#else
+  (void)kernel;
+  (void)grid;
+  (void)block_threads;
+  (void)cluster_size;
+  (void)smem_size;
+  (void)args;
+  printf("    cluster launch requires CUDART_VERSION >= 12000\n");
+  return false;
+#endif
+}
+
 void try_dummy_cluster_launch(char const* name, int block_threads, int smem_size) {
 #if CUDART_VERSION >= 12000
   cudaError_t err = cudaFuncSetAttribute(
@@ -179,22 +245,12 @@ void try_dummy_cluster_launch(char const* name, int block_threads, int smem_size
     check(cudaMemcpy(d_out, &zero, sizeof(int), cudaMemcpyHostToDevice),
           "cudaMemcpy cluster zero");
 
-    cudaLaunchConfig_t config{};
-    config.gridDim = dim3(grid, 1, 1);
-    config.blockDim = dim3(block_threads, 1, 1);
-    config.dynamicSmemBytes = smem_size;
-
-    cudaLaunchAttribute attr{};
-    attr.id = cudaLaunchAttributeClusterDimension;
-    attr.val.clusterDim.x = cluster_size;
-    attr.val.clusterDim.y = 1;
-    attr.val.clusterDim.z = 1;
-    config.attrs = &attr;
-    config.numAttrs = 1;
-
-    err = cudaLaunchKernelEx(&config, cluster_probe_kernel, d_out);
-    if (err == cudaSuccess) {
+    void* args[] = {&d_out};
+    if (launch_cluster_kernel(reinterpret_cast<void*>(cluster_probe_kernel), grid, block_threads,
+                              cluster_size, smem_size, args)) {
       err = cudaDeviceSynchronize();
+    } else {
+      err = cudaGetLastError();
     }
     if (err == cudaSuccess) {
       int got = 0;
@@ -215,6 +271,107 @@ void try_dummy_cluster_launch(char const* name, int block_threads, int smem_size
   (void)block_threads;
   (void)smem_size;
   printf("  dummy_cluster_launches: requires CUDART_VERSION >= 12000\n");
+#endif
+}
+
+void bench_cluster_prefix_probe(int block_threads, int smem_size) {
+#if CUDART_VERSION >= 12000
+  cudaError_t err = cudaFuncSetAttribute(
+      cluster_prefix_state_probe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  if (err != cudaSuccess) {
+    printf("cluster_prefix set_smem failed: %s (%d)\n", cudaGetErrorString(err),
+           static_cast<int>(err));
+    cudaGetLastError();
+    return;
+  }
+  err = cudaFuncSetAttribute(cluster_prefix_state_probe_kernel,
+                             cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  if (err != cudaSuccess) {
+    printf("cluster_prefix nonportable_attr=%s (%d)\n", cudaGetErrorString(err),
+           static_cast<int>(err));
+    cudaGetLastError();
+  }
+
+  constexpr int heads = 64;
+  constexpr int state_elems_per_head = 128 * 128;
+  constexpr int warmup = 5;
+  constexpr int iters = 20;
+  int cluster_sizes[] = {2, 3, 5, 8};
+
+  printf("\n== cluster_prefix_state_probe ==\n");
+  printf("  heads=%d state_elems_per_head=%d block_threads=%d smem=%d warmup=%d iters=%d\n",
+         heads, state_elems_per_head, block_threads, smem_size, warmup, iters);
+
+  for (int segments : cluster_sizes) {
+    int grid = heads * segments;
+    int64_t elems = static_cast<int64_t>(heads) * segments * state_elems_per_head;
+    float* d_segment_states = nullptr;
+    float* d_prefix_states = nullptr;
+    check(cudaMalloc(&d_segment_states, elems * sizeof(float)), "cudaMalloc segment_states");
+    check(cudaMalloc(&d_prefix_states, elems * sizeof(float)), "cudaMalloc prefix_states");
+    check(cudaMemset(d_segment_states, 0, elems * sizeof(float)), "cudaMemset segment_states");
+    check(cudaMemset(d_prefix_states, 0, elems * sizeof(float)), "cudaMemset prefix_states");
+
+    int state_elems_arg = state_elems_per_head;
+    auto launch_once = [&]() {
+      void* args[] = {&d_segment_states, &d_prefix_states, &state_elems_arg, &segments};
+      return launch_cluster_kernel(reinterpret_cast<void*>(cluster_prefix_state_probe_kernel), grid,
+                                   block_threads, segments, smem_size, args);
+    };
+
+    bool ok = true;
+    for (int i = 0; i < warmup; ++i) {
+      ok = launch_once();
+      if (!ok) {
+        break;
+      }
+    }
+    if (ok) {
+      check(cudaDeviceSynchronize(), "cluster_prefix warmup sync");
+    }
+
+    std::vector<float> times;
+    if (ok) {
+      times.reserve(iters);
+      cudaEvent_t start{}, stop{};
+      check(cudaEventCreate(&start), "cudaEventCreate start");
+      check(cudaEventCreate(&stop), "cudaEventCreate stop");
+      for (int i = 0; i < iters; ++i) {
+        check(cudaEventRecord(start), "cudaEventRecord start");
+        ok = launch_once();
+        check(cudaEventRecord(stop), "cudaEventRecord stop");
+        check(cudaEventSynchronize(stop), "cudaEventSynchronize stop");
+        if (!ok) {
+          break;
+        }
+        float ms = 0.0f;
+        check(cudaEventElapsedTime(&ms, start, stop), "cudaEventElapsedTime");
+        times.push_back(ms);
+      }
+      check(cudaEventDestroy(start), "cudaEventDestroy start");
+      check(cudaEventDestroy(stop), "cudaEventDestroy stop");
+    }
+
+    if (ok && !times.empty()) {
+      std::sort(times.begin(), times.end());
+      float sum = 0.0f;
+      for (float t : times) {
+        sum += t;
+      }
+      printf("  segments=%d grid=%d median=%.4f ms avg=%.4f ms min=%.4f ms max=%.4f ms\n",
+             segments, grid, times[times.size() / 2], sum / times.size(), times.front(),
+             times.back());
+    } else {
+      printf("  segments=%d grid=%d failed\n", segments, grid);
+    }
+
+    check(cudaFree(d_segment_states), "cudaFree segment_states");
+    check(cudaFree(d_prefix_states), "cudaFree prefix_states");
+  }
+#else
+  (void)block_threads;
+  (void)smem_size;
+  printf("cluster_prefix_state_probe requires CUDART_VERSION >= 12000\n");
 #endif
 }
 
@@ -276,12 +433,14 @@ void report_kernel(char const* name, int sm_count, bool launch_dummy,
 }
 
 void usage(char const* argv0) {
-  printf("Usage: %s [--launch-dummy] [--launch-cluster-dummy]\n", argv0);
+  printf("Usage: %s [--launch-dummy] [--launch-cluster-dummy] [--bench-cluster-prefix]\n",
+         argv0);
   printf("Reports real FlashInfer/CUTLASS GDN kernel resource usage. With "
          "--launch-dummy, also tests a tiny cooperative grid-sync kernel using the "
          "same block size and dynamic shared memory.\n");
   printf("With --launch-cluster-dummy, tests tiny thread-block-cluster launches "
          "using the same block size and dynamic shared memory.\n");
+  printf("With --bench-cluster-prefix, times a cluster-local state prefix microbenchmark.\n");
 }
 
 }  // namespace
@@ -289,11 +448,14 @@ void usage(char const* argv0) {
 int main(int argc, char** argv) {
   bool launch_dummy = false;
   bool launch_cluster_dummy = false;
+  bool bench_cluster_prefix = false;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--launch-dummy") == 0) {
       launch_dummy = true;
     } else if (strcmp(argv[i], "--launch-cluster-dummy") == 0) {
       launch_cluster_dummy = true;
+    } else if (strcmp(argv[i], "--bench-cluster-prefix") == 0) {
+      bench_cluster_prefix = true;
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       usage(argv[0]);
       return 0;
@@ -340,6 +502,11 @@ int main(int argc, char** argv) {
                                         launch_cluster_dummy);
   report_kernel<StateOnlyKernel<true>>("state_only_checkpoint", sm_count, launch_dummy,
                                        launch_cluster_dummy);
+
+  if (bench_cluster_prefix) {
+    bench_cluster_prefix_probe(FullKernel<false, false>::MaxThreadsPerBlock,
+                               FullKernel<false, false>::SharedStorageSize);
+  }
 
   return 0;
 }

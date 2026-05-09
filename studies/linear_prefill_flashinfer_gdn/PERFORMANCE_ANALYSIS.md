@@ -388,13 +388,26 @@ succeeds for all segment counts tested:
 | 5 | 320 | ok |
 | 8 | 512 | ok |
 
+`bench_gdn_coop_probe --bench-cluster-prefix` then times the prefix-state
+exchange pattern that a cluster implementation would need. The microbenchmark
+writes one `128x128` float state per segment/head to global memory, runs
+`this_cluster().sync()`, and composes each segment's prefix state inside the same
+cluster-launched kernel:
+
+| Segments | Grid | Median (ms) | Notes |
+|---:|---:|---:|---|
+| 2 | 128 | 0.0212 | write + cluster sync + prefix compose |
+| 3 | 192 | 0.0384 | write + cluster sync + prefix compose |
+| 5 | 320 | 0.0586 | write + cluster sync + prefix compose |
+| 8 | 512 | 0.1260 | write + cluster sync + prefix compose |
+
 This is only a launch feasibility test; it does not prove that a full GDN
 cluster implementation is easy. The state exchanged between segment CTAs is
 large (`128x128` float per output/state head), and the current GDN CTA already
-uses 186 KB of shared memory, so a production version would probably need to
-write segment states to global memory and use cluster synchronization plus
-careful memory fencing, rather than keeping all prefix state in distributed
-shared memory.
+uses 186 KB of shared memory, so the realistic communication path is global
+scratch plus cluster synchronization, not keeping all prefix state in distributed
+shared memory. The microbenchmark shows that this prefix exchange is plausible,
+but not free.
 
 Still, this is the first synchronization mechanism tested that is mechanically
 compatible with both requirements:
@@ -415,7 +428,11 @@ prototype:
 6. compute the segment output with the composed prefix state.
 
 This would be a larger rewrite than the previous probes, but it is no longer
-blocked by CUDA launch constraints.
+blocked by CUDA launch constraints. It also has a clear performance caveat: a
+cluster version that still performs separate state-transition and full
+output/correction GDN work would remain close to the current multi-pass cost.
+For the cluster path to beat the original single kernel, it must reuse work
+within the CTA/cluster or otherwise avoid a second full GDN-like pass.
 
 ## Completion Audit
 
@@ -432,7 +449,7 @@ prefill grid enough to fill the GPU SMs.
 | Verify correctness of the best semantic paths | `scan_split --check: max_abs=0`; compute-sanitizer reports `ERROR SUMMARY: 0 errors` | Done |
 | Check cooperative in-kernel prefix feasibility | Actual GDN kernels use 512 threads and 186368 B SMEM, so cooperative resident grid is only one CTA per SM; dummy cooperative launch fails at 128+ CTAs on local H800 PCIe | Done, blocked |
 | Check zero-state output plus exact correction decomposition | `zero_split` is 0.1979 ms and exact `V=0` correction is 0.2072 ms at 1280-token segments, giving a lower-bound total around 0.431 ms with prefix compose | Done, not faster |
-| Check thread-block cluster feasibility | Dummy cluster launch with GDN-sized 512-thread/186368-byte CTA succeeds for cluster sizes 2/3/5/8, enabling a plausible cluster-per-head segment design | Done, feasible |
+| Check thread-block cluster feasibility | Dummy cluster launch with GDN-sized 512-thread/186368-byte CTA succeeds for cluster sizes 2/3/5/8; cluster prefix-state exchange costs 0.0384 ms for 3 segments and 0.0586 ms for 5 segments | Done, feasible but not sufficient |
 | Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3660 ms vs original 0.2575 ms | Not achieved |
 
 Conclusion: grid count can be made large and correctness can be preserved, but
