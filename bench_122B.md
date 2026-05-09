@@ -11,10 +11,13 @@ The H800 columns are from an NCU capture:
 | Column | Meaning |
 |---|---|
 | `H800 kernels` | Number of profiled CUDA kernel rows for this benchmark case. |
-| `H800 cycles_avg` | Sum of `sm__cycles_elapsed.avg` across kernel rows. |
-| `H800 cycles_max` | Sum of `sm__cycles_elapsed.max` across kernel rows. |
+| `H800 cycles_avg` | Sum of `sm__cycles_elapsed.avg` across kernel rows; this is elapsed cycles, not active cycles. |
+| `H800 cycles_max` | Sum of `sm__cycles_elapsed.max` across kernel rows; this is elapsed cycles, not active cycles. |
 | `H800 duration_ns` | Sum of profiled GPU kernel durations in ns. |
 | `H800 latency_us` | `H800 duration_ns / 1000`. |
+
+New `bench_all.sh --ncu-cycles` runs also collect
+`sm__cycles_active.avg/max`; the table below predates that column split.
 
 The PPU columns are from per-case `perfstatistics.log` summaries. PPU latency is
 `compute_cycles / 1.5GHz`.

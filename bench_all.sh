@@ -119,7 +119,7 @@ RESUME_FROM=""
 RESUME_SEEN=1
 RESUME_FOUND=0
 NCU_CYCLES=0
-NCU_METRICS="${NCU_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum}"
+NCU_METRICS="${NCU_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,sm__cycles_active.avg,sm__cycles_active.max,gpu__time_duration.avg}"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
@@ -174,7 +174,9 @@ Environment variables:
   MODEL_SAMPLING_PREFILL_COUNT Model summary prefill sampling count. Default: 1.
   MODEL_SAMPLING_DECODE_COUNT  Model summary decode sampling count. Default: 1.
   NCU_METRICS              Nsight Compute metrics for --ncu-cycles.
-                           Default: sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum
+                           Default: sm__cycles_elapsed.avg,sm__cycles_elapsed.max,
+                           sm__cycles_active.avg,sm__cycles_active.max,
+                           gpu__time_duration.avg
   NCU_LAUNCH_SKIP          Optional Nsight Compute --launch-skip value.
   NCU_LAUNCH_COUNT         Optional Nsight Compute --launch-count value.
 EOF

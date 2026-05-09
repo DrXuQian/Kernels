@@ -233,7 +233,8 @@ sampling/bench_sampling \
 H800 nsys single-case capture:
 
 ```bash
-RUN_ID=case_$(date +%Y%m%d_%H%M%S)
+CASE=flash_attn_decode_full_attn
+RUN_ID=${CASE}_$(date +%Y%m%d_%H%M%S)
 BENCH_RUN_ID="$RUN_ID" \
 PERFRAWLOG_POSTPROCESS=0 \
 nsys profile \
@@ -242,13 +243,20 @@ nsys profile \
   --sample=none \
   --cpuctxsw=none \
   --output=".bench_profiles/$RUN_ID" \
-  ./bench_all.sh --case flash_attn_decode_full_attn
+  ./bench_all.sh --case "$CASE"
 
 nsys stats ".bench_profiles/$RUN_ID.nsys-rep" \
   --report cuda_gpu_trace \
   --format csv \
-  --output ".bench_profiles/${RUN_ID}_trace"
+  --output ".bench_profiles/${CASE}_trace"
+
+python helpers/summarize_nsys_traces.py .bench_profiles \
+  --compare-md bench_122B.md \
+  --output .bench_profiles/nsys_vs_ncu.md
 ```
+
+The nsys summary sums CUDA kernel durations from `cuda_gpu_trace` CSVs and can
+compare them against the H800 NCU duration columns in `bench_122B.md`.
 
 H800 Nsight Compute cycles:
 
@@ -261,7 +269,10 @@ H800 Nsight Compute cycles:
 `--ncu-cycles` writes the raw per-case CSV files under `<OUT_DIR>/ncu/`, a
 case-level aggregate at `<OUT_DIR>/ncu_cycles_summary.md`, and a model-level
 latency report with SVG charts at
-`<OUT_DIR>/model_latency_ncu/model_latency_summary.md`.
+`<OUT_DIR>/model_latency_ncu/model_latency_summary.md`. The default metrics
+include both `sm__cycles_elapsed.avg/max` and `sm__cycles_active.avg/max`.
+Reported `latency_us` is based on `gpu__time_duration.avg` when available;
+elapsed cycles are only used as a fallback.
 
 perfrawlog post-processing:
 
