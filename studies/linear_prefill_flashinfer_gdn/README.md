@@ -116,9 +116,13 @@ Checkpointed split-sequence prototype timing:
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode state_both --bench 5 20
 
+# Time the scan-style prototype: per-segment transition, prefix compose, split output.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode scan_both --bench 5 20
+
 # Compare the full-sequence checkpoint output against the split output.
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
-  --segment-tokens 768 --mode state_split --check
+  --segment-tokens 768 --mode scan_split --check
 ```
 
 Nsight Systems single-kernel check:
@@ -213,6 +217,8 @@ Checkpointed split-sequence prototype:
 | state-checkpoint-only | 768 | 64 | 0.1774 | 0.1779 | skips Q/O path, writes states only |
 | state-split-only | 768 | 320 | 0.2066 | 0.2065 | state-only checkpoint prep, timed split pass |
 | state-both | 768 | 64 + pack + 320 | 0.4102 | 0.4105 | best correct two-pass prototype so far |
+| scan-transition-only | 768 | 320 | 0.1174 | 0.1176 | per-segment state transitions from zero |
+| scan-both | 768 | 320 + prefix + 320 | 0.3773 | 0.3771 | best correct multi-pass prototype so far |
 
 `split-only` uses already prepared segment states, so it measures the useful
 second pass. With `segment_tokens=768`, nsys shows the checkpoint pass at
@@ -226,11 +232,13 @@ check: max_abs=0 max_rel=0 elements=31318016
 
 This is the first study path that raises the GDN grid above H800 SM count while
 preserving recurrent state semantics. It is still not a production replacement:
-even with the state-only checkpoint pass, total time is still slower than the
-original single kernel. The state-only pass confirms that skipping Q/O helps
-(`0.2706 ms -> 0.1774 ms`), but a two-pass design still does too much total work.
-The useful next step would need to parallelize or fuse the state prefix step
-rather than simply running state checkpoint plus split output as separate passes.
+even with the state-only or scan-style checkpoint/prefix pass, total time is
+still slower than the original single kernel. The state-only pass confirms that
+skipping Q/O helps (`0.2706 ms -> 0.1774 ms`), and the scan transition confirms
+that the state prepass can also use a large grid (`0.1174 ms`, 320 CTAs). But the
+multi-pass design still duplicates too much work once the split output pass is
+included. A useful production direction would need to fuse the transition,
+prefix, and output phases or use a cooperative in-kernel prefix.
 
 Validation:
 

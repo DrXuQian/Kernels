@@ -192,6 +192,8 @@ measured split was `segment_tokens=768`, which produces 5 segments and 320 CTAs:
 | checkpoint + pack + split pass | 64 + 4096 + 320 | 0.5097 ms |
 | state-only checkpoint pass | 64 | 0.1774 ms |
 | state-only checkpoint + pack + split pass | 64 + 4096 + 320 | 0.4102 ms |
+| scan transition pass | 320 | 0.1174 ms |
+| scan transition + prefix + split pass | 320 + prefix + 320 | 0.3773 ms |
 
 The split second pass is about 20% faster than the original single kernel, and
 the target-shape output matches the full-sequence checkpoint output exactly in
@@ -221,12 +223,26 @@ Its nsys breakdown for `state_both` is:
 | `pack_segment_input_states` | 4096 | 23.104 us |
 | split GDN | 320 | 210.051 us |
 
+The scan-style variant computes each segment's state transition from zero in
+parallel, computes segment decay coefficients, composes segment input states,
+then runs the same split output pass. It keeps both GDN passes at 320 CTAs and
+is correct and memcheck-clean on the target shape (`max_abs=0`,
+`compute-sanitizer: ERROR SUMMARY: 0 errors`). Its nsys breakdown is:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| state-only per-segment transition | 320 | 122.562 us |
+| `compute_segment_coeffs` | 320 | 4.896 us |
+| `compose_segment_input_states` | 4096 | 37.952 us |
+| split GDN | 320 | 211.106 us |
+
 So sequence splitting is theoretically viable and is the first tested path that
 both increases grid count and preserves recurrent state semantics. It is not yet
 a usable replacement: even after removing Q/O from checkpointing, the correct
-two-pass flow is still `0.4102 ms`, slower than the original `0.2575 ms`. A
-production-quality variant would need a parallel/fused state prefix mechanism,
-not just a separate checkpoint pass plus a split output pass.
+multi-pass flow is still `0.3773 ms`, slower than the original `0.2575 ms`. A
+production-quality variant would need to fuse transition, prefix, and output, or
+use a cooperative kernel with an in-kernel prefix phase, rather than launching
+separate transition and output kernels.
 
 ## Practical Next Steps
 
@@ -242,7 +258,6 @@ not just a separate checkpoint pass plus a split output pass.
    it duplicates the auxiliary path. A useful next attempt would need to share
    QK/KK/alpha-beta work across V slices or split auxiliary/state phases.
 5. The checkpointed split-sequence prototype shows a viable direction for the
-   output pass. The state-only checkpoint pass reduces checkpoint cost but does
-   not make the two-pass design faster overall. The next useful implementation
-   would need a parallel prefix/scan of segment state transitions, or a fused
-   cooperative kernel with an in-kernel state prefix phase.
+   output pass. State-only and scan-style prepasses reduce the prefix cost but do
+   not make the multi-pass design faster overall. The next useful implementation
+   would need to fuse the phases or use a cooperative in-kernel state prefix.
