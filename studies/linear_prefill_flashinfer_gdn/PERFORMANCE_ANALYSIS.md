@@ -435,6 +435,38 @@ standalone cluster-prefix pass is not enough. To beat the original single GDN
 kernel, prefix handling needs to be fused into the GDN CTA/cluster work so the
 algorithm does not pay for separate transition and output/correction passes.
 
+## Fused Cluster Scope
+
+The current FlashInfer GDN kernel cannot become the desired fused cluster kernel
+through a launch-only change:
+
+- `FlatBuilderDeltaRule` always uses `IndividualTileScheduler`, and that
+  scheduler maps work only over `(seq, head)`. There is no segment dimension in
+  the production work descriptor.
+- `FlatMainloopTmaWarpSpecializedDeltaRule` currently has
+  `ClusterShape = Shape<_1, _1, _1>`. The existing GDN kernel therefore does not
+  have a segment cluster baked into its CUTLASS pipeline/barrier layout.
+- The mainloop computes each block's output from the current recurrent state and
+  then updates that state. If a long sequence is split into independent segment
+  CTAs, the correct prefix state for segment `i` is not known until earlier
+  segment transitions are complete. Starting from zero gives the fast
+  `zero_split` path, but the exact correction still needs another GDN-like pass
+  (`correction_full`).
+
+This is why the implemented cluster compose kernel is correct but not faster:
+it only moves the prefix composition into a cluster launch; it does not remove
+the need for a separate state-transition pass and a separate output/correction
+pass. A real winning implementation would need a new collective/scheduler that
+either:
+
+1. computes segment transition summaries and output correction summaries in one
+   pass, then applies prefix state without re-reading the full Q/K/V stream; or
+2. derives an output formula that lets the zero-state output be corrected from a
+   compact per-segment summary instead of a second GDN-like traversal.
+
+Without one of those algorithmic changes, increasing the grid improves SM
+occupancy for a sub-pass but does not improve end-to-end latency.
+
 Still, this is the first synchronization mechanism tested that is mechanically
 compatible with both requirements:
 

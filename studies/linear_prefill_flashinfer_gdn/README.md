@@ -410,6 +410,15 @@ phase is not the missing optimization. A winning implementation would need to
 fold prefix handling into the actual GDN work rather than adding another
 standalone pass.
 
+The remaining fused-cluster path is a larger collective rewrite, not a launch
+flag change. The extracted FlashInfer GDN builder still uses
+`IndividualTileScheduler` over `(seq, head)` and the main collective declares
+`ClusterShape = Shape<_1, _1, _1>`. More importantly, a split segment's exact
+output needs the prefix recurrent state, but that prefix is only known after
+earlier segment transitions complete. The measured `zero_split` and
+`correction_full` modes show that handling this with another GDN-like traversal
+loses the benefit of the larger grid.
+
 Validation:
 
 ```bash
