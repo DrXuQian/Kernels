@@ -46,6 +46,7 @@ the top-level command reference.
 | [studies/ppu_finalize_moe_routing/README.md](studies/ppu_finalize_moe_routing/README.md) | Isolated MoE finalize routing optimization study; not part of default compile or benchmark flows. |
 | [studies/linear_prefill_flashinfer_gdn/README.md](studies/linear_prefill_flashinfer_gdn/README.md) | Isolated FlashInfer GDN prefill stage-count tuning study; not part of default compile or benchmark flows. |
 | [studies/linear_prefill_flashinfer_gdn/PERFORMANCE_ANALYSIS.md](studies/linear_prefill_flashinfer_gdn/PERFORMANCE_ANALYSIS.md) | Root-cause analysis for low GDN prefill utilization and separable compilation impact. |
+| [studies/linear_prefill_flashinfer_gdn/FLASHQLA_UPSTREAM_BENCH.md](studies/linear_prefill_flashinfer_gdn/FLASHQLA_UPSTREAM_BENCH.md) | Upstream FlashQLA speed check and local CUDA CP-proxy comparison for the target GDN shape. |
 
 ## Layout
 

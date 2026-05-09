@@ -10,9 +10,25 @@ Qwen3.5 DeltaNet layer 的 standalone CUDA/Triton kernel bench。
 | `bench_conv1d_update` | `causal_conv1d_update` | Dao-AILab/causal-conv1d | SM80+ | Decode |
 | `bench_linear_ops` | `in_proj_a/b` cuBLAS GEMM, residual add | standalone cuBLAS/CUDA | SM80+ | Prefill + Decode |
 | `bench_gated_delta_net` | `gated_delta_net_cuda` | [llama.cpp](https://github.com/ggml-org/llama.cpp) | SM80+ | Prefill + Decode |
+| `bench_gdn_prefill` | FlashInfer DeltaRule/GDN prefill, single-TU CUDA build | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | SM90 | Prefill |
 | `bench_kda_prefill` | `launch_kda_fwd_prefill_kernel` | [cuLA](https://github.com/inclusionAI/cuLA) | SM90 | Prefill (chunked) |
 | `src/bench_vllm_triton_gdn_prefill.py` | `fused_post_conv_prep` + `chunk_gated_delta_rule` | vLLM FLA/GDN Triton | NVIDIA CUDA/Triton | Prefill |
 | `src/bench_vllm_triton_gdn_decode.py` | `fused_recurrent_gated_delta_rule_packed_decode` | vLLM FLA/GDN Triton | NVIDIA CUDA/Triton | Decode |
+
+## FlashInfer GDN Prefill CUDA
+
+`bench_gdn_prefill` is the CUDA prefill path used by `bench_all.sh` for
+`linear_prefill_flashinfer_gdn`. It is compiled as one translation unit for the
+Qwen3.5 GVA path:
+
+```text
+GVA=true, alpha=true, beta=true, init_state=false, checkpoint=false
+```
+
+This avoids the SM90 `setmaxnreg` loss seen with separable device compilation
+and is the local CUDA path that beats upstream FlashQLA on the target
+`T=3823,Hqk=16,Hv=64,D=128` shape. The generic runtime-dispatch build is kept as
+`bench_gdn_prefill_separable` for debugging and non-target variants.
 
 ## vLLM Triton GDN 提取
 
@@ -93,6 +109,9 @@ make bench_linear_ops
 
 # cuLA chunked prefill (Hopper only)
 ./bench_kda_prefill [seq_len] [num_heads] [head_dim] [num_seqs] # default: 3823 64 128 1
+
+# FlashInfer GDN prefill (Hopper only, Qwen3.5 GVA fast path)
+./bench_gdn_prefill [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs] # default: 3823 16 64 128 1
 
 # vLLM Triton GDN prefill after causal_conv1d
 python3 src/bench_vllm_triton_gdn_prefill.py [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs]
