@@ -34,7 +34,8 @@ using TileShape = cute::Shape<cute::_64, cute::_64, cute::_128>;
 using Scheduler = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
 using Layout = cute::tuple<int64_t, cute::_1, int32_t>;
 
-template <bool InitStateFromInput, bool EnableCheckpointing>
+template <bool InitStateFromInput, bool EnableCheckpointing, int StagesQ = 2,
+          int StagesK = 3, int StagesV = 2>
 using FullOptions = std::tuple<
     flat::kernel::Option<flat::kernel::Tag::kIsDeltaRule, cute::true_type>,
     flat::kernel::Option<flat::kernel::Tag::kIsGVA, cute::true_type>,
@@ -45,12 +46,16 @@ using FullOptions = std::tuple<
                                             cute::false_type>>,
     flat::kernel::Option<flat::kernel::Tag::kEnableCheckpointing,
                          std::conditional_t<EnableCheckpointing, cute::true_type,
-                                            cute::false_type>>>;
+                                            cute::false_type>>,
+    flat::kernel::Option<flat::kernel::Tag::kStagesQ, cute::Int<StagesQ>>,
+    flat::kernel::Option<flat::kernel::Tag::kStagesK, cute::Int<StagesK>>,
+    flat::kernel::Option<flat::kernel::Tag::kStagesV, cute::Int<StagesV>>>;
 
-template <bool InitStateFromInput, bool EnableCheckpointing>
+template <bool InitStateFromInput, bool EnableCheckpointing, int StagesQ = 2,
+          int StagesK = 3, int StagesV = 2>
 using FullKernel = typename flat::kernel::FlatBuilderDeltaRule<
     Element, float, float, TileShape, Layout, Layout, Layout, Layout, Scheduler,
-    FullOptions<InitStateFromInput, EnableCheckpointing>>::Kernel;
+    FullOptions<InitStateFromInput, EnableCheckpointing, StagesQ, StagesK, StagesV>>::Kernel;
 
 template <bool EnableCheckpointing>
 using StateOnlyOptions = std::tuple<
@@ -235,6 +240,10 @@ int main(int argc, char** argv) {
   printf("shared_memory: per_block=%d optin_per_block=%d\n", max_smem, optin_smem);
 
   report_kernel<FullKernel<false, false>>("full_gdn_original", sm_count, launch_dummy);
+  report_kernel<FullKernel<false, false, 2, 2, 2>>("full_gdn_stage_222_k2", sm_count,
+                                                   launch_dummy);
+  report_kernel<FullKernel<false, false, 1, 1, 1>>("full_gdn_stage_111_minimal", sm_count,
+                                                   launch_dummy);
   report_kernel<FullKernel<false, true>>("full_gdn_checkpoint", sm_count, launch_dummy);
   report_kernel<FullKernel<true, false>>("full_gdn_init_state_split", sm_count,
                                          launch_dummy);

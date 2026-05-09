@@ -289,13 +289,15 @@ make coop_probe -j
 
 Observed on the local H800 PCIe:
 
-| Kernel variant | Threads/block | Shared storage | Active blocks/SM | Max resident cooperative grid |
-|---|---:|---:|---:|---:|
-| full GDN original | 512 | 186368 B | 1 | 114 |
-| full GDN checkpoint | 512 | 186368 B | 1 | 114 |
-| full GDN init-state split | 512 | 186368 B | 1 | 114 |
-| state-only transition | 512 | 186368 B | 1 | 114 |
-| state-only checkpoint | 512 | 186368 B | 1 | 114 |
+| Kernel variant | Stages Q/K/V | Threads/block | Shared storage | Active blocks/SM | Max resident cooperative grid |
+|---|---:|---:|---:|---:|---:|
+| full GDN original | 2/3/2 | 512 | 186368 B | 1 | 114 |
+| full GDN `k2` | 2/2/2 | 512 | 169984 B | 1 | 114 |
+| full GDN minimal-stage probe | 1/1/1 | 512 | 120832 B | 1 | 114 |
+| full GDN checkpoint | 2/3/2 | 512 | 186368 B | 1 | 114 |
+| full GDN init-state split | 2/3/2 | 512 | 186368 B | 1 | 114 |
+| state-only transition | 2/3/2 | 512 | 186368 B | 1 | 114 |
+| state-only checkpoint | 2/3/2 | 512 | 186368 B | 1 | 114 |
 
 The dummy cooperative launch uses the same block size and dynamic shared-memory
 request. It succeeds at 64 CTAs and fails at 128 CTAs and above:
@@ -309,9 +311,12 @@ launch grid=320  failed: too many blocks in cooperative launch
 
 This blocks the simple fused cooperative-grid-sync approach. The split output
 phase becomes interesting at 192/256/320 CTAs, but a cooperative kernel with the
-current GDN shared-memory footprint can only resident-launch one CTA per SM. On a
-larger H800 the exact number changes with SM count, but the constraint remains:
-`max_grid = SM_count` while active blocks/SM is 1.
+current GDN shared-memory footprint can only resident-launch one CTA per SM.
+Reducing K stages to the already-tested `k2` variant saves only 16 KB. Even the
+diagnostic `1/1/1` pipeline-stage probe is still 120832 B, above the
+approximately half-SMEM threshold needed for two resident blocks on this device.
+On a larger H800 the exact number changes with SM count, but the constraint
+remains: `max_grid = SM_count` while active blocks/SM is 1.
 
 Therefore the next viable fused design cannot simply add a global grid sync to
 the existing FlashInfer GDN kernel. It would need one of:

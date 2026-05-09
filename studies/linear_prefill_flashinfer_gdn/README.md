@@ -273,14 +273,22 @@ direction would need to fuse the transition, prefix, and output phases or use a
 cooperative in-kernel prefix.
 
 Cooperative single-kernel prefix feasibility was checked with
-`bench_gdn_coop_probe`. On the local H800 PCIe, all relevant GDN variants have
-the same resource shape:
+`bench_gdn_coop_probe`. On the local H800 PCIe, the default GDN resource shape
+is:
 
 ```text
 max_threads_per_block=512
 shared_storage=186368 bytes
 occupancy: active_blocks_per_sm=1
 ```
+
+Reducing pipeline stages is not enough to change occupancy:
+
+| Variant | Stages Q/K/V | Shared storage | Active blocks/SM |
+|---|---:|---:|---:|
+| default | 2/3/2 | 186368 B | 1 |
+| `k2` | 2/2/2 | 169984 B | 1 |
+| minimal-stage probe | 1/1/1 | 120832 B | 1 |
 
 That means a CUDA cooperative grid-sync kernel with the current GDN resource
 footprint can only make one block resident per SM. The local H800 PCIe has 114
@@ -296,9 +304,10 @@ launch grid=320  failed: too many blocks in cooperative launch
 ```
 
 On any H800 variant the limit is still one resident block per SM unless the GDN
-shared-storage footprint is reduced below roughly half of opt-in SMEM. Therefore
-a straightforward cooperative grid-sync version cannot be used to raise this
-kernel to the 192/320 CTA grids that made the split output phase faster. A fused
+shared-storage footprint is reduced below roughly half of opt-in SMEM. Even the
+`1/1/1` stage probe remains above that threshold on this device. Therefore a
+straightforward cooperative grid-sync version cannot be used to raise this kernel
+to the 192/320 CTA grids that made the split output phase faster. A fused
 single-kernel replacement would need either a much smaller-SMEM kernel shape or a
 different algorithm that does not require all split CTAs to be resident at the
 same global synchronization point.
