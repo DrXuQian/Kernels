@@ -18,7 +18,7 @@ Shared kernels such as RMSNorm, cuBLAS GEMM, and W4A16 GEMM live under
 |---|---|
 | [BUILD_AND_BENCH.md](BUILD_AND_BENCH.md) | Per-module compile targets, benchmark commands, profiling modes, and tactic-cache notes. |
 | [OPERATOR_COVERAGE.md](OPERATOR_COVERAGE.md) | Per-module operator list, shapes, implementation source, and `bench_all.sh` labels. |
-| [bench_122B.md](bench_122B.md) | Per-module benchmark results. Missing PPU data is marked `not tested`. |
+| [bench_122B.md](bench_122B.md) | Per-module H800 Nsight Compute benchmark results and current coverage gaps. |
 
 CUTLASS is kept as a git submodule under `third_party/cutlass`. Its upstream
 Markdown files are vendor documentation and are intentionally not indexed here.
