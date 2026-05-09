@@ -45,6 +45,12 @@ studies/linear_prefill_flashinfer_gdn/bench_gdn_tile_study_single_tu \
   3823 16 64 128 1 --bench 10 50
 ```
 
+Correctness-relaxed CP proxy using the local CUDA/FlashInfer kernel:
+
+```bash
+studies/linear_prefill_flashinfer_gdn/sweep_flashinfer_cp_proxy.sh
+```
+
 ## H800 Results
 
 | Shape | Case | Time |
@@ -59,6 +65,37 @@ studies/linear_prefill_flashinfer_gdn/bench_gdn_tile_study_single_tu \
 | `T=4096,Hqk=2,Hv=8` | FlashQLA `auto_cp=True` | 0.133 ms |
 | `T=4096,Hqk=2,Hv=8` | FlashQLA `auto_cp=False` | 0.191 ms |
 | `T=4096,Hqk=2,Hv=8` | FlashInfer Python | 0.343 ms |
+
+## Local CUDA CP Proxy
+
+This proxy splits the total `3823` tokens into multiple independent `cu_seqlens`
+entries and runs the same local single-TU FlashInfer GDN kernel. This is not
+mathematically equivalent to one recurrent sequence because the state is reset at
+each segment. It only measures the optimistic performance upper bound of more
+CTA-level parallelism before adding FlashQLA-style warmup/correction kernels.
+
+Command:
+
+```bash
+studies/linear_prefill_flashinfer_gdn/sweep_flashinfer_cp_proxy.sh
+```
+
+Observed H800 results:
+
+| Segments | Median time |
+|---:|---:|
+| 1 | 0.2607 ms |
+| 2 | 0.2870 ms |
+| 4 | 0.2284 ms |
+| 8 | 0.2206 ms |
+| 16 | 0.2373 ms |
+| 32 | 0.2942 ms |
+
+The best relaxed split is `8` segments at `0.2206 ms`, only about 15% faster
+than the correct single-sequence local CUDA baseline. Since a correct CP port
+would need extra warmup and state-correction kernels, this suggests that a full
+FlashQLA-style CP CUDA port is unlikely to deliver a large gain for the target
+`Hqk=16,Hv=64,T≈4k` shape.
 
 ## Interpretation
 

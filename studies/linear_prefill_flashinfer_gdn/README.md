@@ -7,6 +7,11 @@ See [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) for the deeper root-cause
 analysis. See [FLASHQLA_UPSTREAM_BENCH.md](FLASHQLA_UPSTREAM_BENCH.md) for the
 upstream FlashQLA speed check on the target shape.
 
+Optional helper scripts:
+
+- `bench_flashqla_upstream.py`: run the upstream FlashQLA Python/TileLang benchmark.
+- `sweep_flashinfer_cp_proxy.sh`: sweep a local CUDA split-sequence performance proxy.
+
 The production kernel uses the extracted FlashInfer DeltaNet/GDN prefill path with
 Qwen3.5-122B-A10B shape:
 
