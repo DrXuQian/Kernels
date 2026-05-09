@@ -126,6 +126,14 @@ Checkpointed split-sequence prototype timing:
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode scan_both --bench 5 20
 
+# Time per-segment zero-state output plus state transitions.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode zero_split --bench 5 20
+
+# Time the exact prefix correction pass lower bound: V=0 with composed prefix states.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode correction_full --bench 5 20
+
 # Compare the full-sequence checkpoint output against the split output.
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode scan_split --check
@@ -233,6 +241,10 @@ Checkpointed split-sequence prototype:
 | scan-transition-only | 768 | 320 | 0.1174 | 0.1176 | per-segment state transitions from zero |
 | scan-both | 768 | 320 + prefix + 320 | 0.3773 | 0.3771 | large-grid multi-pass prototype |
 | scan-both | 1280 | 192 + prefix + 192 | 0.3660 | 0.3666 | best scanned multi-pass point |
+| zero-split | 768 | 320 | 0.1888 | 0.1894 | zero-state per-segment output + transition |
+| zero-split | 1280 | 192 | 0.1979 | 0.1977 | zero-state per-segment output + transition |
+| correction-full | 768 | 320 | 0.2064 | 0.2064 | exact prefix correction with `V=0` |
+| correction-full | 1280 | 192 | 0.2072 | 0.2076 | exact prefix correction with `V=0` |
 
 `scan_both` sweep (`--bench 3 10`) on the same target shape:
 
@@ -311,6 +323,23 @@ to the 192/320 CTA grids that made the split output phase faster. A fused
 single-kernel replacement would need either a much smaller-SMEM kernel shape or a
 different algorithm that does not require all split CTAs to be resident at the
 same global synchronization point.
+
+The zero-state plus correction decomposition was also checked. `zero_split`
+computes each segment's zero-state output and state transition in one large-grid
+GDN pass. `correction_full` then times the exact prefix-state correction by
+running the init-state GDN path with `V=0`. This avoids approximate math, but it
+does not avoid the heavy GDN structure: the correction still needs the K/Q
+auxiliary path and homogeneous state evolution. For `segment_tokens=1280`, the
+lower-bound total is already roughly:
+
+```text
+zero_split 0.1979 ms + prefix compose ~0.026 ms + correction_full 0.2072 ms
+  ~= 0.431 ms
+```
+
+That is slower than both the original `0.2575 ms` single kernel and the current
+`scan_both` result, so the exact correction decomposition is not a useful
+replacement path.
 
 Validation:
 

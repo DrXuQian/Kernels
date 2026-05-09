@@ -19,6 +19,10 @@
 //   scan_transition/scan_split/scan_both:
 //               compute per-segment state transitions in parallel, compose the
 //               segment prefix states, then run the split output pass.
+//   zero_split: compute per-segment zero-state output and state transitions.
+//   correction_full:
+//               prepare scan prefix states, then time an exact correction pass
+//               using InitStateFromInput=true and V=0.
 
 #include <algorithm>
 #include <cstdint>
@@ -44,6 +48,13 @@ void launch_gdn_prefill_bf16_gva_checkpoint(
     int32_t num_o_heads, int32_t head_size, int64_t total_seqlen, float scale, int32_t sm_count,
     float* state_checkpoints, int64_t const* checkpoint_cu_starts,
     int32_t checkpoint_every_n_tokens);
+
+void launch_gdn_prefill_bf16_gva_zero_state(
+    cudaStream_t stream, T* output, float* output_state, T const* q, T const* k, T const* v,
+    float const* alpha, float const* beta, int64_t const* cu_seqlens, uint8_t* workspace,
+    int32_t num_seqs, int32_t num_q_heads, int32_t num_k_heads, int32_t num_v_heads,
+    int32_t num_o_heads, int32_t head_size, int64_t total_seqlen, float scale,
+    int32_t sm_count);
 
 void launch_gdn_prefill_bf16_gva_initstate(
     cudaStream_t stream, T* output, float* output_state, T const* q, T const* k, T const* v,
@@ -169,7 +180,7 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
     char const* value = nullptr;
     if (strcmp(argv[i], "--mode") == 0) {
       if (i + 1 >= argc) {
-        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, or scan_both\n");
+        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, or correction_full\n");
         exit(1);
       }
       value = argv[++i];
@@ -195,8 +206,12 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
         *mode = 7;
       } else if (strcmp(value, "scan_both") == 0) {
         *mode = 8;
+      } else if (strcmp(value, "zero_split") == 0) {
+        *mode = 9;
+      } else if (strcmp(value, "correction_full") == 0) {
+        *mode = 10;
       } else {
-        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, or scan_both\n", value);
+        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, or correction_full\n", value);
         exit(1);
       }
       *mode_name = value;
@@ -221,7 +236,7 @@ static int strip_check_arg(int argc, char** argv, bool* check) {
 
 static void usage(char const* argv0) {
   printf("Usage: %s [seqlen] [q_heads] [v_heads] [head_dim] "
-         "[--segment-tokens N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both] [--check] [--bench W I]\n",
+         "[--segment-tokens N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full] [--check] [--bench W I]\n",
          argv0);
   printf("Default shape: 3823 16 64 128, segment_tokens=1024, mode=split\n");
 }
@@ -302,7 +317,8 @@ int main(int argc, char** argv) {
   int64_t split_state_size = static_cast<int64_t>(needed_input_states) * state_elems;
   int64_t checkpoint_size = static_cast<int64_t>(checkpoint_storage_count) * state_elems;
 
-  T *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_o = nullptr, *d_o_split = nullptr;
+  T *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_v_zero = nullptr;
+  T *d_o = nullptr, *d_o_split = nullptr;
   float *d_alpha = nullptr, *d_beta = nullptr;
   float *d_full_final_state = nullptr, *d_split_input_state = nullptr;
   float *d_split_output_state = nullptr, *d_checkpoints = nullptr;
@@ -313,6 +329,7 @@ int main(int argc, char** argv) {
   BENCH_CUDA_CHECK(cudaMalloc(&d_q, q_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_k, k_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_v, v_size * sizeof(T)));
+  BENCH_CUDA_CHECK(cudaMalloc(&d_v_zero, v_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_o, o_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_o_split, o_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_alpha, gate_size * sizeof(float)));
@@ -341,6 +358,7 @@ int main(int argc, char** argv) {
   fill_bf16(d_q, q_size);
   fill_bf16(d_k, k_size);
   fill_bf16(d_v, v_size);
+  BENCH_CUDA_CHECK(cudaMemset(d_v_zero, 0, v_size * sizeof(T)));
 
   std::vector<float> h_gate(gate_size);
   for (auto& x : h_gate) {
@@ -386,6 +404,13 @@ int main(int argc, char** argv) {
         sm_count, d_checkpoints, d_ckpt_cu, segment_tokens);
   };
 
+  auto run_zero_split = [&]() {
+    gdn_splitseq_study::launch_gdn_prefill_bf16_gva_zero_state(
+        0, d_o_split, d_split_output_state, d_q, d_k, d_v, d_alpha, d_beta, d_cu_split,
+        d_workspace, segments, num_q_heads, num_k_heads, num_v_heads, num_o_heads, head_dim,
+        total_seqlen, scale, sm_count);
+  };
+
   auto run_state_checkpoint = [&]() {
     gdn_state_only_study::launch_gdn_prefill_bf16_gva_state_only_checkpoint(
         0, d_o, d_full_final_state, d_q, d_k, d_v, d_alpha, d_beta, d_cu_full, d_workspace,
@@ -428,6 +453,13 @@ int main(int argc, char** argv) {
         head_dim, total_seqlen, scale, sm_count);
   };
 
+  auto run_correction_full = [&]() {
+    gdn_splitseq_study::launch_gdn_prefill_bf16_gva_initstate(
+        0, d_o_split, d_split_output_state, d_q, d_k, d_v_zero, d_split_input_state, d_alpha,
+        d_beta, d_cu_split, d_workspace, segments, num_q_heads, num_k_heads, num_v_heads,
+        num_o_heads, head_dim, total_seqlen, scale, sm_count);
+  };
+
   try {
     if (mode == 0) {
       timer.run(run_checkpoint);
@@ -465,12 +497,20 @@ int main(int argc, char** argv) {
       BENCH_CUDA_CHECK(cudaGetLastError());
       BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       timer.run(run_split);
-    } else {
+    } else if (mode == 8) {
       timer.run([&]() {
         run_transition();
         compose_states();
         run_split();
       });
+    } else if (mode == 9) {
+      timer.run(run_zero_split);
+    } else {
+      run_transition();
+      compose_states();
+      BENCH_CUDA_CHECK(cudaGetLastError());
+      BENCH_CUDA_CHECK(cudaDeviceSynchronize());
+      timer.run(run_correction_full);
     }
   } catch (std::exception const& e) {
     fprintf(stderr, "launch failed: %s\n", e.what());
@@ -511,6 +551,7 @@ int main(int argc, char** argv) {
   cudaFree(d_q);
   cudaFree(d_k);
   cudaFree(d_v);
+  cudaFree(d_v_zero);
   cudaFree(d_o);
   cudaFree(d_o_split);
   cudaFree(d_alpha);

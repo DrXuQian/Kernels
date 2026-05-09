@@ -271,6 +271,45 @@ production-quality variant would need to fuse transition, prefix, and output, or
 use a cooperative kernel with an in-kernel prefix phase, rather than launching
 separate transition and output kernels.
 
+### Zero-State Output Plus Prefix Correction
+
+Another possible decomposition is:
+
+1. Run per-segment GDN from zero state. This produces each segment's local output
+   and local final state with a large grid.
+2. Compose prefix states across segments.
+3. Add the exact prefix-state contribution to the output.
+
+The key question is whether step 3 is cheap. For correctness, the prefix
+contribution is not just a simple `Q @ prefix_state` GEMM: within a segment, the
+prefix state is transformed by the same K/beta/alpha homogeneous recurrence that
+the full GDN kernel uses. A diagnostic `correction_full` mode was added to time
+the exact correction by running the init-state GDN path with `V=0`.
+
+Measured CUDA-event times:
+
+| Mode | Segment tokens | CTAs | Median (ms) | Meaning |
+|---|---:|---:|---:|---|
+| zero-split | 768 | 320 | 0.1888 | zero-state local output + local transition |
+| zero-split | 1280 | 192 | 0.1979 | zero-state local output + local transition |
+| correction-full | 768 | 320 | 0.2064 | exact prefix correction, `V=0` |
+| correction-full | 1280 | 192 | 0.2072 | exact prefix correction, `V=0` |
+
+For the best prefix-compose point from the scan sweep (`segment_tokens=1280`),
+the lower-bound total is:
+
+```text
+zero_split 0.1979 ms + prefix compose ~0.026 ms + correction_full 0.2072 ms
+  ~= 0.431 ms
+```
+
+This is slower than the current `scan_both` path and much slower than the
+original single kernel. Therefore an exact correction pass does not rescue the
+multi-pass split-sequence approach unless the correction itself is rewritten into
+a substantially cheaper specialized kernel. The current FlashInfer/CUTLASS GDN
+structure keeps too much of the original Q/K auxiliary and homogeneous state
+work even when `V=0`.
+
 ## Cooperative In-Kernel Prefix Feasibility
 
 The natural next question is whether transition, prefix, and output can be fused
@@ -342,6 +381,7 @@ prefill grid enough to fill the GPU SMs.
 | Increase grid beyond H800 SM count | split/scan paths reach 192, 256, 320, 384, 512, 640, and 960 CTA cases depending on segment size | Done |
 | Verify correctness of the best semantic paths | `scan_split --check: max_abs=0`; compute-sanitizer reports `ERROR SUMMARY: 0 errors` | Done |
 | Check cooperative in-kernel prefix feasibility | Actual GDN kernels use 512 threads and 186368 B SMEM, so cooperative resident grid is only one CTA per SM; dummy cooperative launch fails at 128+ CTAs on local H800 PCIe | Done, blocked |
+| Check zero-state output plus exact correction decomposition | `zero_split` is 0.1979 ms and exact `V=0` correction is 0.2072 ms at 1280-token segments, giving a lower-bound total around 0.431 ms with prefix compose | Done, not faster |
 | Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3660 ms vs original 0.2575 ms | Not achieved |
 
 Conclusion: grid count can be made large and correctness can be preserved, but
