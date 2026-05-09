@@ -23,6 +23,9 @@
 //   correction_full:
 //               prepare scan prefix states, then time an exact correction pass
 //               using InitStateFromInput=true and V=0.
+//   cluster_scan_split/cluster_scan_both:
+//               same as scan_split/scan_both, but compose segment prefix states
+//               with one thread-block-cluster kernel.
 
 #include <algorithm>
 #include <cstdint>
@@ -33,10 +36,13 @@
 #include <exception>
 #include <vector>
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "bench_timer.h"
+
+namespace cg = cooperative_groups;
 
 namespace gdn_splitseq_study {
 using T = nv_bfloat16;
@@ -153,6 +159,49 @@ __global__ void compose_segment_input_states(float* dst, float const* segment_st
   }
 }
 
+__global__ void compose_segment_input_states_cluster(float* dst, float const* segment_states,
+                                                     float* coeffs, float const* alpha,
+                                                     int64_t const* cu_seqlens, int segments,
+                                                     int num_heads,
+                                                     int64_t state_elems_per_head) {
+  cg::cluster_group cluster = cg::this_cluster();
+  int seg = cluster.block_rank();
+  int head = static_cast<int>(blockIdx.x) / segments;
+  int64_t begin = cu_seqlens[seg];
+  int64_t end = cu_seqlens[seg + 1];
+
+  float log_prod = 0.0f;
+  for (int64_t tok = begin + threadIdx.x; tok < end; tok += blockDim.x) {
+    log_prod += log2f(alpha[tok * num_heads + head] + 1.0e-10f);
+  }
+
+  __shared__ float smem[256];
+  smem[threadIdx.x] = log_prod;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      smem[threadIdx.x] += smem[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    coeffs[seg * num_heads + head] = exp2f(smem[0]);
+  }
+  __threadfence();
+  cluster.sync();
+
+  int64_t dst_base = (static_cast<int64_t>(seg) * num_heads + head) * state_elems_per_head;
+  for (int64_t elem = threadIdx.x; elem < state_elems_per_head; elem += blockDim.x) {
+    float running = 0.0f;
+    for (int j = 0; j < seg; ++j) {
+      int64_t off = (static_cast<int64_t>(j) * num_heads + head) * state_elems_per_head + elem;
+      running = segment_states[off] + coeffs[j * num_heads + head] * running;
+    }
+    dst[dst_base + elem] = running;
+  }
+}
+
 static int strip_int_arg(int argc, char** argv, char const* name, int* value) {
   int out = 0;
   size_t name_len = strlen(name);
@@ -180,7 +229,7 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
     char const* value = nullptr;
     if (strcmp(argv[i], "--mode") == 0) {
       if (i + 1 >= argc) {
-        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, or correction_full\n");
+        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, or cluster_scan_both\n");
         exit(1);
       }
       value = argv[++i];
@@ -210,8 +259,12 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
         *mode = 9;
       } else if (strcmp(value, "correction_full") == 0) {
         *mode = 10;
+      } else if (strcmp(value, "cluster_scan_split") == 0) {
+        *mode = 11;
+      } else if (strcmp(value, "cluster_scan_both") == 0) {
+        *mode = 12;
       } else {
-        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, or correction_full\n", value);
+        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, or cluster_scan_both\n", value);
         exit(1);
       }
       *mode_name = value;
@@ -236,7 +289,7 @@ static int strip_check_arg(int argc, char** argv, bool* check) {
 
 static void usage(char const* argv0) {
   printf("Usage: %s [seqlen] [q_heads] [v_heads] [head_dim] "
-         "[--segment-tokens N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full] [--check] [--bench W I]\n",
+         "[--segment-tokens N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full|cluster_scan_split|cluster_scan_both] [--check] [--bench W I]\n",
          argv0);
   printf("Default shape: 3823 16 64 128, segment_tokens=1024, mode=split\n");
 }
@@ -446,6 +499,39 @@ int main(int argc, char** argv) {
                                                       state_elems_per_head);
   };
 
+  auto compose_states_cluster = [&]() {
+#if CUDART_VERSION >= 12000
+    int threads = 256;
+    cudaError_t attr_err = cudaFuncSetAttribute(
+        compose_segment_input_states_cluster,
+        cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    if (attr_err != cudaSuccess) {
+      cudaGetLastError();
+    }
+
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(segments * num_sab_heads, 1, 1);
+    config.blockDim = dim3(threads, 1, 1);
+    config.dynamicSmemBytes = 0;
+
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = segments;
+    attr.val.clusterDim.y = 1;
+    attr.val.clusterDim.z = 1;
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    BENCH_CUDA_CHECK(cudaLaunchKernelEx(
+        &config, compose_segment_input_states_cluster, d_split_input_state, d_segment_state,
+        d_segment_coeffs, d_alpha, d_cu_split, segments, num_sab_heads,
+        state_elems_per_head));
+#else
+    fprintf(stderr, "cluster_scan modes require CUDA runtime >= 12.0\n");
+    exit(1);
+#endif
+  };
+
   auto run_split = [&]() {
     gdn_splitseq_study::launch_gdn_prefill_bf16_gva_initstate(
         0, d_o_split, d_split_output_state, d_q, d_k, d_v, d_split_input_state, d_alpha, d_beta,
@@ -505,12 +591,24 @@ int main(int argc, char** argv) {
       });
     } else if (mode == 9) {
       timer.run(run_zero_split);
-    } else {
+    } else if (mode == 10) {
       run_transition();
       compose_states();
       BENCH_CUDA_CHECK(cudaGetLastError());
       BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       timer.run(run_correction_full);
+    } else if (mode == 11) {
+      run_transition();
+      compose_states_cluster();
+      BENCH_CUDA_CHECK(cudaGetLastError());
+      BENCH_CUDA_CHECK(cudaDeviceSynchronize());
+      timer.run(run_split);
+    } else {
+      timer.run([&]() {
+        run_transition();
+        compose_states_cluster();
+        run_split();
+      });
     }
   } catch (std::exception const& e) {
     fprintf(stderr, "launch failed: %s\n", e.what());
@@ -523,7 +621,7 @@ int main(int argc, char** argv) {
       printf("check skipped: checkpoint-only modes do not produce split output\n");
     } else {
       BENCH_CUDA_CHECK(cudaDeviceSynchronize());
-      if (mode == 4 || mode == 5 || mode == 7 || mode == 8) {
+      if (mode == 4 || mode == 5 || mode == 7 || mode == 8 || mode == 11 || mode == 12) {
         run_checkpoint();
         BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       }

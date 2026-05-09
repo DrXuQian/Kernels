@@ -409,14 +409,40 @@ scratch plus cluster synchronization, not keeping all prefix state in distribute
 shared memory. The microbenchmark shows that this prefix exchange is plausible,
 but not free.
 
+This was then connected to the real split-sequence dataflow as
+`cluster_scan_split` / `cluster_scan_both`. The cluster kernel computes each
+segment/head decay coefficient, uses `this_cluster().sync()` across segment CTAs
+for one head, and composes the prefix input states consumed by the existing
+init-state GDN split pass. Correctness on the target shape is exact:
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode cluster_scan_both --check
+check: max_abs=0 max_rel=0 elements=31318016
+```
+
+The measured path is still slower than the existing non-cluster scan path:
+
+| Mode | Segment tokens | Grid shape | Median (ms) | Notes |
+|---|---:|---|---:|---|
+| original single-TU | full sequence | 64 | 0.2603 | same rebuilt local binary |
+| scan-both | 1280 | 192 + prefix + 192 | 0.3658 | best current multi-pass point |
+| cluster-scan-both | 768 | 320 + cluster-prefix + 320 | 0.3932 | real cluster compose |
+| cluster-scan-both | 1280 | 192 + cluster-prefix + 192 | 0.4027 | real cluster compose |
+
+So thread-block clusters solve the mechanical synchronization constraint, but a
+standalone cluster-prefix pass is not enough. To beat the original single GDN
+kernel, prefix handling needs to be fused into the GDN CTA/cluster work so the
+algorithm does not pay for separate transition and output/correction passes.
+
 Still, this is the first synchronization mechanism tested that is mechanically
 compatible with both requirements:
 
 - large grid count (`segments * num_v_heads`, e.g. 192 or 320 CTAs);
 - local in-kernel ordering among the segments of one head.
 
-The concrete next implementation direction is therefore a cluster-per-head
-prototype:
+The remaining concrete implementation direction is therefore a fused
+cluster-per-head GDN prototype:
 
 1. change the tile scheduler so blocks are ordered as
    `(head, segment_in_cluster)`, with `clusterDim.x = segments`;
@@ -427,12 +453,13 @@ prototype:
 5. compose prefix states inside the cluster;
 6. compute the segment output with the composed prefix state.
 
-This would be a larger rewrite than the previous probes, but it is no longer
-blocked by CUDA launch constraints. It also has a clear performance caveat: a
-cluster version that still performs separate state-transition and full
-output/correction GDN work would remain close to the current multi-pass cost.
-For the cluster path to beat the original single kernel, it must reuse work
-within the CTA/cluster or otherwise avoid a second full GDN-like pass.
+This would be a larger rewrite than the current real cluster-compose probe, but
+it is no longer blocked by CUDA launch constraints. It also has a clear
+performance caveat: a cluster version that still performs separate
+state-transition and full output/correction GDN work remains close to the
+current multi-pass cost. For the cluster path to beat the original single
+kernel, it must reuse work within the CTA/cluster or otherwise avoid a second
+full GDN-like pass.
 
 ## Completion Audit
 
@@ -450,7 +477,8 @@ prefill grid enough to fill the GPU SMs.
 | Check cooperative in-kernel prefix feasibility | Actual GDN kernels use 512 threads and 186368 B SMEM, so cooperative resident grid is only one CTA per SM; dummy cooperative launch fails at 128+ CTAs on local H800 PCIe | Done, blocked |
 | Check zero-state output plus exact correction decomposition | `zero_split` is 0.1979 ms and exact `V=0` correction is 0.2072 ms at 1280-token segments, giving a lower-bound total around 0.431 ms with prefix compose | Done, not faster |
 | Check thread-block cluster feasibility | Dummy cluster launch with GDN-sized 512-thread/186368-byte CTA succeeds for cluster sizes 2/3/5/8; cluster prefix-state exchange costs 0.0384 ms for 3 segments and 0.0586 ms for 5 segments | Done, feasible but not sufficient |
-| Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3660 ms vs original 0.2575 ms | Not achieved |
+| Check real thread-block cluster compose in split path | `cluster_scan_both --check` reports `max_abs=0`; timing is 0.3932 ms at 768-token segments and 0.4027 ms at 1280-token segments | Done, correct but slower |
+| Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3658 ms vs original 0.2603 ms on the rebuilt local binary | Not achieved |
 
 Conclusion: grid count can be made large and correctness can be preserved, but
 the tested multi-pass decompositions do not improve end-to-end latency. The

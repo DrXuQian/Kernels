@@ -243,6 +243,10 @@ Checkpointed split-sequence prototype:
 | scan-transition-only | 768 | 320 | 0.1174 | 0.1176 | per-segment state transitions from zero |
 | scan-both | 768 | 320 + prefix + 320 | 0.3773 | 0.3771 | large-grid multi-pass prototype |
 | scan-both | 1280 | 192 + prefix + 192 | 0.3660 | 0.3666 | best scanned multi-pass point |
+| cluster-scan-split | 768 | 320 | 0.2077 | 0.2079 | same split pass, prefix prepared by cluster compose |
+| cluster-scan-both | 768 | 320 + cluster-prefix + 320 | 0.3932 | 0.3937 | real cluster compose prototype |
+| cluster-scan-split | 1280 | 192 | 0.2087 | 0.2089 | same split pass, prefix prepared by cluster compose |
+| cluster-scan-both | 1280 | 192 + cluster-prefix + 192 | 0.4027 | 0.4022 | real cluster compose prototype |
 | zero-split | 768 | 320 | 0.1888 | 0.1894 | zero-state per-segment output + transition |
 | zero-split | 1280 | 192 | 0.1979 | 0.1977 | zero-state per-segment output + transition |
 | correction-full | 768 | 320 | 0.2064 | 0.2064 | exact prefix correction with `V=0` |
@@ -379,6 +383,32 @@ version that still runs a state-transition phase and a full output/correction
 phase would remain near the current multi-pass cost. To win, a cluster
 implementation would need to reuse work inside the GDN CTA or otherwise avoid
 the second full GDN-like pass.
+
+A real `cluster_scan_both` mode was also added to the split-seq study. It
+replaces the two standalone prefix kernels (`compute_segment_coeffs` +
+`compose_segment_input_states`) with one thread-block-cluster kernel that
+computes segment coefficients, synchronizes segment CTAs within each head, and
+composes the prefix states. Correctness on the target shape is exact:
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode cluster_scan_both --check
+check: max_abs=0 max_rel=0 elements=31318016
+```
+
+The full path is still slower than the non-cluster scan path:
+
+| Mode | Segment tokens | Grid shape | Median (ms) |
+|---|---:|---|---:|
+| original single-TU | full sequence | 64 | 0.2603 |
+| scan-both | 1280 | 192 + prefix + 192 | 0.3658 |
+| cluster-scan-both | 768 | 320 + cluster-prefix + 320 | 0.3932 |
+| cluster-scan-both | 1280 | 192 + cluster-prefix + 192 | 0.4027 |
+
+This confirms the cluster primitive is usable, but a separate cluster-prefix
+phase is not the missing optimization. A winning implementation would need to
+fold prefix handling into the actual GDN work rather than adding another
+standalone pass.
 
 Validation:
 
