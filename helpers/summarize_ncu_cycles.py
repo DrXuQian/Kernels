@@ -10,16 +10,11 @@ from model_latency_summary import write_model_latency_summary
 LONG_METRICS = {
     "sm__cycles_elapsed.avg",
     "sm__cycles_elapsed.max",
-    "sm__cycles_active.avg",
-    "sm__cycles_active.max",
-    "gpu__time_duration.avg",
     "gpu__time_duration.sum",
 }
 
-ELAPSED_CYCLES_AVG_COLUMNS = ("sm__cycles_elapsed.avg", "sm_cycles_elapsed.avg")
-ELAPSED_CYCLES_MAX_COLUMNS = ("sm__cycles_elapsed.max", "sm_cycles_elapsed.max")
-ACTIVE_CYCLES_AVG_COLUMNS = ("sm__cycles_active.avg", "sm_cycles_active.avg")
-ACTIVE_CYCLES_MAX_COLUMNS = ("sm__cycles_active.max", "sm_cycles_active.max")
+CYCLES_AVG_COLUMNS = ("sm__cycles_elapsed.avg", "sm_cycles_elapsed.avg")
+CYCLES_MAX_COLUMNS = ("sm__cycles_elapsed.max", "sm_cycles_elapsed.max")
 # In Nsight Compute's wide per-kernel CSV, gpu_time_duration.sum can be a
 # reduction over sub-partitions/SMs. Prefer avg, which matches the visible
 # kernel duration column, and keep sum only as a fallback for raw metric CSVs.
@@ -29,13 +24,7 @@ DURATION_COLUMNS = (
     "gpu__time_duration.sum",
     "gpu_time_duration.sum",
 )
-WIDE_METRIC_COLUMNS = set(
-    ELAPSED_CYCLES_AVG_COLUMNS
-    + ELAPSED_CYCLES_MAX_COLUMNS
-    + ACTIVE_CYCLES_AVG_COLUMNS
-    + ACTIVE_CYCLES_MAX_COLUMNS
-    + DURATION_COLUMNS
-)
+WIDE_METRIC_COLUMNS = set(CYCLES_AVG_COLUMNS + CYCLES_MAX_COLUMNS + DURATION_COLUMNS)
 KERNEL_NAME_COLUMNS = ("Kernel Name", "kernel_name", "launch_kernel_name", "Name", "name")
 KERNEL_ID_COLUMNS = ("ID", "id", "Kernel ID", "kernel_id", "launch_id")
 FILTERED_KERNEL_SUBSTRINGS = (
@@ -105,10 +94,8 @@ def make_row(path, kernel_id, kernel_name):
         "case": path.stem,
         "kernel_id": kernel_id,
         "kernel_name": kernel_name,
-        "elapsed_cycles_avg": math.nan,
-        "elapsed_cycles_max": math.nan,
-        "active_cycles_avg": math.nan,
-        "active_cycles_max": math.nan,
+        "cycles_avg": math.nan,
+        "cycles_max": math.nan,
         "duration_ns": math.nan,
     }
 
@@ -156,16 +143,10 @@ def parse_long_metric_csv(path, parsed_rows):
             rows.append(existing)
 
         if metric == "sm__cycles_elapsed.avg":
-            existing["elapsed_cycles_avg"] = value
+            existing["cycles_avg"] = value
         elif metric == "sm__cycles_elapsed.max":
-            existing["elapsed_cycles_max"] = value
-        elif metric == "sm__cycles_active.avg":
-            existing["active_cycles_avg"] = value
-        elif metric == "sm__cycles_active.max":
-            existing["active_cycles_max"] = value
-        elif metric == "gpu__time_duration.avg":
-            existing["duration_ns"] = value
-        elif metric == "gpu__time_duration.sum" and math.isnan(existing["duration_ns"]):
+            existing["cycles_max"] = value
+        elif metric == "gpu__time_duration.sum":
             existing["duration_ns"] = value
 
     return rows
@@ -185,18 +166,10 @@ def parse_wide_kernel_csv(path, parsed_rows):
             continue
 
         record = {header[i]: parsed[i] for i in range(min(len(header), len(parsed)))}
-        elapsed_cycles_avg = first_number(record, ELAPSED_CYCLES_AVG_COLUMNS)
-        elapsed_cycles_max = first_number(record, ELAPSED_CYCLES_MAX_COLUMNS)
-        active_cycles_avg = first_number(record, ACTIVE_CYCLES_AVG_COLUMNS)
-        active_cycles_max = first_number(record, ACTIVE_CYCLES_MAX_COLUMNS)
+        cycles_avg = first_number(record, CYCLES_AVG_COLUMNS)
+        cycles_max = first_number(record, CYCLES_MAX_COLUMNS)
         duration_ns = first_number(record, DURATION_COLUMNS)
-        if (
-            math.isnan(elapsed_cycles_avg)
-            and math.isnan(elapsed_cycles_max)
-            and math.isnan(active_cycles_avg)
-            and math.isnan(active_cycles_max)
-            and math.isnan(duration_ns)
-        ):
+        if math.isnan(cycles_avg) and math.isnan(cycles_max) and math.isnan(duration_ns):
             continue
 
         kernel = first_value(record, KERNEL_NAME_COLUMNS)
@@ -205,10 +178,8 @@ def parse_wide_kernel_csv(path, parsed_rows):
             continue
 
         row = make_row(path, kernel_id, kernel)
-        row["elapsed_cycles_avg"] = elapsed_cycles_avg
-        row["elapsed_cycles_max"] = elapsed_cycles_max
-        row["active_cycles_avg"] = active_cycles_avg
-        row["active_cycles_max"] = active_cycles_max
+        row["cycles_avg"] = cycles_avg
+        row["cycles_max"] = cycles_max
         row["duration_ns"] = duration_ns
         rows.append(row)
 
@@ -296,32 +267,24 @@ def sanitize_kernel(name, max_len=96):
 
 def print_table(rows, title):
     print(title)
-    print(
-        "| case | kernel_id | elapsed_cycles_avg | elapsed_cycles_max | "
-        "active_cycles_avg | active_cycles_max | duration_ns | kernel |"
-    )
-    print("|---|---:|---:|---:|---:|---:|---:|---|")
+    print("| case | kernel_id | cycles_avg | cycles_max | duration_ns | kernel |")
+    print("|---|---:|---:|---:|---:|---|")
     for row in rows:
         print(
-            f"| `{row['case']}` | {row['kernel_id']} | {fmt_number(row['elapsed_cycles_avg'])} | "
-            f"{fmt_number(row['elapsed_cycles_max'])} | {fmt_number(row['active_cycles_avg'])} | "
-            f"{fmt_number(row['active_cycles_max'])} | {fmt_number(row['duration_ns'])} | "
+            f"| `{row['case']}` | {row['kernel_id']} | {fmt_number(row['cycles_avg'])} | "
+            f"{fmt_number(row['cycles_max'])} | {fmt_number(row['duration_ns'])} | "
             f"`{sanitize_kernel(row['kernel_name'])}` |"
         )
 
 
 def print_aggregate_table(rows):
     print("## Nsight Compute Case Aggregate")
-    print(
-        "| case | kernels | sum_elapsed_cycles_avg | sum_elapsed_cycles_max | "
-        "sum_active_cycles_avg | sum_active_cycles_max | sum_duration_ns | latency_us |"
-    )
-    print("|---|---:|---:|---:|---:|---:|---:|---:|")
+    print("| case | kernels | sum_cycles_avg | sum_cycles_max | sum_duration_ns | latency_us |")
+    print("|---|---:|---:|---:|---:|---:|")
     for row in rows:
         print(
-            f"| `{row['case']}` | {row['kernels']} | {fmt_number(row['sum_elapsed_cycles_avg'])} | "
-            f"{fmt_number(row['sum_elapsed_cycles_max'])} | {fmt_number(row['sum_active_cycles_avg'])} | "
-            f"{fmt_number(row['sum_active_cycles_max'])} | {fmt_number(row['sum_duration_ns'])} | "
+            f"| `{row['case']}` | {row['kernels']} | {fmt_number(row['sum_cycles_avg'])} | "
+            f"{fmt_number(row['sum_cycles_max'])} | {fmt_number(row['sum_duration_ns'])} | "
             f"{fmt_number(row['latency_us'])} |"
         )
 
@@ -379,30 +342,26 @@ def main():
         case_rows = [row for row in all_rows if row["case"] == case]
         case_rows.sort(
             key=lambda row: (
-                -1 if math.isnan(row["elapsed_cycles_avg"]) else row["elapsed_cycles_avg"],
-                -1 if math.isnan(row["elapsed_cycles_max"]) else row["elapsed_cycles_max"],
+                -1 if math.isnan(row["cycles_avg"]) else row["cycles_avg"],
+                -1 if math.isnan(row["cycles_max"]) else row["cycles_max"],
             ),
             reverse=True,
         )
         slowest.append(case_rows[0])
-        sum_elapsed_cycles_avg = nan_sum(row["elapsed_cycles_avg"] for row in case_rows)
-        sum_elapsed_cycles_max = nan_sum(row["elapsed_cycles_max"] for row in case_rows)
-        sum_active_cycles_avg = nan_sum(row["active_cycles_avg"] for row in case_rows)
-        sum_active_cycles_max = nan_sum(row["active_cycles_max"] for row in case_rows)
+        sum_cycles_avg = nan_sum(row["cycles_avg"] for row in case_rows)
+        sum_cycles_max = nan_sum(row["cycles_max"] for row in case_rows)
         sum_duration_ns = nan_sum(row["duration_ns"] for row in case_rows)
         if not math.isnan(sum_duration_ns):
             latency_us = sum_duration_ns / 1000.0
-        elif not math.isnan(sum_elapsed_cycles_avg):
-            latency_us = sum_elapsed_cycles_avg / (args.ghz * 1000.0)
+        elif not math.isnan(sum_cycles_avg):
+            latency_us = sum_cycles_avg / (args.ghz * 1000.0)
         else:
             latency_us = math.nan
         aggregate_row = {
             "case": case,
             "kernels": len(case_rows),
-            "sum_elapsed_cycles_avg": sum_elapsed_cycles_avg,
-            "sum_elapsed_cycles_max": sum_elapsed_cycles_max,
-            "sum_active_cycles_avg": sum_active_cycles_avg,
-            "sum_active_cycles_max": sum_active_cycles_max,
+            "sum_cycles_avg": sum_cycles_avg,
+            "sum_cycles_max": sum_cycles_max,
             "sum_duration_ns": sum_duration_ns,
             "latency_us": latency_us,
         }
@@ -412,8 +371,7 @@ def main():
                 {
                     "case": case,
                     "latency_us": latency_us,
-                    "cycles": sum_elapsed_cycles_avg,
-                    "active_cycles": sum_active_cycles_avg,
+                    "cycles": sum_cycles_avg,
                     "duration_ns": sum_duration_ns,
                     "source": str(args.ncu_dir / f"{case}.csv"),
                 }
