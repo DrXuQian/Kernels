@@ -1,0 +1,6 @@
+bench_gdn_tile_study
+*.o
+*.nsys-rep
+*.sqlite
+*.csv
+*.log

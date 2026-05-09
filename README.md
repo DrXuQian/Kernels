@@ -44,6 +44,7 @@ the top-level command reference.
 | [general/w4a16_gemm/machete_standalone/CUTLASS55_TACTICS_H800.md](general/w4a16_gemm/machete_standalone/CUTLASS55_TACTICS_H800.md) | H800 CUTLASS55 tactic-cache measurements. |
 | [general/w4a16_gemm/machete_standalone/INSTRUCTION_COUNT_ANALYSIS.md](general/w4a16_gemm/machete_standalone/INSTRUCTION_COUNT_ANALYSIS.md) | PPU instruction-count comparison for CUTLASS55 vs Machete. |
 | [studies/ppu_finalize_moe_routing/README.md](studies/ppu_finalize_moe_routing/README.md) | Isolated MoE finalize routing optimization study; not part of default compile or benchmark flows. |
+| [studies/linear_prefill_flashinfer_gdn/README.md](studies/linear_prefill_flashinfer_gdn/README.md) | Isolated FlashInfer GDN prefill stage-count tuning study; not part of default compile or benchmark flows. |
 
 ## Layout
 
