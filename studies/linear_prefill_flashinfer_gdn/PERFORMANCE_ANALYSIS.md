@@ -294,6 +294,8 @@ Measured CUDA-event times:
 | zero-split | 1280 | 192 | 0.1979 | zero-state local output + local transition |
 | correction-full | 768 | 320 | 0.2064 | exact prefix correction, `V=0` |
 | correction-full | 1280 | 192 | 0.2072 | exact prefix correction, `V=0` |
+| zero-v-correction-full | 768 | 320 | 0.2049 | exact correction, skips V TMA/load path |
+| zero-v-correction-full | 1280 | 192 | 0.2084 | exact correction, skips V TMA/load path |
 
 For the best prefix-compose point from the scan sweep (`segment_tokens=1280`),
 the lower-bound total is:
@@ -467,6 +469,40 @@ either:
 Without one of those algorithmic changes, increasing the grid improves SM
 occupancy for a sub-pass but does not improve end-to-end latency.
 
+### Zero-V Correction Probe
+
+`correction_full` already passes a zero V tensor, but the generic GDN collective
+still instantiates the V TMA/load pipeline. A dedicated `zero_v_correction_full`
+study collective was added to test whether that was the remaining easy win. It
+skips V descriptor prefetch, V TMA loads, and the V pipeline wait/release, while
+preserving Q/K, QK/KK, `S@K`, `NewV`, output, and state-update math.
+
+The path is exact against the generic correction path:
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --mode zero_v_correction_full --check
+check: max_abs=0 max_rel=0 elements=31318016
+
+compute-sanitizer --tool memcheck --print-limit 1 \
+  ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --mode zero_v_correction_full
+ERROR SUMMARY: 0 errors
+```
+
+The measured benefit is negligible:
+
+| Mode | Segment tokens | Median (ms) | Avg (ms) |
+|---|---:|---:|---:|
+| correction-full | 768 | 0.2065 | 0.2064 |
+| zero-v-correction-full | 768 | 0.2049 | 0.2050 |
+| correction-full | 1280 | 0.2072 | 0.2070 |
+| zero-v-correction-full | 1280 | 0.2084 | 0.2092 |
+
+This rules out the zero V load as the dominant correction cost. The correction
+pass is dominated by the structural Q/K and state-transform work, and the custom
+zero-v collective also triggers a ptxas WGMMA serialization warning.
+
 Still, this is the first synchronization mechanism tested that is mechanically
 compatible with both requirements:
 
@@ -510,6 +546,7 @@ prefill grid enough to fill the GPU SMs.
 | Check zero-state output plus exact correction decomposition | `zero_split` is 0.1979 ms and exact `V=0` correction is 0.2072 ms at 1280-token segments, giving a lower-bound total around 0.431 ms with prefix compose | Done, not faster |
 | Check thread-block cluster feasibility | Dummy cluster launch with GDN-sized 512-thread/186368-byte CTA succeeds for cluster sizes 2/3/5/8; cluster prefix-state exchange costs 0.0384 ms for 3 segments and 0.0586 ms for 5 segments | Done, feasible but not sufficient |
 | Check real thread-block cluster compose in split path | `cluster_scan_both --check` reports `max_abs=0`; timing is 0.3932 ms at 768-token segments and 0.4027 ms at 1280-token segments | Done, correct but slower |
+| Check whether zero V loading dominates correction cost | `zero_v_correction_full --check` reports `max_abs=0`; timing is 0.2049 ms vs 0.2065 ms at 768-token segments and 0.2084 ms vs 0.2072 ms at 1280-token segments | Done, not the bottleneck |
 | Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3658 ms vs original 0.2603 ms on the rebuilt local binary | Not achieved |
 
 Conclusion: grid count can be made large and correctness can be preserved, but

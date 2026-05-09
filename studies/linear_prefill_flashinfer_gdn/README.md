@@ -251,6 +251,8 @@ Checkpointed split-sequence prototype:
 | zero-split | 1280 | 192 | 0.1979 | 0.1977 | zero-state per-segment output + transition |
 | correction-full | 768 | 320 | 0.2064 | 0.2064 | exact prefix correction with `V=0` |
 | correction-full | 1280 | 192 | 0.2072 | 0.2076 | exact prefix correction with `V=0` |
+| zero-v-correction-full | 768 | 320 | 0.2049 | 0.2050 | exact correction, skips V TMA/load path |
+| zero-v-correction-full | 1280 | 192 | 0.2084 | 0.2092 | exact correction, skips V TMA/load path |
 
 `scan_both` sweep (`--bench 3 10`) on the same target shape:
 
@@ -418,6 +420,32 @@ output needs the prefix recurrent state, but that prefix is only known after
 earlier segment transitions complete. The measured `zero_split` and
 `correction_full` modes show that handling this with another GDN-like traversal
 loses the benefit of the larger grid.
+
+A dedicated `zero_v_correction_full` collective was also tested to check whether
+the exact correction pass is mostly paying for loading a zero V tensor. This
+study path skips V TMA prefetch/load and removes the V pipeline wait/release, but
+keeps Q/K, QK/KK, `S@K`, `NewV`, output, and state-update math. It is exact
+against the generic `correction_full` path:
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --mode zero_v_correction_full --check
+check: max_abs=0 max_rel=0 elements=31318016
+compute-sanitizer: ERROR SUMMARY: 0 errors
+```
+
+The speedup is negligible:
+
+| Mode | Segment tokens | Median (ms) |
+|---|---:|---:|
+| correction-full | 768 | 0.2065 |
+| zero-v-correction-full | 768 | 0.2049 |
+| correction-full | 1280 | 0.2072 |
+| zero-v-correction-full | 1280 | 0.2084 |
+
+So the correction bottleneck is the structural Q/K and state-transform work, not
+the zero V load. The custom collective also triggers a ptxas WGMMA serialization
+warning, so this path is not a useful optimization target.
 
 Validation:
 

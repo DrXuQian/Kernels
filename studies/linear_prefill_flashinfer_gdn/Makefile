@@ -24,7 +24,7 @@ INC := $(CCCL_INC) \
 BINS := bench_gdn_tile_study bench_gdn_blockdv_study bench_gdn_splitseq_study bench_gdn_coop_probe
 OBJS := bench_gdn_tile_study.o gdn_tile_study_dispatch.o
 BLOCKDV_OBJS := bench_gdn_blockdv_study.o gdn_blockdv_study_dispatch.o
-SPLITSEQ_OBJS := bench_gdn_splitseq_study.o gdn_splitseq_study_dispatch.o gdn_state_only_study_dispatch.o
+SPLITSEQ_OBJS := bench_gdn_splitseq_study.o gdn_splitseq_study_dispatch.o gdn_state_only_study_dispatch.o gdn_zero_v_study_dispatch.o
 
 .PHONY: all single_tu blockdv_single_tu splitseq_single_tu coop_probe clean
 
@@ -65,6 +65,9 @@ gdn_splitseq_study_dispatch.o: src/gdn_splitseq_study_dispatch.cu
 gdn_state_only_study_dispatch.o: src/gdn_state_only_study_dispatch.cu src/state_only/flat_kernel_builder_delta_rule_state_only.hpp src/state_only/flat_collective_tma_warpspecialized_delta_rule_state_only.hpp
 	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
 
+gdn_zero_v_study_dispatch.o: src/gdn_zero_v_study_dispatch.cu src/zero_v/flat_kernel_builder_delta_rule_zero_v.hpp src/zero_v/flat_collective_tma_warpspecialized_delta_rule_zero_v.hpp
+	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
+
 bench_gdn_splitseq_study: $(SPLITSEQ_OBJS)
 	$(NVCC) $(ARCH) $^ -o $@
 
@@ -77,7 +80,7 @@ bench_gdn_tile_study_single_tu: src/bench_gdn_tile_study_single_tu.cu src/bench_
 bench_gdn_blockdv_study_single_tu: src/bench_gdn_blockdv_study_single_tu.cu src/bench_gdn_blockdv_study.cu src/gdn_blockdv_study_dispatch.cu src/gdn_blockdv_study_kernel.cuh src/block_dv/flat_kernel_builder_delta_rule_blockdv.hpp src/block_dv/flat_collective_tma_warpspecialized_delta_rule_blockdv.hpp src/block_dv/flat_tile_scheduler_blockdv.hpp src/block_dv/flat_collective_load_blockdv.hpp src/block_dv/flat_collective_store_blockdv.hpp
 	$(NVCC) $(CFLAGS) $(INC) $< -o $@
 
-bench_gdn_splitseq_study_single_tu: src/bench_gdn_splitseq_study_single_tu.cu src/bench_gdn_splitseq_study.cu src/gdn_splitseq_study_dispatch.cu src/gdn_state_only_study_dispatch.cu src/state_only/flat_kernel_builder_delta_rule_state_only.hpp src/state_only/flat_collective_tma_warpspecialized_delta_rule_state_only.hpp
+bench_gdn_splitseq_study_single_tu: src/bench_gdn_splitseq_study_single_tu.cu src/bench_gdn_splitseq_study.cu src/gdn_splitseq_study_dispatch.cu src/gdn_state_only_study_dispatch.cu src/gdn_zero_v_study_dispatch.cu src/state_only/flat_kernel_builder_delta_rule_state_only.hpp src/state_only/flat_collective_tma_warpspecialized_delta_rule_state_only.hpp src/zero_v/flat_kernel_builder_delta_rule_zero_v.hpp src/zero_v/flat_collective_tma_warpspecialized_delta_rule_zero_v.hpp
 	$(NVCC) $(CFLAGS) $(INC) $< -o $@
 
 clean:

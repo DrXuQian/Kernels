@@ -26,6 +26,9 @@
 //   cluster_scan_split/cluster_scan_both:
 //               same as scan_split/scan_both, but compose segment prefix states
 //               with one thread-block-cluster kernel.
+//   zero_v_correction_full:
+//               same prefix prep as correction_full, then time a study-only
+//               InitStateFromInput correction collective that skips V loads.
 
 #include <algorithm>
 #include <cstdint>
@@ -87,6 +90,17 @@ void launch_gdn_prefill_bf16_gva_state_only_transition(
     int32_t num_seqs, int32_t num_q_heads, int32_t num_k_heads, int32_t num_v_heads,
     int32_t num_o_heads, int32_t head_size, int64_t total_seqlen, float scale, int32_t sm_count);
 }  // namespace gdn_state_only_study
+
+namespace gdn_zero_v_study {
+using T = nv_bfloat16;
+
+void launch_gdn_prefill_bf16_gva_zero_v_initstate(
+    cudaStream_t stream, T* output, float* output_state, T const* q, T const* k, T const* v,
+    float const* input_state, float const* alpha, float const* beta, int64_t const* cu_seqlens,
+    uint8_t* workspace_buffer, int32_t num_seqs, int32_t num_q_heads, int32_t num_k_heads,
+    int32_t num_v_heads, int32_t num_o_heads, int32_t head_size, int64_t total_seqlen,
+    float scale, int32_t sm_count);
+}  // namespace gdn_zero_v_study
 
 #define BENCH_CUDA_CHECK(e)                                                                         \
   do {                                                                                              \
@@ -229,7 +243,7 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
     char const* value = nullptr;
     if (strcmp(argv[i], "--mode") == 0) {
       if (i + 1 >= argc) {
-        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, or cluster_scan_both\n");
+        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, cluster_scan_both, or zero_v_correction_full\n");
         exit(1);
       }
       value = argv[++i];
@@ -263,8 +277,10 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
         *mode = 11;
       } else if (strcmp(value, "cluster_scan_both") == 0) {
         *mode = 12;
+      } else if (strcmp(value, "zero_v_correction_full") == 0) {
+        *mode = 13;
       } else {
-        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, or cluster_scan_both\n", value);
+        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, cluster_scan_both, or zero_v_correction_full\n", value);
         exit(1);
       }
       *mode_name = value;
@@ -289,7 +305,7 @@ static int strip_check_arg(int argc, char** argv, bool* check) {
 
 static void usage(char const* argv0) {
   printf("Usage: %s [seqlen] [q_heads] [v_heads] [head_dim] "
-         "[--segment-tokens N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full|cluster_scan_split|cluster_scan_both] [--check] [--bench W I]\n",
+         "[--segment-tokens N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full|cluster_scan_split|cluster_scan_both|zero_v_correction_full] [--check] [--bench W I]\n",
          argv0);
   printf("Default shape: 3823 16 64 128, segment_tokens=1024, mode=split\n");
 }
@@ -539,11 +555,26 @@ int main(int argc, char** argv) {
         head_dim, total_seqlen, scale, sm_count);
   };
 
-  auto run_correction_full = [&]() {
+  auto run_correction_full_to = [&](T* output, float* output_state) {
     gdn_splitseq_study::launch_gdn_prefill_bf16_gva_initstate(
-        0, d_o_split, d_split_output_state, d_q, d_k, d_v_zero, d_split_input_state, d_alpha,
+        0, output, output_state, d_q, d_k, d_v_zero, d_split_input_state, d_alpha,
         d_beta, d_cu_split, d_workspace, segments, num_q_heads, num_k_heads, num_v_heads,
         num_o_heads, head_dim, total_seqlen, scale, sm_count);
+  };
+
+  auto run_correction_full = [&]() {
+    run_correction_full_to(d_o_split, d_split_output_state);
+  };
+
+  auto run_zero_v_correction_full_to = [&](T* output, float* output_state) {
+    gdn_zero_v_study::launch_gdn_prefill_bf16_gva_zero_v_initstate(
+        0, output, output_state, d_q, d_k, d_v_zero, d_split_input_state, d_alpha, d_beta,
+        d_cu_split, d_workspace, segments, num_q_heads, num_k_heads, num_v_heads, num_o_heads,
+        head_dim, total_seqlen, scale, sm_count);
+  };
+
+  auto run_zero_v_correction_full = [&]() {
+    run_zero_v_correction_full_to(d_o_split, d_split_output_state);
   };
 
   try {
@@ -603,12 +634,18 @@ int main(int argc, char** argv) {
       BENCH_CUDA_CHECK(cudaGetLastError());
       BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       timer.run(run_split);
-    } else {
+    } else if (mode == 12) {
       timer.run([&]() {
         run_transition();
         compose_states_cluster();
         run_split();
       });
+    } else {
+      run_transition();
+      compose_states();
+      BENCH_CUDA_CHECK(cudaGetLastError());
+      BENCH_CUDA_CHECK(cudaDeviceSynchronize());
+      timer.run(run_zero_v_correction_full);
     }
   } catch (std::exception const& e) {
     fprintf(stderr, "launch failed: %s\n", e.what());
@@ -621,7 +658,10 @@ int main(int argc, char** argv) {
       printf("check skipped: checkpoint-only modes do not produce split output\n");
     } else {
       BENCH_CUDA_CHECK(cudaDeviceSynchronize());
-      if (mode == 4 || mode == 5 || mode == 7 || mode == 8 || mode == 11 || mode == 12) {
+      if (mode == 13) {
+        run_correction_full_to(d_o, d_full_final_state);
+        BENCH_CUDA_CHECK(cudaDeviceSynchronize());
+      } else if (mode == 4 || mode == 5 || mode == 7 || mode == 8 || mode == 11 || mode == 12) {
         run_checkpoint();
         BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       }
