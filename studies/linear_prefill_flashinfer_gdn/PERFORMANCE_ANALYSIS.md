@@ -165,6 +165,13 @@ the auxiliary work is not shared across the two `DV=64` CTAs. So for
 The prototype is intended for performance diagnosis of the fused prefill kernel;
 it should stay isolated and should not replace the default benchmark.
 
+Trying to push the same idea further to `block_DV=32` is blocked by the current
+CUTLASS GMMA shape constraints. The state/O GMMA tile's M dimension becomes 32,
+and SM90 GMMA rejects it at compile time because tile M must be a multiple of 64.
+So increasing grid beyond 128 CTAs requires a different decomposition, such as
+sequence/context splitting with state correction or splitting auxiliary/state
+phases, not just a smaller V tile.
+
 ## Practical Next Steps
 
 1. Build this FlashInfer GDN prefill kernel as one translation unit, or otherwise

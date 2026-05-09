@@ -166,6 +166,11 @@ kernel because every V slice duplicates the QK/KK/alpha-beta auxiliary work. The
 extra CTA parallelism is not enough to pay for the duplicated auxiliary path on
 `T=3823,Hqk=16,Hv=64,D=128`.
 
+`block_DV=32` was also checked as a way to raise the target shape from 128 CTAs
+to 256 CTAs. It is not a legal direct instantiation of this CUTLASS collective:
+SM90 GMMA requires the relevant tile M dimension to be a multiple of 64, and
+`DV=32` fails compile-time with `Tile_M must be a multiple of 64`.
+
 Validation:
 
 ```bash
