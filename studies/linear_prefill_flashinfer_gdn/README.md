@@ -62,6 +62,12 @@ make bench_gdn_blockdv_study -j
 make blockdv_single_tu -j
 ```
 
+Build the study-only checkpointed split-sequence prototype:
+
+```bash
+make splitseq_single_tu -j
+```
+
 ## Run
 
 Single launch:
@@ -93,6 +99,22 @@ Block-DV prototype timing:
 ```bash
 ./bench_gdn_blockdv_study 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
 ./bench_gdn_blockdv_study_single_tu 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
+```
+
+Checkpointed split-sequence prototype timing:
+
+```bash
+# Time only the second pass. The first pass prepares segment input states.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode split --bench 5 20
+
+# Time the full current two-pass prototype.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode both --bench 5 20
+
+# Compare the full-sequence checkpoint output against the split output.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 768 --mode split --check
 ```
 
 Nsight Systems single-kernel check:
@@ -170,6 +192,36 @@ extra CTA parallelism is not enough to pay for the duplicated auxiliary path on
 to 256 CTAs. It is not a legal direct instantiation of this CUTLASS collective:
 SM90 GMMA requires the relevant tile M dimension to be a multiple of 64, and
 `DV=32` fails compile-time with `Tile_M must be a multiple of 64`.
+
+Checkpointed split-sequence prototype:
+
+| Mode | Segment tokens | CTAs in timed GDN | Median (ms) | Avg (ms) | Notes |
+|---|---:|---:|---:|---:|---|
+| original single-TU | full sequence | 64 | 0.2575 | 0.2577 | one GDN kernel |
+| split-only | 2048 | 128 | 0.2731 | 0.2731 | too little parallelism |
+| split-only | 1024 | 256 | 0.2269 | 0.2268 | faster than original |
+| split-only | 768 | 320 | 0.2074 | 0.2074 | best measured split-only |
+| split-only | 704 | 384 | 0.2231 | 0.2231 | more per-segment overhead |
+| split-only | 640 | 384 | 0.2352 | 0.2352 | more per-segment overhead |
+| split-only | 512 | 512 | 0.2356 | 0.2357 | too many short segments |
+| checkpoint-only | 768 | 64 | 0.2706 | 0.2704 | full GDN with checkpoint writes |
+| both | 768 | 64 + pack + 320 | 0.5097 | 0.5092 | current correct two-pass prototype |
+
+`split-only` uses already prepared segment states, so it measures the useful
+second pass. With `segment_tokens=768`, nsys shows the checkpoint pass at
+`gridX=64`, the split GDN pass at `gridX=320`, and the split GDN duration at
+about `211 us`. Correctness on the target shape was checked against the
+full-sequence checkpoint pass:
+
+```text
+check: max_abs=0 max_rel=0 elements=31318016
+```
+
+This is the first study path that raises the GDN grid above H800 SM count while
+preserving recurrent state semantics. It is still not a production replacement:
+the current checkpoint pass is a full GDN pass, so total time is slower than the
+original. The useful next step would be a state-only checkpoint/prefix pass that
+skips Q/O work and writes only segment boundary states.
 
 Validation:
 

@@ -16,6 +16,8 @@ bench_conv1d_update
 bench_gated_delta_net
 bench_fused_rms_norm_gate
 bench_gdn_prefill
+bench_gdn_splitseq_study
+bench_gdn_splitseq_study_single_tu
 bench_kda_prefill
 bench_layernorm
 bench_rmsnorm

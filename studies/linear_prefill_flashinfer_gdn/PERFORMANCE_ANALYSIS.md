@@ -172,6 +172,41 @@ So increasing grid beyond 128 CTAs requires a different decomposition, such as
 sequence/context splitting with state correction or splitting auxiliary/state
 phases, not just a smaller V tile.
 
+## Checkpointed Split-Sequence Study
+
+The next decomposition uses existing FlashInfer semantics instead of resetting
+state. The first pass runs the built-in checkpointing mode and writes recurrent
+state at segment boundaries. The second pass treats each segment as an
+independent logical sequence with `InitStateFromInput=true`, using those boundary
+states as initial state.
+
+This raises only the timed second pass from `1 * 64 = 64` CTAs to
+`segments * 64` CTAs. For the target `T=3823,Hqk=16,Hv=64,D=128`, the best
+measured split was `segment_tokens=768`, which produces 5 segments and 320 CTAs:
+
+| Path | CTAs | H800 CUDA-event time |
+|---|---:|---:|
+| original single-TU GDN | 64 | 0.2575 ms |
+| split-seq second pass, 768-token segments | 320 | 0.2074 ms |
+| checkpoint pass only | 64 | 0.2706 ms |
+| checkpoint + pack + split pass | 64 + 4096 + 320 | 0.5097 ms |
+
+The split second pass is about 20% faster than the original single kernel, and
+the target-shape output matches the full-sequence checkpoint output exactly in
+bf16 storage (`max_abs=0`). nsys confirms the intended grid shape:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| checkpoint GDN | 64 | 273.476 us |
+| `pack_segment_input_states` | 4096 | 25.792 us |
+| split GDN | 320 | 211.458 us |
+
+So sequence splitting is theoretically viable and is the first tested path that
+both increases grid count and preserves recurrent state semantics. It is not yet
+a usable replacement because the checkpoint pass duplicates the full GDN work.
+A production-quality variant would need a state-only prefix/checkpoint kernel
+that skips Q/O work and computes only the recurrent state at segment boundaries.
+
 ## Practical Next Steps
 
 1. Build this FlashInfer GDN prefill kernel as one translation unit, or otherwise
@@ -185,3 +220,6 @@ phases, not just a smaller V tile.
 4. Plain V-dimension blocking is not enough for this CUTLASS extraction because
    it duplicates the auxiliary path. A useful next attempt would need to share
    QK/KK/alpha-beta work across V slices or split auxiliary/state phases.
+5. The checkpointed split-sequence prototype shows a viable direction. The next
+   useful implementation is a state-only checkpoint/prefix pass; without that,
+   the two-pass correct prototype is slower overall despite a faster split pass.
