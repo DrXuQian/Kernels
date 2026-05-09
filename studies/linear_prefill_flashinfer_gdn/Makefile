@@ -21,14 +21,17 @@ INC := $(CCCL_INC) \
        -I../../include \
        -DFLAT_SM90A_ENABLED
 
-BINS := bench_gdn_tile_study
+BINS := bench_gdn_tile_study bench_gdn_blockdv_study
 OBJS := bench_gdn_tile_study.o gdn_tile_study_dispatch.o
+BLOCKDV_OBJS := bench_gdn_blockdv_study.o gdn_blockdv_study_dispatch.o
 
-.PHONY: all single_tu clean
+.PHONY: all single_tu blockdv_single_tu clean
 
 all: $(BINS)
 
 single_tu: bench_gdn_tile_study_single_tu
+
+blockdv_single_tu: bench_gdn_blockdv_study_single_tu
 
 bench_gdn_tile_study.o: src/bench_gdn_tile_study.cu
 	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
@@ -39,8 +42,20 @@ gdn_tile_study_dispatch.o: src/gdn_tile_study_dispatch.cu src/gdn_tile_study_ker
 bench_gdn_tile_study: $(OBJS)
 	$(NVCC) $(ARCH) $^ -o $@
 
+bench_gdn_blockdv_study.o: src/bench_gdn_blockdv_study.cu
+	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
+
+gdn_blockdv_study_dispatch.o: src/gdn_blockdv_study_dispatch.cu src/gdn_blockdv_study_kernel.cuh src/block_dv/flat_kernel_builder_delta_rule_blockdv.hpp src/block_dv/flat_collective_tma_warpspecialized_delta_rule_blockdv.hpp src/block_dv/flat_tile_scheduler_blockdv.hpp src/block_dv/flat_collective_load_blockdv.hpp src/block_dv/flat_collective_store_blockdv.hpp
+	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
+
+bench_gdn_blockdv_study: $(BLOCKDV_OBJS)
+	$(NVCC) $(ARCH) $^ -o $@
+
 bench_gdn_tile_study_single_tu: src/bench_gdn_tile_study_single_tu.cu src/bench_gdn_tile_study.cu src/gdn_tile_study_dispatch.cu src/gdn_tile_study_kernel.cuh
 	$(NVCC) $(CFLAGS) $(INC) $< -o $@
 
+bench_gdn_blockdv_study_single_tu: src/bench_gdn_blockdv_study_single_tu.cu src/bench_gdn_blockdv_study.cu src/gdn_blockdv_study_dispatch.cu src/gdn_blockdv_study_kernel.cuh src/block_dv/flat_kernel_builder_delta_rule_blockdv.hpp src/block_dv/flat_collective_tma_warpspecialized_delta_rule_blockdv.hpp src/block_dv/flat_tile_scheduler_blockdv.hpp src/block_dv/flat_collective_load_blockdv.hpp src/block_dv/flat_collective_store_blockdv.hpp
+	$(NVCC) $(CFLAGS) $(INC) $< -o $@
+
 clean:
-	rm -f $(OBJS) $(BINS) bench_gdn_tile_study_single_tu
+	rm -f $(OBJS) $(BLOCKDV_OBJS) $(BINS) bench_gdn_tile_study_single_tu bench_gdn_blockdv_study_single_tu

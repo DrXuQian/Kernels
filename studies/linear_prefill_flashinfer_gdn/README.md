@@ -55,6 +55,13 @@ Build the single-translation-unit diagnostic target:
 make single_tu -j
 ```
 
+Build the study-only FlashQLA-style V-dimension blocking prototype:
+
+```bash
+make bench_gdn_blockdv_study -j
+make blockdv_single_tu -j
+```
+
 ## Run
 
 Single launch:
@@ -79,6 +86,13 @@ Single-TU timing:
 
 ```bash
 ./bench_gdn_tile_study_single_tu 3823 16 64 128 1 --tile 64 --variant default --bench 20 200
+```
+
+Block-DV prototype timing:
+
+```bash
+./bench_gdn_blockdv_study 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
+./bench_gdn_blockdv_study_single_tu 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
 ```
 
 Nsight Systems single-kernel check:
@@ -137,6 +151,30 @@ The bigger result is the single-translation-unit build:
 | separable | k2 | 0.5092 | 0.5123 | best separable variant |
 | single TU | default | 0.2617 | 0.2617 | avoids `setmaxnreg` loss |
 
+FlashQLA-style `block_DV=64` prototype:
+
+| Build | CTA layout | Median (ms) | Avg (ms) | Notes |
+|---|---|---:|---:|---|
+| separable | `Hv * ceil(DV/64) = 128` CTAs | 1.0334 | 1.0324 | still has serialized WGMMA from separable compilation |
+| single TU | `Hv * ceil(DV/64) = 128` CTAs | 0.5046 | 0.5065 | valid single kernel, but slower than original single-TU |
+
+The `block_DV=64` path confirms the FlashQLA scheduling idea is mechanically
+implementable in the local CUDA/CUTLASS extraction: the V/O compute path is
+sliced to 64 columns per CTA while Q/K remain 128-dimensional. It is still a
+study prototype, not a replacement kernel. It does not improve this specific
+kernel because every V slice duplicates the QK/KK/alpha-beta auxiliary work. The
+extra CTA parallelism is not enough to pay for the duplicated auxiliary path on
+`T=3823,Hqk=16,Hv=64,D=128`.
+
+Validation:
+
+```bash
+compute-sanitizer --tool memcheck --print-limit 1 \
+  ./bench_gdn_blockdv_study_single_tu 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default
+```
+
+Observed: `ERROR SUMMARY: 0 errors`.
+
 The larger tile idea does not apply cleanly to this extracted GVA DeltaRule
 collective because `128x128x128` fails compile-time MMA layout assertions.
 
@@ -159,3 +197,4 @@ Observed CUDA kernel summary:
 |---|---|---:|---:|
 | separable | k2 | 1 | 515.494 us |
 | single TU | default | 1 | 262.810 us |
+| block-DV single TU | default | 1 | 511.688 us |

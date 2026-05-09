@@ -67,6 +67,7 @@ python3 studies/linear_prefill_flashinfer_gdn/bench_flashqla_force_cp.py \
 | `T=3823,Hqk=16,Hv=64` | FlashQLA forced sequence-CP | 0.505 ms |
 | `T=3823,Hqk=16,Hv=64` | FlashInfer Python | 0.272 ms |
 | `T=3823,Hqk=16,Hv=64` | Local FlashInfer single-TU standalone | 0.263 ms |
+| `T=3823,Hqk=16,Hv=64` | Local CUDA `block_DV=64` single-TU study | 0.505 ms |
 | `T=4096,Hqk=16,Hv=64` | FlashQLA `auto_cp=True` | 0.455 ms |
 | `T=4096,Hqk=16,Hv=64` | FlashQLA `auto_cp=False` | 0.455 ms |
 | `T=4096,Hqk=16,Hv=64` | FlashInfer Python | 0.283 ms |
@@ -126,6 +127,14 @@ borrow is FlashQLA's V-dimension blocking heuristic: for `Hv=64` on H800, it
 chooses `block_DV=64`, so each V head is split into two CTAs and the launch has
 about `128` CTAs instead of `64`. That can improve SM occupancy without adding
 the recurrent state-correction kernels required by sequence-CP.
+
+The local CUDA `block_DV=64` study confirms that this is mechanically feasible,
+but it is slower (`0.505 ms`) than the original single-TU FlashInfer/CUTLASS
+kernel (`0.263 ms`). The reason is structural: splitting V doubles the number of
+CTAs, but this CUTLASS collective also duplicates the QK/KK/alpha-beta auxiliary
+work for each V slice. For this target shape, duplicated auxiliary work costs
+more than the extra SM occupancy saves. The local block-DV code remains a study
+prototype and is not wired into default benchmarks.
 
 For this repo, the useful ideas to borrow are:
 

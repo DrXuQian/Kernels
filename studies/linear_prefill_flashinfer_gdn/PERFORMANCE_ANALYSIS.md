@@ -136,6 +136,35 @@ best among tested variants:
 | q3 | 3/3/2 | 0.2734 ms |
 | v3 | 2/3/3 | 0.2730 ms |
 
+## FlashQLA-Style Block-DV Study
+
+FlashQLA also increases CTA count by choosing `block_DV=64/32` when the number
+of V heads is too small to fill the GPU. A study-only CUDA prototype was added
+under `src/block_dv/` that keeps the Q/K dimension at 128 and slices the V/O
+compute path to `block_DV=64`.
+
+The prototype is functional and memcheck-clean:
+
+```bash
+make blockdv_single_tu -j
+compute-sanitizer --tool memcheck --print-limit 1 \
+  ./bench_gdn_blockdv_study_single_tu 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default
+```
+
+However it is slower on H800:
+
+| Kernel | CTAs | H800 single-TU kernel time |
+|---|---:|---:|
+| original FlashInfer GDN | 64 | 259 us nsys / 0.257 ms CUDA event |
+| block-DV=64 prototype | 128 | 512 us nsys / 0.505 ms CUDA event |
+
+The likely reason is structural: this CUTLASS collective duplicates the QK/KK
+and alpha/beta auxiliary path for every V slice. The V/state work is split, but
+the auxiliary work is not shared across the two `DV=64` CTAs. So for
+`T=3823,Hqk=16,Hv=64,D=128`, extra occupancy is outweighed by duplicated work.
+The prototype is intended for performance diagnosis of the fused prefill kernel;
+it should stay isolated and should not replace the default benchmark.
+
 ## Practical Next Steps
 
 1. Build this FlashInfer GDN prefill kernel as one translation unit, or otherwise
@@ -146,6 +175,6 @@ best among tested variants:
    If present, it is the primary reason the current production standalone is slow.
 3. Keep tile `64x64x128`; the naive `128x128x128` GVA DeltaRule instantiation fails
    compile-time MMA layout assertions in the extracted FlashInfer collective.
-4. If more optimization is needed, it likely requires algorithmic restructuring:
-   more independent CTAs, persistent scheduling across heads/chunks, or splitting
-   auxiliary/state phases. Stage-count tuning alone is not enough.
+4. Plain V-dimension blocking is not enough for this CUTLASS extraction because
+   it duplicates the auxiliary path. A useful next attempt would need to share
+   QK/KK/alpha-beta work across V slices or split auxiliary/state phases.
