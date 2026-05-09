@@ -218,7 +218,24 @@ Checkpointed split-sequence prototype:
 | state-split-only | 768 | 320 | 0.2066 | 0.2065 | state-only checkpoint prep, timed split pass |
 | state-both | 768 | 64 + pack + 320 | 0.4102 | 0.4105 | best correct two-pass prototype so far |
 | scan-transition-only | 768 | 320 | 0.1174 | 0.1176 | per-segment state transitions from zero |
-| scan-both | 768 | 320 + prefix + 320 | 0.3773 | 0.3771 | best correct multi-pass prototype so far |
+| scan-both | 768 | 320 + prefix + 320 | 0.3773 | 0.3771 | large-grid multi-pass prototype |
+| scan-both | 1280 | 192 + prefix + 192 | 0.3660 | 0.3666 | best scanned multi-pass point |
+
+`scan_both` sweep (`--bench 3 10`) on the same target shape:
+
+| Segment tokens | Segments | Timed GDN CTAs | Median (ms) | Avg (ms) |
+|---:|---:|---:|---:|---:|
+| 2048 | 2 | 128 | 0.4753 | 0.4744 |
+| 1536 | 3 | 192 | 0.4292 | 0.4291 |
+| 1280 | 3 | 192 | 0.3660 | 0.3666 |
+| 1024 | 4 | 256 | 0.4072 | 0.4068 |
+| 896 | 5 | 320 | 0.4225 | 0.4229 |
+| 768 | 5 | 320 | 0.3793 | 0.3796 |
+| 704 | 6 | 384 | 0.4181 | 0.4183 |
+| 640 | 6 | 384 | 0.4350 | 0.4348 |
+| 512 | 8 | 512 | 0.4510 | 0.4509 |
+| 384 | 10 | 640 | 0.4957 | 0.4956 |
+| 256 | 15 | 960 | 0.6183 | 0.6174 |
 
 `split-only` uses already prepared segment states, so it measures the useful
 second pass. With `segment_tokens=768`, nsys shows the checkpoint pass at
@@ -237,8 +254,10 @@ still slower than the original single kernel. The state-only pass confirms that
 skipping Q/O helps (`0.2706 ms -> 0.1774 ms`), and the scan transition confirms
 that the state prepass can also use a large grid (`0.1174 ms`, 320 CTAs). But the
 multi-pass design still duplicates too much work once the split output pass is
-included. A useful production direction would need to fuse the transition,
-prefix, and output phases or use a cooperative in-kernel prefix.
+included. The 1280-token sweep point is the best measured multi-pass variant,
+but it is still slower than the original single kernel. A useful production
+direction would need to fuse the transition, prefix, and output phases or use a
+cooperative in-kernel prefix.
 
 Validation:
 

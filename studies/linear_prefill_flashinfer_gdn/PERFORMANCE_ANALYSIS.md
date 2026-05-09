@@ -193,7 +193,8 @@ measured split was `segment_tokens=768`, which produces 5 segments and 320 CTAs:
 | state-only checkpoint pass | 64 | 0.1774 ms |
 | state-only checkpoint + pack + split pass | 64 + 4096 + 320 | 0.4102 ms |
 | scan transition pass | 320 | 0.1174 ms |
-| scan transition + prefix + split pass | 320 + prefix + 320 | 0.3773 ms |
+| scan transition + prefix + split pass, 768-token segments | 320 + prefix + 320 | 0.3773 ms |
+| scan transition + prefix + split pass, 1280-token segments | 192 + prefix + 192 | 0.3660 ms |
 
 The split second pass is about 20% faster than the original single kernel, and
 the target-shape output matches the full-sequence checkpoint output exactly in
@@ -236,13 +237,60 @@ is correct and memcheck-clean on the target shape (`max_abs=0`,
 | `compose_segment_input_states` | 4096 | 37.952 us |
 | split GDN | 320 | 211.106 us |
 
+Sweeping segment sizes did not find an end-to-end win. The best measured point
+was `segment_tokens=1280`, with 192 CTAs for both GDN passes:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| state-only per-segment transition | 192 | 126.017 us |
+| `compute_segment_coeffs` | 192 | 5.408 us |
+| `compose_segment_input_states` | 4096 | 20.864 us |
+| split GDN | 192 | 210.883 us |
+
+The sweep result:
+
+| Segment tokens | Segments | GDN CTAs | Median (ms) |
+|---:|---:|---:|---:|
+| 2048 | 2 | 128 | 0.4753 |
+| 1536 | 3 | 192 | 0.4292 |
+| 1280 | 3 | 192 | 0.3660 |
+| 1024 | 4 | 256 | 0.4072 |
+| 896 | 5 | 320 | 0.4225 |
+| 768 | 5 | 320 | 0.3793 |
+| 704 | 6 | 384 | 0.4181 |
+| 640 | 6 | 384 | 0.4350 |
+| 512 | 8 | 512 | 0.4510 |
+| 384 | 10 | 640 | 0.4957 |
+| 256 | 15 | 960 | 0.6183 |
+
 So sequence splitting is theoretically viable and is the first tested path that
 both increases grid count and preserves recurrent state semantics. It is not yet
 a usable replacement: even after removing Q/O from checkpointing, the correct
-multi-pass flow is still `0.3773 ms`, slower than the original `0.2575 ms`. A
+multi-pass flow is still `0.3660 ms`, slower than the original `0.2575 ms`. A
 production-quality variant would need to fuse transition, prefix, and output, or
 use a cooperative kernel with an in-kernel prefix phase, rather than launching
 separate transition and output kernels.
+
+## Completion Audit
+
+Objective: use a FlashQLA-like or otherwise valid decomposition to raise the GDN
+prefill grid enough to fill the GPU SMs.
+
+| Requirement | Evidence | Status |
+|---|---|---|
+| Keep experiments isolated from production benchmarks | All new GDN experiments live under `studies/linear_prefill_flashinfer_gdn`; `bench_all.sh` is not modified | Done |
+| Try FlashQLA-style V blocking | `block_DV=64` prototype reaches 128 CTAs and is memcheck-clean | Done, not faster |
+| Understand why smaller V blocking cannot continue | `block_DV=32` fails CUTLASS SM90 GMMA static assertion: tile M must be multiple of 64 | Done |
+| Try sequence splitting without breaking recurrent state | Checkpointed split-seq path uses `EnableCheckpointing` + `InitStateFromInput`; target-shape `max_abs=0` | Done |
+| Increase grid beyond H800 SM count | split/scan paths reach 192, 256, 320, 384, 512, 640, and 960 CTA cases depending on segment size | Done |
+| Verify correctness of the best semantic paths | `scan_split --check: max_abs=0`; compute-sanitizer reports `ERROR SUMMARY: 0 errors` | Done |
+| Achieve an end-to-end faster replacement | Best correct multi-pass path is 0.3660 ms vs original 0.2575 ms | Not achieved |
+
+Conclusion: grid count can be made large and correctness can be preserved, but
+the tested multi-pass decompositions do not improve end-to-end latency. The
+remaining viable direction is not more standalone passes; it is a fused or
+cooperative implementation that performs transition, prefix, and output in one
+kernel or one cooperative launch.
 
 ## Practical Next Steps
 
