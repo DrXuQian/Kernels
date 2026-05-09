@@ -22,7 +22,7 @@ The PPU columns are from per-case `perfstatistics.log` summaries. PPU latency is
 For multi-kernel cases, H800 `duration_ns` is the sum of kernel durations, not
 host-side wall time between kernels. It intentionally excludes CPU launch cost
 and cuBLAS/Python dispatch gaps. A `-` means that device/result set did not
-include that case.
+include that case and no identical-shape proxy was available.
 
 Default model-repeat assumptions used by `bench_all.sh` and the summary tools:
 
@@ -42,62 +42,98 @@ Default model-repeat assumptions used by `bench_all.sh` and the summary tools:
 
 ## Coverage Gaps
 
-H800 NCU rows missing from this H800 result set:
+Using unique benchmark shapes/operators, the H800 NCU result set covers every
+current `bench_all.sh --list` case. The provided PPU result set is missing only
+one unique operator:
 
-- `linear_attn_decode_in_proj_b_cublas`
-- `linear_attn_prefill_in_proj_b_cublas`
-- `flash_attn_decode_rmsnorm`
-- `flash_attn_prefill_rmsnorm`
-- `flash_attn_decode_residual_add`
-- `flash_attn_prefill_residual_add`
-- `w4a16_prefill_full_attn_v_proj_cutlass55`
-- `w4a16_prefill_full_attn_o_proj_cutlass55`
-- `w4a16_decode_full_attn_v_proj_fpA_intB`
-- `w4a16_decode_full_attn_o_proj_fpA_intB`
-- `moe_ffn_decode_rmsnorm`
-- `moe_ffn_prefill_rmsnorm`
-- `moe_ffn_decode_residual_add`
-- `moe_ffn_prefill_residual_add`
-
-
-PPU rows missing from the provided PPU result set:
-
-- `linear_attn_decode_in_proj_b_cublas`
-- `linear_attn_prefill_in_proj_b_cublas`
-- `flash_attn_decode_rmsnorm`
-- `flash_attn_prefill_rmsnorm`
-- `flash_attn_decode_residual_add`
-- `flash_attn_prefill_residual_add`
-- `w4a16_prefill_full_attn_v_proj_cutlass55`
-- `w4a16_prefill_full_attn_o_proj_cutlass55`
-- `w4a16_decode_full_attn_v_proj_fpA_intB`
-- `w4a16_decode_full_attn_o_proj_fpA_intB`
-- `moe_ffn_decode_rmsnorm`
-- `moe_ffn_prefill_rmsnorm`
-- `moe_ffn_decode_residual_add`
-- `moe_ffn_prefill_residual_add`
 - `sampling_lm_head_gemm`
 
+Several exact labels are absent from one or both raw result tables because
+`bench_all.sh` deduplicates identical shapes. In the tables below, those rows
+are filled with the proxy measurements listed here:
 
-Exact labels absent from both raw result sets. These are covered by identical-
-shape deduped proxy measurements in `bench_all.sh`, not missing standalone
-implementations:
+| Missing exact label | Covered by proxy |
+|---|---|
+| `linear_attn_decode_in_proj_b_cublas` | `linear_attn_decode_in_proj_a_cublas` |
+| `linear_attn_prefill_in_proj_b_cublas` | `linear_attn_prefill_in_proj_a_cublas` |
+| `flash_attn_decode_rmsnorm` | `linear_attn_decode_rmsnorm` |
+| `flash_attn_prefill_rmsnorm` | `linear_attn_prefill_rmsnorm` |
+| `flash_attn_decode_residual_add` | `linear_attn_decode_residual_add` |
+| `flash_attn_prefill_residual_add` | `linear_attn_prefill_residual_add` |
+| `w4a16_prefill_full_attn_v_proj_cutlass55` | `w4a16_prefill_full_attn_k_proj_cutlass55` |
+| `w4a16_prefill_full_attn_o_proj_cutlass55` | `w4a16_prefill_linear_attn_out_proj_cutlass55` |
+| `w4a16_decode_full_attn_v_proj_fpA_intB` | `w4a16_decode_full_attn_k_proj_fpA_intB` |
+| `w4a16_decode_full_attn_o_proj_fpA_intB` | `w4a16_decode_linear_attn_out_proj_fpA_intB` |
+| `moe_ffn_decode_rmsnorm` | `linear_attn_decode_rmsnorm` |
+| `moe_ffn_prefill_rmsnorm` | `linear_attn_prefill_rmsnorm` |
+| `moe_ffn_decode_residual_add` | `linear_attn_decode_residual_add` |
+| `moe_ffn_prefill_residual_add` | `linear_attn_prefill_residual_add` |
 
-- `linear_attn_decode_in_proj_b_cublas`
-- `linear_attn_prefill_in_proj_b_cublas`
-- `flash_attn_decode_rmsnorm`
-- `flash_attn_prefill_rmsnorm`
-- `flash_attn_decode_residual_add`
-- `flash_attn_prefill_residual_add`
-- `w4a16_prefill_full_attn_v_proj_cutlass55`
-- `w4a16_prefill_full_attn_o_proj_cutlass55`
-- `w4a16_decode_full_attn_v_proj_fpA_intB`
-- `w4a16_decode_full_attn_o_proj_fpA_intB`
-- `moe_ffn_decode_rmsnorm`
-- `moe_ffn_prefill_rmsnorm`
-- `moe_ffn_decode_residual_add`
-- `moe_ffn_prefill_residual_add`
+## Model-Level Comparison
 
+Totals below apply the model-repeat assumptions above: 12 full-attention
+layers, 36 linear-attention layers, 48 MoE-FFN layers, and one sampling step for
+prefill and decode. The PPU result set does not include `sampling_lm_head_gemm`;
+for model-level totals and plots only, that row is imputed from the H800 value
+(`488.736 us`) and should be treated as a placeholder.
+
+Regenerate the charts with:
+
+```bash
+python helpers/plot_122b_comparison.py \
+  --input bench_122B.md \
+  --out-dir figures/bench_122B
+```
+
+| Phase | H800 total ms | PPU total ms | PPU/H800 |
+|---|---:|---:|---:|
+| prefill | 234.213 | 281.435 | 1.202x |
+| decode | 9.992 | 12.302 | 1.231x |
+
+![Model latency totals](figures/bench_122B/model_latency_totals.svg)
+
+### Operator Share
+
+These pies aggregate logical operator classes after applying layer-count
+multipliers. The long tail is grouped into `Other`.
+
+![Prefill operator share](figures/bench_122B/prefill_operator_share.svg)
+
+![Decode operator share](figures/bench_122B/decode_operator_share.svg)
+
+### Kernel Contributions
+
+These pies and bars compare logical kernel/case contributions to total model
+latency. The pies show where total time goes; the bars make absolute
+H800-vs-PPU deltas visible.
+
+![Prefill kernel share](figures/bench_122B/prefill_kernel_share.svg)
+
+![Decode kernel share](figures/bench_122B/decode_kernel_share.svg)
+
+![Prefill kernel contributions](figures/bench_122B/prefill_kernel_contributions.svg)
+
+![Decode kernel contributions](figures/bench_122B/decode_kernel_contributions.svg)
+
+Largest prefill deltas:
+
+| Case | H800 ms | PPU ms | Delta |
+|---|---:|---:|---:|
+| `linear_prefill_flashinfer_gdn` | 19.325 | 43.492 | +24.167 |
+| `moe_gated_prefill_trtllm` | 5.161 | 25.021 | +19.860 |
+| `linear_attn_prefill_fused_rms_norm_gate` | 13.026 | 22.873 | +9.848 |
+| `moe_expand_prefill_trtllm` | 17.447 | 9.057 | -8.390 |
+| `moe_gate_up_prefill_trtllm` | 53.327 | 46.204 | -7.123 |
+
+Largest decode deltas:
+
+| Case | H800 ms | PPU ms | Delta |
+|---|---:|---:|---:|
+| `moe_shared_expert_gate_decode_cublas` | 0.402 | 1.120 | +0.717 |
+| `moe_gate_up_decode_vllm` | 0.822 | 1.494 | +0.672 |
+| `moe_router_gate_decode_cublas` | 0.550 | 1.104 | +0.554 |
+| `linear_attn_decode_in_proj_a_cublas` | 0.379 | 0.832 | +0.453 |
+| `linear_attn_decode_in_proj_b_cublas` | 0.379 | 0.832 | +0.453 |
 
 ## Flash-Attn
 
@@ -105,30 +141,30 @@ implementations:
 
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `flash_attn_decode_rmsnorm` | - | - | - | - | - | - | - |
+| `flash_attn_decode_rmsnorm` | 1 | 9231.240 | 9234 | 5856 | 5.856 | 6213 | 4.142 |
 | `w4a16_decode_full_attn_q_proj_gate_fpA_intB` | 1 | 22334.090 | 22458 | 14240 | 14.240 | 23959 | 15.973 |
 | `w4a16_decode_full_attn_k_proj_fpA_intB` | 1 | 11493.730 | 11500 | 7264 | 7.264 | 8020 | 5.347 |
-| `w4a16_decode_full_attn_v_proj_fpA_intB` | - | - | - | - | - | - | - |
+| `w4a16_decode_full_attn_v_proj_fpA_intB` | 1 | 11493.730 | 11500 | 7264 | 7.264 | 8020 | 5.347 |
 | `flash_attn_decode_q_norm` | 1 | 6608.640 | 6611 | 4224 | 4.224 | 2737 | 1.825 |
 | `flash_attn_decode_k_norm` | 1 | 6603.450 | 6609 | 4160 | 4.160 | 2872 | 1.915 |
 | `flash_attn_decode_full_attn` | 2 | 62353.970 | 62380 | 39520 | 39.520 | 69718 | 46.479 |
-| `w4a16_decode_full_attn_o_proj_fpA_intB` | - | - | - | - | - | - | - |
-| `flash_attn_decode_residual_add` | - | - | - | - | - | - | - |
+| `w4a16_decode_full_attn_o_proj_fpA_intB` | 1 | 22811.050 | 22850 | 14400 | 14.400 | 21352 | 14.235 |
+| `flash_attn_decode_residual_add` | 1 | 5151.470 | 5155 | 3264 | 3.264 | 3228 | 2.152 |
 
 
 ### Prefill
 
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `flash_attn_prefill_rmsnorm` | - | - | - | - | - | - | - |
+| `flash_attn_prefill_rmsnorm` | 1 | 79363.090 | 79459 | 50016 | 50.016 | 108227 | 72.151 |
 | `w4a16_prefill_full_attn_q_proj_gate_cutlass55` | 1 | 805173.480 | 808926 | 520576 | 520.576 | 899115 | 599.410 |
 | `w4a16_prefill_full_attn_k_proj_cutlass55` | 1 | 62091.330 | 62328 | 39552 | 39.552 | 64527 | 43.018 |
-| `w4a16_prefill_full_attn_v_proj_cutlass55` | - | - | - | - | - | - | - |
+| `w4a16_prefill_full_attn_v_proj_cutlass55` | 1 | 62091.330 | 62328 | 39552 | 39.552 | 64527 | 43.018 |
 | `flash_attn_prefill_q_norm` | 1 | 279564.500 | 279614 | 175872 | 175.872 | 385933 | 257.289 |
 | `flash_attn_prefill_k_norm` | 1 | 22809.360 | 22846 | 14400 | 14.400 | 26025 | 17.350 |
 | `flash_attn_prefill_full_attn` | 1 | 1487535.360 | 1490135 | 940224 | 940.224 | 1154801 | 769.867 |
-| `w4a16_prefill_full_attn_o_proj_cutlass55` | - | - | - | - | - | - | - |
-| `flash_attn_prefill_residual_add` | - | - | - | - | - | - | - |
+| `w4a16_prefill_full_attn_o_proj_cutlass55` | 1 | 420792.230 | 425083 | 276544 | 276.544 | 491633 | 327.755 |
+| `flash_attn_prefill_residual_add` | 1 | 52426.420 | 52459 | 33024 | 33.024 | 81945 | 54.630 |
 
 
 ## Linear-Attn
@@ -139,7 +175,7 @@ implementations:
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `linear_attn_decode_rmsnorm` | 1 | 9231.240 | 9234 | 5856 | 5.856 | 6213 | 4.142 |
 | `linear_attn_decode_in_proj_a_cublas` | 2 | 16649.140 | 16658 | 10528 | 10.528 | 34682 | 23.121 |
-| `linear_attn_decode_in_proj_b_cublas` | - | - | - | - | - | - | - |
+| `linear_attn_decode_in_proj_b_cublas` | 2 | 16649.140 | 16658 | 10528 | 10.528 | 34682 | 23.121 |
 | `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` | 1 | 18618.710 | 18699 | 11840 | 11.840 | 23057 | 15.371 |
 | `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | 1 | 15418.240 | 15474 | 9792 | 9.792 | 13637 | 9.091 |
 | `linear_decode_conv1d_update` | 1 | 8286.940 | 8289 | 5248 | 5.248 | 4422 | 2.948 |
@@ -155,7 +191,7 @@ implementations:
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `linear_attn_prefill_rmsnorm` | 1 | 79363.090 | 79459 | 50016 | 50.016 | 108227 | 72.151 |
 | `linear_attn_prefill_in_proj_a_cublas` | 1 | 20938.480 | 20985 | 13440 | 13.440 | 33721 | 22.481 |
-| `linear_attn_prefill_in_proj_b_cublas` | - | - | - | - | - | - | - |
+| `linear_attn_prefill_in_proj_b_cublas` | 1 | 20938.480 | 20985 | 13440 | 13.440 | 33721 | 22.481 |
 | `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | 1 | 592874.410 | 596695 | 385696 | 385.696 | 661500 | 441.000 |
 | `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | 1 | 432869.740 | 437242 | 285152 | 285.152 | 482193 | 321.462 |
 | `linear_prefill_conv1d_fwd` | 1 | 161232.470 | 161616 | 101792 | 101.792 | 177643 | 118.429 |
@@ -171,7 +207,7 @@ implementations:
 
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `moe_ffn_decode_rmsnorm` | - | - | - | - | - | - | - |
+| `moe_ffn_decode_rmsnorm` | 1 | 9231.240 | 9234 | 5856 | 5.856 | 6213 | 4.142 |
 | `w4a16_decode_consistent_expert_up_fpA_intB` | 1 | 12252.640 | 12259 | 7744 | 7.744 | 7542 | 5.028 |
 | `moe_shared_expert_activation_decode_trtllm` | 1 | 9294.920 | 9300 | 5888 | 5.888 | 6848 | 4.565 |
 | `w4a16_decode_consistent_expert_down_fpA_intB` | 1 | 7944.020 | 7962 | 5024 | 5.024 | 8025 | 5.350 |
@@ -184,14 +220,14 @@ implementations:
 | `moe_finalize_decode_vllm` | 1 | 7634.830 | 7642 | 4832 | 4.832 | 2658 | 1.772 |
 | `moe_shared_expert_gate_decode_cublas` | 2 | 13200.280 | 13212 | 8384 | 8.384 | 34988 | 23.325 |
 | `moe_shared_expert_fusion_decode` | 1 | 6080.480 | 6084 | 3840 | 3.840 | 3353 | 2.235 |
-| `moe_ffn_decode_residual_add` | - | - | - | - | - | - | - |
+| `moe_ffn_decode_residual_add` | 1 | 5151.470 | 5155 | 3264 | 3.264 | 3228 | 2.152 |
 
 
 ### Prefill
 
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `moe_ffn_prefill_rmsnorm` | - | - | - | - | - | - | - |
+| `moe_ffn_prefill_rmsnorm` | 1 | 79363.090 | 79459 | 50016 | 50.016 | 108227 | 72.151 |
 | `w4a16_prefill_consistent_expert_up_cutlass55` | 1 | 132728.790 | 134702 | 87648 | 87.648 | 169672 | 113.115 |
 | `moe_shared_expert_activation_prefill_trtllm` | 1 | 26612.330 | 26697 | 16832 | 16.832 | 40187 | 26.791 |
 | `w4a16_prefill_consistent_expert_down_cutlass55` | 1 | 77089.480 | 77699 | 50400 | 50.400 | 86561 | 57.707 |
@@ -205,12 +241,13 @@ implementations:
 | `moe_finalize_prefill_trtllm` | 1 | 392343.940 | 392360 | 246784 | 246.784 | 259207 | 172.805 |
 | `moe_shared_expert_gate_prefill_cublas` | 1 | 27503 | 27568 | 17376 | 17.376 | 33751 | 22.501 |
 | `moe_shared_expert_fusion_prefill` | 1 | 100865.060 | 100943 | 63520 | 63.520 | 209201 | 139.467 |
-| `moe_ffn_prefill_residual_add` | - | - | - | - | - | - | - |
+| `moe_ffn_prefill_residual_add` | 1 | 52426.420 | 52459 | 33024 | 33.024 | 81945 | 54.630 |
 
 
 ## Sampling
 
-Sampling is decode-only in the default `bench_all.sh` model summary.
+`bench_all.sh` records the sampling cases once. The model-level comparison
+above counts one sampling step in both prefill and decode.
 
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -227,10 +264,7 @@ Sampling is decode-only in the default `bench_all.sh` model summary.
 - This H800 result set includes FlashAttention core, fused RMSNorm gate,
   TRT-LLM shared-expert activation, and `moe_align_decode_vllm`, which were
   missing from the earlier H800 table.
-- Some logical duplicate cases are absent from one device table because the
-  benchmark runner can skip already measured identical shapes. They are listed
-  in coverage gaps as absent from that specific result set, not as missing
-  standalone implementations.
-- Between the H800 NCU and provided PPU result sets, every current
-  `bench_all.sh --list` case is either present by exact label or covered by an
-  identical-shape deduped proxy measurement.
+- PPU sampling is incomplete only because `sampling_lm_head_gemm` is absent from
+  the provided PPU result set.
+- Every other current `bench_all.sh --list` case is either present by exact
+  label or represented by the identical-shape proxy measurements listed above.
