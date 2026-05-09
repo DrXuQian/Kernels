@@ -4,7 +4,8 @@ This is an isolated optimization study for `linear_prefill_flashinfer_gdn`.
 It is intentionally not wired into the top-level compile or benchmark scripts.
 
 See [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) for the deeper root-cause
-analysis.
+analysis. See [FLASHQLA_UPSTREAM_BENCH.md](FLASHQLA_UPSTREAM_BENCH.md) for the
+upstream FlashQLA speed check on the target shape.
 
 The production kernel uses the extracted FlashInfer DeltaNet/GDN prefill path with
 Qwen3.5-122B-A10B shape:
