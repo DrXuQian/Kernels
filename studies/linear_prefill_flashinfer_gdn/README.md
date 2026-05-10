@@ -292,6 +292,29 @@ but it is still slower than the original single kernel. A useful production
 direction would need to fuse the transition, prefix, and output phases or use a
 cooperative in-kernel prefix.
 
+Nsight Systems confirms the grid-coverage story on the local H800 PCIe
+(`sms=114`). Each GDN CTA uses `186368` bytes dynamic shared memory, so occupancy
+is one active CTA per SM. The original kernel has only 64 CTAs and cannot fill
+the GPU. The split variants do create enough CTAs to fill the GPU, but their
+multi-pass overhead dominates:
+
+| Case | Kernel launches | GDN gridX | Block | Dyn smem | nsys duration |
+|---|---:|---:|---:|---:|---:|
+| original single-TU | 1 | 64 | 512 | 186368 B | 264.7 us |
+| zero-split, 768 tokens | 1 | 320 | 512 | 186368 B | 195.3 us |
+| scan-both, 1280 tokens, transition | 1 | 192 | 512 | 186368 B | 127.7 us |
+| scan-both, 1280 tokens, split output | 1 | 192 | 512 | 186368 B | 213.6 us |
+
+The same local machine blocks Nsight Compute performance counters with
+`ERR_NVGPUCTRPERM`, so direct SM throughput counters were not available here.
+The NCU command used for machines with enabled counters is:
+
+```bash
+ncu --csv --page raw --print-units base --kernel-name-base demangled \
+  -k regex:.*FlatKernelTmaWarpSpecializedDeltaRule.* --launch-count 1 \
+  ./bench_gdn_tile_study_single_tu 3823 16 64 128 --tile 64 --variant default
+```
+
 Cooperative single-kernel prefix feasibility was checked with
 `bench_gdn_coop_probe`. On the local H800 PCIe, the default GDN resource shape
 is:

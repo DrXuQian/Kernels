@@ -271,6 +271,33 @@ production-quality variant would need to fuse transition, prefix, and output, or
 use a cooperative kernel with an in-kernel prefix phase, rather than launching
 separate transition and output kernels.
 
+Nsight Systems was used as a profiler fallback because this local machine blocks
+Nsight Compute counters with `ERR_NVGPUCTRPERM`. It confirms that the split
+variants really do fix the launch-grid underfill. On the local H800 PCIe,
+`sms=114` and the GDN kernel uses `186368` bytes dynamic shared memory, which
+keeps occupancy at one active CTA per SM:
+
+| Case | Kernel | gridX | blockX | dyn smem | nsys duration |
+|---|---|---:|---:|---:|---:|
+| original single-TU | GDN | 64 | 512 | 186368 B | 264.7 us |
+| zero-split, 768 tokens | GDN | 320 | 512 | 186368 B | 195.3 us |
+| scan-both, 1280 tokens | state transition GDN | 192 | 512 | 186368 B | 127.7 us |
+| scan-both, 1280 tokens | compose prefix | 4096 | 256 | 0 B | 21.2 us |
+| scan-both, 1280 tokens | split output GDN | 192 | 512 | 186368 B | 213.6 us |
+
+So the objective's mechanical part is met for sub-passes: grid count can be made
+larger than SM count. The performance part is not met end-to-end because the
+extra state transition, prefix composition, and second output pass cost more
+than the occupancy gain saves.
+
+For systems with NCU counters enabled, the direct metric command is:
+
+```bash
+ncu --csv --page raw --print-units base --kernel-name-base demangled \
+  -k regex:.*FlatKernelTmaWarpSpecializedDeltaRule.* --launch-count 1 \
+  ./bench_gdn_tile_study_single_tu 3823 16 64 128 --tile 64 --variant default
+```
+
 ### Zero-State Output Plus Prefix Correction
 
 Another possible decomposition is:
@@ -540,7 +567,8 @@ prefill grid enough to fill the GPU SMs.
 | Try FlashQLA-style V blocking | `block_DV=64` prototype reaches 128 CTAs and is memcheck-clean | Done, not faster |
 | Understand why smaller V blocking cannot continue | `block_DV=32` fails CUTLASS SM90 GMMA static assertion: tile M must be multiple of 64 | Done |
 | Try sequence splitting without breaking recurrent state | Checkpointed split-seq path uses `EnableCheckpointing` + `InitStateFromInput`; target-shape `max_abs=0` | Done |
-| Increase grid beyond H800 SM count | split/scan paths reach 192, 256, 320, 384, 512, 640, and 960 CTA cases depending on segment size | Done |
+| Increase grid beyond H800 SM count | split/scan paths reach 192, 256, 320, 384, 512, 640, and 960 CTA cases depending on segment size; nsys confirms `gridX=320` for `zero_split` and `gridX=192` for both GDN passes in `scan_both` | Done |
+| Check whether SM underfill is mechanically fixed | GDN occupancy is one CTA/SM due to 186368 B dynamic SMEM; original grid 64 underfills local 114-SM H800, while 192/320-CTA split passes can fill it | Done for grid coverage; direct NCU counters blocked locally by `ERR_NVGPUCTRPERM` |
 | Verify correctness of the best semantic paths | `scan_split --check: max_abs=0`; compute-sanitizer reports `ERROR SUMMARY: 0 errors` | Done |
 | Check cooperative in-kernel prefix feasibility | Actual GDN kernels use 512 threads and 186368 B SMEM, so cooperative resident grid is only one CTA per SM; dummy cooperative launch fails at 128+ CTAs on local H800 PCIe | Done, blocked |
 | Check zero-state output plus exact correction decomposition | `zero_split` is 0.1979 ms and exact `V=0` correction is 0.2072 ms at 1280-token segments, giving a lower-bound total around 0.431 ms with prefix compose | Done, not faster |
