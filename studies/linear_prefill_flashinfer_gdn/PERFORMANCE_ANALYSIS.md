@@ -74,6 +74,69 @@ This is not an NCU counter; it is the launch/resource upper bound from the actua
 kernel launch. It explains why whole-GPU utilization can look low even when each
 active CTA is doing useful work.
 
+### First-Principles Split Boundary
+
+FlashQLA's context-parallel path is not a single-kernel implementation of the
+whole recurrence. Its forward wrapper first launches:
+
+1. `chunk_local_cumsum` for the gate prefix data;
+2. `kkt_solve` for the per-chunk triangular system;
+3. optional CP preprocessing (`get_warmup_chunks`, `fused_gdr_h`,
+   `correct_initial_states`) when the heuristic enables CP;
+4. `fused_chunk_gdr_fwd` for the main output/state pass.
+
+The upstream CP heuristic disables CP when the effective batch/head grid is
+already large enough:
+
+```text
+use_cp = Be * H <= 40 or (Be * H <= 56 and max_seq_chunks >= 128)
+```
+
+For the repo target shape (`B=1,Hv=64,T~4k`), `Be * H = 64`, so upstream
+FlashQLA does not enable sequence CP by default. This matches the measured
+`auto_cp=True` and `auto_cp=False` timings being effectively identical.
+
+The recurrence is the limiting dependency:
+
+```text
+state_i = F_i(state_{i-1}, K_i, V_i, alpha_i, beta_i)
+out_i   = G_i(state_{i-1}, Q_i, K_i, V_i, alpha_i, beta_i)
+```
+
+Splitting the sequence creates more CTAs only if each segment also receives the
+correct prefix state. A single-kernel split can therefore win only if it provides
+one of these mechanisms:
+
+- a legal in-kernel prefix among segment CTAs, without requiring all split CTAs
+  to be resident at a grid-wide barrier;
+- a cluster-local prefix formulation that also computes output in the same
+  fused cluster work;
+- or a compact correction formula that applies the prefix state's contribution
+  without running another full GDN-like traversal.
+
+Simply launching more CTAs is not sufficient. A small head-count sweep with the
+single-TU baseline shows the wave-quantization effect:
+
+```bash
+for hv in 32 64 96 128; do
+  studies/linear_prefill_flashinfer_gdn/bench_gdn_tile_study_single_tu \
+    3823 16 $hv 128 1 --tile 64 --variant default --bench 5 20
+done
+```
+
+| `Hv` | Grid CTAs | Median (ms) | Interpretation |
+|---:|---:|---:|---|
+| 32 | 32 | 0.2608 | one underfilled wave |
+| 64 | 64 | 0.2613 | still one underfilled wave |
+| 96 | 96 | 0.2723 | closer to filling local H800 SMs |
+| 128 | 128 | 0.5362 | spills into a second wave on the 114-SM local H800 |
+
+This confirms the core issue: below one resident wave, whole-GPU utilization is
+poor, but latency is still dominated by the serial per-CTA recurrent loop. Once
+the grid exceeds one resident wave, latency can jump instead of falling. A
+winning decomposition must both fill SMs and reduce or reuse the serial
+per-segment work.
+
 ## Serial Work Inside Each CTA
 
 For `seqlen=3823` and tile `64`, each CTA processes:
