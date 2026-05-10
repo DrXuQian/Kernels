@@ -36,6 +36,9 @@
 //               segment, either serialized on the GDN stream or overlapped on a
 //               second stream. This tests whether idle SMs can be used by later
 //               chunk-local work without changing GDN recurrence semantics.
+//   stream_segments_rms_gate_serial/stream_segments_rms_gate_overlap:
+//               same scheduling test using the real linear-attention fused
+//               RMSNorm+sigmoid-gate kernel shape, (segment_tokens*num_v_heads, head_dim).
 
 #include <algorithm>
 #include <cstdint>
@@ -236,6 +239,59 @@ __global__ void post_consumer_bf16_kernel(nv_bfloat16 const* input, float* outpu
   }
 }
 
+__global__ void fused_rms_norm_gate_segment_kernel(
+    nv_bfloat16 const* __restrict__ x, nv_bfloat16 const* __restrict__ z,
+    nv_bfloat16 const* __restrict__ weight, nv_bfloat16* __restrict__ output, int rows, int dim,
+    float eps) {
+  int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  int tid = threadIdx.x;
+  nv_bfloat16 const* x_row = x + static_cast<int64_t>(row) * dim;
+  nv_bfloat16 const* z_row = z + static_cast<int64_t>(row) * dim;
+  nv_bfloat16* out_row = output + static_cast<int64_t>(row) * dim;
+
+  float local_sum_sq = 0.0f;
+  for (int i = tid; i < dim; i += blockDim.x) {
+    float v = __bfloat162float(x_row[i]);
+    local_sum_sq += v * v;
+  }
+
+  __shared__ float warp_sums[32];
+  int warp_id = tid >> 5;
+  int lane = tid & 31;
+  int nwarps = (blockDim.x + 31) / 32;
+
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_sum_sq += __shfl_down_sync(0xffffffff, local_sum_sq, offset);
+  }
+  if (lane == 0) {
+    warp_sums[warp_id] = local_sum_sq;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int i = 0; i < nwarps; ++i) {
+      total += warp_sums[i];
+    }
+    warp_sums[0] = total;
+  }
+  __syncthreads();
+
+  float inv_rms = rsqrtf(warp_sums[0] / dim + eps);
+  for (int i = tid; i < dim; i += blockDim.x) {
+    float xv = __bfloat162float(x_row[i]) * inv_rms;
+    float wv = __bfloat162float(weight[i]);
+    float zv = __bfloat162float(z_row[i]);
+    float gate = 1.0f / (1.0f + expf(-zv));
+    out_row[i] = __float2bfloat16(xv * wv * gate);
+  }
+}
+
 static int strip_int_arg(int argc, char** argv, char const* name, int* value) {
   int out = 0;
   size_t name_len = strlen(name);
@@ -263,7 +319,7 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
     char const* value = nullptr;
     if (strcmp(argv[i], "--mode") == 0) {
       if (i + 1 >= argc) {
-        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, cluster_scan_both, zero_v_correction_full, stream_segments, stream_segments_post_serial, or stream_segments_post_overlap\n");
+        fprintf(stderr, "--mode requires checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, cluster_scan_both, zero_v_correction_full, stream_segments, stream_segments_post_serial, stream_segments_post_overlap, stream_segments_rms_gate_serial, or stream_segments_rms_gate_overlap\n");
         exit(1);
       }
       value = argv[++i];
@@ -305,8 +361,12 @@ static int strip_mode_arg(int argc, char** argv, int* mode, char const** mode_na
         *mode = 15;
       } else if (strcmp(value, "stream_segments_post_overlap") == 0) {
         *mode = 16;
+      } else if (strcmp(value, "stream_segments_rms_gate_serial") == 0) {
+        *mode = 17;
+      } else if (strcmp(value, "stream_segments_rms_gate_overlap") == 0) {
+        *mode = 18;
       } else {
-        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, cluster_scan_both, zero_v_correction_full, stream_segments, stream_segments_post_serial, or stream_segments_post_overlap\n", value);
+        fprintf(stderr, "unsupported --mode=%s; use checkpoint, split, both, state_checkpoint, state_split, state_both, scan_transition, scan_split, scan_both, zero_split, correction_full, cluster_scan_split, cluster_scan_both, zero_v_correction_full, stream_segments, stream_segments_post_serial, stream_segments_post_overlap, stream_segments_rms_gate_serial, or stream_segments_rms_gate_overlap\n", value);
         exit(1);
       }
       *mode_name = value;
@@ -331,7 +391,7 @@ static int strip_check_arg(int argc, char** argv, bool* check) {
 
 static void usage(char const* argv0) {
   printf("Usage: %s [seqlen] [q_heads] [v_heads] [head_dim] "
-         "[--segment-tokens N] [--post-rounds N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full|cluster_scan_split|cluster_scan_both|zero_v_correction_full|stream_segments|stream_segments_post_serial|stream_segments_post_overlap] [--check] [--bench W I]\n",
+         "[--segment-tokens N] [--post-rounds N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full|cluster_scan_split|cluster_scan_both|zero_v_correction_full|stream_segments|stream_segments_post_serial|stream_segments_post_overlap|stream_segments_rms_gate_serial|stream_segments_rms_gate_overlap] [--check] [--bench W I]\n",
          argv0);
   printf("Default shape: 3823 16 64 128, segment_tokens=1024, mode=split\n");
 }
@@ -415,7 +475,8 @@ int main(int argc, char** argv) {
   int64_t checkpoint_size = static_cast<int64_t>(checkpoint_storage_count) * state_elems;
 
   T *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_v_zero = nullptr;
-  T *d_o = nullptr, *d_o_split = nullptr;
+  T *d_o = nullptr, *d_o_split = nullptr, *d_gate_z = nullptr, *d_gate_weight = nullptr;
+  T* d_gate_out = nullptr;
   float *d_alpha = nullptr, *d_beta = nullptr;
   float *d_full_final_state = nullptr, *d_split_input_state = nullptr;
   float *d_split_output_state = nullptr, *d_checkpoints = nullptr;
@@ -430,6 +491,9 @@ int main(int argc, char** argv) {
   BENCH_CUDA_CHECK(cudaMalloc(&d_v_zero, v_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_o, o_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_o_split, o_size * sizeof(T)));
+  BENCH_CUDA_CHECK(cudaMalloc(&d_gate_z, o_size * sizeof(T)));
+  BENCH_CUDA_CHECK(cudaMalloc(&d_gate_weight, head_dim * sizeof(T)));
+  BENCH_CUDA_CHECK(cudaMalloc(&d_gate_out, o_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_alpha, gate_size * sizeof(float)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_beta, gate_size * sizeof(float)));
   BENCH_CUDA_CHECK(cudaMalloc(&d_full_final_state, state_elems * sizeof(float)));
@@ -459,6 +523,8 @@ int main(int argc, char** argv) {
   fill_bf16(d_q, q_size);
   fill_bf16(d_k, k_size);
   fill_bf16(d_v, v_size);
+  fill_bf16(d_gate_z, o_size);
+  fill_bf16(d_gate_weight, head_dim);
   BENCH_CUDA_CHECK(cudaMemset(d_v_zero, 0, v_size * sizeof(T)));
 
   std::vector<float> h_gate(gate_size);
@@ -486,6 +552,7 @@ int main(int argc, char** argv) {
 
   BENCH_CUDA_CHECK(cudaMemset(d_o, 0, o_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMemset(d_o_split, 0, o_size * sizeof(T)));
+  BENCH_CUDA_CHECK(cudaMemset(d_gate_out, 0, o_size * sizeof(T)));
   BENCH_CUDA_CHECK(cudaMemset(d_full_final_state, 0, state_elems * sizeof(float)));
   BENCH_CUDA_CHECK(cudaMemset(d_split_input_state, 0, split_state_size * sizeof(float)));
   BENCH_CUDA_CHECK(cudaMemset(d_split_output_state, 0, split_state_size * sizeof(float)));
@@ -612,7 +679,7 @@ int main(int argc, char** argv) {
     run_zero_v_correction_full_to(d_o_split, d_split_output_state);
   };
 
-  auto run_stream_segments = [&](bool run_post, bool overlap_post) {
+  auto run_stream_segments = [&](int post_kind, bool overlap_post) {
     cudaStream_t gdn_stream = nullptr;
     cudaStream_t post_stream = nullptr;
     BENCH_CUDA_CHECK(cudaStreamCreateWithFlags(&gdn_stream, cudaStreamNonBlocking));
@@ -634,17 +701,24 @@ int main(int argc, char** argv) {
           d_beta, d_cu_split + i, d_workspace, 1, num_q_heads, num_k_heads, num_v_heads,
           num_o_heads, head_dim, total_seqlen, scale, sm_count);
 
-      if (run_post) {
+      if (post_kind != 0) {
         BENCH_CUDA_CHECK(cudaEventRecord(segment_done[i], gdn_stream));
         cudaStream_t consumer_stream = overlap_post ? post_stream : gdn_stream;
         BENCH_CUDA_CHECK(cudaStreamWaitEvent(consumer_stream, segment_done[i], 0));
         int64_t elems = seg_tokens * static_cast<int64_t>(num_o_heads) * head_dim;
-        int threads = 256;
-        int blocks = static_cast<int>(std::min<int64_t>(4096, (elems + threads - 1) / threads));
-        post_consumer_bf16_kernel<<<blocks, threads, 0, consumer_stream>>>(
-            d_o_split + seg_begin * static_cast<int64_t>(num_o_heads) * head_dim,
-            d_post_scratch + seg_begin * static_cast<int64_t>(num_o_heads) * head_dim,
-            elems, post_rounds);
+        int64_t offset = seg_begin * static_cast<int64_t>(num_o_heads) * head_dim;
+        if (post_kind == 1) {
+          int threads = 256;
+          int blocks =
+              static_cast<int>(std::min<int64_t>(4096, (elems + threads - 1) / threads));
+          post_consumer_bf16_kernel<<<blocks, threads, 0, consumer_stream>>>(
+              d_o_split + offset, d_post_scratch + offset, elems, post_rounds);
+        } else {
+          int rows = static_cast<int>(seg_tokens * static_cast<int64_t>(num_o_heads));
+          fused_rms_norm_gate_segment_kernel<<<rows, 256, 0, consumer_stream>>>(
+              d_o_split + offset, d_gate_z + offset, d_gate_weight, d_gate_out + offset, rows,
+              head_dim, 1.0e-6f);
+        }
       }
     }
 
@@ -727,11 +801,15 @@ int main(int argc, char** argv) {
       BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       timer.run(run_zero_v_correction_full);
     } else if (mode == 14) {
-      timer.run([&]() { run_stream_segments(false, false); });
+      timer.run([&]() { run_stream_segments(0, false); });
     } else if (mode == 15) {
-      timer.run([&]() { run_stream_segments(true, false); });
+      timer.run([&]() { run_stream_segments(1, false); });
+    } else if (mode == 16) {
+      timer.run([&]() { run_stream_segments(1, true); });
+    } else if (mode == 17) {
+      timer.run([&]() { run_stream_segments(2, false); });
     } else {
-      timer.run([&]() { run_stream_segments(true, true); });
+      timer.run([&]() { run_stream_segments(2, true); });
     }
   } catch (std::exception const& e) {
     fprintf(stderr, "launch failed: %s\n", e.what());
@@ -748,7 +826,8 @@ int main(int argc, char** argv) {
         run_correction_full_to(d_o, d_full_final_state);
         BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       } else if (mode == 4 || mode == 5 || mode == 7 || mode == 8 || mode == 11 ||
-                 mode == 12 || mode == 14 || mode == 15 || mode == 16) {
+                 mode == 12 || mode == 14 || mode == 15 || mode == 16 || mode == 17 ||
+                 mode == 18) {
         run_checkpoint();
         BENCH_CUDA_CHECK(cudaDeviceSynchronize());
       }
@@ -779,6 +858,9 @@ int main(int argc, char** argv) {
   cudaFree(d_v_zero);
   cudaFree(d_o);
   cudaFree(d_o_split);
+  cudaFree(d_gate_z);
+  cudaFree(d_gate_weight);
+  cudaFree(d_gate_out);
   cudaFree(d_alpha);
   cudaFree(d_beta);
   cudaFree(d_full_final_state);

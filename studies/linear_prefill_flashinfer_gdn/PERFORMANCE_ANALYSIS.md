@@ -634,6 +634,39 @@ The next useful experiment would replace the synthetic post kernel with the real
 chunk-local downstream work, such as output gating/projection or residual add,
 and measure whether the extra segment launches are repaid by overlap.
 
+That next check was done with the real extracted fused RMSNorm+sigmoid-gate
+kernel used by the linear-attention block. The gate is chunk-local and has shape
+`(segment_tokens * num_v_heads, head_dim)`.
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --mode stream_segments_rms_gate_overlap --check
+check: max_abs=0 max_rel=0 elements=31318016
+```
+
+Measured CUDA-event timings:
+
+| Mode | Segment tokens | Median (ms) | Meaning |
+|---|---:|---:|---|
+| stream-segments | 1280 | 0.3108 | exact segmented GDN only |
+| stream-segments + RMS gate serial | 1280 | 0.7516 | GDN and real gate on one stream |
+| stream-segments + RMS gate overlap | 1280 | 0.6720 | real gate overlaps with following GDN segment |
+
+The nsys timeline confirms the real gate overlaps with GDN:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| segment 0 GDN | 64 | 103.5 us |
+| segment 1 GDN + segment 0 RMS gate | 64 + 81920 | 102.1 us + 216.7 us, overlapped |
+| segment 2 GDN + segment 1 RMS gate | 64 + 81920 | 98.7 us + 210.5 us, overlapped |
+| segment 2 RMS gate | 80832 | 149.7 us |
+
+This validates the scheduling idea with a real downstream operator. The hidden
+time is modest, about 80 us in this configuration, because the RMS gate itself
+launches a very large grid and dominates once it starts. Still, it is the first
+correct path that converts GDN's unused-SM slack into useful work from the same
+linear-attention block.
+
 Still, this is the first synchronization mechanism tested that is mechanically
 compatible with both requirements:
 

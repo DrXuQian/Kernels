@@ -140,6 +140,11 @@ Checkpointed split-sequence prototype timing:
   --segment-tokens 1280 --post-rounds 32 \
   --mode stream_segments_post_overlap --bench 5 20
 
+# Same scheduling test with the real linear-attention fused RMSNorm+sigmoid-gate
+# kernel shape: (segment_tokens*num_v_heads, head_dim).
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --mode stream_segments_rms_gate_overlap --bench 5 20
+
 # Compare the full-sequence checkpoint output against the split output.
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode scan_split --check
@@ -262,6 +267,8 @@ Checkpointed split-sequence prototype:
 | stream-segments | 1280 | 3 sequential 64-CTA GDN launches | 0.3130 | 0.3137 | exact state handoff across segment launches |
 | stream-segments + post serial | 1280 | GDN segment + synthetic post on same stream | 0.4641 | 0.4651 | `--post-rounds 32` |
 | stream-segments + post overlap | 1280 | GDN stream + synthetic post stream | 0.4192 | 0.4113 | `--post-rounds 32`; exact GDN output |
+| stream-segments + RMS gate serial | 1280 | GDN segment + real fused RMSNorm gate on same stream | 0.7516 | 0.7515 | gate shape `(segment_tokens*64,128)` |
+| stream-segments + RMS gate overlap | 1280 | GDN stream + real fused RMSNorm gate stream | 0.6720 | 0.6896 | exact GDN output; hides about 80 us |
 
 `scan_both` sweep (`--bench 3 10`) on the same target shape:
 
@@ -510,6 +517,31 @@ It does show that the user's proposed scheduling direction is mechanically
 valid: for downstream work that is local to a completed sequence chunk, CUDA can
 run it concurrently with the next GDN segment and recover part of the unused-SM
 slack.
+
+The same experiment was repeated with a real downstream kernel: the extracted
+linear-attention fused RMSNorm+sigmoid-gate operation. It uses one CTA per
+`(token, v_head)` row, so each 1280-token segment launches about 81920 CTAs for
+the gate. Correctness of the GDN output remains exact:
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --mode stream_segments_rms_gate_overlap --check
+check: max_abs=0 max_rel=0 elements=31318016
+```
+
+The nsys timeline confirms real overlap:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| segment 0 GDN | 64 | 103.5 us |
+| segment 1 GDN + segment 0 RMS gate | 64 + 81920 | 102.1 us + 216.7 us, overlapped |
+| segment 2 GDN + segment 1 RMS gate | 64 + 81920 | 98.7 us + 210.5 us, overlapped |
+| segment 2 RMS gate | 80832 | 149.7 us |
+
+This is a stronger validation than the synthetic post kernel: downstream
+chunk-local work can run in the SM slack left by GDN. The gain is limited because
+the RMS gate kernel is itself large and saturates the GPU, but this establishes a
+concrete pipeline strategy for real linear-attention block kernels.
 
 Validation:
 
