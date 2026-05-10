@@ -134,6 +134,12 @@ Checkpointed split-sequence prototype timing:
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode correction_full --bench 5 20
 
+# Time an exact stream pipeline. GDN still carries state sequentially across
+# segments, while synthetic per-segment post work can overlap on a second stream.
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --post-rounds 32 \
+  --mode stream_segments_post_overlap --bench 5 20
+
 # Compare the full-sequence checkpoint output against the split output.
 ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
   --segment-tokens 768 --mode scan_split --check
@@ -253,6 +259,9 @@ Checkpointed split-sequence prototype:
 | correction-full | 1280 | 192 | 0.2072 | 0.2076 | exact prefix correction with `V=0` |
 | zero-v-correction-full | 768 | 320 | 0.2049 | 0.2050 | exact correction, skips V TMA/load path |
 | zero-v-correction-full | 1280 | 192 | 0.2084 | 0.2092 | exact correction, skips V TMA/load path |
+| stream-segments | 1280 | 3 sequential 64-CTA GDN launches | 0.3130 | 0.3137 | exact state handoff across segment launches |
+| stream-segments + post serial | 1280 | GDN segment + synthetic post on same stream | 0.4641 | 0.4651 | `--post-rounds 32` |
+| stream-segments + post overlap | 1280 | GDN stream + synthetic post stream | 0.4192 | 0.4113 | `--post-rounds 32`; exact GDN output |
 
 `scan_both` sweep (`--bench 3 10`) on the same target shape:
 
@@ -469,6 +478,38 @@ The speedup is negligible:
 So the correction bottleneck is the structural Q/K and state-transform work, not
 the zero V load. The custom collective also triggers a ptxas WGMMA serialization
 warning, so this path is not a useful optimization target.
+
+The stream-pipelined modes test a different scheduling idea. Instead of making
+one GDN launch use more than 64 CTAs, they keep the recurrence exact and process
+sequence segments in order, passing each segment's final state to the next
+segment launch. As soon as one segment output is ready, a synthetic per-segment
+post kernel can run on another stream while the next GDN segment runs. This uses
+SMs left idle by the 64-CTA GDN launch without changing GDN semantics.
+
+Correctness for the GDN output is exact:
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --post-rounds 32 \
+  --mode stream_segments_post_overlap --check
+check: max_abs=0 max_rel=0 elements=31318016
+```
+
+The `nsys` timeline for `segment_tokens=1280,post_rounds=32` shows the intended
+overlap:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| segment 0 GDN | 64 | 103.1 us |
+| segment 0 post + segment 1 GDN | 4096 + 64 | 108.2 us + 111.4 us, overlapped |
+| segment 1 post + segment 2 GDN | 4096 + 64 | 108.9 us + 104.8 us, overlapped |
+| segment 2 post | 4096 | 47.3 us |
+
+This is not yet a production replacement because the post kernel is synthetic.
+It does show that the user's proposed scheduling direction is mechanically
+valid: for downstream work that is local to a completed sequence chunk, CUDA can
+run it concurrently with the next GDN segment and recover part of the unused-SM
+slack.
 
 Validation:
 

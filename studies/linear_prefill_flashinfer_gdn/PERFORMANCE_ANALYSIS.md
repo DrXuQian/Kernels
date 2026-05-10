@@ -593,6 +593,47 @@ This rules out the zero V load as the dominant correction cost. The correction
 pass is dominated by the structural Q/K and state-transform work, and the custom
 zero-v collective also triggers a ptxas WGMMA serialization warning.
 
+## Stream-Pipelined Chunk Overlap
+
+A different way to use the idle SMs is to keep GDN itself underfilled but overlap
+later chunk-local work with the next GDN segment. This respects the recurrence:
+segment `i+1` starts only after segment `i` writes its final state, but post work
+for segment `i` can run on a separate stream while segment `i+1` is running.
+
+The study mode is exact for GDN output:
+
+```text
+./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  --segment-tokens 1280 --post-rounds 32 \
+  --mode stream_segments_post_overlap --check
+check: max_abs=0 max_rel=0 elements=31318016
+```
+
+Measured CUDA-event timings on the local H800:
+
+| Mode | Segment tokens | Grid shape | Median (ms) | Meaning |
+|---|---:|---|---:|---|
+| stream-segments | 1280 | 3 sequential 64-CTA GDN launches | 0.3130 | exact segmented GDN only |
+| stream-segments + post serial | 1280 | GDN segment + synthetic post on same stream | 0.4641 | no overlap, `post_rounds=32` |
+| stream-segments + post overlap | 1280 | GDN stream + synthetic post stream | 0.4192 | overlaps post for completed chunks |
+
+The nsys timeline confirms real kernel overlap:
+
+| Kernel | gridX | Duration |
+|---|---:|---:|
+| segment 0 GDN | 64 | 103.1 us |
+| segment 0 post + segment 1 GDN | 4096 + 64 | 108.2 us + 111.4 us, overlapped |
+| segment 1 post + segment 2 GDN | 4096 + 64 | 108.9 us + 104.8 us, overlapped |
+| segment 2 post | 4096 | 47.3 us |
+
+This does not make one GDN kernel fill the GPU, and the synthetic post kernel is
+only a scheduling proxy. It does show a viable first-principles path: pipeline
+the linear-attention block at sequence-segment granularity so chunk-local
+downstream operations consume SMs that the 64-CTA GDN segment does not occupy.
+The next useful experiment would replace the synthetic post kernel with the real
+chunk-local downstream work, such as output gating/projection or residual add,
+and measure whether the extra segment launches are repaid by overlap.
+
 Still, this is the first synchronization mechanism tested that is mechanically
 compatible with both requirements:
 
