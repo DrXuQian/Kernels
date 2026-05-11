@@ -37,13 +37,14 @@ shared_expert_gate: (tokens, 3072) x (3072, 1) -> (tokens, 1)
 shared_fusion:      routed + sigmoid(shared_expert_gate) * shared_expert
 ```
 
-The formula matches the TensorRT-LLM/vLLM Qwen3-Next model path. The router gate
-and shared expert gate projections are dense FP16/BF16 cuBLAS GEMMs; the fusion
-is isolated as one standalone CUDA kernel so it can be profiled separately.
+The formula matches the TensorRT-LLM/vLLM Qwen3-Next model path. The router
+gate and shared expert gate projections are modeled with `general/bench_cublas_gemm`.
+The fusion is isolated as one standalone CUDA kernel so it can be profiled
+separately.
 
 ```bash
-moe_ffn/bench_shared_expert --op=router_gate_gemm --tokens=3823 --hidden=3072 --out-dim=256 --dtype fp16 --bench 0 1
-moe_ffn/bench_shared_expert --op=gate_gemv --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
+general/bench_cublas_gemm --m=3823 --n=256 --k=3072 --dtype fp16 --bench 0 1
+general/bench_cublas_gemm --m=3823 --n=1 --k=3072 --dtype fp16 --bench 0 1
 moe_ffn/bench_shared_expert --op=sigmoid_mul_add --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
 ```
 

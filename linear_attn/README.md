@@ -8,7 +8,8 @@ Qwen3.5 DeltaNet layer 的 standalone CUDA/Triton kernel bench。
 |-------|--------|------|-----|------|
 | `bench_conv1d_fwd` | `causal_conv1d_fwd` | [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) | SM80+ | Prefill |
 | `bench_conv1d_update` | `causal_conv1d_update` | Dao-AILab/causal-conv1d | SM80+ | Decode |
-| `bench_linear_ops` | `in_proj_a/b` cuBLAS GEMM, residual add | standalone cuBLAS/CUDA | SM80+ | Prefill + Decode |
+| `bench_linear_ops` | residual add | standalone CUDA | SM80+ | Prefill + Decode |
+| `../general/bench_cublas_gemm` | `in_proj_a` / `in_proj_b` dense GEMM | cuBLAS FP16/BF16 GEMM | SM80+ | Prefill + Decode |
 | `bench_gated_delta_net` | `gated_delta_net_cuda` | [llama.cpp](https://github.com/ggml-org/llama.cpp) | SM80+ | Prefill + Decode |
 | `bench_gdn_prefill` | FlashInfer DeltaRule/GDN prefill standalone | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | SM90 | Prefill |
 | `bench_kda_prefill` | `launch_kda_fwd_prefill_kernel` | [cuLA](https://github.com/inclusionAI/cuLA) | SM90 | Prefill (chunked) |
@@ -98,9 +99,8 @@ make bench_linear_ops
 # GDN 递推 (decode: n_tokens=1, prefill: n_tokens>1)
 ./bench_gated_delta_net [n_tokens] [heads] [head_dim] [n_seqs]  # default: 1 64 128 1
 
-# FP16/BF16 dense adjuncts
-./bench_linear_ops --op=in_proj_a --tokens=3823 --hidden=3072 --out-dim=64 --dtype fp16 --bench 0 1
-./bench_linear_ops --op=in_proj_b --tokens=3823 --hidden=3072 --out-dim=64 --dtype fp16 --bench 0 1
+# FP16/BF16 dense adjuncts.
+../general/bench_cublas_gemm --m=3823 --n=64 --k=3072 --dtype fp16 --bench 0 1
 ./bench_linear_ops --op=residual_add --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
 
 # cuLA chunked prefill (Hopper only)

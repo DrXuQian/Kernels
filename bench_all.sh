@@ -92,6 +92,7 @@ repo_path() {
 MACHETE_BIN="$(repo_path "general/w4a16_gemm/machete_standalone/build_cmake_release/test_machete_gemm")"
 FPA_BIN="$(repo_path "general/w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm")"
 CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
+CUDA_CORE_GEMV_BIN="$(repo_path "general/bench_cuda_core_gemv")"
 MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
 MOE_TRTLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/trtllm/auxiliary")"
 MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
@@ -123,6 +124,7 @@ NCU_METRICS="${NCU_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__t
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
+DECODE_CUBLAS_BACKEND="${DECODE_CUBLAS_BACKEND:-cuda_core}"
 
 declare -A DEDUPE_LABEL_BY_KEY=()
 declare -A DEDUPE_LOG_BY_KEY=()
@@ -165,6 +167,7 @@ Environment variables:
   BENCH_DEDUPE             Set to 0 to rerun duplicate benchmark commands/shapes.
                            Default: 1. Duplicate case logs point at the first
                            case that measured the same key.
+  DECODE_CUBLAS_BACKEND    cublas or cuda_core for non-lm-head decode dense GEMM. Default: cuda_core.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
@@ -270,6 +273,15 @@ done
 if [[ -n "$RESUME_FROM" ]]; then
   RESUME_SEEN=0
 fi
+
+case "$DECODE_CUBLAS_BACKEND" in
+  cublas|cuda_core)
+    ;;
+  *)
+    echo "[bench_all][error] DECODE_CUBLAS_BACKEND must be cublas or cuda_core, got: $DECODE_CUBLAS_BACKEND" >&2
+    exit 1
+    ;;
+esac
 
 require_bin() {
   local path="$1"
@@ -810,6 +822,35 @@ run_cublas_gemm_case() {
     --bench 0 1
 }
 
+run_cuda_core_gemv_case() {
+  local label="$1"
+  local m="$2"
+  local n="$3"
+  local k="$4"
+  local out_dtype="${5:-fp16}"
+
+  run_case "$label" \
+    --dedupe-key "cuda-core-gemv:$m,$n,$k,fp16,$out_dtype" \
+    "$CUDA_CORE_GEMV_BIN" \
+    --m="$m" --n="$n" --k="$k" --dtype fp16 --out-dtype "$out_dtype" \
+    --bench 0 1
+}
+
+run_decode_dense_gemm_case() {
+  local cublas_label="$1"
+  local cuda_core_label="$2"
+  local m="$3"
+  local n="$4"
+  local k="$5"
+  local out_dtype="${6:-fp16}"
+
+  if [[ "$DECODE_CUBLAS_BACKEND" == "cuda_core" ]]; then
+    run_cuda_core_gemv_case "$cuda_core_label" "$m" "$n" "$k" "$out_dtype"
+  else
+    run_cublas_gemm_case "$cublas_label" "$m" "$n" "$k" "$out_dtype"
+  fi
+}
+
 run_moe_shared_expert_case() {
   local label="$1"
   local op="$2"
@@ -890,6 +931,7 @@ else
   echo "ctx len:        $CTX_LEN"
   echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     vLLM components"
+  echo "decode dense:   $DECODE_CUBLAS_BACKEND"
   echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
     echo "case filters:   ${CASE_FILTERS[*]}"
@@ -918,8 +960,10 @@ fi
 run_rmsnorm_case "linear_attn_decode_rmsnorm" "$LINEAR_RMSNORM_BIN" "$DECODE_TOKENS"
 run_rmsnorm_case "linear_attn_prefill_rmsnorm" "$LINEAR_RMSNORM_BIN" "$PREFILL_TOKENS"
 
-run_linear_dense_case "linear_attn_decode_in_proj_a_cublas" "in_proj_a" "$DECODE_TOKENS" "$LINEAR_SMALL_PROJ_N"
-run_linear_dense_case "linear_attn_decode_in_proj_b_cublas" "in_proj_b" "$DECODE_TOKENS" "$LINEAR_SMALL_PROJ_N"
+run_decode_dense_gemm_case "linear_attn_decode_in_proj_a_cublas" "linear_attn_decode_in_proj_a_cuda_core" \
+  "$DECODE_TOKENS" "$LINEAR_SMALL_PROJ_N" "$HIDDEN_DIM" fp16
+run_decode_dense_gemm_case "linear_attn_decode_in_proj_b_cublas" "linear_attn_decode_in_proj_b_cuda_core" \
+  "$DECODE_TOKENS" "$LINEAR_SMALL_PROJ_N" "$HIDDEN_DIM" fp16
 
 run_linear_dense_case "linear_attn_prefill_in_proj_a_cublas" "in_proj_a" "$PREFILL_TOKENS" "$LINEAR_SMALL_PROJ_N"
 run_linear_dense_case "linear_attn_prefill_in_proj_b_cublas" "in_proj_b" "$PREFILL_TOKENS" "$LINEAR_SMALL_PROJ_N"
@@ -1032,10 +1076,10 @@ run_moe_shared_expert_activation_case "moe_shared_expert_activation_decode_trtll
 run_w4a16_decode_fpa_case "w4a16_decode_consistent_expert_down_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
 
-run_cublas_gemm_case "moe_router_gate_decode_cublas" \
+run_decode_dense_gemm_case "moe_router_gate_decode_cublas" "moe_router_gate_decode_cuda_core" \
   "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$HIDDEN_DIM" fp16
 
-run_cublas_gemm_case "moe_shared_expert_gate_decode_cublas" \
+run_decode_dense_gemm_case "moe_shared_expert_gate_decode_cublas" "moe_shared_expert_gate_decode_cuda_core" \
   "$DECODE_TOKENS" 1 "$HIDDEN_DIM" fp16
 
 run_moe_shared_expert_case "moe_shared_expert_fusion_decode" "sigmoid_mul_add" "$DECODE_TOKENS"

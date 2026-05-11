@@ -75,8 +75,8 @@ Module order:
 | Order | Kernel | Shape | Status | Implementation | `bench_all.sh` case / note |
 |---:|---|---:|---|---|---|
 | 1 | RMSNorm | `(1,3072)` | covered | `linear_attn/bench_rmsnorm` | `linear_attn_decode_rmsnorm` |
-| 2 | `in_proj_a` FP16 GEMM | `(1,3072)->(1,64)` | covered | `general/bench_cublas_gemm` | `linear_attn_decode_in_proj_a_cublas` |
-| 3 | `in_proj_b` FP16 GEMM | `(1,3072)->(1,64)` | covered | `general/bench_cublas_gemm` | `linear_attn_decode_in_proj_b_cublas` |
+| 2 | `in_proj_a` FP16 GEMV | `(1,3072)->(1,64)` | covered | `general/bench_cuda_core_gemv` | `linear_attn_decode_in_proj_a_cuda_core` |
+| 3 | `in_proj_b` FP16 GEMV | `(1,3072)->(1,64)` | covered | `general/bench_cuda_core_gemv` | `linear_attn_decode_in_proj_b_cuda_core` |
 | 4 | `in_proj_qkv` W4A16 GEMM | `(1,3072)->(1,12288)` | covered | `general/w4a16_gemm/fpA_intB_standalone` | `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` |
 | 5 | `in_proj_z` W4A16 GEMM | `(1,3072)->(1,8192)` | covered | `general/w4a16_gemm/fpA_intB_standalone` | `w4a16_decode_linear_attn_in_proj_z_fpA_intB` |
 | 6 | Gate prep, `g = -exp(A) * softplus(a + dt_bias)` | `(1,64)` | missing | none | missing: no CUDA standalone in repo |
@@ -113,14 +113,14 @@ Module order:
 | Order | Kernel | Shape | Status | Implementation | `bench_all.sh` case / note |
 |---:|---|---:|---|---|---|
 | 1 | RMSNorm | `(1,3072)` | covered | `moe_ffn/bench_rmsnorm` | `moe_ffn_decode_rmsnorm` |
-| 2 | Router gate FP16 GEMM | `(1,3072)->(1,256)` | covered | `general/bench_cublas_gemm` | `moe_router_gate_decode_cublas` |
+| 2 | Router gate FP16 GEMV | `(1,3072)->(1,256)` | covered | `general/bench_cuda_core_gemv` | `moe_router_gate_decode_cuda_core` |
 | 3 | Routing top-k | `(1,256)->topk` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating` | `moe_routing_decode_vllm` |
 | 4 | MoE align metadata | `(1,256,topk=8,block=16)` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_align`; vLLM general two-kernel path | `moe_align_decode_vllm` |
 | 5 | MoE gate/up W4A16 GEMM | routed `(8,1,3072)->(8,1,2048)` | covered | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe` | `moe_gate_up_decode_vllm` |
 | 6 | Gated activation | `(8,1,2048)->(8,1,1024)` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul` | `moe_gated_decode_vllm` |
 | 7 | MoE down W4A16 GEMM | routed `(8,1,1024)->(8,1,3072)` | covered | `moe_ffn/w4a16/vllm/marlin/bench_marlin_moe` | `moe_down_decode_vllm` |
 | 8 | Finalize / sum experts | `(8,1,3072)->(1,3072)` | covered | `moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum` | `moe_finalize_decode_vllm` |
-| 9 | Shared expert gate FP16 GEMM | `(1,3072)->(1,1)` | covered | `general/bench_cublas_gemm` | `moe_shared_expert_gate_decode_cublas` |
+| 9 | Shared expert gate FP16 GEMV | `(1,3072)->(1,1)` | covered | `general/bench_cuda_core_gemv` | `moe_shared_expert_gate_decode_cuda_core` |
 | 10 | Shared/consistent expert up W4A16 GEMM | `(1,3072)->(1,2048)` | covered | `general/w4a16_gemm/fpA_intB_standalone` | `w4a16_decode_consistent_expert_up_fpA_intB` |
 | 11 | Shared expert activation, `SiLU(gate) * up` | `(1,2048)->(1,1024)` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation` | `moe_shared_expert_activation_decode_trtllm` |
 | 12 | Shared/consistent expert down W4A16 GEMM | `(1,1024)->(1,3072)` | covered | `general/w4a16_gemm/fpA_intB_standalone` | `w4a16_decode_consistent_expert_down_fpA_intB` |
@@ -149,6 +149,7 @@ No Sampling kernels are used in prefill.
 | Backend | Implementation | Used by |
 |---|---|---|
 | FP16/BF16 GEMM | `general/bench_cublas_gemm` | Linear-Attn, MoE-FFN, Sampling |
+| FP16/BF16 decode GEMV | `general/bench_cuda_core_gemv` | Linear-Attn and MoE-FFN decode dense projections except `lm_head` |
 | RMSNorm | `general/bench_rmsnorm.cu`, built into category folders | Flash-Attn, Linear-Attn, MoE-FFN |
 | W4A16 prefill GEMM | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | Flash-Attn, Linear-Attn, MoE-FFN |
 | W4A16 decode GEMM | `general/w4a16_gemm/fpA_intB_standalone` | Flash-Attn, Linear-Attn, MoE-FFN |

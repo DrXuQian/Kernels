@@ -108,7 +108,7 @@ def build_model_rows(rows: list[dict[str, object]]) -> tuple[list[dict[str, obje
         h800_us = row["h800_us"]
         ppu_us = row["ppu_us"]
         ppu_imputed = False
-        if ppu_us is None and h800_us is not None and case == "sampling_lm_head_gemm":
+        if ppu_us is None and h800_us is not None and case in {"sampling_lm_head_gemm", "sampling_lm_head_vllm_linear"}:
             # The current PPU data is missing only lm_head. Use H800 as a
             # neutral placeholder so model totals remain comparable.
             ppu_us = h800_us
@@ -254,6 +254,8 @@ def short_case_label(case: str) -> str:
         ("moe_", ""),
         ("_trtllm", ""),
         ("_vllm", ""),
+        ("_linear", ""),
+        ("_cuda_core", ""),
         ("_cutlass55", ""),
         ("_fpA_intB", ""),
         ("_cublas", ""),

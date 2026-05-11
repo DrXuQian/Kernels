@@ -30,8 +30,8 @@ OPERATOR_COLORS = {
     "W4A16 GEMM (fpA_intB)": "#76B7B2",
     "MoE grouped GEMM (TRT-LLM)": "#59A14F",
     "MoE GEMM (vLLM Marlin)": "#8CD17D",
-    "FP16 GEMM (cuBLAS)": "#B07AA1",
-    "LM head GEMM (cuBLAS)": "#FF9DA7",
+    "FP16 GEMM (vLLM/cuBLASLt)": "#B07AA1",
+    "LM head GEMM (vLLM/cuBLASLt)": "#FF9DA7",
     "RMSNorm": "#9C755F",
     "Q/K RMSNorm": "#BAB0AC",
     "FlashAttention core": "#EDC948",
@@ -101,10 +101,12 @@ def classify_operator(case: str) -> str:
         return "MoE grouped GEMM (TRT-LLM)"
     if base in {"moe_gate_up_decode_vllm", "moe_down_decode_vllm"}:
         return "MoE GEMM (vLLM Marlin)"
-    if base == "sampling_lm_head_gemm":
-        return "LM head GEMM (cuBLAS)"
-    if base.endswith("_cublas"):
-        return "FP16 GEMM (cuBLAS)"
+    if base in {"sampling_lm_head_gemm", "sampling_lm_head_vllm_linear"}:
+        return "LM head GEMM (vLLM/cuBLASLt)"
+    if base.endswith("_cuda_core"):
+        return "FP16 GEMV (CUDA core)"
+    if base.endswith("_cublas") or base.endswith("_vllm_linear"):
+        return "FP16 GEMM (vLLM/cuBLASLt)"
     if base.endswith("_q_norm") or base.endswith("_k_norm"):
         return "Q/K RMSNorm"
     if base.endswith("_rmsnorm"):
