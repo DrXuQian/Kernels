@@ -87,8 +87,8 @@ python helpers/plot_122b_comparison.py \
 
 | Phase | H800 total ms | PPU total ms | PPU/H800 |
 |---|---:|---:|---:|
-| prefill | 234.213 | 281.435 | 1.202x |
-| decode | 9.992 | 12.302 | 1.231x |
+| prefill | 234.213 | 288.021 | 1.230x |
+| decode | 9.992 | 12.225 | 1.223x |
 
 ![Model latency totals](figures/bench_122B/model_latency_totals.svg)
 
@@ -120,20 +120,20 @@ Largest prefill deltas:
 | Case | H800 ms | PPU ms | Delta |
 |---|---:|---:|---:|
 | `linear_prefill_flashinfer_gdn` | 19.325 | 43.492 | +24.167 |
-| `moe_gated_prefill_trtllm` | 5.161 | 25.021 | +19.860 |
-| `linear_attn_prefill_fused_rms_norm_gate` | 13.026 | 22.873 | +9.848 |
-| `moe_expand_prefill_trtllm` | 17.447 | 9.057 | -8.390 |
-| `moe_gate_up_prefill_trtllm` | 53.327 | 46.204 | -7.123 |
+| `moe_finalize_prefill_trtllm` | 11.846 | 22.607 | +10.762 |
+| `linear_attn_prefill_fused_rms_norm_gate` | 13.026 | 22.870 | +9.845 |
+| `moe_gate_up_prefill_trtllm` | 53.327 | 44.529 | -8.798 |
+| `moe_gated_prefill_trtllm` | 5.161 | 9.253 | +4.092 |
 
 Largest decode deltas:
 
 | Case | H800 ms | PPU ms | Delta |
 |---|---:|---:|---:|
 | `moe_shared_expert_gate_decode_cublas` | 0.402 | 1.120 | +0.717 |
-| `moe_gate_up_decode_vllm` | 0.822 | 1.494 | +0.672 |
 | `moe_router_gate_decode_cublas` | 0.550 | 1.104 | +0.554 |
-| `linear_attn_decode_in_proj_a_cublas` | 0.379 | 0.832 | +0.453 |
-| `linear_attn_decode_in_proj_b_cublas` | 0.379 | 0.832 | +0.453 |
+| `moe_gate_up_decode_vllm` | 0.822 | 1.290 | +0.469 |
+| `moe_down_decode_vllm` | 0.725 | 1.185 | +0.460 |
+| `linear_attn_decode_in_proj_b_cublas` | 0.379 | 0.837 | +0.458 |
 
 ## Flash-Attn
 
@@ -157,13 +157,13 @@ Largest decode deltas:
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `flash_attn_prefill_rmsnorm` | 1 | 79363.090 | 79459 | 50016 | 50.016 | 108227 | 72.151 |
-| `w4a16_prefill_full_attn_q_proj_gate_cutlass55` | 1 | 805173.480 | 808926 | 520576 | 520.576 | 899115 | 599.410 |
+| `w4a16_prefill_full_attn_q_proj_gate_cutlass55` | 1 | 805173.480 | 808926 | 520576 | 520.576 | 899473 | 599.649 |
 | `w4a16_prefill_full_attn_k_proj_cutlass55` | 1 | 62091.330 | 62328 | 39552 | 39.552 | 64527 | 43.018 |
 | `w4a16_prefill_full_attn_v_proj_cutlass55` | 1 | 62091.330 | 62328 | 39552 | 39.552 | 64527 | 43.018 |
 | `flash_attn_prefill_q_norm` | 1 | 279564.500 | 279614 | 175872 | 175.872 | 385933 | 257.289 |
-| `flash_attn_prefill_k_norm` | 1 | 22809.360 | 22846 | 14400 | 14.400 | 26025 | 17.350 |
-| `flash_attn_prefill_full_attn` | 1 | 1487535.360 | 1490135 | 940224 | 940.224 | 1154801 | 769.867 |
-| `w4a16_prefill_full_attn_o_proj_cutlass55` | 1 | 420792.230 | 425083 | 276544 | 276.544 | 491633 | 327.755 |
+| `flash_attn_prefill_k_norm` | 1 | 22809.360 | 22846 | 14400 | 14.400 | 25927 | 17.285 |
+| `flash_attn_prefill_full_attn` | 1 | 1487535.360 | 1490135 | 940224 | 940.224 | 1145923 | 763.949 |
+| `w4a16_prefill_full_attn_o_proj_cutlass55` | 1 | 420792.230 | 425083 | 276544 | 276.544 | 491333 | 327.555 |
 | `flash_attn_prefill_residual_add` | 1 | 52426.420 | 52459 | 33024 | 33.024 | 81945 | 54.630 |
 
 
@@ -174,10 +174,10 @@ Largest decode deltas:
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `linear_attn_decode_rmsnorm` | 1 | 9231.240 | 9234 | 5856 | 5.856 | 6213 | 4.142 |
-| `linear_attn_decode_in_proj_a_cublas` | 2 | 16649.140 | 16658 | 10528 | 10.528 | 34682 | 23.121 |
-| `linear_attn_decode_in_proj_b_cublas` | 2 | 16649.140 | 16658 | 10528 | 10.528 | 34682 | 23.121 |
+| `linear_attn_decode_in_proj_a_cublas` | 2 | 16649.140 | 16658 | 10528 | 10.528 | 34871 | 23.247 |
+| `linear_attn_decode_in_proj_b_cublas` | 2 | 16649.140 | 16658 | 10528 | 10.528 | 34871 | 23.247 |
 | `w4a16_decode_linear_attn_in_proj_qkv_fpA_intB` | 1 | 18618.710 | 18699 | 11840 | 11.840 | 23057 | 15.371 |
-| `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | 1 | 15418.240 | 15474 | 9792 | 9.792 | 13637 | 9.091 |
+| `w4a16_decode_linear_attn_in_proj_z_fpA_intB` | 1 | 15418.240 | 15474 | 9792 | 9.792 | 13791 | 9.194 |
 | `linear_decode_conv1d_update` | 1 | 8286.940 | 8289 | 5248 | 5.248 | 4422 | 2.948 |
 | `linear_decode_gdn` | 1 | 10672.440 | 10693 | 6784 | 6.784 | 6869 | 4.579 |
 | `linear_attn_decode_fused_rms_norm_gate` | 1 | 6774.830 | 6781 | 4288 | 4.288 | 3684 | 2.456 |
@@ -192,12 +192,12 @@ Largest decode deltas:
 | `linear_attn_prefill_rmsnorm` | 1 | 79363.090 | 79459 | 50016 | 50.016 | 108227 | 72.151 |
 | `linear_attn_prefill_in_proj_a_cublas` | 1 | 20938.480 | 20985 | 13440 | 13.440 | 33721 | 22.481 |
 | `linear_attn_prefill_in_proj_b_cublas` | 1 | 20938.480 | 20985 | 13440 | 13.440 | 33721 | 22.481 |
-| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | 1 | 592874.410 | 596695 | 385696 | 385.696 | 661500 | 441.000 |
-| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | 1 | 432869.740 | 437242 | 285152 | 285.152 | 482193 | 321.462 |
-| `linear_prefill_conv1d_fwd` | 1 | 161232.470 | 161616 | 101792 | 101.792 | 177643 | 118.429 |
+| `w4a16_prefill_linear_attn_in_proj_qkv_cutlass55` | 1 | 592874.410 | 596695 | 385696 | 385.696 | 662199 | 441.466 |
+| `w4a16_prefill_linear_attn_in_proj_z_cutlass55` | 1 | 432869.740 | 437242 | 285152 | 285.152 | 482531 | 321.687 |
+| `linear_prefill_conv1d_fwd` | 1 | 161232.470 | 161616 | 101792 | 101.792 | 178356 | 118.904 |
 | `linear_prefill_flashinfer_gdn` | 1 | 850767.770 | 851348 | 536800 | 536.800 | 1812153 | 1208.102 |
-| `linear_attn_prefill_fused_rms_norm_gate` | 1 | 575178.060 | 575254 | 361824 | 361.824 | 953052 | 635.368 |
-| `w4a16_prefill_linear_attn_out_proj_cutlass55` | 1 | 420792.230 | 425083 | 276544 | 276.544 | 491633 | 327.755 |
+| `linear_attn_prefill_fused_rms_norm_gate` | 1 | 575178.060 | 575254 | 361824 | 361.824 | 952929 | 635.286 |
+| `w4a16_prefill_linear_attn_out_proj_cutlass55` | 1 | 420792.230 | 425083 | 276544 | 276.544 | 491333 | 327.555 |
 | `linear_attn_prefill_residual_add` | 1 | 52426.420 | 52459 | 33024 | 33.024 | 81945 | 54.630 |
 
 
@@ -208,16 +208,16 @@ Largest decode deltas:
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `moe_ffn_decode_rmsnorm` | 1 | 9231.240 | 9234 | 5856 | 5.856 | 6213 | 4.142 |
-| `w4a16_decode_consistent_expert_up_fpA_intB` | 1 | 12252.640 | 12259 | 7744 | 7.744 | 7542 | 5.028 |
+| `w4a16_decode_consistent_expert_up_fpA_intB` | 1 | 12252.640 | 12259 | 7744 | 7.744 | 8419 | 5.613 |
 | `moe_shared_expert_activation_decode_trtllm` | 1 | 9294.920 | 9300 | 5888 | 5.888 | 6848 | 4.565 |
-| `w4a16_decode_consistent_expert_down_fpA_intB` | 1 | 7944.020 | 7962 | 5024 | 5.024 | 8025 | 5.350 |
+| `w4a16_decode_consistent_expert_down_fpA_intB` | 1 | 7944.020 | 7962 | 5024 | 5.024 | 4695 | 3.130 |
 | `moe_router_gate_decode_cublas` | 2 | 18050.210 | 18140 | 11456 | 11.456 | 34498 | 22.999 |
-| `moe_routing_decode_vllm` | 1 | 12085.060 | 12090 | 7616 | 7.616 | 10909 | 7.273 |
+| `moe_routing_decode_vllm` | 1 | 12085.060 | 12090 | 7616 | 7.616 | 10905 | 7.270 |
 | `moe_align_decode_vllm` | 2 | 13724.260 | 13732 | 8704 | 8.704 | 13567 | 9.045 |
-| `moe_gate_up_decode_vllm` | 1 | 26597.980 | 26721 | 17120 | 17.120 | 46675 | 31.117 |
-| `moe_gated_decode_vllm` | 1 | 5744.880 | 5750 | 3648 | 3.648 | 4386 | 2.924 |
-| `moe_down_decode_vllm` | 1 | 23587.170 | 23632 | 15104 | 15.104 | 31287 | 20.858 |
-| `moe_finalize_decode_vllm` | 1 | 7634.830 | 7642 | 4832 | 4.832 | 2658 | 1.772 |
+| `moe_gate_up_decode_vllm` | 1 | 26597.980 | 26721 | 17120 | 17.120 | 40321 | 26.881 |
+| `moe_gated_decode_vllm` | 1 | 5744.880 | 5750 | 3648 | 3.648 | 2350 | 1.567 |
+| `moe_down_decode_vllm` | 1 | 23587.170 | 23632 | 15104 | 15.104 | 37020 | 24.680 |
+| `moe_finalize_decode_vllm` | 1 | 7634.830 | 7642 | 4832 | 4.832 | 4947 | 3.298 |
 | `moe_shared_expert_gate_decode_cublas` | 2 | 13200.280 | 13212 | 8384 | 8.384 | 34988 | 23.325 |
 | `moe_shared_expert_fusion_decode` | 1 | 6080.480 | 6084 | 3840 | 3.840 | 3353 | 2.235 |
 | `moe_ffn_decode_residual_add` | 1 | 5151.470 | 5155 | 3264 | 3.264 | 3228 | 2.152 |
@@ -228,18 +228,18 @@ Largest decode deltas:
 | Case | H800 kernels | H800 cycles_avg | H800 cycles_max | H800 duration_ns | H800 latency_us | PPU cycles | PPU latency_us@1.5GHz |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `moe_ffn_prefill_rmsnorm` | 1 | 79363.090 | 79459 | 50016 | 50.016 | 108227 | 72.151 |
-| `w4a16_prefill_consistent_expert_up_cutlass55` | 1 | 132728.790 | 134702 | 87648 | 87.648 | 169672 | 113.115 |
+| `w4a16_prefill_consistent_expert_up_cutlass55` | 1 | 132728.790 | 134702 | 87648 | 87.648 | 167896 | 111.931 |
 | `moe_shared_expert_activation_prefill_trtllm` | 1 | 26612.330 | 26697 | 16832 | 16.832 | 40187 | 26.791 |
-| `w4a16_prefill_consistent_expert_down_cutlass55` | 1 | 77089.480 | 77699 | 50400 | 50.400 | 86561 | 57.707 |
-| `moe_router_gate_prefill_cublas` | 1 | 24605.770 | 24756 | 15968 | 15.968 | 33684 | 22.456 |
+| `w4a16_prefill_consistent_expert_down_cutlass55` | 1 | 77089.480 | 77699 | 50400 | 50.400 | 90627 | 60.418 |
+| `moe_router_gate_prefill_cublas` | 1 | 24605.770 | 24756 | 15968 | 15.968 | 33694 | 22.463 |
 | `moe_routing_prefill_trtllm` | 1 | 19699.640 | 19716 | 12416 | 12.416 | 11896 | 7.931 |
 | `moe_expert_map_prefill_trtllm` | 3 | 52065.540 | 52089 | 32800 | 32.800 | 47107 | 31.405 |
-| `moe_expand_prefill_trtllm` | 1 | 577938.230 | 577951 | 363488 | 363.488 | 283036 | 188.691 |
-| `moe_gate_up_prefill_trtllm` | 1 | 1765885.640 | 1766003 | 1110976 | 1110.976 | 1443884 | 962.589 |
-| `moe_gated_prefill_trtllm` | 1 | 170279.360 | 170736 | 107520 | 107.520 | 781893 | 521.262 |
-| `moe_down_prefill_trtllm` | 1 | 939983.710 | 940907 | 592192 | 592.192 | 738710 | 492.473 |
-| `moe_finalize_prefill_trtllm` | 1 | 392343.940 | 392360 | 246784 | 246.784 | 259207 | 172.805 |
-| `moe_shared_expert_gate_prefill_cublas` | 1 | 27503 | 27568 | 17376 | 17.376 | 33751 | 22.501 |
+| `moe_expand_prefill_trtllm` | 1 | 577938.230 | 577951 | 363488 | 363.488 | 472476 | 314.984 |
+| `moe_gate_up_prefill_trtllm` | 1 | 1765885.640 | 1766003 | 1110976 | 1110.976 | 1391534 | 927.689 |
+| `moe_gated_prefill_trtllm` | 1 | 170279.360 | 170736 | 107520 | 107.520 | 289141 | 192.761 |
+| `moe_down_prefill_trtllm` | 1 | 939983.710 | 940907 | 592192 | 592.192 | 851867 | 567.911 |
+| `moe_finalize_prefill_trtllm` | 1 | 392343.940 | 392360 | 246784 | 246.784 | 706473 | 470.982 |
+| `moe_shared_expert_gate_prefill_cublas` | 1 | 27503 | 27568 | 17376 | 17.376 | 33719 | 22.479 |
 | `moe_shared_expert_fusion_prefill` | 1 | 100865.060 | 100943 | 63520 | 63.520 | 209201 | 139.467 |
 | `moe_ffn_prefill_residual_add` | 1 | 52426.420 | 52459 | 33024 | 33.024 | 81945 | 54.630 |
 
@@ -253,7 +253,7 @@ above counts one sampling step in both prefill and decode.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `sampling_lm_head_gemm` | 1 | 769939.480 | 771560 | 488736 | 488.736 | - | - |
 | `sampling_topk_mask_logits` | 1 | 75616.240 | 75620 | 47584 | 47.584 | 86641 | 57.761 |
-| `sampling_softmax` | 2 | 74527.520 | 74538 | 46944 | 46.944 | 69316 | 46.211 |
+| `sampling_softmax` | 2 | 74527.520 | 74538 | 46944 | 46.944 | 70017 | 46.678 |
 | `sampling_top_p` | 1 | 44388.740 | 44391 | 27968 | 27.968 | 63841 | 42.561 |
 
 ## Interpretation Notes
