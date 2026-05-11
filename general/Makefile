@@ -12,7 +12,7 @@ ARCH ?= -arch=sm_80
 CUDA_CCCL_INC ?= $(if $(CUDA_ROOT),-I$(CUDA_ROOT)/targets/x86_64-linux/include/cccl,)
 INCLUDES := -I../include
 
-BINS := bench_layernorm bench_rmsnorm bench_cublas_gemm
+BINS := bench_layernorm bench_rmsnorm bench_cublas_gemm bench_cuda_core_gemv
 
 .PHONY: all clean
 
@@ -26,6 +26,9 @@ bench_rmsnorm: bench_rmsnorm.cu ../include/bench_timer.h
 
 bench_cublas_gemm: bench_cublas_gemm.cu ../include/bench_timer.h
 	$(NVCC) $(CFLAGS) $(ARCH) $(CUDA_CCCL_INC) $(INCLUDES) $< -o $@ -lcublas
+
+bench_cuda_core_gemv: bench_cuda_core_gemv.cu ../include/bench_timer.h
+	$(NVCC) $(CFLAGS) $(ARCH) $(CUDA_CCCL_INC) $(INCLUDES) $< -o $@
 
 clean:
 	rm -f $(BINS)

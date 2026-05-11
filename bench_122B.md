@@ -104,8 +104,10 @@ multipliers. The long tail is grouped into `Other`.
 ### Kernel Contributions
 
 These pies and bars compare logical kernel/case contributions to total model
-latency. The pies show where total time goes; the bars make absolute
-H800-vs-PPU deltas visible.
+latency. The per-case bars keep each benchmark label separate. The kernel-type
+bars merge same-source logical kernels, for example cutlass55 W4A16 GEMMs,
+fpA_intB GEMMs, TRT-LLM MoE grouped GEMMs, vLLM Marlin MoE GEMMs, cuBLAS GEMMs,
+and norm/elementwise classes.
 
 ![Prefill kernel share](figures/bench_122B/prefill_kernel_share.svg)
 
@@ -114,6 +116,10 @@ H800-vs-PPU deltas visible.
 ![Prefill kernel contributions](figures/bench_122B/prefill_kernel_contributions.svg)
 
 ![Decode kernel contributions](figures/bench_122B/decode_kernel_contributions.svg)
+
+![Prefill kernel-type contributions](figures/bench_122B/prefill_kernel_type_contributions.svg)
+
+![Decode kernel-type contributions](figures/bench_122B/decode_kernel_type_contributions.svg)
 
 Largest prefill deltas:
 

@@ -331,6 +331,40 @@ def plot_case_bars(case_rows: dict[tuple[str, str], dict[str, object]], phase: s
     plt.close(fig)
 
 
+def plot_operator_bars(
+    operator_totals: dict[tuple[str, str], dict[str, float]],
+    phase: str,
+    out: Path,
+    limit: int = 18,
+) -> None:
+    rows = [
+        {"operator": operator, "H800": vals["H800"], "PPU": vals["PPU"]}
+        for (ph, operator), vals in operator_totals.items()
+        if ph == phase
+    ]
+    rows.sort(key=lambda r: max(float(r["H800"]), float(r["PPU"])), reverse=True)
+    rows = rows[:limit]
+    rows.reverse()
+    labels = [str(row["operator"]) for row in rows]
+    y = range(len(rows))
+    width = 0.36
+    h800 = [float(row["H800"]) / 1000.0 for row in rows]
+    ppu = [float(row["PPU"]) / 1000.0 for row in rows]
+    height = max(5.2, 0.42 * len(rows) + 1.2)
+    fig, ax = plt.subplots(figsize=(12.5, height))
+    ax.barh([v - width / 2 for v in y], h800, height=width, label="H800", color=DEVICE_COLORS["H800"])
+    ax.barh([v + width / 2 for v in y], ppu, height=width, label="PPU", color=DEVICE_COLORS["PPU"])
+    ax.set_yticks(list(y), labels)
+    ax.tick_params(axis="y", labelsize=8)
+    ax.set_xlabel("Model latency contribution (ms)")
+    ax.set_title(f"Top {phase.capitalize()} Kernel-Type Contributions")
+    ax.legend(loc="lower right")
+    ax.grid(axis="x", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out, format="svg")
+    plt.close(fig)
+
+
 def markdown_summary(totals: dict[str, dict[str, float]], imputed: list[str]) -> str:
     rows = [
         "| Phase | H800 total ms | PPU total ms | PPU/H800 |",
@@ -366,6 +400,8 @@ def main() -> None:
     plot_case_pies(cases, "decode", args.out_dir / "decode_kernel_share.svg")
     plot_case_bars(cases, "prefill", args.out_dir / "prefill_kernel_contributions.svg")
     plot_case_bars(cases, "decode", args.out_dir / "decode_kernel_contributions.svg")
+    plot_operator_bars(operator_totals, "prefill", args.out_dir / "prefill_kernel_type_contributions.svg")
+    plot_operator_bars(operator_totals, "decode", args.out_dir / "decode_kernel_type_contributions.svg")
 
     print(markdown_summary(totals, imputed))
 

@@ -22,6 +22,7 @@ bench_kda_prefill
 bench_layernorm
 bench_rmsnorm
 bench_cublas_gemm
+bench_cuda_core_gemv
 bench_sampling
 bench_linear_ops
 bench_shared_expert
