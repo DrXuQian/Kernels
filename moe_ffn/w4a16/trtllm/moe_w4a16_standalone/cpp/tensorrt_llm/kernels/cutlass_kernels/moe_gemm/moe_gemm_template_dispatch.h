@@ -64,6 +64,7 @@
 #include "./launchers/fused_moe_gemm_launcher_sm80.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
 #include "./launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
+#include "./moe_cuda_core_gemv.h"
 #include "./moe_gemm_template_dispatch_tma_ws.h"
 #include "./moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
 #include "./moe_tma_warp_specialized_traits.h"
@@ -692,6 +693,20 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
         sm_ >= 89 || !hopper_inputs.isValid(), "Hopper input information is set for non specialized implementation");
     TLLM_CHECK_WITH_INFO(sm_ >= 90 || !inputs.gemm_config.is_tma_warp_specialized,
         "Hopper configuration provided for non-Hopper architecture");
+
+    if (inputs.gemm_config.enableCudaKernel)
+    {
+        if constexpr (std::is_same_v<WeightType, cutlass::uint4b_t> && std::is_same_v<T, OutputType>
+            && std::is_same_v<ScaleBiasType, OutputType>)
+        {
+            dispatchMoeCudaCoreGemvM1<T, OutputType>(inputs);
+            return;
+        }
+        else
+        {
+            TLLM_THROW("CUDA-core MoE GEMV supports W4A16 scale-only kernels only");
+        }
+    }
 
     if (sm_ >= 75 && sm_ < 80)
     {

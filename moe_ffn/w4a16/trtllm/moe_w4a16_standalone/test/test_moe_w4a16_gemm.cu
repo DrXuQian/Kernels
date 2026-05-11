@@ -53,6 +53,7 @@ struct Args
     bool verify = false;
     bool list_configs = false;
     bool sweep_configs = false;
+    bool cuda_core = false;
 };
 
 void check_cuda(cudaError_t status, char const* expr, char const* file, int line)
@@ -119,7 +120,7 @@ void print_usage(char const* name)
     std::printf(
         "Usage: %s [--dtype=fp16|bf16] [--experts=N] [--m_per_expert=N] [--n=N] [--k=N]\n"
         "          [--group_size=N] [--warmup=N] [--iters=N] [--tile_enum=N] [--stages=N]\n"
-        "          [--tactic=<file>] [--verify] [--list_configs] [--sweep_configs]\n",
+        "          [--tactic=<file>] [--verify] [--list_configs] [--sweep_configs] [--cuda_core]\n",
         name);
 }
 
@@ -151,6 +152,10 @@ bool parse_args(int argc, char** argv, Args& args)
         {
             args.sweep_configs = true;
         }
+        else if (std::strcmp(arg, "--cuda_core") == 0)
+        {
+            args.cuda_core = true;
+        }
         else if (std::strncmp(arg, "--tactic=", 9) == 0)
         {
             args.tactic_file = arg + 9;
@@ -179,6 +184,16 @@ tc::CutlassGemmConfig make_sm80_config(int tile_enum, int stages)
     config.split_k_style = tc::SplitKStyle::NO_SPLIT_K;
     config.sm_version = 80;
     config.enableCudaKernel = false;
+    return config;
+}
+
+tc::CutlassGemmConfig make_cuda_core_config()
+{
+    tc::CutlassGemmConfig config{};
+    config.enableCudaKernel = true;
+    config.sm_version = 80;
+    config.split_k_factor = 1;
+    config.split_k_style = tc::SplitKStyle::NO_SPLIT_K;
     return config;
 }
 
@@ -223,6 +238,9 @@ bool deserialize_config(std::string const& str, tc::CutlassGemmConfig& out)
     if (cuda == 1)
     {
         out.enableCudaKernel = true;
+        out.sm_version = 80;
+        out.split_k_factor = 1;
+        out.split_k_style = tc::SplitKStyle::NO_SPLIT_K;
         return true;
     }
 
@@ -302,9 +320,40 @@ bool same_sm80_config(tc::CutlassGemmConfig const& a, tc::CutlassGemmConfig cons
         && a.split_k_style == b.split_k_style && a.sm_version == b.sm_version;
 }
 
+bool same_config(tc::CutlassGemmConfig const& a, tc::CutlassGemmConfig const& b)
+{
+    if (a.enableCudaKernel || b.enableCudaKernel)
+    {
+        return a.enableCudaKernel == b.enableCudaKernel;
+    }
+    return same_sm80_config(a, b);
+}
+
+bool cuda_core_supported_args(const Args& args)
+{
+    return args.m_per_expert == 1 && (args.group_size == 64 || args.group_size == 128)
+        && args.k % args.group_size == 0 && args.k % 64 == 0 && args.n % 16 == 0;
+}
+
+std::string config_name(tc::CutlassGemmConfig const& config)
+{
+    if (config.enableCudaKernel)
+    {
+        return "cuda_core";
+    }
+    std::ostringstream s;
+    s << "tile_enum=" << static_cast<int>(config.tile_config_sm80) << " stages=" << config.stages
+      << " split_k=" << config.split_k_factor << " sm=" << config.sm_version;
+    return s.str();
+}
+
 template <typename T>
 std::vector<tc::CutlassGemmConfig> benchmark_configs(const Args& args)
 {
+    if (args.cuda_core)
+    {
+        return {make_cuda_core_config()};
+    }
     if (!args.sweep_configs)
     {
         return {make_sm80_config(args.tile_enum, args.stages)};
@@ -327,13 +376,21 @@ std::vector<tc::CutlassGemmConfig> benchmark_configs(const Args& args)
         }
         out.push_back(config);
     }
+    if (cuda_core_supported_args(args))
+    {
+        out.push_back(make_cuda_core_config());
+    }
     return out;
 }
 
 template <typename T>
-bool is_supported_config(tc::CutlassGemmConfig const& config)
+bool is_supported_config(tc::CutlassGemmConfig const& config, const Args& args)
 {
-    if (config.enableCudaKernel || config.is_tma_warp_specialized)
+    if (config.enableCudaKernel)
+    {
+        return cuda_core_supported_args(args);
+    }
+    if (config.is_tma_warp_specialized)
     {
         return false;
     }
@@ -341,7 +398,7 @@ bool is_supported_config(tc::CutlassGemmConfig const& config)
     sweep_args.sweep_configs = true;
     for (auto const& candidate : benchmark_configs<T>(sweep_args))
     {
-        if (same_sm80_config(config, candidate))
+        if (same_config(config, candidate))
         {
             return true;
         }
@@ -350,7 +407,7 @@ bool is_supported_config(tc::CutlassGemmConfig const& config)
 }
 
 template <typename T>
-void print_configs()
+void print_configs(const Args& args)
 {
     auto configs = tk::MoeGemmRunner<T, cutlass::uint4b_t, T>::getConfigs(80, false);
     std::set<std::tuple<int, int, int, int>> seen;
@@ -368,6 +425,10 @@ void print_configs()
         }
         std::printf("tile_enum=%d stages=%d split_k=%d sm=%d\n", static_cast<int>(config.tile_config_sm80),
             config.stages, config.split_k_factor, config.sm_version);
+    }
+    if (cuda_core_supported_args(args))
+    {
+        std::printf("cuda=1 backend=cuda_core requires m_per_expert=1 group_size=64|128 n%%16=0 k%%64=0\n");
     }
 }
 
@@ -389,9 +450,10 @@ int run(const Args& args)
         std::fprintf(stderr, "k must be divisible by group_size.\n");
         return 1;
     }
-    if (args.group_size != 128 && args.group_size != args.k)
+    if (args.group_size != 128 && args.group_size != args.k && !(args.cuda_core && args.group_size == 64))
     {
-        std::fprintf(stderr, "This CUTLASS MoE W4A16 path supports group_size=128 or group_size=k.\n");
+        std::fprintf(stderr,
+            "This CUTLASS MoE W4A16 path supports group_size=128 or group_size=k; CUDA-core also supports 64.\n");
         return 1;
     }
     if (args.k % 64 != 0 || args.n % 128 != 0)
@@ -399,10 +461,17 @@ int run(const Args& args)
         std::fprintf(stderr, "Default config expects k multiple of 64 and n multiple of 128.\n");
         return 1;
     }
+    if (args.cuda_core && !cuda_core_supported_args(args))
+    {
+        std::fprintf(stderr,
+            "--cuda_core requires m_per_expert=1, group_size=64|128, k divisible by group_size and 64, and n "
+            "divisible by 16.\n");
+        return 1;
+    }
 
     if (args.list_configs)
     {
-        print_configs<T>();
+        print_configs<T>(args);
         return 0;
     }
 
@@ -481,7 +550,7 @@ int run(const Args& args)
         if (load_tactic(args.tactic_file, dtype_name<T>(), args.experts, args.m_per_expert, args.n, args.k,
                 args.group_size, cached_config))
         {
-            if (!is_supported_config<T>(cached_config))
+            if (!is_supported_config<T>(cached_config, args))
             {
                 std::printf("tactic cache entry unsupported for this MoE W4A16 build: profiling...\n");
                 Args sweep_args = args;
@@ -540,9 +609,7 @@ int run(const Args& args)
             float const avg_ms = elapsed_ms / std::max(args.iters, 1);
             if (args.sweep_configs)
             {
-                std::printf("config dtype=%s tile_enum=%d stages=%d split_k=%d sm=%d avg_ms=%.4f\n",
-                    dtype_name<T>(), static_cast<int>(config.tile_config_sm80), config.stages,
-                    config.split_k_factor, config.sm_version, avg_ms);
+                std::printf("config dtype=%s %s avg_ms=%.4f\n", dtype_name<T>(), config_name(config).c_str(), avg_ms);
             }
             if (avg_ms < best_ms)
             {
@@ -554,8 +621,8 @@ int run(const Args& args)
         {
             if (args.sweep_configs)
             {
-                std::fprintf(stderr, "config dtype=%s tile_enum=%d stages=%d failed: %s\n",
-                    dtype_name<T>(), static_cast<int>(config.tile_config_sm80), config.stages, e.what());
+                std::fprintf(stderr, "config dtype=%s %s failed: %s\n", dtype_name<T>(),
+                    config_name(config).c_str(), e.what());
             }
             CHECK_CUDA(cudaDeviceSynchronize());
         }
@@ -598,9 +665,9 @@ int run(const Args& args)
         }
     }
 
-    std::printf("dtype=%s experts=%d m_per_expert=%d n=%d k=%d group_size=%d tile_enum=%d stages=%d avg_ms=%.4f",
+    std::printf("dtype=%s experts=%d m_per_expert=%d n=%d k=%d group_size=%d config=%s avg_ms=%.4f",
         dtype_name<T>(), args.experts, args.m_per_expert, args.n, args.k, args.group_size,
-        static_cast<int>(best_config.tile_config_sm80), best_config.stages, best_ms);
+        config_name(best_config).c_str(), best_ms);
     if (args.verify)
     {
         std::printf(" verify=%s max_abs_err=%.6f", ok ? "ok" : "failed", max_abs_err);

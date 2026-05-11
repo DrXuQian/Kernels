@@ -899,14 +899,23 @@ run_moe_trtllm_gemm_case() {
   local n="$3"
   local k="$4"
 
-  run_case "$label" \
-    --require-file "$MOE_TRTLLM_TACTIC" \
-    --require-tactic-entry "$MOE_TRTLLM_TACTIC" "fp16,$MOE_EXPERTS,$m_per_expert,$n,$k,$MOE_GROUP|" \
-    "$MOE_TRTLLM_BIN" \
-    --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$m_per_expert" \
-    --n="$n" --k="$k" --group_size="$MOE_GROUP" \
-    --tactic="$MOE_TRTLLM_TACTIC" \
-    --warmup=0 --iters=1
+  if [[ "$m_per_expert" == "1" ]]; then
+    run_case "$label" \
+      "$MOE_TRTLLM_BIN" \
+      --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$m_per_expert" \
+      --n="$n" --k="$k" --group_size="$MOE_GROUP" \
+      --cuda_core \
+      --warmup=0 --iters=1
+  else
+    run_case "$label" \
+      --require-file "$MOE_TRTLLM_TACTIC" \
+      --require-tactic-entry "$MOE_TRTLLM_TACTIC" "fp16,$MOE_EXPERTS,$m_per_expert,$n,$k,$MOE_GROUP|" \
+      "$MOE_TRTLLM_BIN" \
+      --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$m_per_expert" \
+      --n="$n" --k="$k" --group_size="$MOE_GROUP" \
+      --tactic="$MOE_TRTLLM_TACTIC" \
+      --warmup=0 --iters=1
+  fi
 }
 
 run_linear_dense_case() {

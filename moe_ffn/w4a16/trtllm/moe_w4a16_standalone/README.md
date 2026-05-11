@@ -8,6 +8,8 @@ grouped GEMM path for weight-only W4A16. It supports:
 - BF16 activations x INT4 weights -> BF16 output
 - groupwise INT4 scales with group size 128 or K
 - CUTLASS SM80 grouped-GEMM path, including Hopper fallback to the SM80 kernels
+- optional CUDA-core decode GEMV path for `m_per_expert=1`, using the same
+  INT4 weight/scales layout as `weightOnlyBatchedGemv`
 
 The standalone target does not link against TensorRT, TensorRT-LLM runtime,
 Python, or Torch. CUTLASS is still required.
@@ -31,6 +33,10 @@ What is NOT included (limitations)
 - Python/Torch bindings or TensorRT-LLM runtime integration
 
 The CLI expects input rows to already be grouped by expert.
+The CUDA-core path is intentionally narrow: each expert may contribute at most
+one row in the cumulative `total_tokens_including_expert` array. It is meant for
+decode-side MoE GEMV experiments; prefill continues to use the CUTLASS grouped
+GEMM path.
 
 Config selection (aligned with TRT-LLM-style profiling)
 -------------------------------------------------------
@@ -41,11 +47,13 @@ MoE W4A16 configs for the given shape.
 - `--sweep_configs`: time every supported SM80 candidate and print each result.
 - `--tactic=<file>`: load a cached best config for the exact shape. On a miss,
   profile the supported configs and append the best result to the cache.
+- `--cuda_core`: force the CUDA-core `m_per_expert=1` GEMV path.
 
 The tactic serialization after `|` matches `fpA_intB_standalone`:
 
 ```
 cuda=0,tma=0,tile80=<enum>,stages=<n>,splitk=1,sk_style=0
+cuda=1
 ```
 
 The MoE cache key includes dtype and expert layout:
@@ -114,6 +122,47 @@ moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gem
   --dtype=fp16 --experts=8 --m_per_expert=1 --n=3072 --k=1024 \
   --group_size=128 --warmup=100 --iters=1000 --sweep_configs
 ```
+
+Force CUDA-core decode GEMV for one shape:
+
+```
+moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+  --dtype=fp16 --experts=8 --m_per_expert=1 --n=3072 --k=1024 \
+  --group_size=128 --cuda_core --warmup=0 --iters=1
+```
+
+CUDA-core decode check against `fpA_intB`
+-----------------------------------------
+The CUDA-core path is intended to match the `fpA_intB_standalone`
+`weightOnlyBatchedGemv` behavior when `experts=1, m_per_expert=1`. For
+`experts>1`, the MoE path keeps a single launch and maps `grid.x` to experts.
+
+Commands used for the H800 spot check:
+
+```
+general/w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
+  --m=1 --n=2048 --k=3072 --group_size=128 --config=cuda --warmup=100 --iters=1000
+moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+  --dtype=fp16 --experts=1 --m_per_expert=1 --n=2048 --k=3072 \
+  --group_size=128 --cuda_core --warmup=100 --iters=1000
+moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
+  --dtype=fp16 --experts=8 --m_per_expert=1 --n=2048 --k=3072 \
+  --group_size=128 --cuda_core --warmup=100 --iters=1000
+```
+
+| Shape | Path | Experts | Time (us) | Minimum bytes | Effective BW (GB/s) |
+|---|---:|---:|---:|---:|---:|
+| `n=2048,k=3072` | `fpA_intB --config=cuda` | 1 | 4.884 | 3,352,576 | 686 |
+| `n=2048,k=3072` | MoE `--cuda_core` | 1 | 4.900 | 3,254,272 | 664 |
+| `n=2048,k=3072` | MoE `--cuda_core` | 8 | 11.700 | 26,034,176 | 2225 |
+| `n=3072,k=1024` | `fpA_intB --config=cuda` | 1 | 3.514 | 1,679,360 | 478 |
+| `n=3072,k=1024` | MoE `--cuda_core` | 1 | 3.700 | 1,630,208 | 441 |
+| `n=3072,k=1024` | MoE `--cuda_core` | 8 | 8.500 | 13,041,664 | 1534 |
+
+The byte model is a lower-bound traffic estimate: activation + packed INT4
+weight + group scales + output. The `fpA_intB` number also includes zero-point
+traffic because its CUDA fallback benchmark passes non-null zeros; the MoE
+decode path is scale-only.
 
 Use the H800 tactic cache:
 

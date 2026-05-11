@@ -38,6 +38,7 @@ endif()
 
 set(MOE_W4A16_SOURCES
     cpp/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+    cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_cuda_core_gemv.cu
     cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu
     cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu
 )
