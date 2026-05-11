@@ -125,6 +125,7 @@ NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
 DECODE_CUBLAS_BACKEND="${DECODE_CUBLAS_BACKEND:-cuda_core}"
+DECODE_MOE_BACKEND="${DECODE_MOE_BACKEND:-vllm}"
 
 declare -A DEDUPE_LABEL_BY_KEY=()
 declare -A DEDUPE_LOG_BY_KEY=()
@@ -168,6 +169,7 @@ Environment variables:
                            Default: 1. Duplicate case logs point at the first
                            case that measured the same key.
   DECODE_CUBLAS_BACKEND    cublas or cuda_core for non-lm-head decode dense GEMM. Default: cuda_core.
+  DECODE_MOE_BACKEND       vllm or trtllm for decode routed MoE pipeline. Default: vllm.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
@@ -247,6 +249,14 @@ while [[ $# -gt 0 ]]; do
       RUN_DIR="${1#*=}"
       shift
       ;;
+    --decode-moe-backend)
+      DECODE_MOE_BACKEND="${2:?missing value for $1}"
+      shift 2
+      ;;
+    --decode-moe-backend=*)
+      DECODE_MOE_BACKEND="${1#*=}"
+      shift
+      ;;
     -h|--help|help)
       usage
       exit 0
@@ -279,6 +289,15 @@ case "$DECODE_CUBLAS_BACKEND" in
     ;;
   *)
     echo "[bench_all][error] DECODE_CUBLAS_BACKEND must be cublas or cuda_core, got: $DECODE_CUBLAS_BACKEND" >&2
+    exit 1
+    ;;
+esac
+
+case "$DECODE_MOE_BACKEND" in
+  vllm|trtllm)
+    ;;
+  *)
+    echo "[bench_all][error] DECODE_MOE_BACKEND must be vllm or trtllm, got: $DECODE_MOE_BACKEND" >&2
     exit 1
     ;;
 esac
@@ -874,6 +893,22 @@ run_moe_shared_expert_activation_case() {
     --bench 0 1
 }
 
+run_moe_trtllm_gemm_case() {
+  local label="$1"
+  local m_per_expert="$2"
+  local n="$3"
+  local k="$4"
+
+  run_case "$label" \
+    --require-file "$MOE_TRTLLM_TACTIC" \
+    --require-tactic-entry "$MOE_TRTLLM_TACTIC" "fp16,$MOE_EXPERTS,$m_per_expert,$n,$k,$MOE_GROUP|" \
+    "$MOE_TRTLLM_BIN" \
+    --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$m_per_expert" \
+    --n="$n" --k="$k" --group_size="$MOE_GROUP" \
+    --tactic="$MOE_TRTLLM_TACTIC" \
+    --warmup=0 --iters=1
+}
+
 run_linear_dense_case() {
   local label="$1"
   local op="$2"
@@ -930,7 +965,7 @@ else
   echo "decode tokens:  $DECODE_TOKENS"
   echo "ctx len:        $CTX_LEN"
   echo "moe prefill:    TensorRT-LLM components"
-  echo "moe decode:     vLLM components"
+  echo "moe decode:     $DECODE_MOE_BACKEND components"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
   echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
@@ -1128,29 +1163,57 @@ run_case "moe_finalize_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
   --bench 0 1
 
-run_case "moe_routing_decode_vllm" \
-  "$MOE_VLLM_AUX_DIR/bench_topk_gating" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" \
-  --bench 0 1
+if [[ "$DECODE_MOE_BACKEND" == "trtllm" ]]; then
+  run_case "moe_routing_decode_trtllm" \
+    "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
+    --bench 0 1
 
-run_case "moe_align_decode_vllm" \
-  "$MOE_VLLM_AUX_DIR/bench_moe_align" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 \
-  --bench 0 1
+  run_case "moe_expert_map_decode_trtllm" \
+    "$MOE_TRTLLM_AUX_DIR/bench_expert_map" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" auto \
+    --bench 0 1
 
-run_case "moe_gate_up_decode_vllm" \
-  "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_GATE_K" "$MOE_GATE_N" \
-  --balanced --no-topk-weights --bench 0 1
+  run_case "moe_expand_decode_trtllm" \
+    "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_GATE_K" fp16 \
+    --bench 0 1
 
-run_case "moe_gated_decode_vllm" \
-  "$MOE_VLLM_AUX_DIR/bench_silu_and_mul" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_INTERMEDIATE" \
-  --bench 0 1
+  run_moe_trtllm_gemm_case "moe_gate_up_decode_trtllm" \
+    "$DECODE_TOKENS" "$MOE_GATE_N" "$MOE_GATE_K"
 
-run_case "moe_down_decode_vllm" \
-  "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_DOWN_K" "$MOE_DOWN_N" \
-  --balanced --bench 0 1
+  run_case "moe_gated_decode_trtllm" \
+    "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_INTERMEDIATE" fp16 \
+    --bench 0 1
 
-run_case "moe_finalize_decode_vllm" \
-  "$MOE_VLLM_AUX_DIR/bench_moe_sum" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" \
-  --bench 0 1
+  run_moe_trtllm_gemm_case "moe_down_decode_trtllm" \
+    "$DECODE_TOKENS" "$MOE_DOWN_N" "$MOE_DOWN_K"
+
+  run_case "moe_finalize_decode_trtllm" \
+    "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
+    --bench 0 1
+else
+  run_case "moe_routing_decode_vllm" \
+    "$MOE_VLLM_AUX_DIR/bench_topk_gating" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" \
+    --bench 0 1
+
+  run_case "moe_align_decode_vllm" \
+    "$MOE_VLLM_AUX_DIR/bench_moe_align" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" 16 \
+    --bench 0 1
+
+  run_case "moe_gate_up_decode_vllm" \
+    "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_GATE_K" "$MOE_GATE_N" \
+    --balanced --no-topk-weights --bench 0 1
+
+  run_case "moe_gated_decode_vllm" \
+    "$MOE_VLLM_AUX_DIR/bench_silu_and_mul" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_INTERMEDIATE" \
+    --bench 0 1
+
+  run_case "moe_down_decode_vllm" \
+    "$MOE_VLLM_MARLIN_BIN" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" "$MOE_DOWN_K" "$MOE_DOWN_N" \
+    --balanced --bench 0 1
+
+  run_case "moe_finalize_decode_vllm" \
+    "$MOE_VLLM_AUX_DIR/bench_moe_sum" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" \
+    --bench 0 1
+fi
 
 run_cublas_gemm_case "sampling_lm_head_gemm" \
   "$DECODE_TOKENS" "$SAMPLING_VOCAB" "$HIDDEN_DIM" fp32

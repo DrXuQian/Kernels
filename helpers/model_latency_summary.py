@@ -97,7 +97,12 @@ def classify_operator(case: str) -> str:
         return "W4A16 GEMM (cutlass55)"
     if "fpa_intb" in base:
         return "W4A16 GEMM (fpA_intB)"
-    if base in {"moe_gate_up_prefill_trtllm", "moe_down_prefill_trtllm"}:
+    if base in {
+        "moe_gate_up_prefill_trtllm",
+        "moe_down_prefill_trtllm",
+        "moe_gate_up_decode_trtllm",
+        "moe_down_decode_trtllm",
+    }:
         return "MoE grouped GEMM (TRT-LLM)"
     if base in {"moe_gate_up_decode_vllm", "moe_down_decode_vllm"}:
         return "MoE GEMM (vLLM Marlin)"
@@ -121,15 +126,15 @@ def classify_operator(case: str) -> str:
         return "Causal Conv1d"
     if "fused_rms_norm_gate" in base:
         return "Fused RMSNorm gate"
-    if base in {"moe_routing_prefill_trtllm", "moe_routing_decode_vllm"}:
+    if base in {"moe_routing_prefill_trtllm", "moe_routing_decode_trtllm", "moe_routing_decode_vllm"}:
         return "MoE routing/topk"
-    if base in {"moe_expert_map_prefill_trtllm", "moe_align_decode_vllm"}:
+    if base in {"moe_expert_map_prefill_trtllm", "moe_expert_map_decode_trtllm", "moe_align_decode_vllm"}:
         return "MoE expert metadata/align"
-    if base == "moe_expand_prefill_trtllm":
+    if base in {"moe_expand_prefill_trtllm", "moe_expand_decode_trtllm"}:
         return "MoE expand rows"
-    if base in {"moe_gated_prefill_trtllm", "moe_gated_decode_vllm"}:
+    if base in {"moe_gated_prefill_trtllm", "moe_gated_decode_trtllm", "moe_gated_decode_vllm"}:
         return "MoE gated activation"
-    if base in {"moe_finalize_prefill_trtllm", "moe_finalize_decode_vllm"}:
+    if base in {"moe_finalize_prefill_trtllm", "moe_finalize_decode_trtllm", "moe_finalize_decode_vllm"}:
         return "MoE finalize/sum"
     if "shared_expert_activation" in base:
         return "Shared expert activation"

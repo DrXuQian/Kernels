@@ -38,6 +38,15 @@ Module order:
 
 ### Decode
 
+Default `bench_all.sh` decode routed MoE uses the vLLM Marlin path below.
+Use `--decode-moe-backend=trtllm` or `DECODE_MOE_BACKEND=trtllm` to switch the
+routed MoE sub-pipeline to TensorRT-LLM cases:
+`moe_routing_decode_trtllm`, `moe_expert_map_decode_trtllm`,
+`moe_expand_decode_trtllm`, `moe_gate_up_decode_trtllm`,
+`moe_gated_decode_trtllm`, `moe_down_decode_trtllm`, and
+`moe_finalize_decode_trtllm`. The TRT-LLM MoE GEMM tactic cache already covers
+the decode gate/up and down shapes.
+
 | Order | Kernel | Shape | Status | Implementation | `bench_all.sh` case / note |
 |---:|---|---:|---|---|---|
 | 1 | RMSNorm | `(1,3072)` | covered | `flash_attn/bench_rmsnorm` | `flash_attn_decode_rmsnorm` |

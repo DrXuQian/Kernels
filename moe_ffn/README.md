@@ -26,6 +26,24 @@ make -C moe_ffn
 targets plus the TensorRT-LLM MoE GEMM CMake target. It does not build every
 vLLM decode auxiliary used by the default benchmark suite.
 
+## Decode Backend Switch
+
+`bench_all.sh` uses vLLM Marlin for routed MoE decode by default. To run the
+TensorRT-LLM decode routed MoE pipeline instead:
+
+```bash
+./bench_all.sh --decode-moe-backend=trtllm --case moe_gate_up_decode_trtllm
+
+DECODE_MOE_BACKEND=trtllm ./bench_all.sh decode_trtllm
+```
+
+The TensorRT-LLM MoE GEMM cache includes the decode keys:
+
+```text
+fp16,8,1,2048,3072,128|...
+fp16,8,1,3072,1024,128|...
+```
+
 ## Shared Expert
 
 Qwen3-Next style MoE also has a shared expert path in addition to the routed
