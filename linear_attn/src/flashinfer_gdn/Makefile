@@ -19,20 +19,8 @@ BINS       := bench_gdn_prefill
 
 all: $(BINS)
 
-# Kernel template instantiation (bf16 GVA only, slow compile)
-kernel_inst.o: kernel_inst.cu
-	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
-
-# Dispatch (runtime bool → template param mapping)
-dispatch.o: dispatch.cu
-	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
-
-# Bench main (fast compile, no heavy templates)
-bench.o: bench_gdn_prefill.cu
-	$(NVCC) $(CFLAGS) $(INC) -dc $< -o $@
-
-bench_gdn_prefill: bench.o dispatch.o kernel_inst.o
-	$(NVCC) $(ARCH) $^ -o $@
+bench_gdn_prefill: bench_gdn_prefill_single_tu.cu dispatch.cu bench_gdn_prefill.cu
+	$(NVCC) $(CFLAGS) $(INC) $< -o $@
 
 clean:
 	rm -f *.o $(BINS)

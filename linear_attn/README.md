@@ -19,13 +19,13 @@ Qwen3.5 DeltaNet layer 的 standalone CUDA/Triton kernel bench。
 ## FlashInfer GDN Prefill CUDA
 
 `bench_gdn_prefill` is the CUDA prefill path used by `bench_all.sh` for
-`linear_prefill_flashinfer_gdn`. The default module build keeps the generic
-runtime-dispatch/separable-compilation path.
+`linear_prefill_flashinfer_gdn`. The default module build now compiles dispatch
+and main in one translation unit so ptxas can preserve SM90 warpgroup register
+reallocation for this warp-specialized kernel.
 
-The faster single-translation-unit build is intentionally kept under
-`studies/linear_prefill_flashinfer_gdn` as an isolated experiment. It avoids the
-SM90 `setmaxnreg` loss seen with separable device compilation, but it is not the
-default production benchmark target.
+The experimental variants remain under `studies/linear_prefill_flashinfer_gdn`;
+the production binary uses the same single-translation-unit build style, without
+changing the benchmark interface.
 
 ## vLLM Triton GDN 提取
 
