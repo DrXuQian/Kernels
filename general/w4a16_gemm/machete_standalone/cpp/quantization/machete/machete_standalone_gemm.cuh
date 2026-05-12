@@ -244,18 +244,20 @@ struct MacheteKernelTemplate
     using EpilogueArguments = typename GemmKernel::EpilogueArguments;
 
     static Arguments create_arguments(ElementA const* A, ElementB const* B, ElementD* D,
-        ElementSGroup const* group_scales, ElementZGroup const* group_zeros, int m, int n, int k, int group_size)
+        ElementSGroup const* group_scales, ElementZGroup const* group_zeros, int m, int n, int k, int group_size,
+        int batch_count = 1)
     {
         static_assert(!with_group_zeropoints || with_group_scales);
+        MACHETE_CHECK(batch_count > 0, "batch_count must be positive");
         if (group_size == -1)
         {
             group_size = k;
         }
         int const scale_k = (k + group_size - 1) / group_size;
 
-        auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
-        auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
-        auto stride_Dt = permute_layout<1, 0, 2>(make_layout(make_shape(m, n, 1), stride_D)).stride();
+        auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, batch_count));
+        auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, batch_count));
+        auto stride_Dt = permute_layout<1, 0, 2>(make_layout(make_shape(m, n, batch_count), stride_D)).stride();
 
         MainloopArguments mainloop_arguments{};
         EpilogueArguments epilogue_arguments{{}, nullptr, {}, D, stride_Dt};
@@ -264,16 +266,20 @@ struct MacheteKernelTemplate
         {
             MACHETE_CHECK(group_scales != nullptr, "group scales are required");
             MACHETE_CHECK(group_zeros != nullptr, "group zeros are required");
-            auto stride_S = cutlass::make_cute_packed_stride(StrideSGroup{}, cute::make_shape(scale_k, n, 1));
-            auto stride_St = permute_layout<1, 0, 2>(make_layout(make_shape(scale_k, n, 1), stride_S)).stride();
+            auto stride_S
+                = cutlass::make_cute_packed_stride(StrideSGroup{}, cute::make_shape(scale_k, n, batch_count));
+            auto stride_St
+                = permute_layout<1, 0, 2>(make_layout(make_shape(scale_k, n, batch_count), stride_S)).stride();
             mainloop_arguments
                 = MainloopArguments{B, StrideBUnused{}, A, stride_A, group_scales, stride_St, group_size, group_zeros};
         }
         else if constexpr (with_group_scales)
         {
             MACHETE_CHECK(group_scales != nullptr, "group scales are required");
-            auto stride_S = cutlass::make_cute_packed_stride(StrideSGroup{}, cute::make_shape(scale_k, n, 1));
-            auto stride_St = permute_layout<1, 0, 2>(make_layout(make_shape(scale_k, n, 1), stride_S)).stride();
+            auto stride_S
+                = cutlass::make_cute_packed_stride(StrideSGroup{}, cute::make_shape(scale_k, n, batch_count));
+            auto stride_St
+                = permute_layout<1, 0, 2>(make_layout(make_shape(scale_k, n, batch_count), stride_S)).stride();
             mainloop_arguments = MainloopArguments{B, StrideBUnused{}, A, stride_A, group_scales, stride_St, group_size};
         }
         else
@@ -281,8 +287,9 @@ struct MacheteKernelTemplate
             mainloop_arguments = MainloopArguments{B, StrideBUnused{}, A, stride_A};
         }
 
-        return Arguments{
-            cutlass::gemm::GemmUniversalMode::kGemm, {n, m, k, 1}, mainloop_arguments, epilogue_arguments};
+        auto const mode
+            = batch_count > 1 ? cutlass::gemm::GemmUniversalMode::kBatched : cutlass::gemm::GemmUniversalMode::kGemm;
+        return Arguments{mode, {n, m, k, batch_count}, mainloop_arguments, epilogue_arguments};
     }
 
     static size_t get_workspace_size(Arguments const& args) { return Gemm::get_workspace_size(args); }
@@ -329,6 +336,10 @@ void machete_mm_fp16_u4b8(cudaStream_t stream, cutlass::half_t const* A, cutlass
     cutlass::half_t const* scales, cutlass::half_t* D, int m, int n, int k, int group_size,
     MacheteSchedule schedule, void* workspace, size_t workspace_bytes);
 
+void machete_grouped_mm_fp16_u4b8(cudaStream_t stream, cutlass::half_t const* A, cutlass::vllm_uint4b8_t const* B,
+    cutlass::half_t const* scales, cutlass::half_t* D, int experts, int m_per_expert, int n, int k, int group_size,
+    MacheteSchedule schedule, void* workspace, size_t workspace_bytes);
+
 void machete_mm_bf16_u4b8(cudaStream_t stream, cutlass::bfloat16_t const* A, cutlass::vllm_uint4b8_t const* B,
     cutlass::bfloat16_t const* scales, cutlass::bfloat16_t* D, int m, int n, int k, int group_size,
     MacheteSchedule schedule, void* workspace, size_t workspace_bytes);
@@ -343,6 +354,10 @@ void machete_mm_bf16_u4(cudaStream_t stream, cutlass::bfloat16_t const* A, cutla
 
 size_t machete_get_workspace_size_fp16_u4b8(cutlass::half_t const* A, cutlass::vllm_uint4b8_t const* B,
     cutlass::half_t const* scales, cutlass::half_t* D, int m, int n, int k, int group_size, MacheteSchedule schedule);
+
+size_t machete_grouped_get_workspace_size_fp16_u4b8(cutlass::half_t const* A, cutlass::vllm_uint4b8_t const* B,
+    cutlass::half_t const* scales, cutlass::half_t* D, int experts, int m_per_expert, int n, int k, int group_size,
+    MacheteSchedule schedule);
 
 size_t machete_get_workspace_size_bf16_u4b8(cutlass::bfloat16_t const* A, cutlass::vllm_uint4b8_t const* B,
     cutlass::bfloat16_t const* scales, cutlass::bfloat16_t* D, int m, int n, int k, int group_size,

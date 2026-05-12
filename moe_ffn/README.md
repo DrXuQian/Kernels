@@ -10,7 +10,7 @@ Standalone kernels for MoE/FFN layer components.
 | `bench_shared_expert` | Router gate GEMM, shared expert gate GEMV, and `sigmoid(gate) * shared + routed` fusion |
 | `w4a16/trtllm/moe_w4a16_standalone/` | TensorRT-LLM MoE W4A16 grouped GEMM |
 | `w4a16/trtllm/auxiliary/` | TensorRT-LLM routing, expand, activation, finalize helpers |
-| `w4a16/machete/` | SM90 per-expert Machete MoE prefill benchmark |
+| `w4a16/machete/` | SM90 grouped Machete MoE prefill GEMM benchmark |
 | `w4a16/vllm/marlin/` | vLLM Marlin MoE W4A16 GEMM |
 | `w4a16/vllm/auxiliary/` | vLLM topk, align, activation, finalize helpers |
 

@@ -11,16 +11,18 @@ using AWQKernel = MacheteKernelTemplate<ElementA, cutlass::uint4b_t, ElementA, f
 
 template <typename Kernel, typename ElementA>
 typename Kernel::Arguments make_args(cudaStream_t, ElementA const* A, typename Kernel::ElementB const* B,
-    ElementA const* scales, ElementA const* zeros, ElementA* D, int m, int n, int k, int group_size)
+    ElementA const* scales, ElementA const* zeros, ElementA* D, int m, int n, int k, int group_size,
+    int batch_count = 1)
 {
-    return Kernel::create_arguments(A, B, D, scales, zeros, m, n, k, group_size);
+    return Kernel::create_arguments(A, B, D, scales, zeros, m, n, k, group_size, batch_count);
 }
 
 template <typename Kernel, typename ElementA>
 void run_kernel(cudaStream_t stream, ElementA const* A, typename Kernel::ElementB const* B, ElementA const* scales,
-    ElementA const* zeros, ElementA* D, int m, int n, int k, int group_size, void* workspace, size_t workspace_bytes)
+    ElementA const* zeros, ElementA* D, int m, int n, int k, int group_size, void* workspace, size_t workspace_bytes,
+    int batch_count = 1)
 {
-    auto args = make_args<Kernel>(stream, A, B, scales, zeros, D, m, n, k, group_size);
+    auto args = make_args<Kernel>(stream, A, B, scales, zeros, D, m, n, k, group_size, batch_count);
     MACHETE_CHECK(Kernel::can_implement(args), "Machete kernel cannot implement the requested problem");
     size_t const needed = Kernel::get_workspace_size(args);
     MACHETE_CHECK(workspace_bytes >= needed, "insufficient workspace", workspace_bytes, "needed", needed);
@@ -29,9 +31,9 @@ void run_kernel(cudaStream_t stream, ElementA const* A, typename Kernel::Element
 
 template <typename Kernel, typename ElementA>
 size_t workspace_size(cudaStream_t stream, ElementA const* A, typename Kernel::ElementB const* B, ElementA const* scales,
-    ElementA const* zeros, ElementA* D, int m, int n, int k, int group_size)
+    ElementA const* zeros, ElementA* D, int m, int n, int k, int group_size, int batch_count = 1)
 {
-    auto args = make_args<Kernel>(stream, A, B, scales, zeros, D, m, n, k, group_size);
+    auto args = make_args<Kernel>(stream, A, B, scales, zeros, D, m, n, k, group_size, batch_count);
     MACHETE_CHECK(Kernel::can_implement(args), "Machete kernel cannot implement the requested problem");
     return Kernel::get_workspace_size(args);
 }
@@ -137,6 +139,16 @@ void machete_mm_fp16_u4b8(cudaStream_t stream, cutlass::half_t const* A, cutlass
     MACHETE_CHECK(false, "unsupported schedule", schedule.name);
 }
 
+void machete_grouped_mm_fp16_u4b8(cudaStream_t stream, cutlass::half_t const* A, cutlass::vllm_uint4b8_t const* B,
+    cutlass::half_t const* scales, cutlass::half_t* D, int experts, int m_per_expert, int n, int k, int group_size,
+    MacheteSchedule schedule, void* workspace, size_t workspace_bytes)
+{
+    MACHETE_DISPATCH_SCHEDULE(cutlass::half_t, GPTQKernel,
+        return run_kernel<Kernel, cutlass::half_t>(stream, A, B, scales, nullptr, D, m_per_expert, n, k, group_size,
+            workspace, workspace_bytes, experts));
+    MACHETE_CHECK(false, "unsupported schedule", schedule.name);
+}
+
 void machete_mm_bf16_u4b8(cudaStream_t stream, cutlass::bfloat16_t const* A, cutlass::vllm_uint4b8_t const* B,
     cutlass::bfloat16_t const* scales, cutlass::bfloat16_t* D, int m, int n, int k, int group_size,
     MacheteSchedule schedule, void* workspace, size_t workspace_bytes)
@@ -173,6 +185,17 @@ size_t machete_get_workspace_size_fp16_u4b8(cutlass::half_t const* A, cutlass::v
     cudaStream_t stream{};
     MACHETE_DISPATCH_SCHEDULE(cutlass::half_t, GPTQKernel,
         return workspace_size<Kernel, cutlass::half_t>(stream, A, B, scales, nullptr, D, m, n, k, group_size));
+    MACHETE_CHECK(false, "unsupported schedule", schedule.name);
+}
+
+size_t machete_grouped_get_workspace_size_fp16_u4b8(cutlass::half_t const* A, cutlass::vllm_uint4b8_t const* B,
+    cutlass::half_t const* scales, cutlass::half_t* D, int experts, int m_per_expert, int n, int k, int group_size,
+    MacheteSchedule schedule)
+{
+    cudaStream_t stream{};
+    MACHETE_DISPATCH_SCHEDULE(cutlass::half_t, GPTQKernel,
+        return workspace_size<Kernel, cutlass::half_t>(
+            stream, A, B, scales, nullptr, D, m_per_expert, n, k, group_size, experts));
     MACHETE_CHECK(false, "unsupported schedule", schedule.name);
 }
 

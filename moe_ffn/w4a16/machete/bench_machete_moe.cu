@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -29,8 +30,10 @@ struct Args
     bool profile_gemm_only = false;
     bool verify = false;
     bool verify_reference = false;
+    bool sequential = false;
     int verify_samples = 4096;
     std::string schedule;
+    std::string tactic_file;
 };
 
 void check_cuda(cudaError_t status, char const* label)
@@ -56,9 +59,9 @@ bool parse_int(char const* arg, char const* key, int& out)
 void print_usage(char const* name)
 {
     std::printf("Usage: %s [--experts=N] [--m_per_expert=N] [--n=N] [--k=N] [--group_size=N]\n"
-                "          [--schedule=<machete schedule>] [--warmup=N] [--iters=N]\n"
+                "          [--schedule=<machete schedule>] [--tactic=PATH] [--warmup=N] [--iters=N]\n"
                 "          [--profile_gemm_only] [--verify] [--verify_reference]\n"
-                "          [--verify_samples=N] [--no_checksum]\n",
+                "          [--verify_samples=N] [--sequential] [--no_checksum]\n",
         name);
 }
 
@@ -84,6 +87,17 @@ Args parse_args(int argc, char** argv)
             args.schedule = argv[i] + 11;
             continue;
         }
+        if (std::strncmp(argv[i], "--tactic=", 9) == 0)
+        {
+            args.tactic_file = argv[i] + 9;
+            continue;
+        }
+        if (std::strncmp(argv[i], "--machete_tactic=", 17) == 0
+            || std::strncmp(argv[i], "--machete-tactic=", 17) == 0)
+        {
+            args.tactic_file = argv[i] + 17;
+            continue;
+        }
         if (std::strcmp(argv[i], "--profile_gemm_only") == 0 || std::strcmp(argv[i], "--profile-gemm-only") == 0)
         {
             args.profile_gemm_only = true;
@@ -97,6 +111,11 @@ Args parse_args(int argc, char** argv)
         if (std::strcmp(argv[i], "--verify_reference") == 0 || std::strcmp(argv[i], "--verify-reference") == 0)
         {
             args.verify_reference = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--sequential") == 0)
+        {
+            args.sequential = true;
             continue;
         }
         if (std::strcmp(argv[i], "--no_checksum") == 0 || std::strcmp(argv[i], "--no-checksum") == 0)
@@ -126,6 +145,49 @@ Args parse_args(int argc, char** argv)
         std::exit(1);
     }
     return args;
+}
+
+std::string tactic_key(int experts, int m_per_expert, int n, int k, int group_size)
+{
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "fp16,%d,%d,%d,%d,%d|", experts, m_per_expert, n, k, group_size);
+    return buf;
+}
+
+bool load_tactic_schedule(
+    std::string const& path, int experts, int m_per_expert, int n, int k, int group_size, std::string& schedule_name)
+{
+    std::ifstream f(path);
+    if (!f.is_open())
+    {
+        return false;
+    }
+
+    std::string const prefix = tactic_key(experts, m_per_expert, n, k, group_size);
+    std::string line;
+    while (std::getline(f, line))
+    {
+        if (line.empty() || line[0] == '#')
+        {
+            continue;
+        }
+        if (line.compare(0, prefix.size(), prefix) != 0)
+        {
+            continue;
+        }
+        std::string const payload = line.substr(prefix.size());
+        std::string const needle = "schedule=";
+        auto pos = payload.find(needle);
+        if (pos == std::string::npos)
+        {
+            return false;
+        }
+        pos += needle.size();
+        auto const end = payload.find(',', pos);
+        schedule_name = payload.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        return !schedule_name.empty();
+    }
+    return false;
 }
 
 cutlass::half_t make_half_value(size_t i, float scale)
@@ -309,7 +371,26 @@ int main(int argc, char** argv)
     Args const args = parse_args(argc, argv);
 
     MacheteSchedule schedule{};
-    if (args.schedule.empty())
+    if (!args.tactic_file.empty())
+    {
+        std::string schedule_name;
+        if (!load_tactic_schedule(
+                args.tactic_file, args.experts, args.m_per_expert, args.n, args.k, args.group_size, schedule_name))
+        {
+            std::fprintf(stderr, "machete tactic cache MISS from %s for key %s\n", args.tactic_file.c_str(),
+                tactic_key(args.experts, args.m_per_expert, args.n, args.k, args.group_size).c_str());
+            return 1;
+        }
+        auto parsed = schedule_from_name(schedule_name);
+        if (!parsed)
+        {
+            std::fprintf(stderr, "Unknown schedule in tactic cache: %s\n", schedule_name.c_str());
+            return 1;
+        }
+        schedule = *parsed;
+        std::printf("machete tactic cache HIT from %s: %s\n", args.tactic_file.c_str(), schedule.name);
+    }
+    else if (args.schedule.empty())
     {
         schedule = select_schedule(args.m_per_expert, args.n, args.k);
     }
@@ -396,32 +477,43 @@ int main(int argc, char** argv)
             "cudaMemcpy d_b_prepacked");
     }
 
-    size_t const workspace_bytes = machete_get_workspace_size_fp16_u4b8(d_a,
-        reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_prepacked), d_scales, d_out, args.m_per_expert, args.n,
-        args.k, args.group_size, schedule);
+    size_t const workspace_bytes = args.sequential
+        ? machete_get_workspace_size_fp16_u4b8(d_a, reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_prepacked),
+            d_scales, d_out, args.m_per_expert, args.n, args.k, args.group_size, schedule)
+        : machete_grouped_get_workspace_size_fp16_u4b8(d_a,
+            reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_prepacked), d_scales, d_out, args.experts,
+            args.m_per_expert, args.n, args.k, args.group_size, schedule);
     void* d_workspace = nullptr;
     if (workspace_bytes > 0)
     {
         check_cuda(cudaMalloc(&d_workspace, workspace_bytes), "cudaMalloc d_workspace");
     }
 
-    auto launch_all_experts = [&]() {
-        for (int expert = 0; expert < args.experts; ++expert)
+    auto launch_moe_gemm = [&]() {
+        if (args.sequential)
         {
-            auto const a_offset = static_cast<size_t>(expert) * args.m_per_expert * args.k;
-            auto const b_offset = static_cast<size_t>(expert) * b_words_per_expert;
-            auto const scale_offset = static_cast<size_t>(expert) * (args.k / args.group_size) * args.n;
-            auto const out_offset = static_cast<size_t>(expert) * args.m_per_expert * args.n;
-            machete_mm_fp16_u4b8(stream, d_a + a_offset,
-                reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_prepacked + b_offset), d_scales + scale_offset,
-                d_out + out_offset, args.m_per_expert, args.n, args.k, args.group_size, schedule, d_workspace,
-                workspace_bytes);
+            for (int expert = 0; expert < args.experts; ++expert)
+            {
+                auto const a_offset = static_cast<size_t>(expert) * args.m_per_expert * args.k;
+                auto const b_offset = static_cast<size_t>(expert) * b_words_per_expert;
+                auto const scale_offset = static_cast<size_t>(expert) * (args.k / args.group_size) * args.n;
+                auto const out_offset = static_cast<size_t>(expert) * args.m_per_expert * args.n;
+                machete_mm_fp16_u4b8(stream, d_a + a_offset,
+                    reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_prepacked + b_offset),
+                    d_scales + scale_offset, d_out + out_offset, args.m_per_expert, args.n, args.k, args.group_size,
+                    schedule, d_workspace, workspace_bytes);
+            }
+            return;
         }
+        machete_grouped_mm_fp16_u4b8(stream, d_a, reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_prepacked),
+            d_scales, d_out, args.experts, args.m_per_expert, args.n, args.k, args.group_size, schedule, d_workspace,
+            workspace_bytes);
     };
 
     std::printf("Machete MoE W4A16 prefill bench: experts=%d m_per_expert=%d n=%d k=%d group_size=%d\n",
         args.experts, args.m_per_expert, args.n, args.k, args.group_size);
     std::printf("selected schedule: %s\n", schedule.name);
+    std::printf("dispatch: %s\n", args.sequential ? "sequential_per_expert" : "grouped_batched");
     if (args.verify_reference)
     {
         std::printf("offline_prepack: raw GPTQ u4b8 data prepacked before timing for CPU reference\n");
@@ -430,20 +522,20 @@ int main(int argc, char** argv)
     {
         std::printf("offline_prepack: synthetic prepacked data; no runtime prepack or file IO\n");
     }
-    std::printf("workspace bytes per expert: %zu\n", workspace_bytes);
+    std::printf("workspace bytes: %zu\n", workspace_bytes);
 
     if (args.verify)
     {
-        verify_zero_input(d_a, h_a.data(), h_a.size(), d_out, out_elems, stream, launch_all_experts);
+        verify_zero_input(d_a, h_a.data(), h_a.size(), d_out, out_elems, stream, launch_moe_gemm);
     }
     if (args.verify_reference)
     {
-        verify_cpu_reference(args, h_a, h_b_raw, h_scales, d_out, out_elems, stream, launch_all_experts);
+        verify_cpu_reference(args, h_a, h_b_raw, h_scales, d_out, out_elems, stream, launch_moe_gemm);
     }
 
     for (int i = 0; i < args.warmup; ++i)
     {
-        launch_all_experts();
+        launch_moe_gemm();
     }
     check_cuda(cudaStreamSynchronize(stream), "warmup sync");
     if (args.profile_gemm_only)
@@ -458,7 +550,7 @@ int main(int argc, char** argv)
     check_cuda(cudaEventRecord(start, stream), "cudaEventRecord start");
     for (int i = 0; i < args.iters; ++i)
     {
-        launch_all_experts();
+        launch_moe_gemm();
     }
     check_cuda(cudaEventRecord(stop, stream), "cudaEventRecord stop");
     check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize stop");
@@ -484,8 +576,9 @@ int main(int argc, char** argv)
 
     double const avg_us = double(ms) * 1000.0 / args.iters;
     double const flops = 2.0 * args.experts * double(args.m_per_expert) * args.n * args.k;
+    int const kernels_per_iter = args.sequential ? args.experts : 1;
     std::printf("Avg MoE GEMM time: %.3f us (%.1f TFLOPS, %d experts, %d kernels/iter, %d iters, %d warmup)\n",
-        avg_us, flops / (avg_us * 1e-6) / 1e12, args.experts, args.experts, args.iters, args.warmup);
+        avg_us, flops / (avg_us * 1e-6) / 1e12, args.experts, kernels_per_iter, args.iters, args.warmup);
 
     check_cuda(cudaEventDestroy(start), "cudaEventDestroy start");
     check_cuda(cudaEventDestroy(stop), "cudaEventDestroy stop");

@@ -1,0 +1,5 @@
+# Machete MoE W4A16 grouped tactic cache
+# Format: dtype,experts,m_per_expert,n,k,group|schedule=<machete_schedule>,avg_us=<measured_time>
+# Shapes are Qwen3.5-122B-A10B per-expert GEMMs. The benchmark launches one batched/grouped kernel per iteration.
+fp16,8,3823,2048,3072,128|schedule=128x256_2x1x1_TmaMI_TmaCoop_streamK,avg_us=604.848
+fp16,8,3823,3072,1024,128|schedule=128x256_2x1x1_TmaMI_TmaCoop_streamK,avg_us=358.692
