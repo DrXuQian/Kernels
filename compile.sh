@@ -79,7 +79,8 @@ Targets:
   moe-vllm-auxiliary   moe_ffn/w4a16/vllm/auxiliary/
   moe-trtllm           moe_ffn/w4a16/trtllm/moe_w4a16_standalone/
   moe-trtllm-auxiliary moe_ffn/w4a16/trtllm/auxiliary/
-  moe                  moe-ffn + moe-trtllm
+  moe-machete          moe_ffn/w4a16/machete/ SM90 per-expert Machete MoE prefill
+  moe                  moe-ffn + moe-trtllm + moe-machete
 
   w4a16-marlin         general/w4a16_gemm/marlin_standalone/
   w4a16-fpa            general/w4a16_gemm/fpA_intB_standalone/
@@ -502,6 +503,12 @@ configure_target() {
     default|general|linear_attn|flash_attn|sampling|flashinfer-gdn|moe-ffn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
       log "$1 uses a Makefile or direct nvcc build; no CMake configure step."
       ;;
+    moe-machete)
+      configure_cmake_target \
+        moe_ffn/w4a16/machete \
+        "moe_ffn/w4a16/machete/$BUILD_DIR_NAME" \
+        gpu_arch
+      ;;
     moe-trtllm)
       configure_cmake_target \
         moe_ffn/w4a16/trtllm/moe_w4a16_standalone \
@@ -573,6 +580,13 @@ build_target() {
     moe-trtllm-auxiliary)
       build_make_dir moe_ffn/w4a16/trtllm/auxiliary "$GPU_ARCH"
       ;;
+    moe-machete)
+      build_cmake_target \
+        moe_ffn/w4a16/machete \
+        "moe_ffn/w4a16/machete/$BUILD_DIR_NAME" \
+        gpu_arch \
+        bench_machete_moe
+      ;;
     w4a16-marlin)
       build_make_dir general/w4a16_gemm/marlin_standalone "$MARLIN_ARCH"
       ;;
@@ -641,6 +655,9 @@ clean_target() {
     moe-trtllm-auxiliary)
       clean_make_dir moe_ffn/w4a16/trtllm/auxiliary
       ;;
+    moe-machete)
+      clean_cmake_dir "moe_ffn/w4a16/machete/$BUILD_DIR_NAME"
+      ;;
     w4a16-marlin)
       clean_make_dir general/w4a16_gemm/marlin_standalone
       ;;
@@ -671,11 +688,11 @@ expand_one_target() {
     all)
       printf '%s\n' \
         general linear_attn flash_attn sampling flashinfer-gdn \
-        moe-ffn moe-trtllm \
+        moe-ffn moe-trtllm moe-machete \
         w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;
     moe)
-      printf '%s\n' moe-ffn moe-trtllm
+      printf '%s\n' moe-ffn moe-trtllm moe-machete
       ;;
     moe-vllm)
       printf '%s\n' moe-vllm-marlin moe-vllm-auxiliary
@@ -706,6 +723,9 @@ expand_one_target() {
       ;;
     trtllm-moe|moe_w4a16_standalone)
       printf '%s\n' moe-trtllm
+      ;;
+    machete-moe|moe-machete|moe_machete)
+      printf '%s\n' moe-machete
       ;;
     trtllm-aux|trtllm-auxiliary|moe-trtllm-aux)
       printf '%s\n' moe-trtllm-auxiliary

@@ -7,20 +7,21 @@ auxiliary kernels, so they live in separate subtrees.
 For the current Nsight Systems component breakdown, see
 `TRTLLM_VS_VLLM_BREAKDOWN.md`.
 
-The root `bench_all.sh` default uses the faster measured path for each phase:
-TensorRT-LLM components for prefill and vLLM components for decode.
+The root `bench_all.sh` default uses TensorRT-LLM components for prefill and
+vLLM components for decode. The `machete/` subtree is an additional SM90
+prefill experiment: it launches one standalone Machete GEMM per active expert
+after offline weight prepack. It is not wired into the default model breakdown.
 
-Machete is not a MoE GEMM path here. It is used by dense W4A16 linear layers
-under `general/w4a16_gemm/machete_standalone`. The vLLM MoE decode path in this
-repo is Marlin MoE plus vLLM auxiliary kernels. Older PyTorch-extension
-benchmark scripts remain under `vllm/bench_python/` for historical reference,
-but their old README/results are intentionally not restored because they are not
-part of the current standalone build or `bench_all.sh` path.
+Older PyTorch-extension benchmark scripts remain under `vllm/bench_python/` for
+historical reference, but their old README/results are intentionally not
+restored because they are not part of the current standalone build or
+`bench_all.sh` path.
 
 ## Layout
 
 ```
 moe_ffn/w4a16/
+├── machete/       # SM90 per-expert Machete MoE prefill benchmark
 ├── vllm/
 │   ├── marlin/       # vLLM Marlin MoE W4A16 GEMM
 │   ├── auxiliary/    # vLLM topk, align, silu_and_mul, sum
@@ -29,6 +30,38 @@ moe_ffn/w4a16/
     ├── moe_w4a16_standalone/ # TensorRT-LLM MoE grouped W4A16 GEMM
     └── auxiliary/            # TensorRT-LLM routing, expert-map, and pipeline helpers
 ```
+
+## Machete Prefill Experiment
+
+`machete/` reuses the vLLM Machete standalone extraction from
+`general/w4a16_gemm/machete_standalone` and launches one SM90 Machete GEMM per
+expert. It assumes activations are already grouped by expert and weights are
+already in Machete's prepacked layout.
+
+Build:
+
+```bash
+./compile.sh build moe-machete
+```
+
+Qwen3.5-122B-A10B prefill expert GEMM commands:
+
+```bash
+moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
+  --experts=8 --m_per_expert=3823 --n=2048 --k=3072 \
+  --group_size=128 --warmup=20 --iters=100 --no_checksum
+
+moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
+  --experts=8 --m_per_expert=3823 --n=3072 --k=1024 \
+  --group_size=128 --warmup=20 --iters=100 --no_checksum
+```
+
+H800 spot check (`warmup=20`, `iters=100`, FP16, group size 128):
+
+| Shape | Machete MoE | TRT-LLM grouped MoE |
+|---|---:|---:|
+| gate/up `n=2048,k=3072` | 817.072 us | 1240.5 us |
+| down `n=3072,k=1024` | 518.570 us | 682.7 us |
 
 ## vLLM Pipeline
 

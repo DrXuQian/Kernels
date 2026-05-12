@@ -10,6 +10,7 @@ Standalone kernels for MoE/FFN layer components.
 | `bench_shared_expert` | Router gate GEMM, shared expert gate GEMV, and `sigmoid(gate) * shared + routed` fusion |
 | `w4a16/trtllm/moe_w4a16_standalone/` | TensorRT-LLM MoE W4A16 grouped GEMM |
 | `w4a16/trtllm/auxiliary/` | TensorRT-LLM routing, expand, activation, finalize helpers |
+| `w4a16/machete/` | SM90 per-expert Machete MoE prefill benchmark |
 | `w4a16/vllm/marlin/` | vLLM Marlin MoE W4A16 GEMM |
 | `w4a16/vllm/auxiliary/` | vLLM topk, align, activation, finalize helpers |
 
@@ -18,13 +19,14 @@ Standalone kernels for MoE/FFN layer components.
 ```bash
 make -C moe_ffn
 
-# Or use the repo-level build script for the pieces used by bench_all.sh:
-./compile.sh build moe-ffn moe-trtllm moe-trtllm-auxiliary moe-vllm
+# Or use the repo-level build script for bench_all pieces and related experiments:
+./compile.sh build moe-ffn moe-trtllm moe-trtllm-auxiliary moe-machete moe-vllm
 ```
 
 `./compile.sh build moe` is a smaller alias for the category-local Makefile
-targets plus the TensorRT-LLM MoE GEMM CMake target. It does not build every
-vLLM decode auxiliary used by the default benchmark suite.
+targets plus the TensorRT-LLM MoE GEMM and Machete MoE prefill CMake targets.
+It does not build every vLLM decode auxiliary used by the default benchmark
+suite.
 
 ## Decode Backend Switch
 
