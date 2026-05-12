@@ -53,6 +53,19 @@ moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
 
 Both commands launch `experts` GEMM kernels per benchmark iteration.
 
+## Correctness Smoke
+
+`--verify` runs a lightweight zero-input invariant check before timing: it sets
+all activations to zero, pre-fills the output with a sentinel, launches all expert
+GEMMs once, and checks every output element is zero within `1e-3`. It then
+restores the benchmark input and continues with the requested timing loop.
+
+```bash
+moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
+  --experts=8 --m_per_expert=3823 --n=2048 --k=3072 \
+  --group_size=128 --warmup=1 --iters=1 --verify --no_checksum
+```
+
 ## H800 Check
 
 Measured with CUDA events on H800, FP16 activations, INT4 weights, group size

@@ -27,6 +27,7 @@ struct Args
     int iters = 100;
     bool no_checksum = true;
     bool profile_gemm_only = false;
+    bool verify = false;
     std::string schedule;
 };
 
@@ -54,7 +55,7 @@ void print_usage(char const* name)
 {
     std::printf("Usage: %s [--experts=N] [--m_per_expert=N] [--n=N] [--k=N] [--group_size=N]\n"
                 "          [--schedule=<machete schedule>] [--warmup=N] [--iters=N]\n"
-                "          [--profile_gemm_only] [--no_checksum]\n",
+                "          [--profile_gemm_only] [--verify] [--no_checksum]\n",
         name);
 }
 
@@ -83,6 +84,11 @@ Args parse_args(int argc, char** argv)
         if (std::strcmp(argv[i], "--profile_gemm_only") == 0 || std::strcmp(argv[i], "--profile-gemm-only") == 0)
         {
             args.profile_gemm_only = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--verify") == 0)
+        {
+            args.verify = true;
             continue;
         }
         if (std::strcmp(argv[i], "--no_checksum") == 0 || std::strcmp(argv[i], "--no-checksum") == 0)
@@ -130,6 +136,54 @@ std::vector<uint32_t> make_synthetic_prepacked_words(size_t words)
         packed[i] = state;
     }
     return packed;
+}
+
+template <typename LaunchFn>
+void verify_zero_input(cutlass::half_t* d_a, cutlass::half_t const* h_a, size_t a_elems, cutlass::half_t* d_out,
+    size_t out_elems, cudaStream_t stream, LaunchFn const& launch_all_experts)
+{
+    size_t const a_bytes = a_elems * sizeof(cutlass::half_t);
+    size_t const out_bytes = out_elems * sizeof(cutlass::half_t);
+
+    check_cuda(cudaMemset(d_a, 0, a_bytes), "verify cudaMemset d_a");
+    check_cuda(cudaMemset(d_out, 0x7f, out_bytes), "verify cudaMemset d_out sentinel");
+    launch_all_experts();
+    check_cuda(cudaGetLastError(), "verify launch");
+    check_cuda(cudaStreamSynchronize(stream), "verify sync");
+
+    std::vector<cutlass::half_t> h_out(out_elems);
+    check_cuda(cudaMemcpy(h_out.data(), d_out, out_bytes, cudaMemcpyDeviceToHost), "verify cudaMemcpy d_out");
+
+    double max_abs = 0.0;
+    size_t bad_count = 0;
+    size_t first_bad = 0;
+    double first_bad_value = 0.0;
+    for (size_t i = 0; i < h_out.size(); ++i)
+    {
+        double const value = std::fabs(static_cast<double>(float(h_out[i])));
+        max_abs = std::max(max_abs, value);
+        if (value > 1e-3)
+        {
+            if (bad_count == 0)
+            {
+                first_bad = i;
+                first_bad_value = static_cast<double>(float(h_out[i]));
+            }
+            ++bad_count;
+        }
+    }
+
+    check_cuda(cudaMemcpy(d_a, h_a, a_bytes, cudaMemcpyHostToDevice), "verify restore d_a");
+    check_cuda(cudaMemset(d_out, 0, out_bytes), "verify clear d_out");
+
+    if (bad_count != 0)
+    {
+        std::fprintf(stderr,
+            "verify_zero_input FAILED: max_abs=%.8e bad_count=%zu first_bad_index=%zu first_bad_value=%.8e\n",
+            max_abs, bad_count, first_bad, first_bad_value);
+        std::exit(2);
+    }
+    std::printf("verify_zero_input PASS: checked=%zu max_abs=%.8e\n", h_out.size(), max_abs);
 }
 
 } // namespace
@@ -226,6 +280,11 @@ int main(int argc, char** argv)
     std::printf("selected schedule: %s\n", schedule.name);
     std::printf("offline_prepack: synthetic prepacked data; no runtime prepack or file IO\n");
     std::printf("workspace bytes per expert: %zu\n", workspace_bytes);
+
+    if (args.verify)
+    {
+        verify_zero_input(d_a, h_a.data(), h_a.size(), d_out, out_elems, stream, launch_all_experts);
+    }
 
     for (int i = 0; i < args.warmup; ++i)
     {
