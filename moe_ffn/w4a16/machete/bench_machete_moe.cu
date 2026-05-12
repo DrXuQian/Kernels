@@ -28,6 +28,8 @@ struct Args
     bool no_checksum = true;
     bool profile_gemm_only = false;
     bool verify = false;
+    bool verify_reference = false;
+    int verify_samples = 4096;
     std::string schedule;
 };
 
@@ -55,7 +57,8 @@ void print_usage(char const* name)
 {
     std::printf("Usage: %s [--experts=N] [--m_per_expert=N] [--n=N] [--k=N] [--group_size=N]\n"
                 "          [--schedule=<machete schedule>] [--warmup=N] [--iters=N]\n"
-                "          [--profile_gemm_only] [--verify] [--no_checksum]\n",
+                "          [--profile_gemm_only] [--verify] [--verify_reference]\n"
+                "          [--verify_samples=N] [--no_checksum]\n",
         name);
 }
 
@@ -72,7 +75,7 @@ Args parse_args(int argc, char** argv)
         if (parse_int(argv[i], "--experts=", args.experts) || parse_int(argv[i], "--m_per_expert=", args.m_per_expert)
             || parse_int(argv[i], "--n=", args.n) || parse_int(argv[i], "--k=", args.k)
             || parse_int(argv[i], "--group_size=", args.group_size) || parse_int(argv[i], "--warmup=", args.warmup)
-            || parse_int(argv[i], "--iters=", args.iters))
+            || parse_int(argv[i], "--iters=", args.iters) || parse_int(argv[i], "--verify_samples=", args.verify_samples))
         {
             continue;
         }
@@ -91,6 +94,11 @@ Args parse_args(int argc, char** argv)
             args.verify = true;
             continue;
         }
+        if (std::strcmp(argv[i], "--verify_reference") == 0 || std::strcmp(argv[i], "--verify-reference") == 0)
+        {
+            args.verify_reference = true;
+            continue;
+        }
         if (std::strcmp(argv[i], "--no_checksum") == 0 || std::strcmp(argv[i], "--no-checksum") == 0)
         {
             args.no_checksum = true;
@@ -106,9 +114,10 @@ Args parse_args(int argc, char** argv)
         std::exit(1);
     }
     if (args.experts <= 0 || args.m_per_expert <= 0 || args.n <= 0 || args.k <= 0 || args.iters <= 0
-        || args.warmup < 0)
+        || args.warmup < 0 || args.verify_samples <= 0)
     {
-        std::fprintf(stderr, "experts, m_per_expert, n, k, iters must be positive and warmup must be non-negative.\n");
+        std::fprintf(stderr,
+            "experts, m_per_expert, n, k, iters, verify_samples must be positive and warmup must be non-negative.\n");
         std::exit(1);
     }
     if (args.k % 64 != 0 || args.n % 128 != 0 || args.group_size <= 0 || args.k % args.group_size != 0)
@@ -136,6 +145,37 @@ std::vector<uint32_t> make_synthetic_prepacked_words(size_t words)
         packed[i] = state;
     }
     return packed;
+}
+
+std::vector<uint32_t> make_packed_u4b8_col_major(int experts, int k, int n)
+{
+    int constexpr pack = 8;
+    int const packed_k = k / pack;
+    std::vector<uint32_t> packed(static_cast<size_t>(experts) * packed_k * n, 0);
+    for (int expert = 0; expert < experts; ++expert)
+    {
+        for (int col = 0; col < n; ++col)
+        {
+            for (int pk = 0; pk < packed_k; ++pk)
+            {
+                uint32_t word = 0;
+                for (int i = 0; i < pack; ++i)
+                {
+                    int const row = pk * pack + i;
+                    uint32_t const q = static_cast<uint32_t>((row + 3 * col + 5 * expert) & 0xF);
+                    word |= q << (4 * i);
+                }
+                packed[(static_cast<size_t>(expert) * n + col) * packed_k + pk] = word;
+            }
+        }
+    }
+    return packed;
+}
+
+float dequant_u4b8(uint32_t word, int k_mod_pack)
+{
+    int const q = static_cast<int>((word >> (4 * k_mod_pack)) & 0xF);
+    return static_cast<float>(q - 8);
 }
 
 template <typename LaunchFn>
@@ -186,6 +226,80 @@ void verify_zero_input(cutlass::half_t* d_a, cutlass::half_t const* h_a, size_t 
     std::printf("verify_zero_input PASS: checked=%zu max_abs=%.8e\n", h_out.size(), max_abs);
 }
 
+template <typename LaunchFn>
+void verify_cpu_reference(Args const& args, std::vector<cutlass::half_t> const& h_a,
+    std::vector<uint32_t> const& h_b_raw, std::vector<cutlass::half_t> const& h_scales, cutlass::half_t* d_out,
+    size_t out_elems, cudaStream_t stream, LaunchFn const& launch_all_experts)
+{
+    int constexpr pack = 8;
+    int const packed_k = args.k / pack;
+    size_t const out_bytes = out_elems * sizeof(cutlass::half_t);
+
+    check_cuda(cudaMemset(d_out, 0, out_bytes), "verify_reference clear d_out");
+    launch_all_experts();
+    check_cuda(cudaGetLastError(), "verify_reference launch");
+    check_cuda(cudaStreamSynchronize(stream), "verify_reference sync");
+
+    std::vector<cutlass::half_t> h_out(out_elems);
+    check_cuda(cudaMemcpy(h_out.data(), d_out, out_bytes, cudaMemcpyDeviceToHost), "verify_reference copy d_out");
+
+    size_t const sample_count = std::min<size_t>(out_elems, static_cast<size_t>(args.verify_samples));
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    size_t bad_count = 0;
+    size_t first_bad = 0;
+    double first_gpu = 0.0;
+    double first_ref = 0.0;
+
+    for (size_t sample = 0; sample < sample_count; ++sample)
+    {
+        size_t const idx = (sample_count == out_elems) ? sample : (sample * out_elems / sample_count);
+        int const col = static_cast<int>(idx % args.n);
+        size_t const tmp = idx / args.n;
+        int const row = static_cast<int>(tmp % args.m_per_expert);
+        int const expert = static_cast<int>(tmp / args.m_per_expert);
+
+        float acc = 0.0f;
+        size_t const a_base = (static_cast<size_t>(expert) * args.m_per_expert + row) * args.k;
+        size_t const b_base = static_cast<size_t>(expert) * args.n * packed_k + static_cast<size_t>(col) * packed_k;
+        size_t const scale_base = static_cast<size_t>(expert) * (args.k / args.group_size) * args.n;
+        for (int kk = 0; kk < args.k; ++kk)
+        {
+            uint32_t const word = h_b_raw[b_base + kk / pack];
+            float const w = dequant_u4b8(word, kk % pack);
+            float const scale = float(h_scales[scale_base + static_cast<size_t>(kk / args.group_size) * args.n + col]);
+            acc += float(h_a[a_base + kk]) * w * scale;
+        }
+
+        float const ref = float(cutlass::half_t(acc));
+        float const gpu = float(h_out[idx]);
+        double const abs_err = std::fabs(static_cast<double>(gpu) - static_cast<double>(ref));
+        double const rel_err = abs_err / std::max(1e-6, std::fabs(static_cast<double>(ref)));
+        max_abs = std::max(max_abs, abs_err);
+        max_rel = std::max(max_rel, rel_err);
+        if (abs_err > 5e-2 && rel_err > 5e-2)
+        {
+            if (bad_count == 0)
+            {
+                first_bad = idx;
+                first_gpu = gpu;
+                first_ref = ref;
+            }
+            ++bad_count;
+        }
+    }
+
+    if (bad_count != 0)
+    {
+        std::fprintf(stderr,
+            "verify_cpu_reference FAILED: samples=%zu max_abs=%.8e max_rel=%.8e bad_count=%zu "
+            "first_bad_index=%zu gpu=%.8e ref=%.8e\n",
+            sample_count, max_abs, max_rel, bad_count, first_bad, first_gpu, first_ref);
+        std::exit(3);
+    }
+    std::printf("verify_cpu_reference PASS: samples=%zu max_abs=%.8e max_rel=%.8e\n", sample_count, max_abs, max_rel);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -228,29 +342,59 @@ int main(int argc, char** argv)
     {
         h_scales[i] = make_half_value(i, 0.001f);
     }
-    std::vector<uint32_t> h_b_prepacked = make_synthetic_prepacked_words(b_words);
+    std::vector<uint32_t> h_b_raw;
+    std::vector<uint32_t> h_b_prepacked;
+    if (args.verify_reference)
+    {
+        h_b_raw = make_packed_u4b8_col_major(args.experts, args.k, args.n);
+    }
+    else
+    {
+        h_b_prepacked = make_synthetic_prepacked_words(b_words);
+    }
 
     cutlass::half_t* d_a = nullptr;
     cutlass::half_t* d_scales = nullptr;
     cutlass::half_t* d_out = nullptr;
+    uint32_t* d_b_raw = nullptr;
     uint32_t* d_b_prepacked = nullptr;
 
     size_t const a_bytes = h_a.size() * sizeof(cutlass::half_t);
     size_t const scales_bytes = h_scales.size() * sizeof(cutlass::half_t);
     size_t const out_bytes = out_elems * sizeof(cutlass::half_t);
-    size_t const b_bytes = h_b_prepacked.size() * sizeof(uint32_t);
+    size_t const b_bytes = b_words * sizeof(uint32_t);
 
     check_cuda(cudaMalloc(&d_a, a_bytes), "cudaMalloc d_a");
     check_cuda(cudaMalloc(&d_scales, scales_bytes), "cudaMalloc d_scales");
     check_cuda(cudaMalloc(&d_out, out_bytes), "cudaMalloc d_out");
+    if (args.verify_reference)
+    {
+        check_cuda(cudaMalloc(&d_b_raw, b_bytes), "cudaMalloc d_b_raw");
+    }
     check_cuda(cudaMalloc(&d_b_prepacked, b_bytes), "cudaMalloc d_b_prepacked");
     check_cuda(cudaMemcpy(d_a, h_a.data(), a_bytes, cudaMemcpyHostToDevice), "cudaMemcpy d_a");
     check_cuda(cudaMemcpy(d_scales, h_scales.data(), scales_bytes, cudaMemcpyHostToDevice), "cudaMemcpy d_scales");
-    check_cuda(cudaMemcpy(d_b_prepacked, h_b_prepacked.data(), b_bytes, cudaMemcpyHostToDevice),
-        "cudaMemcpy d_b_prepacked");
 
     cudaStream_t stream{};
     check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate");
+
+    if (args.verify_reference)
+    {
+        check_cuda(cudaMemcpy(d_b_raw, h_b_raw.data(), b_bytes, cudaMemcpyHostToDevice), "cudaMemcpy d_b_raw");
+        for (int expert = 0; expert < args.experts; ++expert)
+        {
+            auto const b_offset = static_cast<size_t>(expert) * b_words_per_expert;
+            prepack_B_fp16_u4b8(stream, reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_raw + b_offset),
+                reinterpret_cast<cutlass::vllm_uint4b8_t*>(d_b_prepacked + b_offset), args.k, args.n);
+        }
+        check_cuda(cudaGetLastError(), "verify_reference prepack launch");
+        check_cuda(cudaStreamSynchronize(stream), "verify_reference prepack sync");
+    }
+    else
+    {
+        check_cuda(cudaMemcpy(d_b_prepacked, h_b_prepacked.data(), b_bytes, cudaMemcpyHostToDevice),
+            "cudaMemcpy d_b_prepacked");
+    }
 
     size_t const workspace_bytes = machete_get_workspace_size_fp16_u4b8(d_a,
         reinterpret_cast<cutlass::vllm_uint4b8_t const*>(d_b_prepacked), d_scales, d_out, args.m_per_expert, args.n,
@@ -278,12 +422,23 @@ int main(int argc, char** argv)
     std::printf("Machete MoE W4A16 prefill bench: experts=%d m_per_expert=%d n=%d k=%d group_size=%d\n",
         args.experts, args.m_per_expert, args.n, args.k, args.group_size);
     std::printf("selected schedule: %s\n", schedule.name);
-    std::printf("offline_prepack: synthetic prepacked data; no runtime prepack or file IO\n");
+    if (args.verify_reference)
+    {
+        std::printf("offline_prepack: raw GPTQ u4b8 data prepacked before timing for CPU reference\n");
+    }
+    else
+    {
+        std::printf("offline_prepack: synthetic prepacked data; no runtime prepack or file IO\n");
+    }
     std::printf("workspace bytes per expert: %zu\n", workspace_bytes);
 
     if (args.verify)
     {
         verify_zero_input(d_a, h_a.data(), h_a.size(), d_out, out_elems, stream, launch_all_experts);
+    }
+    if (args.verify_reference)
+    {
+        verify_cpu_reference(args, h_a, h_b_raw, h_scales, d_out, out_elems, stream, launch_all_experts);
     }
 
     for (int i = 0; i < args.warmup; ++i)
@@ -342,6 +497,10 @@ int main(int argc, char** argv)
     check_cuda(cudaFree(d_a), "cudaFree d_a");
     check_cuda(cudaFree(d_scales), "cudaFree d_scales");
     check_cuda(cudaFree(d_out), "cudaFree d_out");
+    if (d_b_raw)
+    {
+        check_cuda(cudaFree(d_b_raw), "cudaFree d_b_raw");
+    }
     check_cuda(cudaFree(d_b_prepacked), "cudaFree d_b_prepacked");
     return 0;
 }

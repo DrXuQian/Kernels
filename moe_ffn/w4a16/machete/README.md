@@ -66,6 +66,20 @@ moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
   --group_size=128 --warmup=1 --iters=1 --verify --no_checksum
 ```
 
+`--verify_reference` runs a stronger sampled CPU reference check. In this mode
+the benchmark generates raw GPTQ u4b8 col-major weights, runs the Machete GPU
+prepack once before timing, launches the expert GEMMs, and compares sampled GPU
+outputs against a CPU dequantize-and-accumulate reference computed from the raw
+weights, scales, and activations. The reference check is intentionally sampled so
+it remains usable for the full Qwen prefill shape.
+
+```bash
+moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
+  --experts=8 --m_per_expert=3823 --n=2048 --k=3072 \
+  --group_size=128 --warmup=1 --iters=1 --verify_reference \
+  --verify_samples=4096 --no_checksum
+```
+
 ## H800 Check
 
 Measured with CUDA events on H800, FP16 activations, INT4 weights, group size
