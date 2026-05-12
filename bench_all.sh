@@ -1146,27 +1146,13 @@ run_case "moe_expand_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_GATE_K" fp16 \
   --bench 0 1
 
-run_case "moe_gate_up_prefill_trtllm" \
-  --require-file "$MOE_TRTLLM_TACTIC" \
-  --require-tactic-entry "$MOE_TRTLLM_TACTIC" "fp16,$MOE_EXPERTS,$PREFILL_TOKENS,$MOE_GATE_N,$MOE_GATE_K,$MOE_GROUP|" \
-  "$MOE_TRTLLM_BIN" \
-  --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
-  --n="$MOE_GATE_N" --k="$MOE_GATE_K" --group_size="$MOE_GROUP" \
-  --tactic="$MOE_TRTLLM_TACTIC" \
-  --warmup=0 --iters=1
+run_moe_trtllm_gemm_case "moe_gate_up_prefill_trtllm" "$PREFILL_TOKENS" "$MOE_GATE_N" "$MOE_GATE_K"
 
 run_case "moe_gated_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_INTERMEDIATE" fp16 \
   --bench 0 1
 
-run_case "moe_down_prefill_trtllm" \
-  --require-file "$MOE_TRTLLM_TACTIC" \
-  --require-tactic-entry "$MOE_TRTLLM_TACTIC" "fp16,$MOE_EXPERTS,$PREFILL_TOKENS,$MOE_DOWN_N,$MOE_DOWN_K,$MOE_GROUP|" \
-  "$MOE_TRTLLM_BIN" \
-  --dtype=fp16 --experts="$MOE_EXPERTS" --m_per_expert="$PREFILL_TOKENS" \
-  --n="$MOE_DOWN_N" --k="$MOE_DOWN_K" --group_size="$MOE_GROUP" \
-  --tactic="$MOE_TRTLLM_TACTIC" \
-  --warmup=0 --iters=1
+run_moe_trtllm_gemm_case "moe_down_prefill_trtllm" "$PREFILL_TOKENS" "$MOE_DOWN_N" "$MOE_DOWN_K"
 
 run_case "moe_finalize_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
