@@ -9,8 +9,8 @@ Machete GEMM kernel for all active experts. Weight prepack is modeled as
 offline: the benchmark initializes synthetic prepacked Machete-layout weights
 directly and does not time prepack or file I/O.
 
-`--sequential` is kept only as a comparison mode. The default path is the
-grouped/batched single-kernel path used by `bench_all.sh` for MoE prefill GEMMs.
+`--sequential` is kept only as a comparison mode. This benchmark is a standalone
+comparison path; the root `bench_all.sh` default uses the TensorRT-LLM MoE GEMM.
 
 ## Build
 

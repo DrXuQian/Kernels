@@ -106,9 +106,9 @@ the decode gate/up and down shapes.
 | 3 | Routing top-k | `(3823,256)->topk` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_custom_moe_routing` | `moe_routing_prefill_trtllm` |
 | 4 | Expert map / prefix metadata | topk/expert metadata | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_expert_map` | `moe_expert_map_prefill_trtllm` |
 | 5 | Expand input rows | `(3823,3072)->(3823*8,3072)` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_expand_input_rows` | `moe_expand_prefill_trtllm` |
-| 6 | MoE gate/up W4A16 GEMM | grouped experts, per expert `(3823,3072)->(3823,2048)` | covered | `moe_ffn/w4a16/machete` | `moe_gate_up_prefill_machete` |
+| 6 | MoE gate/up W4A16 GEMM | grouped experts, per expert `(3823,3072)->(3823,2048)` | covered | `moe_ffn/w4a16/trtllm/moe_w4a16_standalone` | `moe_gate_up_prefill_trtllm` |
 | 7 | Gated activation | `(3823*8,2048)->(3823*8,1024)` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_gated_activation` | `moe_gated_prefill_trtllm` |
-| 8 | MoE down W4A16 GEMM | grouped experts, per expert `(3823,1024)->(3823,3072)` | covered | `moe_ffn/w4a16/machete` | `moe_down_prefill_machete` |
+| 8 | MoE down W4A16 GEMM | grouped experts, per expert `(3823,1024)->(3823,3072)` | covered | `moe_ffn/w4a16/trtllm/moe_w4a16_standalone` | `moe_down_prefill_trtllm` |
 | 9 | Finalize routing | `(3823*8,3072)->(3823,3072)` | covered | `moe_ffn/w4a16/trtllm/auxiliary/bench_finalize_moe_routing` | `moe_finalize_prefill_trtllm` |
 | 10 | Shared expert gate FP16 GEMM | `(3823,3072)->(3823,1)` | covered | `general/bench_cublas_gemm` | `moe_shared_expert_gate_prefill_cublas` |
 | 11 | Shared/consistent expert up W4A16 GEMM | `(3823,3072)->(3823,2048)` | covered | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | `w4a16_prefill_consistent_expert_up_cutlass55` |

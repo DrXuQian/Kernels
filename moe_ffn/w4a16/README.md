@@ -7,9 +7,9 @@ auxiliary kernels, so they live in separate subtrees.
 For the current Nsight Systems component breakdown, see
 `TRTLLM_VS_VLLM_BREAKDOWN.md`.
 
-The root `bench_all.sh` default uses TensorRT-LLM auxiliary components for
-prefill, grouped Machete W4A16 GEMM for prefill MoE gate/up and down GEMMs, and
-vLLM components for decode.
+The root `bench_all.sh` default uses TensorRT-LLM components for prefill and
+vLLM components for decode. The `machete/` subtree is a separate SM90 grouped
+Machete prefill GEMM benchmark and is not part of the default model breakdown.
 
 Older PyTorch-extension benchmark scripts remain under `vllm/bench_python/` for
 historical reference, but their old README/results are intentionally not

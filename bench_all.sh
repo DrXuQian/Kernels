@@ -94,7 +94,6 @@ FPA_BIN="$(repo_path "general/w4a16_gemm/fpA_intB_standalone/build_cmake_release
 CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
 CUDA_CORE_GEMV_BIN="$(repo_path "general/bench_cuda_core_gemv")"
 MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
-MOE_MACHETE_BIN="$(repo_path "moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe")"
 MOE_TRTLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/trtllm/auxiliary")"
 MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
 MOE_VLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/vllm/auxiliary")"
@@ -110,7 +109,6 @@ SAMPLING_BIN="$(repo_path "sampling/bench_sampling")"
 MACHETE_TACTIC="$(repo_path "general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache")"
 FPA_TACTIC="$(repo_path "general/w4a16_gemm/fpA_intB_standalone/tactics_h800.cache")"
 MOE_TRTLLM_TACTIC="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache")"
-MOE_MACHETE_TACTIC="$(repo_path "moe_ffn/w4a16/machete/machete_moe_tactics_h800.cache")"
 
 FAILED=0
 LIST_CASES=0
@@ -920,22 +918,6 @@ run_moe_trtllm_gemm_case() {
   fi
 }
 
-run_moe_machete_grouped_gemm_case() {
-  local label="$1"
-  local m_per_expert="$2"
-  local n="$3"
-  local k="$4"
-
-  run_case "$label" \
-    --require-file "$MOE_MACHETE_TACTIC" \
-    --require-tactic-entry "$MOE_MACHETE_TACTIC" "fp16,$MOE_EXPERTS,$m_per_expert,$n,$k,$MOE_GROUP|" \
-    "$MOE_MACHETE_BIN" \
-    --experts="$MOE_EXPERTS" --m_per_expert="$m_per_expert" \
-    --n="$n" --k="$k" --group_size="$MOE_GROUP" \
-    --tactic="$MOE_MACHETE_TACTIC" \
-    --warmup=1 --iters=1 --no_checksum
-}
-
 run_linear_dense_case() {
   local label="$1"
   local op="$2"
@@ -991,7 +973,7 @@ else
   echo "prefill tokens: $PREFILL_TOKENS"
   echo "decode tokens:  $DECODE_TOKENS"
   echo "ctx len:        $CTX_LEN"
-  echo "moe prefill:    TensorRT-LLM aux + grouped Machete GEMM"
+  echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     $DECODE_MOE_BACKEND components"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
   echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
@@ -1164,13 +1146,13 @@ run_case "moe_expand_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_expand_input_rows" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_GATE_K" fp16 \
   --bench 0 1
 
-run_moe_machete_grouped_gemm_case "moe_gate_up_prefill_machete" "$PREFILL_TOKENS" "$MOE_GATE_N" "$MOE_GATE_K"
+run_moe_trtllm_gemm_case "moe_gate_up_prefill_trtllm" "$PREFILL_TOKENS" "$MOE_GATE_N" "$MOE_GATE_K"
 
 run_case "moe_gated_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_INTERMEDIATE" fp16 \
   --bench 0 1
 
-run_moe_machete_grouped_gemm_case "moe_down_prefill_machete" "$PREFILL_TOKENS" "$MOE_DOWN_N" "$MOE_DOWN_K"
+run_moe_trtllm_gemm_case "moe_down_prefill_trtllm" "$PREFILL_TOKENS" "$MOE_DOWN_N" "$MOE_DOWN_K"
 
 run_case "moe_finalize_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
