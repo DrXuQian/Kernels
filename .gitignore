@@ -42,5 +42,6 @@ general/w4a16_gemm/marlin_standalone/marlin_standalone
 .bench_profiles/
 .bench_logs/
 profiles/
+exported_binaries/
 bench_expert_map
 general/w4a16_gemm/fpA_intB/
