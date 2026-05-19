@@ -1,0 +1,7 @@
+bench_residual_add_bw
+*.o
+*.log
+*.csv
+*.ncu-rep
+*.nsys-rep
+
