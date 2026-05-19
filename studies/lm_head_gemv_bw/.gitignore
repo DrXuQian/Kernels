@@ -1,0 +1,7 @@
+bench_lm_head_gemv
+*.o
+*.log
+*.csv
+*.ncu-rep
+*.nsys-rep
+
