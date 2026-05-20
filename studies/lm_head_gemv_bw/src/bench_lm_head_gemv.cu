@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -15,6 +16,17 @@
         if (err != cudaSuccess)                                                                                        \
         {                                                                                                              \
             std::fprintf(stderr, "CUDA %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));                    \
+            std::exit(1);                                                                                              \
+        }                                                                                                              \
+    } while (0)
+
+#define CHECK_CUBLAS(x)                                                                                                \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cublasStatus_t err = (x);                                                                                      \
+        if (err != CUBLAS_STATUS_SUCCESS)                                                                              \
+        {                                                                                                              \
+            std::fprintf(stderr, "cuBLAS %s:%d: status=%d\n", __FILE__, __LINE__, static_cast<int>(err));             \
             std::exit(1);                                                                                              \
         }                                                                                                              \
     } while (0)
@@ -92,7 +104,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
                 argv[0]);
@@ -328,6 +340,47 @@ void run_copy_case(Options const& opt)
     CHECK_CUDA(cudaFree(dst));
 }
 
+void run_cublas_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.k) * opt.n * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight_kn = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight_kn, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight_kn, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    cublasHandle_t handle = nullptr;
+    CHECK_CUBLAS(cublasCreate(&handle));
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    // Row-major C[1,N] = A[1,K] * B[K,N], expressed as column-major GEMM:
+    // C_col[N,1] = B_col[N,K] * A_col[K,1].
+    float ms = median_time_ms(
+        [&] {
+            CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, opt.n, 1, opt.k, &alpha, d_weight_kn,
+                CUDA_R_16F, opt.n, d_hidden, CUDA_R_16F, opt.k, &beta, d_logits, CUDA_R_32F, opt.n, CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        },
+        opt.warmup, opt.iters);
+    CHECK_CUDA(cudaGetLastError());
+
+    std::printf("cublas lm_head: n=%d k=%d weight=%.3f MB logits=%.3f MB\n", opt.n, opt.k, weight_bytes / 1.0e6,
+        logits_bytes / 1.0e6);
+    print_bw("cublas", ms, static_cast<double>(weight_bytes + logits_bytes));
+
+    CHECK_CUBLAS(cublasDestroy(handle));
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight_kn));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -341,6 +394,7 @@ int main(int argc, char** argv)
     if (opt.op == "all")
     {
         run_gemv_cases(opt, true, true);
+        run_cublas_case(opt);
         run_copy_case(opt);
     }
     else if (opt.op == "shared")
@@ -355,6 +409,10 @@ int main(int argc, char** argv)
     {
         run_copy_case(opt);
     }
+    else if (opt.op == "cublas")
+    {
+        run_cublas_case(opt);
+    }
     else
     {
         std::fprintf(stderr, "unknown op: %s\n", opt.op.c_str());
@@ -362,4 +420,3 @@ int main(int argc, char** argv)
     }
     return 0;
 }
-

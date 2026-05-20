@@ -236,6 +236,13 @@ Local H800 result for `N=248320, K=3072`:
 For LM head, cuBLAS and the dedicated kernel are both near the copy roofline.
 This is because the problem has enough `N` and enough mandatory weight traffic.
 
+The in-directory cuBLAS bandwidth example is:
+
+```bash
+cd studies/lm_head_gemv_bw
+./bench_lm_head_gemv --op=cublas --n=248320 --k=3072 --warmup=100 --iters=200
+```
+
 ## Implication For Decode Kernels
 
 For decode dense projections:

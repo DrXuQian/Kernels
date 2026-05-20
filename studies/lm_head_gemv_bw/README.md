@@ -36,6 +36,12 @@ Run the optimized kernel and copy roofline:
 ./bench_lm_head_gemv --op=all --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 ```
 
+Only cuBLAS bandwidth baseline:
+
+```bash
+./bench_lm_head_gemv --op=cublas --n=248320 --k=3072 --warmup=100 --iters=200
+```
+
 Only LM head GEMV:
 
 ```bash
@@ -56,7 +62,7 @@ for w in 4 8 16; do
 done
 ```
 
-Compare with the current cuBLAS LM head baseline from the repo root:
+The same cuBLAS baseline can also be run from the generic repo benchmark:
 
 ```bash
 ../../general/bench_cublas_gemm \
