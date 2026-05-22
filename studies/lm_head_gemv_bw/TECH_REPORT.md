@@ -276,6 +276,7 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 | `ptx_cpasync` | Weight streamed global->shared via `cp.async` (sm_80+); in-flight load data lands in shared memory, not registers, so outstanding-window depth is decoupled from register pressure. 32 registers, `Stages`-deep software pipeline; case self-checks correctness vs the simple GEMV. |
 | `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
 | `ptx_ru` | Configurable `rows_per_warp={1,2,4,8}` and `k_unroll={4,8,16}` path for memory-outstanding sweeps. |
+| `ptx_rlean` | Like `ptx_ru` but one accumulator per row instead of `rows*k_unroll`. More rows amortize the fixed hidden-load registers, raising weight-loads-per-register; the lean accumulator lets 4-8 rows fit the register budget (`r4 u8` is 40 registers, same as 2-row `ptx_r2u8`). For testing whether more rows lifts chip-wide in-flight on a register-resident-bound backend. |
 
 On the local H800, `ptx_chunk4` is the best variant. This suggests load
 instruction count / contiguous issue still matters slightly even when the simple
@@ -348,6 +349,19 @@ register-resident variant both factors are bounded by the register file. For
 independently of the 32-register occupancy footprint — the only lever that can
 match a large bandwidth-delay product. On H800, deeper Stages still nudges the
 roofline (1.952 / 1.960 / 1.965 TB/s for Stages 4 / 8 / 16).
+
+For a register-resident kernel the chip-wide in-flight bytes are bounded by how
+much of the register file holds outstanding load data. Each warp spends
+`KUnroll` registers on hidden loads — fixed overhead, since the hidden vector is
+shared across the warp's rows — and `RowsPerWarp * KUnroll` on weight loads. The
+weight-loads-per-register ratio therefore rises with `RowsPerWarp` (~0.4 at 2
+rows, ~0.6 at 4-8): more rows per warp pack more weight in flight into the same
+register budget, the opposite of going to 1 row. `ptx_rlean` exploits this with
+a single accumulator per row — the independent rows themselves supply the FMA
+ILP — which keeps 4-8 rows inside the register budget where `ptx_ru`'s
+`acc[rows][k_unroll]` would spill. On H800 this does not help (its roofline is
+bandwidth, not in-flight), but on a backend bound by register-resident in-flight
+it raises chip-wide in-flight without resorting to cp.async.
 
 For SASS / final-ISA inspection, use:
 

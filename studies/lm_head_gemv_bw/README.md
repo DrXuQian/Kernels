@@ -122,6 +122,28 @@ for r in 1 2 4 8; do
 done
 ```
 
+Register-lean many-rows sweep (`ptx_rlean`): same `--rows-per-warp` x
+`--k-unroll` grid, but one accumulator per row instead of `rows*k_unroll`. The
+hidden-load registers are fixed per-warp overhead, so more rows amortize them
+and raise weight-loads-per-register — the quantity that bounds chip-wide
+in-flight bytes for a register-resident kernel. The lean accumulator is what
+lets 4-8 rows fit the register budget: `ptx_rlean --rows-per-warp=4
+--k-unroll=8` is 40 registers on H800, the same as the 2-row `ptx_r2u8`.
+
+```bash
+for r in 1 2 4 8; do
+  for u in 4 8; do
+    ./bench_lm_head_gemv \
+      --op=ptx_rlean \
+      --rows-per-warp=$r \
+      --k-unroll=$u \
+      --n=248320 --k=3072 \
+      --warps-per-block=16 \
+      --warmup=100 --iters=200
+  done
+done
+```
+
 Single-kernel NCU capture for the same sweep:
 
 ```bash
