@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -104,7 +105,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
                 argv[0]);
@@ -168,6 +169,32 @@ __device__ __forceinline__ float warp_sum(float v)
     return v;
 }
 
+__device__ __forceinline__ uint32_t ptx_ld_global_u32(void const* ptr)
+{
+    uint32_t value;
+    asm volatile("ld.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
+    return value;
+}
+
+__device__ __forceinline__ float ptx_fma_rn_f32(float a, float b, float c)
+{
+    float value;
+    asm volatile("fma.rn.f32 %0, %1, %2, %3;" : "=f"(value) : "f"(a), "f"(b), "f"(c));
+    return value;
+}
+
+__device__ __forceinline__ void ptx_st_global_f32(float* ptr, float value)
+{
+    asm volatile("st.global.f32 [%0], %1;" ::"l"(ptr), "f"(value));
+}
+
+__device__ __forceinline__ half2 half2_from_u32(uint32_t packed)
+{
+    unsigned short lo = static_cast<unsigned short>(packed & 0xffffu);
+    unsigned short hi = static_cast<unsigned short>(packed >> 16);
+    return __halves2half2(__ushort_as_half(lo), __ushort_as_half(hi));
+}
+
 template <int WarpsPerBlock, bool CacheActivation>
 __global__ void lm_head_gemv_kernel(half const* __restrict__ hidden, half const* __restrict__ weight,
     float* __restrict__ logits, int n, int k)
@@ -221,6 +248,48 @@ __global__ void lm_head_gemv_kernel(half const* __restrict__ hidden, half const*
     }
 }
 
+template <int WarpsPerBlock>
+__global__ void lm_head_gemv_ptx_kernel(
+    half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
+{
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int row = blockIdx.x * WarpsPerBlock + warp;
+    if (row >= n)
+    {
+        return;
+    }
+
+    int k2 = k / 2;
+    half2 const* h2 = reinterpret_cast<half2 const*>(hidden);
+    half2 const* w2 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(row) * k);
+
+    float acc = 0.0f;
+    for (int i = lane; i < k2; i += 32)
+    {
+        uint32_t h_pack = ptx_ld_global_u32(h2 + i);
+        uint32_t w_pack = ptx_ld_global_u32(w2 + i);
+        float2 h = __half22float2(half2_from_u32(h_pack));
+        float2 w = __half22float2(half2_from_u32(w_pack));
+        acc = ptx_fma_rn_f32(h.x, w.x, acc);
+        acc = ptx_fma_rn_f32(h.y, w.y, acc);
+    }
+
+    // Qwen3.5 K=3072 is even. Keep a generic odd-K fallback outside the main path.
+    if ((k & 1) && lane == 0)
+    {
+        int i = k - 1;
+        acc = ptx_fma_rn_f32(__half2float(hidden[i]), __half2float(weight[static_cast<long long>(row) * k + i]), acc);
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0)
+    {
+        ptx_st_global_f32(logits + row, acc);
+    }
+}
+
 __global__ void copy_u8_kernel(ulonglong4* __restrict__ dst, ulonglong4 const* __restrict__ src, size_t n)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -271,6 +340,29 @@ float run_lm_head(Options const& opt, bool cache_activation, half const* d_hidde
     return run_lm_head_kernel<16, false>(opt, d_hidden, d_weight, d_logits);
 }
 
+template <int WarpsPerBlock>
+float run_lm_head_ptx_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    int blocks = (opt.n + WarpsPerBlock - 1) / WarpsPerBlock;
+    return median_time_ms(
+        [&] { lm_head_gemv_ptx_kernel<WarpsPerBlock><<<blocks, threads>>>(d_hidden, d_weight, d_logits, opt.n, opt.k); },
+        opt.warmup, opt.iters);
+}
+
+float run_lm_head_ptx(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.warps_per_block == 4)
+    {
+        return run_lm_head_ptx_kernel<4>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.warps_per_block == 8)
+    {
+        return run_lm_head_ptx_kernel<8>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_kernel<16>(opt, d_hidden, d_weight, d_logits);
+}
+
 void print_bw(char const* name, float ms, double bytes)
 {
     double gbps = bytes / (ms * 1.0e-3) / 1.0e9;
@@ -278,7 +370,7 @@ void print_bw(char const* name, float ms, double bytes)
         gbps, gbps / 1000.0);
 }
 
-void run_gemv_cases(Options const& opt, bool run_shared, bool run_global)
+void run_gemv_cases(Options const& opt, bool run_shared, bool run_global, bool run_ptx)
 {
     size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
     size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
@@ -307,6 +399,12 @@ void run_gemv_cases(Options const& opt, bool run_shared, bool run_global)
         float ms = run_lm_head(opt, false, d_hidden, d_weight, d_logits);
         CHECK_CUDA(cudaGetLastError());
         print_bw("global_a", ms, mandatory_traffic);
+    }
+    if (run_ptx)
+    {
+        float ms = run_lm_head_ptx(opt, d_hidden, d_weight, d_logits);
+        CHECK_CUDA(cudaGetLastError());
+        print_bw("ptx_global", ms, mandatory_traffic);
     }
 
     CHECK_CUDA(cudaFree(d_hidden));
@@ -393,17 +491,21 @@ int main(int argc, char** argv)
 
     if (opt.op == "all")
     {
-        run_gemv_cases(opt, true, true);
+        run_gemv_cases(opt, true, true, true);
         run_cublas_case(opt);
         run_copy_case(opt);
     }
     else if (opt.op == "shared")
     {
-        run_gemv_cases(opt, true, false);
+        run_gemv_cases(opt, true, false, false);
     }
     else if (opt.op == "global")
     {
-        run_gemv_cases(opt, false, true);
+        run_gemv_cases(opt, false, true, false);
+    }
+    else if (opt.op == "ptx")
+    {
+        run_gemv_cases(opt, false, false, true);
     }
     else if (opt.op == "copy" || opt.op == "copy_u8")
     {

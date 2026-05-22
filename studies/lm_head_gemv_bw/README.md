@@ -48,6 +48,12 @@ Only LM head GEMV:
 ./bench_lm_head_gemv --op=shared --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 ```
 
+Only the inline-PTX GEMV path:
+
+```bash
+./bench_lm_head_gemv --op=ptx --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+```
+
 Only copy roofline with the same weight bytes:
 
 ```bash
@@ -86,6 +92,7 @@ Local H800 PCIe, `N=248320`, `K=3072`, fp16 input/weight and fp32 logits:
 | `shared`, 8 warps/block | 0.7927 ms | 1.926 TB/s |
 | `shared`, 16 warps/block | 0.7928 ms | 1.926 TB/s |
 | `global`, 8 warps/block | 0.7897 ms | 1.933 TB/s |
+| `ptx_global`, 8 warps/block | 0.7868 ms | 1.940 TB/s |
 | cuBLAS baseline | 0.7903 ms | ~1.932 TB/s |
 | `copy_u8` weight-sized copy | 1.7238 ms | 1.770 TB/s |
 
@@ -93,3 +100,7 @@ The GEMV bandwidth is computed using mandatory LM head traffic
 `weight_bytes + logits_bytes`, not read+write copy traffic. For this shape that
 is `1526.671 MB`. The dedicated row-major kernel is effectively matching cuBLAS
 for this decode LM head case.
+
+The `ptx_global` path fixes the critical load/FMA/store sequence with inline PTX
+(`ld.global.u32`, `fma.rn.f32`, `st.global.f32`) to reduce sensitivity to CUDA
+C++ frontend optimization differences.

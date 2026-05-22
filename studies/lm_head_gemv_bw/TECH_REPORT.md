@@ -231,10 +231,23 @@ Local H800 result for `N=248320, K=3072`:
 |---|---:|---:|
 | custom `shared`, 8 warps/block | 0.7927 ms | 1.926 TB/s |
 | custom `global`, 8 warps/block | 0.7897 ms | 1.933 TB/s |
+| custom `ptx_global`, 8 warps/block | 0.7868 ms | 1.940 TB/s |
 | cuBLAS | 0.7903 ms | ~1.932 TB/s |
 
 For LM head, cuBLAS and the dedicated kernel are both near the copy roofline.
 This is because the problem has enough `N` and enough mandatory weight traffic.
+
+The `ptx_global` variant keeps the same warp-per-row mapping, but fixes the
+critical memory and arithmetic instructions with inline PTX:
+
+```text
+ld.global.u32   // one packed half2 load from hidden / weight
+fma.rn.f32      // explicit fp32 FMA
+st.global.f32   // logits write
+```
+
+This is not meant to beat cuBLAS materially. It exists to reduce differences
+from CUDA C++ frontend optimization when comparing compiler behavior.
 
 The in-directory cuBLAS bandwidth example is:
 
