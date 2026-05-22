@@ -123,7 +123,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
@@ -1262,6 +1262,126 @@ __global__ void lm_head_gemv_ptx_r2_chunk4u2_kernel(
     }
 }
 
+// Configurable-depth wide-load variant. Same structure as ptx_r2_chunk4u2, but
+// the number of chunk4 tiles batched per K step is a template parameter: Tiles
+// chunk4 tiles == 3*Tiles v4 (128-bit) loads issued before any FMA == 64*Tiles
+// bytes/lane in flight per row pair. Used to push the outstanding window past
+// ptx_r2u8 / ptx_r2_chunk4u2 on backends that can sustain more in-flight loads.
+// ptx_r2_chunk4u4 instantiates this at Tiles=4 (12 v4 loads, 192 bytes/lane).
+template <int WarpsPerBlock, int Tiles>
+__global__ void lm_head_gemv_ptx_r2_chunk4u_kernel(
+    half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
+{
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int row0 = (blockIdx.x * WarpsPerBlock + warp) * 2;
+    if (row0 >= n)
+    {
+        return;
+    }
+    int row1 = row0 + 1;
+    bool has_row1 = row1 < n;
+    int safe_row1 = has_row1 ? row1 : row0;
+
+    int k2 = k / 2;
+    int step_half2 = 128 * Tiles;
+    int full_k2 = (k2 / step_half2) * step_half2;
+    half2 const* h2 = reinterpret_cast<half2 const*>(hidden);
+    half2 const* w20 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(row0) * k);
+    half2 const* w21 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(safe_row1) * k);
+
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int step = 0; step < full_k2; step += step_half2)
+    {
+        uint32_t hp[Tiles][4];
+        uint32_t ap[Tiles][4];
+        uint32_t bp[Tiles][4];
+
+        // Issue all 3*Tiles v4 loads before any conversion or FMA. w21 is clamped
+        // to a valid row so every load is unconditional and the loop is branch-free.
+#pragma unroll
+        for (int t = 0; t < Tiles; ++t)
+        {
+            int base = step + t * 128 + lane * 4;
+            ptx_ld_global_v4_u32(h2 + base, hp[t][0], hp[t][1], hp[t][2], hp[t][3]);
+        }
+#pragma unroll
+        for (int t = 0; t < Tiles; ++t)
+        {
+            int base = step + t * 128 + lane * 4;
+            ptx_ld_global_v4_u32(w20 + base, ap[t][0], ap[t][1], ap[t][2], ap[t][3]);
+        }
+#pragma unroll
+        for (int t = 0; t < Tiles; ++t)
+        {
+            int base = step + t * 128 + lane * 4;
+            ptx_ld_global_v4_u32(w21 + base, bp[t][0], bp[t][1], bp[t][2], bp[t][3]);
+        }
+
+#pragma unroll
+        for (int t = 0; t < Tiles; ++t)
+        {
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+            {
+                float2 h = __half22float2(half2_from_u32(hp[t][c]));
+                float2 a = __half22float2(half2_from_u32(ap[t][c]));
+                float2 b = __half22float2(half2_from_u32(bp[t][c]));
+                acc0[c] = ptx_fma_rn_f32(h.x, a.x, acc0[c]);
+                acc0[c] = ptx_fma_rn_f32(h.y, a.y, acc0[c]);
+                acc1[c] = ptx_fma_rn_f32(h.x, b.x, acc1[c]);
+                acc1[c] = ptx_fma_rn_f32(h.y, b.y, acc1[c]);
+            }
+        }
+    }
+
+    float tail0 = 0.0f;
+    float tail1 = 0.0f;
+    for (int i = full_k2 + lane; i < k2; i += 32)
+    {
+        uint32_t h_pack = ptx_ld_global_u32(h2 + i);
+        uint32_t w0_pack = ptx_ld_global_u32(w20 + i);
+        float2 h = __half22float2(half2_from_u32(h_pack));
+        float2 w0 = __half22float2(half2_from_u32(w0_pack));
+        tail0 = ptx_fma_rn_f32(h.x, w0.x, tail0);
+        tail0 = ptx_fma_rn_f32(h.y, w0.y, tail0);
+        if (has_row1)
+        {
+            uint32_t w1_pack = ptx_ld_global_u32(w21 + i);
+            float2 w1 = __half22float2(half2_from_u32(w1_pack));
+            tail1 = ptx_fma_rn_f32(h.x, w1.x, tail1);
+            tail1 = ptx_fma_rn_f32(h.y, w1.y, tail1);
+        }
+    }
+
+    float r0 = (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]) + tail0;
+    float r1 = (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]) + tail1;
+    if ((k & 1) && lane == 0)
+    {
+        int kk = k - 1;
+        float h = __half2float(hidden[kk]);
+        r0 = ptx_fma_rn_f32(h, __half2float(weight[static_cast<long long>(row0) * k + kk]), r0);
+        if (has_row1)
+        {
+            r1 = ptx_fma_rn_f32(h, __half2float(weight[static_cast<long long>(row1) * k + kk]), r1);
+        }
+    }
+
+    r0 = warp_sum(r0);
+    r1 = warp_sum(r1);
+    if (lane == 0)
+    {
+        ptx_st_global_f32(logits + row0, r0);
+        if (has_row1)
+        {
+            ptx_st_global_f32(logits + row1, r1);
+        }
+    }
+}
+
 template <int WarpsPerBlock, int RowsPerWarp, int KUnroll>
 __global__ void lm_head_gemv_ptx_ru_kernel(
     half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
@@ -1562,6 +1682,33 @@ float run_lm_head_ptx_r2_chunk4u2(Options const& opt, half const* d_hidden, half
         return run_lm_head_ptx_r2_chunk4u2_kernel<8>(opt, d_hidden, d_weight, d_logits);
     }
     return run_lm_head_ptx_r2_chunk4u2_kernel<16>(opt, d_hidden, d_weight, d_logits);
+}
+
+template <int WarpsPerBlock, int Tiles>
+float run_lm_head_ptx_r2_chunk4u_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    int blocks = (opt.n + 2 * WarpsPerBlock - 1) / (2 * WarpsPerBlock);
+    return median_time_ms(
+        [&] {
+            lm_head_gemv_ptx_r2_chunk4u_kernel<WarpsPerBlock, Tiles>
+                <<<blocks, threads>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        },
+        opt.warmup, opt.iters);
+}
+
+template <int Tiles>
+float run_lm_head_ptx_r2_chunk4u(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.warps_per_block == 4)
+    {
+        return run_lm_head_ptx_r2_chunk4u_kernel<4, Tiles>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.warps_per_block == 8)
+    {
+        return run_lm_head_ptx_r2_chunk4u_kernel<8, Tiles>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_r2_chunk4u_kernel<16, Tiles>(opt, d_hidden, d_weight, d_logits);
 }
 
 template <int WarpsPerBlock>
@@ -1865,6 +2012,33 @@ void run_gemv_r2_chunk4u2_case(Options const& opt)
     CHECK_CUDA(cudaFree(d_logits));
 }
 
+void run_gemv_r2_chunk4u4_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_r2_chunk4u4: n=%d k=%d weight=%.3f MB logits=%.3f MB warps/block=%d\n", opt.n, opt.k,
+        weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.warps_per_block);
+    float ms = run_lm_head_ptx_r2_chunk4u<4>(opt, d_hidden, d_weight, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw("ptx_r2_chunk4u4", ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
 void run_copy_case(Options const& opt)
 {
     size_t bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
@@ -1975,6 +2149,10 @@ int main(int argc, char** argv)
     else if (opt.op == "ptx_r2_chunk4u2")
     {
         run_gemv_r2_chunk4u2_case(opt);
+    }
+    else if (opt.op == "ptx_r2_chunk4u4")
+    {
+        run_gemv_r2_chunk4u4_case(opt);
     }
     else if (opt.op == "ptx_chunk4")
     {

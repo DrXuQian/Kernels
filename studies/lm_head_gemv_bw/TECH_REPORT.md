@@ -238,6 +238,7 @@ Local H800 result for `N=248320, K=3072`:
 | custom `ptx_chunk4`, 8 warps/block, `-O3` | 0.7807 ms | 1.955 TB/s |
 | custom `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
 | custom `ptx_r2_chunk4u2`, 8 warps/block, `-O3` | 0.7868 ms | 1.940 TB/s |
+| custom `ptx_r2_chunk4u4`, 8 warps/block, `-O3` | 0.7862 ms | 1.942 TB/s |
 | custom `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | custom `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | custom `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
@@ -268,6 +269,7 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 | `ptx_chunk4` | Each lane loads 4 consecutive `half2` values with `ld.global.v4.u32`, reducing load instruction count and improving contiguous memory issue. |
 | `ptx_r2_chunk4` | 2 rows/warp plus `chunk4`; tests whether more independent weight streams help after load vectorization. |
 | `ptx_r2_chunk4u2` | 2 rows/warp, `chunk4` v4 loads, 2-tile unroll with all 6 v4 loads issued before any FMA. Wide-load version of `ptx_r2u8`: same ~96 bytes/lane outstanding, 6 wide loads instead of 24 narrow ones. |
+| `ptx_r2_chunk4u4` | 2 rows/warp, `chunk4` v4 loads, 4-tile unroll with all 12 v4 loads issued before any FMA. Doubles the `ptx_r2_chunk4u2` window to 192 bytes/lane; 54 registers on H800, no spills. |
 | `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
 | `ptx_ru` | Configurable `rows_per_warp={1,2,4,8}` and `k_unroll={4,8,16}` path for memory-outstanding sweeps. |
 
@@ -299,6 +301,14 @@ stalls shrink. The value to verify after switching to `ptx_r2u8` is the sum of
 `ptx_r2u8` (narrow, deep window) and `ptx_r2_chunk4u2` (wide, deep window) on the
 target backend separates the two levers: whether the gain comes from wider
 memory transactions or from a deeper outstanding-request queue.
+
+`ptx_r2_chunk4u4` extends the wide-and-deep variant to 4 chunk4 tiles (12 v4
+loads, 192 bytes/lane in flight). Each v4 load consumes one `vldcnt`/`vmcnt`
+slot but carries 128 bits, so the wide-load variants reach a given byte window
+with 4x fewer outstanding-load counter slots than the scalar `ptx_r2u8` path --
+which matters when that counter, not the register file, is the limit. The
+practical depth ceiling is register pressure: `ptx_r2_chunk4u4` is 54 registers
+on H800, and going deeper risks spills that are fatal for a bandwidth kernel.
 
 For SASS / final-ISA inspection, use:
 
