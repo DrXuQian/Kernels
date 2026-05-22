@@ -77,6 +77,12 @@ More aggressive inline-PTX variants:
 # 2 output rows per warp + consecutive chunk4 loads.
 ./bench_lm_head_gemv --op=ptx_r2_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 
+# 2 rows/warp + chunk4 v4 loads + 2-tile unroll: all 6 v4 loads issued before
+# any FMA. Combines the wide loads of ptx_r2_chunk4 with the deep outstanding
+# window of ptx_r2u8 (same ~96 bytes/lane in flight as ptx_r2u8, but via 6 wide
+# loads instead of 24 narrow ones).
+./bench_lm_head_gemv --op=ptx_r2_chunk4u2 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+
 # 4 output rows per warp + consecutive chunk4 loads. Useful to test whether
 # more independent weight streams help a backend, but it has higher register pressure.
 ./bench_lm_head_gemv --op=ptx_r4_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
@@ -171,6 +177,7 @@ Local H800 PCIe, `N=248320`, `K=3072`, fp16 input/weight and fp32 logits:
 | `ptx_r2u8`, 8 warps/block, `-O3` | 0.7900 ms | 1.932 TB/s |
 | `ptx_chunk4`, 8 warps/block, `-O3` | 0.7807 ms | 1.955 TB/s |
 | `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
+| `ptx_r2_chunk4u2`, 8 warps/block, `-O3` | 0.7868 ms | 1.940 TB/s |
 | `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
@@ -202,3 +209,9 @@ profile that shows N loads followed by one `s.wait vldcnt(N-1)` / `vmcnt`
 instruction). There, issuing 24 loads up front gives the memory subsystem a
 deeper request queue to hide DRAM latency, which should shrink the load-wait
 stalls and the idle gaps in the block timeline.
+
+`ptx_r2_chunk4u2` is the wide-load version of the same idea: it keeps the same
+~96 bytes/lane outstanding as `ptx_r2u8`, but issues them as 6 `ld.global.v4.u32`
+(128-bit) loads instead of 24 `ld.global.u32`. Running `ptx_r2_chunk4` (wide,
+shallow), `ptx_r2u8` (narrow, deep) and `ptx_r2_chunk4u2` (wide, deep) on a
+backend separates the load-width lever from the load-count lever.

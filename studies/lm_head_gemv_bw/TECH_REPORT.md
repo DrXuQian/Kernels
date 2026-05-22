@@ -237,6 +237,7 @@ Local H800 result for `N=248320, K=3072`:
 | custom `ptx_r2u8`, 8 warps/block, `-O3` | 0.7900 ms | 1.932 TB/s |
 | custom `ptx_chunk4`, 8 warps/block, `-O3` | 0.7807 ms | 1.955 TB/s |
 | custom `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
+| custom `ptx_r2_chunk4u2`, 8 warps/block, `-O3` | 0.7868 ms | 1.940 TB/s |
 | custom `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | custom `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | custom `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
@@ -266,6 +267,7 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 | `ptx_r2u8` | 2 rows/warp, 8-way K unroll, all 24 packed loads of an iteration issued before any FMA. Widens the outstanding-load window (~24 loads in flight vs ~8 for `ptx_r2u4`) for latency-bound backends idle behind `s.wait`/`vmcnt` load waits. |
 | `ptx_chunk4` | Each lane loads 4 consecutive `half2` values with `ld.global.v4.u32`, reducing load instruction count and improving contiguous memory issue. |
 | `ptx_r2_chunk4` | 2 rows/warp plus `chunk4`; tests whether more independent weight streams help after load vectorization. |
+| `ptx_r2_chunk4u2` | 2 rows/warp, `chunk4` v4 loads, 2-tile unroll with all 6 v4 loads issued before any FMA. Wide-load version of `ptx_r2u8`: same ~96 bytes/lane outstanding, 6 wide loads instead of 24 narrow ones. |
 | `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
 | `ptx_ru` | Configurable `rows_per_warp={1,2,4,8}` and `k_unroll={4,8,16}` path for memory-outstanding sweeps. |
 
@@ -291,6 +293,12 @@ loads. There the deeper source-level load batch translates into a deeper
 hardware request queue, so more DRAM latency is overlapped and the load-wait
 stalls shrink. The value to verify after switching to `ptx_r2u8` is the sum of
 `s.wait`/`vmcnt` stall cycles and the timeline idle fraction, not raw FLOPs.
+
+`ptx_r2_chunk4u2` applies the same deep-window idea on top of 128-bit
+`ld.global.v4.u32` loads. Running `ptx_r2_chunk4` (wide, shallow window),
+`ptx_r2u8` (narrow, deep window) and `ptx_r2_chunk4u2` (wide, deep window) on the
+target backend separates the two levers: whether the gain comes from wider
+memory transactions or from a deeper outstanding-request queue.
 
 For SASS / final-ISA inspection, use:
 
