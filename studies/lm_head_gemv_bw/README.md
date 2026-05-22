@@ -88,6 +88,12 @@ More aggressive inline-PTX variants:
 # backends that can sustain a deeper in-flight load queue.
 ./bench_lm_head_gemv --op=ptx_r2_chunk4u4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 
+# ptx_r2_chunk4u2 with the hidden vector staged into shared memory once per
+# block (only the 4 weight v4 loads hit global). Diagnostic: the gap vs
+# ptx_r2_chunk4u2 measures how much hidden re-read traffic a backend pushes to
+# DRAM. Ties ptx_r2_chunk4u2 on backends that cache the hidden vector.
+./bench_lm_head_gemv --op=ptx_r2_chunk4u2_smem --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+
 # 4 output rows per warp + consecutive chunk4 loads. Useful to test whether
 # more independent weight streams help a backend, but it has higher register pressure.
 ./bench_lm_head_gemv --op=ptx_r4_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
@@ -184,6 +190,7 @@ Local H800 PCIe, `N=248320`, `K=3072`, fp16 input/weight and fp32 logits:
 | `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
 | `ptx_r2_chunk4u2`, 8 warps/block, `-O3` | 0.7868 ms | 1.940 TB/s |
 | `ptx_r2_chunk4u4`, 8 warps/block, `-O3` | 0.7862 ms | 1.942 TB/s |
+| `ptx_r2_chunk4u2_smem`, 8 warps/block, `-O3` | 0.7871 ms | 1.940 TB/s |
 | `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
@@ -226,3 +233,13 @@ backend separates the load-width lever from the load-count lever.
 192 bytes/lane in flight. On H800 ptxas still schedules it to the roofline at 54
 registers with no spills; on a latency-bound backend it is the deepest of the
 wide-load variants before register pressure becomes the limit.
+
+`ptx_r2_chunk4u2_smem` is a diagnostic, not a depth variant: it is
+`ptx_r2_chunk4u2` with the hidden vector staged into shared memory once per
+block, so the inner loop reads hidden from smem and only weight hits global. In
+a GEMV the weight is read once, but the hidden vector is needed by every output
+row — each warp re-reads the whole 6 KB hidden vector, ~763 MB total for this
+shape. A backend with enough cache (H800: 50 MB L2) absorbs those re-reads, so
+`ptx_r2_chunk4u2_smem` ties `ptx_r2_chunk4u2` on H800. A backend that re-reads
+hidden from DRAM does not — the gap between the two variants measures that
+otherwise-uncounted redundant traffic.

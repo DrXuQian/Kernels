@@ -239,6 +239,7 @@ Local H800 result for `N=248320, K=3072`:
 | custom `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
 | custom `ptx_r2_chunk4u2`, 8 warps/block, `-O3` | 0.7868 ms | 1.940 TB/s |
 | custom `ptx_r2_chunk4u4`, 8 warps/block, `-O3` | 0.7862 ms | 1.942 TB/s |
+| custom `ptx_r2_chunk4u2_smem`, 8 warps/block, `-O3` | 0.7871 ms | 1.940 TB/s |
 | custom `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | custom `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | custom `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
@@ -270,6 +271,7 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 | `ptx_r2_chunk4` | 2 rows/warp plus `chunk4`; tests whether more independent weight streams help after load vectorization. |
 | `ptx_r2_chunk4u2` | 2 rows/warp, `chunk4` v4 loads, 2-tile unroll with all 6 v4 loads issued before any FMA. Wide-load version of `ptx_r2u8`: same ~96 bytes/lane outstanding, 6 wide loads instead of 24 narrow ones. |
 | `ptx_r2_chunk4u4` | 2 rows/warp, `chunk4` v4 loads, 4-tile unroll with all 12 v4 loads issued before any FMA. Doubles the `ptx_r2_chunk4u2` window to 192 bytes/lane; 54 registers on H800, no spills. |
+| `ptx_r2_chunk4u2_smem` | `ptx_r2_chunk4u2` with the hidden vector staged into shared memory once per block. Diagnostic: the gap vs `ptx_r2_chunk4u2` measures how much redundant hidden re-read traffic a backend pushes to DRAM. |
 | `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
 | `ptx_ru` | Configurable `rows_per_warp={1,2,4,8}` and `k_unroll={4,8,16}` path for memory-outstanding sweeps. |
 
@@ -309,6 +311,19 @@ with 4x fewer outstanding-load counter slots than the scalar `ptx_r2u8` path --
 which matters when that counter, not the register file, is the limit. The
 practical depth ceiling is register pressure: `ptx_r2_chunk4u4` is 54 registers
 on H800, and going deeper risks spills that are fatal for a bandwidth kernel.
+
+The outstanding-window variants all read the hidden vector from global memory,
+once per warp. In a GEMV the weight matrix is read exactly once, but the hidden
+vector is needed by every output row, so each of the ~N/2 warps re-reads the
+whole 6 KB hidden vector — ~763 MB of hidden traffic for `N=248320`, versus
+1526 MB of weight. The benchmark's mandatory-traffic figure counts only the
+weight, which is correct when a backend caches hidden (H800's 50 MB L2 does, so
+`ptx_r2_chunk4u2_smem` ties `ptx_r2_chunk4u2`). On a backend that re-reads
+hidden from DRAM, the real traffic is ~1.5x the counted figure, which alone caps
+the reported bandwidth utilization near 67%. `ptx_r2_chunk4u2_smem` stages the
+hidden vector into shared memory once per block to remove that redundancy; the
+gap between it and `ptx_r2_chunk4u2` isolates how large the effect is on a given
+backend.
 
 For SASS / final-ISA inspection, use:
 

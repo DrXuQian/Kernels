@@ -123,7 +123,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
@@ -1382,6 +1382,180 @@ __global__ void lm_head_gemv_ptx_r2_chunk4u_kernel(
     }
 }
 
+// Clean isolation test for the redundant-hidden-read hypothesis. Identical to
+// ptx_r2_chunk4u2 (2 rows/warp, 6-v4 outstanding window, inline-PTX weight
+// loads) except the hidden vector is cooperatively staged into shared memory
+// once per block; the inner loop then reads hidden from smem and only the 4
+// weight v4 loads hit global. If a backend does not cache the 6 KB hidden
+// vector, every warp re-reads it from DRAM (~763 MB total for this shape);
+// staging it in smem cuts that to one read per block. Comparing this against
+// ptx_r2_chunk4u2 changes only the hidden path, nothing else.
+template <int WarpsPerBlock>
+__global__ void lm_head_gemv_ptx_r2_chunk4u2_smem_kernel(
+    half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
+{
+    extern __shared__ half s_hidden[];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    // Stage hidden into shared memory before the row-range check so every
+    // thread in the block reaches __syncthreads().
+    for (int i = tid; i < k; i += WarpsPerBlock * 32)
+    {
+        s_hidden[i] = hidden[i];
+    }
+    __syncthreads();
+
+    int row0 = (blockIdx.x * WarpsPerBlock + warp) * 2;
+    if (row0 >= n)
+    {
+        return;
+    }
+    int row1 = row0 + 1;
+    bool has_row1 = row1 < n;
+    int safe_row1 = has_row1 ? row1 : row0;
+
+    int k2 = k / 2;
+    int full_k2 = (k2 / 256) * 256;
+    half2 const* sh2 = reinterpret_cast<half2 const*>(s_hidden);
+    half2 const* w20 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(row0) * k);
+    half2 const* w21 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(safe_row1) * k);
+
+    float acc00 = 0.0f;
+    float acc01 = 0.0f;
+    float acc02 = 0.0f;
+    float acc03 = 0.0f;
+    float acc10 = 0.0f;
+    float acc11 = 0.0f;
+    float acc12 = 0.0f;
+    float acc13 = 0.0f;
+
+    for (int step = 0; step < full_k2; step += 256)
+    {
+        int base0 = step + lane * 4;
+        int base1 = step + 128 + lane * 4;
+
+        // hidden from shared memory; only the 4 weight v4 loads hit global.
+        uint4 hv0 = *reinterpret_cast<uint4 const*>(sh2 + base0);
+        uint4 hv1 = *reinterpret_cast<uint4 const*>(sh2 + base1);
+        uint32_t a0_0, a0_1, a0_2, a0_3;
+        uint32_t a1_0, a1_1, a1_2, a1_3;
+        uint32_t b0_0, b0_1, b0_2, b0_3;
+        uint32_t b1_0, b1_1, b1_2, b1_3;
+        ptx_ld_global_v4_u32(w20 + base0, a0_0, a0_1, a0_2, a0_3);
+        ptx_ld_global_v4_u32(w20 + base1, a1_0, a1_1, a1_2, a1_3);
+        ptx_ld_global_v4_u32(w21 + base0, b0_0, b0_1, b0_2, b0_3);
+        ptx_ld_global_v4_u32(w21 + base1, b1_0, b1_1, b1_2, b1_3);
+
+        float2 h = __half22float2(half2_from_u32(hv0.x));
+        float2 a = __half22float2(half2_from_u32(a0_0));
+        float2 b = __half22float2(half2_from_u32(b0_0));
+        acc00 = ptx_fma_rn_f32(h.x, a.x, acc00);
+        acc00 = ptx_fma_rn_f32(h.y, a.y, acc00);
+        acc10 = ptx_fma_rn_f32(h.x, b.x, acc10);
+        acc10 = ptx_fma_rn_f32(h.y, b.y, acc10);
+
+        h = __half22float2(half2_from_u32(hv0.y));
+        a = __half22float2(half2_from_u32(a0_1));
+        b = __half22float2(half2_from_u32(b0_1));
+        acc01 = ptx_fma_rn_f32(h.x, a.x, acc01);
+        acc01 = ptx_fma_rn_f32(h.y, a.y, acc01);
+        acc11 = ptx_fma_rn_f32(h.x, b.x, acc11);
+        acc11 = ptx_fma_rn_f32(h.y, b.y, acc11);
+
+        h = __half22float2(half2_from_u32(hv0.z));
+        a = __half22float2(half2_from_u32(a0_2));
+        b = __half22float2(half2_from_u32(b0_2));
+        acc02 = ptx_fma_rn_f32(h.x, a.x, acc02);
+        acc02 = ptx_fma_rn_f32(h.y, a.y, acc02);
+        acc12 = ptx_fma_rn_f32(h.x, b.x, acc12);
+        acc12 = ptx_fma_rn_f32(h.y, b.y, acc12);
+
+        h = __half22float2(half2_from_u32(hv0.w));
+        a = __half22float2(half2_from_u32(a0_3));
+        b = __half22float2(half2_from_u32(b0_3));
+        acc03 = ptx_fma_rn_f32(h.x, a.x, acc03);
+        acc03 = ptx_fma_rn_f32(h.y, a.y, acc03);
+        acc13 = ptx_fma_rn_f32(h.x, b.x, acc13);
+        acc13 = ptx_fma_rn_f32(h.y, b.y, acc13);
+
+        h = __half22float2(half2_from_u32(hv1.x));
+        a = __half22float2(half2_from_u32(a1_0));
+        b = __half22float2(half2_from_u32(b1_0));
+        acc00 = ptx_fma_rn_f32(h.x, a.x, acc00);
+        acc00 = ptx_fma_rn_f32(h.y, a.y, acc00);
+        acc10 = ptx_fma_rn_f32(h.x, b.x, acc10);
+        acc10 = ptx_fma_rn_f32(h.y, b.y, acc10);
+
+        h = __half22float2(half2_from_u32(hv1.y));
+        a = __half22float2(half2_from_u32(a1_1));
+        b = __half22float2(half2_from_u32(b1_1));
+        acc01 = ptx_fma_rn_f32(h.x, a.x, acc01);
+        acc01 = ptx_fma_rn_f32(h.y, a.y, acc01);
+        acc11 = ptx_fma_rn_f32(h.x, b.x, acc11);
+        acc11 = ptx_fma_rn_f32(h.y, b.y, acc11);
+
+        h = __half22float2(half2_from_u32(hv1.z));
+        a = __half22float2(half2_from_u32(a1_2));
+        b = __half22float2(half2_from_u32(b1_2));
+        acc02 = ptx_fma_rn_f32(h.x, a.x, acc02);
+        acc02 = ptx_fma_rn_f32(h.y, a.y, acc02);
+        acc12 = ptx_fma_rn_f32(h.x, b.x, acc12);
+        acc12 = ptx_fma_rn_f32(h.y, b.y, acc12);
+
+        h = __half22float2(half2_from_u32(hv1.w));
+        a = __half22float2(half2_from_u32(a1_3));
+        b = __half22float2(half2_from_u32(b1_3));
+        acc03 = ptx_fma_rn_f32(h.x, a.x, acc03);
+        acc03 = ptx_fma_rn_f32(h.y, a.y, acc03);
+        acc13 = ptx_fma_rn_f32(h.x, b.x, acc13);
+        acc13 = ptx_fma_rn_f32(h.y, b.y, acc13);
+    }
+
+    float tail0 = 0.0f;
+    float tail1 = 0.0f;
+    for (int i = full_k2 + lane; i < k2; i += 32)
+    {
+        float2 h = __half22float2(sh2[i]);
+        uint32_t w0_pack = ptx_ld_global_u32(w20 + i);
+        float2 w0 = __half22float2(half2_from_u32(w0_pack));
+        tail0 = ptx_fma_rn_f32(h.x, w0.x, tail0);
+        tail0 = ptx_fma_rn_f32(h.y, w0.y, tail0);
+        if (has_row1)
+        {
+            uint32_t w1_pack = ptx_ld_global_u32(w21 + i);
+            float2 w1 = __half22float2(half2_from_u32(w1_pack));
+            tail1 = ptx_fma_rn_f32(h.x, w1.x, tail1);
+            tail1 = ptx_fma_rn_f32(h.y, w1.y, tail1);
+        }
+    }
+
+    float acc0 = (acc00 + acc01) + (acc02 + acc03) + tail0;
+    float acc1 = (acc10 + acc11) + (acc12 + acc13) + tail1;
+    if ((k & 1) && lane == 0)
+    {
+        int kk = k - 1;
+        float h = __half2float(s_hidden[kk]);
+        acc0 = ptx_fma_rn_f32(h, __half2float(weight[static_cast<long long>(row0) * k + kk]), acc0);
+        if (has_row1)
+        {
+            acc1 = ptx_fma_rn_f32(h, __half2float(weight[static_cast<long long>(row1) * k + kk]), acc1);
+        }
+    }
+
+    acc0 = warp_sum(acc0);
+    acc1 = warp_sum(acc1);
+    if (lane == 0)
+    {
+        ptx_st_global_f32(logits + row0, acc0);
+        if (has_row1)
+        {
+            ptx_st_global_f32(logits + row1, acc1);
+        }
+    }
+}
+
 template <int WarpsPerBlock, int RowsPerWarp, int KUnroll>
 __global__ void lm_head_gemv_ptx_ru_kernel(
     half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
@@ -1712,6 +1886,34 @@ float run_lm_head_ptx_r2_chunk4u(Options const& opt, half const* d_hidden, half 
 }
 
 template <int WarpsPerBlock>
+float run_lm_head_ptx_r2_chunk4u2_smem_kernel(
+    Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    int blocks = (opt.n + 2 * WarpsPerBlock - 1) / (2 * WarpsPerBlock);
+    size_t smem = static_cast<size_t>(opt.k) * sizeof(half);
+    return median_time_ms(
+        [&] {
+            lm_head_gemv_ptx_r2_chunk4u2_smem_kernel<WarpsPerBlock>
+                <<<blocks, threads, smem>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        },
+        opt.warmup, opt.iters);
+}
+
+float run_lm_head_ptx_r2_chunk4u2_smem(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.warps_per_block == 4)
+    {
+        return run_lm_head_ptx_r2_chunk4u2_smem_kernel<4>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.warps_per_block == 8)
+    {
+        return run_lm_head_ptx_r2_chunk4u2_smem_kernel<8>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_r2_chunk4u2_smem_kernel<16>(opt, d_hidden, d_weight, d_logits);
+}
+
+template <int WarpsPerBlock>
 float run_lm_head_ptx_r2u4_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
 {
     int threads = WarpsPerBlock * 32;
@@ -2039,6 +2241,33 @@ void run_gemv_r2_chunk4u4_case(Options const& opt)
     CHECK_CUDA(cudaFree(d_logits));
 }
 
+void run_gemv_r2_chunk4u2_smem_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_r2_chunk4u2_smem: n=%d k=%d weight=%.3f MB logits=%.3f MB warps/block=%d\n", opt.n, opt.k,
+        weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.warps_per_block);
+    float ms = run_lm_head_ptx_r2_chunk4u2_smem(opt, d_hidden, d_weight, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw("ptx_r2_chunk4u2_smem", ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
 void run_copy_case(Options const& opt)
 {
     size_t bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
@@ -2153,6 +2382,10 @@ int main(int argc, char** argv)
     else if (opt.op == "ptx_r2_chunk4u4")
     {
         run_gemv_r2_chunk4u4_case(opt);
+    }
+    else if (opt.op == "ptx_r2_chunk4u2_smem")
+    {
+        run_gemv_r2_chunk4u2_smem_case(opt);
     }
     else if (opt.op == "ptx_chunk4")
     {
