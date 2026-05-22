@@ -92,7 +92,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|scalar|half8|copy|memcpy|copy_u4|copy_u8]\n"
+            std::printf("Usage: %s [--op all|scalar|half8|copy|memcpy|copy_u4|copy_u8|copy_unroll|copy_u8_unroll{1,2,4,8,16}]\n"
                         "          [--tokens N] [--hidden N] [--mib MiB] [--warmup N] [--iters N]\n",
                 argv[0]);
             std::exit(0);
@@ -208,6 +208,37 @@ __global__ void copy_u8_kernel(ulonglong4* __restrict__ dst, ulonglong4 const* _
     }
 }
 
+template <int Unroll>
+__global__ void copy_u8_unroll_kernel(ulonglong4* __restrict__ dst, ulonglong4 const* __restrict__ src, size_t n)
+{
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x * Unroll;
+    size_t full_n = (n / Unroll) * Unroll;
+    for (size_t base = tid * Unroll; base < full_n; base += stride)
+    {
+        ulonglong4 values[Unroll];
+
+#pragma unroll
+        for (int i = 0; i < Unroll; ++i)
+        {
+            values[i] = src[base + i];
+        }
+
+#pragma unroll
+        for (int i = 0; i < Unroll; ++i)
+        {
+            dst[base + i] = values[i];
+        }
+    }
+
+    size_t tail = full_n + tid;
+    size_t tail_stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t i = tail; i < n; i += tail_stride)
+    {
+        dst[i] = src[i];
+    }
+}
+
 void print_bw(char const* name, float ms, double bytes)
 {
     double gbps = bytes / (ms * 1.0e-3) / 1.0e9;
@@ -259,7 +290,25 @@ void run_residual_cases(Options const& opt, bool run_scalar, bool run_half8)
     CHECK_CUDA(cudaFree(d_out));
 }
 
-void run_copy_cases(Options const& opt, bool run_memcpy, bool run_u4, bool run_u8)
+template <int Unroll>
+void run_copy_u8_unroll_case(Options const& opt, void* dst, void const* src, size_t bytes, int blocks, int threads,
+    double copy_traffic)
+{
+    size_t n = bytes / sizeof(ulonglong4);
+    char name[64];
+    std::snprintf(name, sizeof(name), "copy_u8_unroll%d", Unroll);
+    float ms = median_time_ms(
+        [&] {
+            copy_u8_unroll_kernel<Unroll>
+                <<<blocks, threads>>>(static_cast<ulonglong4*>(dst), static_cast<ulonglong4 const*>(src), n);
+        },
+        opt.warmup, opt.iters);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw(name, ms, copy_traffic);
+}
+
+void run_copy_cases(Options const& opt, bool run_memcpy, bool run_u4, bool run_u8, bool run_unroll1, bool run_unroll2,
+    bool run_unroll4, bool run_unroll8, bool run_unroll16)
 {
     size_t bytes = opt.mib > 0 ? opt.mib * 1024ULL * 1024ULL : static_cast<size_t>(opt.tokens * opt.hidden) * sizeof(half);
     bytes = bytes / sizeof(ulonglong4) * sizeof(ulonglong4);
@@ -304,6 +353,26 @@ void run_copy_cases(Options const& opt, bool run_memcpy, bool run_u4, bool run_u
         CHECK_CUDA(cudaGetLastError());
         print_bw("copy_u8_kernel", ms, copy_traffic);
     }
+    if (run_unroll1)
+    {
+        run_copy_u8_unroll_case<1>(opt, dst, src, bytes, blocks, threads, copy_traffic);
+    }
+    if (run_unroll2)
+    {
+        run_copy_u8_unroll_case<2>(opt, dst, src, bytes, blocks, threads, copy_traffic);
+    }
+    if (run_unroll4)
+    {
+        run_copy_u8_unroll_case<4>(opt, dst, src, bytes, blocks, threads, copy_traffic);
+    }
+    if (run_unroll8)
+    {
+        run_copy_u8_unroll_case<8>(opt, dst, src, bytes, blocks, threads, copy_traffic);
+    }
+    if (run_unroll16)
+    {
+        run_copy_u8_unroll_case<16>(opt, dst, src, bytes, blocks, threads, copy_traffic);
+    }
 
     CHECK_CUDA(cudaFree(src));
     CHECK_CUDA(cudaFree(dst));
@@ -322,7 +391,7 @@ int main(int argc, char** argv)
     if (opt.op == "all")
     {
         run_residual_cases(opt, true, true);
-        run_copy_cases(opt, true, true, true);
+        run_copy_cases(opt, true, true, true, false, false, false, false, false);
     }
     else if (opt.op == "scalar")
     {
@@ -334,19 +403,43 @@ int main(int argc, char** argv)
     }
     else if (opt.op == "copy")
     {
-        run_copy_cases(opt, true, true, true);
+        run_copy_cases(opt, true, true, true, false, false, false, false, false);
     }
     else if (opt.op == "memcpy")
     {
-        run_copy_cases(opt, true, false, false);
+        run_copy_cases(opt, true, false, false, false, false, false, false, false);
     }
     else if (opt.op == "copy_u4")
     {
-        run_copy_cases(opt, false, true, false);
+        run_copy_cases(opt, false, true, false, false, false, false, false, false);
     }
     else if (opt.op == "copy_u8")
     {
-        run_copy_cases(opt, false, false, true);
+        run_copy_cases(opt, false, false, true, false, false, false, false, false);
+    }
+    else if (opt.op == "copy_unroll")
+    {
+        run_copy_cases(opt, false, false, false, true, true, true, true, true);
+    }
+    else if (opt.op == "copy_u8_unroll1")
+    {
+        run_copy_cases(opt, false, false, false, true, false, false, false, false);
+    }
+    else if (opt.op == "copy_u8_unroll2")
+    {
+        run_copy_cases(opt, false, false, false, false, true, false, false, false);
+    }
+    else if (opt.op == "copy_u8_unroll4")
+    {
+        run_copy_cases(opt, false, false, false, false, false, true, false, false);
+    }
+    else if (opt.op == "copy_u8_unroll8")
+    {
+        run_copy_cases(opt, false, false, false, false, false, false, true, false);
+    }
+    else if (opt.op == "copy_u8_unroll16")
+    {
+        run_copy_cases(opt, false, false, false, false, false, false, false, true);
     }
     else
     {
@@ -355,4 +448,3 @@ int main(int argc, char** argv)
     }
     return 0;
 }
-

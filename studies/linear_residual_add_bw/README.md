@@ -7,6 +7,7 @@ flows. It is a small study for comparing:
 - optimized residual add: vectorized `Half8` load/store with `half2` add
 - pure memory copy: `cudaMemcpyAsync` device-to-device
 - pure memory copy: SM copy kernels using `uint4` and `ulonglong4`
+- pure memory copy: SM `ulonglong4` kernels with load/store split unroll
 
 The target operator is Qwen3.5 linear/full-attention residual add:
 
@@ -58,6 +59,30 @@ Run only copy roofline with a fixed allocation size:
 ./bench_residual_add_bw --op=copy --mib=2048 --warmup=200 --iters=300
 ```
 
+Run the copy outstanding experiment. These variants use the same `ulonglong4`
+vector type, but each thread preloads `1/2/4/8/16` vectors before storing them:
+
+```bash
+./bench_residual_add_bw --op=copy_unroll --mib=4096 --warmup=100 --iters=200
+
+for u in 1 2 4 8 16; do
+  ./bench_residual_add_bw --op=copy_u8_unroll${u} --mib=4096 --warmup=100 --iters=200
+done
+```
+
+Single-kernel NCU capture:
+
+```bash
+METRICS='gpu__time_duration.avg,dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct,smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct'
+
+for u in 1 2 4 8 16; do
+  ncu --target-processes all --kernel-name-base demangled --page raw --csv \
+    --metrics "$METRICS" \
+    ./bench_residual_add_bw --op=copy_u8_unroll${u} --mib=4096 --warmup=0 --iters=1 \
+    > /tmp/copy_u${u}.csv
+done
+```
+
 Run only the vectorized residual add:
 
 ```bash
@@ -80,4 +105,3 @@ On the local H800 PCIe, the main observations were:
 Interpretation: the scalar production kernel is not a pure memory-copy roofline
 case because it converts through fp32 per element. The half8 study path removes
 that overhead and reaches roughly the device-copy roofline on H800.
-

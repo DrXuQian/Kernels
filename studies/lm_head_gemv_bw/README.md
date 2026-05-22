@@ -76,6 +76,44 @@ More aggressive inline-PTX variants:
 ./bench_lm_head_gemv --op=ptx_r4_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 ```
 
+Configurable outstanding experiment:
+
+```bash
+# rows_per_warp={1,2,4,8}, k_unroll={4,8,16}
+for r in 1 2 4 8; do
+  for u in 4 8 16; do
+    ./bench_lm_head_gemv \
+      --op=ptx_ru \
+      --rows-per-warp=$r \
+      --k-unroll=$u \
+      --n=248320 --k=3072 \
+      --warps-per-block=8 \
+      --warmup=100 --iters=200
+  done
+done
+```
+
+Single-kernel NCU capture for the same sweep:
+
+```bash
+METRICS='gpu__time_duration.avg,dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active,smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct,smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct'
+
+for r in 1 2 4 8; do
+  for u in 4 8 16; do
+    ncu --target-processes all --kernel-name-base demangled --page raw --csv \
+      --metrics "$METRICS" \
+      ./bench_lm_head_gemv \
+        --op=ptx_ru \
+        --rows-per-warp=$r \
+        --k-unroll=$u \
+        --n=248320 --k=3072 \
+        --warps-per-block=8 \
+        --warmup=0 --iters=1 \
+      > /tmp/gemv_r${r}_u${u}.csv
+  done
+done
+```
+
 Compile with `-O1` if you want to reduce backend scheduling aggressiveness for
 compiler-sensitivity checks:
 

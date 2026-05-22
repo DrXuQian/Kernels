@@ -265,6 +265,7 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 | `ptx_chunk4` | Each lane loads 4 consecutive `half2` values with `ld.global.v4.u32`, reducing load instruction count and improving contiguous memory issue. |
 | `ptx_r2_chunk4` | 2 rows/warp plus `chunk4`; tests whether more independent weight streams help after load vectorization. |
 | `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
+| `ptx_ru` | Configurable `rows_per_warp={1,2,4,8}` and `k_unroll={4,8,16}` path for memory-outstanding sweeps. |
 
 On the local H800, `ptx_chunk4` is the best variant. This suggests load
 instruction count / contiguous issue still matters slightly even when the simple

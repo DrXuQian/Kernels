@@ -41,6 +41,8 @@ struct Options
     int n = 248320;
     int k = 3072;
     int warps_per_block = 8;
+    int rows_per_warp = 1;
+    int k_unroll = 4;
     int warmup = 100;
     int iters = 200;
 };
@@ -87,6 +89,22 @@ Options parse_args(int argc, char** argv)
         {
             opt.warps_per_block = std::atoi(argv[++i]);
         }
+        else if (starts_with(argv[i], "--rows-per-warp="))
+        {
+            opt.rows_per_warp = std::atoi(argv[i] + 16);
+        }
+        else if (std::strcmp(argv[i], "--rows-per-warp") == 0)
+        {
+            opt.rows_per_warp = std::atoi(argv[++i]);
+        }
+        else if (starts_with(argv[i], "--k-unroll="))
+        {
+            opt.k_unroll = std::atoi(argv[i] + 11);
+        }
+        else if (std::strcmp(argv[i], "--k-unroll") == 0)
+        {
+            opt.k_unroll = std::atoi(argv[++i]);
+        }
         else if (starts_with(argv[i], "--warmup="))
         {
             opt.warmup = std::atoi(argv[i] + 9);
@@ -105,8 +123,9 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_chunk4|ptx_r2_chunk4|ptx_r4_chunk4|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_chunk4|ptx_r2_chunk4|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
+                        "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
                 argv[0]);
             std::exit(0);
@@ -126,6 +145,16 @@ Options parse_args(int argc, char** argv)
     if (opt.warps_per_block != 4 && opt.warps_per_block != 8 && opt.warps_per_block != 16)
     {
         std::fprintf(stderr, "warps-per-block must be 4, 8, or 16\n");
+        std::exit(1);
+    }
+    if (opt.rows_per_warp != 1 && opt.rows_per_warp != 2 && opt.rows_per_warp != 4 && opt.rows_per_warp != 8)
+    {
+        std::fprintf(stderr, "rows-per-warp must be 1, 2, 4, or 8\n");
+        std::exit(1);
+    }
+    if (opt.k_unroll != 4 && opt.k_unroll != 8 && opt.k_unroll != 16)
+    {
+        std::fprintf(stderr, "k-unroll must be 4, 8, or 16\n");
         std::exit(1);
     }
     return opt;
@@ -885,6 +914,131 @@ __global__ void lm_head_gemv_ptx_r2_chunk4_kernel(
     }
 }
 
+template <int WarpsPerBlock, int RowsPerWarp, int KUnroll>
+__global__ void lm_head_gemv_ptx_ru_kernel(
+    half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
+{
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int row_base = (blockIdx.x * WarpsPerBlock + warp) * RowsPerWarp;
+    if (row_base >= n)
+    {
+        return;
+    }
+
+    int k2 = k / 2;
+    half2 const* h2 = reinterpret_cast<half2 const*>(hidden);
+    half2 const* w2[RowsPerWarp];
+    bool has_row[RowsPerWarp];
+
+#pragma unroll
+    for (int r = 0; r < RowsPerWarp; ++r)
+    {
+        int row = row_base + r;
+        has_row[r] = row < n;
+        int safe_row = has_row[r] ? row : row_base;
+        w2[r] = reinterpret_cast<half2 const*>(weight + static_cast<long long>(safe_row) * k);
+    }
+
+    float acc[RowsPerWarp][KUnroll];
+    float tail[RowsPerWarp];
+#pragma unroll
+    for (int r = 0; r < RowsPerWarp; ++r)
+    {
+        tail[r] = 0.0f;
+#pragma unroll
+        for (int u = 0; u < KUnroll; ++u)
+        {
+            acc[r][u] = 0.0f;
+        }
+    }
+
+    int i = lane;
+    for (; i + 32 * (KUnroll - 1) < k2; i += 32 * KUnroll)
+    {
+        uint32_t h_pack[KUnroll];
+        uint32_t w_pack[RowsPerWarp][KUnroll];
+
+#pragma unroll
+        for (int u = 0; u < KUnroll; ++u)
+        {
+            h_pack[u] = ptx_ld_global_u32(h2 + i + 32 * u);
+        }
+
+#pragma unroll
+        for (int r = 0; r < RowsPerWarp; ++r)
+        {
+            if (has_row[r])
+            {
+#pragma unroll
+                for (int u = 0; u < KUnroll; ++u)
+                {
+                    w_pack[r][u] = ptx_ld_global_u32(w2[r] + i + 32 * u);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < KUnroll; ++u)
+        {
+            float2 h = __half22float2(half2_from_u32(h_pack[u]));
+#pragma unroll
+            for (int r = 0; r < RowsPerWarp; ++r)
+            {
+                if (has_row[r])
+                {
+                    float2 w = __half22float2(half2_from_u32(w_pack[r][u]));
+                    acc[r][u] = ptx_fma_rn_f32(h.x, w.x, acc[r][u]);
+                    acc[r][u] = ptx_fma_rn_f32(h.y, w.y, acc[r][u]);
+                }
+            }
+        }
+    }
+
+    for (; i < k2; i += 32)
+    {
+        uint32_t h_pack = ptx_ld_global_u32(h2 + i);
+        float2 h = __half22float2(half2_from_u32(h_pack));
+#pragma unroll
+        for (int r = 0; r < RowsPerWarp; ++r)
+        {
+            if (has_row[r])
+            {
+                uint32_t w_pack = ptx_ld_global_u32(w2[r] + i);
+                float2 w = __half22float2(half2_from_u32(w_pack));
+                tail[r] = ptx_fma_rn_f32(h.x, w.x, tail[r]);
+                tail[r] = ptx_fma_rn_f32(h.y, w.y, tail[r]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < RowsPerWarp; ++r)
+    {
+        if (has_row[r])
+        {
+            float out = tail[r];
+#pragma unroll
+            for (int u = 0; u < KUnroll; ++u)
+            {
+                out += acc[r][u];
+            }
+            if ((k & 1) && lane == 0)
+            {
+                int kk = k - 1;
+                float h = __half2float(hidden[kk]);
+                out = ptx_fma_rn_f32(h, __half2float(weight[static_cast<long long>(row_base + r) * k + kk]), out);
+            }
+            out = warp_sum(out);
+            if (lane == 0)
+            {
+                ptx_st_global_f32(logits + row_base + r, out);
+            }
+        }
+    }
+}
+
 __global__ void copy_u8_kernel(ulonglong4* __restrict__ dst, ulonglong4 const* __restrict__ src, size_t n)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1088,6 +1242,65 @@ float run_lm_head_ptx_r4_chunk4(Options const& opt, half const* d_hidden, half c
     return run_lm_head_ptx_r4_chunk4_kernel<16>(opt, d_hidden, d_weight, d_logits);
 }
 
+template <int WarpsPerBlock, int RowsPerWarp, int KUnroll>
+float run_lm_head_ptx_ru_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    int rows_per_block = WarpsPerBlock * RowsPerWarp;
+    int blocks = (opt.n + rows_per_block - 1) / rows_per_block;
+    return median_time_ms(
+        [&] {
+            lm_head_gemv_ptx_ru_kernel<WarpsPerBlock, RowsPerWarp, KUnroll>
+                <<<blocks, threads>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        },
+        opt.warmup, opt.iters);
+}
+
+template <int WarpsPerBlock, int RowsPerWarp>
+float run_lm_head_ptx_ru_rows(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.k_unroll == 4)
+    {
+        return run_lm_head_ptx_ru_kernel<WarpsPerBlock, RowsPerWarp, 4>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.k_unroll == 8)
+    {
+        return run_lm_head_ptx_ru_kernel<WarpsPerBlock, RowsPerWarp, 8>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_ru_kernel<WarpsPerBlock, RowsPerWarp, 16>(opt, d_hidden, d_weight, d_logits);
+}
+
+template <int WarpsPerBlock>
+float run_lm_head_ptx_ru_warps(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.rows_per_warp == 1)
+    {
+        return run_lm_head_ptx_ru_rows<WarpsPerBlock, 1>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.rows_per_warp == 2)
+    {
+        return run_lm_head_ptx_ru_rows<WarpsPerBlock, 2>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.rows_per_warp == 4)
+    {
+        return run_lm_head_ptx_ru_rows<WarpsPerBlock, 4>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_ru_rows<WarpsPerBlock, 8>(opt, d_hidden, d_weight, d_logits);
+}
+
+float run_lm_head_ptx_ru(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.warps_per_block == 4)
+    {
+        return run_lm_head_ptx_ru_warps<4>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.warps_per_block == 8)
+    {
+        return run_lm_head_ptx_ru_warps<8>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_ru_warps<16>(opt, d_hidden, d_weight, d_logits);
+}
+
 void print_bw(char const* name, float ms, double bytes)
 {
     double gbps = bytes / (ms * 1.0e-3) / 1.0e9;
@@ -1168,6 +1381,36 @@ void run_gemv_cases(Options const& opt, bool run_shared, bool run_global, bool r
     CHECK_CUDA(cudaFree(d_logits));
 }
 
+void run_gemv_ru_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_ru: n=%d k=%d weight=%.3f MB logits=%.3f MB warps/block=%d rows/warp=%d k_unroll=%d\n",
+        opt.n, opt.k, weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.warps_per_block, opt.rows_per_warp,
+        opt.k_unroll);
+    float ms = run_lm_head_ptx_ru(opt, d_hidden, d_weight, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    char name[64];
+    std::snprintf(name, sizeof(name), "ptx_ru_r%d_u%d", opt.rows_per_warp, opt.k_unroll);
+    print_bw(name, ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
 void run_copy_case(Options const& opt)
 {
     size_t bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
@@ -1242,8 +1485,8 @@ int main(int argc, char** argv)
     Options opt = parse_args(argc, argv);
     cudaDeviceProp prop{};
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
-    std::printf("device=%s sms=%d op=%s warmup=%d iters=%d\n", prop.name, prop.multiProcessorCount, opt.op.c_str(),
-        opt.warmup, opt.iters);
+    std::printf("device=%s sms=%d op=%s warmup=%d iters=%d rows/warp=%d k_unroll=%d\n", prop.name,
+        prop.multiProcessorCount, opt.op.c_str(), opt.warmup, opt.iters, opt.rows_per_warp, opt.k_unroll);
 
     if (opt.op == "all")
     {
@@ -1282,6 +1525,10 @@ int main(int argc, char** argv)
     else if (opt.op == "ptx_r4_chunk4")
     {
         run_gemv_cases(opt, false, false, false, false, false, false, false, true);
+    }
+    else if (opt.op == "ptx_ru")
+    {
+        run_gemv_ru_case(opt);
     }
     else if (opt.op == "copy" || opt.op == "copy_u8")
     {
