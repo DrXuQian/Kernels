@@ -2039,6 +2039,9 @@ float run_lm_head_ptx_cpasync_kernel(Options const& opt, half const* d_hidden, h
     int blocks = (opt.n + WarpsPerBlock - 1) / WarpsPerBlock;
     int ring_off = ((opt.k * static_cast<int>(sizeof(half)) + 15) / 16) * 16;
     size_t smem = static_cast<size_t>(ring_off) + static_cast<size_t>(WarpsPerBlock) * Stages * 128 * sizeof(half2);
+    // Deep pipelines exceed the 48 KB default; opt into the larger limit.
+    CHECK_CUDA(cudaFuncSetAttribute(lm_head_gemv_ptx_cpasync_kernel<WarpsPerBlock, Stages>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
     return median_time_ms(
         [&] {
             lm_head_gemv_ptx_cpasync_kernel<WarpsPerBlock, Stages>
@@ -2047,17 +2050,35 @@ float run_lm_head_ptx_cpasync_kernel(Options const& opt, half const* d_hidden, h
         opt.warmup, opt.iters);
 }
 
+// --k-unroll selects the cp.async pipeline depth (Stages). Deeper Stages keeps
+// more weight tiles in flight in shared memory: per warp the in-flight window
+// is (Stages-1) tiles * 512 B. Stages=4 is shallower than the register-resident
+// chunk4 window; Stages=16 is ~2.5x deeper.
+template <int WarpsPerBlock>
+float run_lm_head_ptx_cpasync_stages(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.k_unroll == 4)
+    {
+        return run_lm_head_ptx_cpasync_kernel<WarpsPerBlock, 4>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.k_unroll == 8)
+    {
+        return run_lm_head_ptx_cpasync_kernel<WarpsPerBlock, 8>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_cpasync_kernel<WarpsPerBlock, 16>(opt, d_hidden, d_weight, d_logits);
+}
+
 float run_lm_head_ptx_cpasync(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
 {
     if (opt.warps_per_block == 4)
     {
-        return run_lm_head_ptx_cpasync_kernel<4, 4>(opt, d_hidden, d_weight, d_logits);
+        return run_lm_head_ptx_cpasync_stages<4>(opt, d_hidden, d_weight, d_logits);
     }
     if (opt.warps_per_block == 8)
     {
-        return run_lm_head_ptx_cpasync_kernel<8, 4>(opt, d_hidden, d_weight, d_logits);
+        return run_lm_head_ptx_cpasync_stages<8>(opt, d_hidden, d_weight, d_logits);
     }
-    return run_lm_head_ptx_cpasync_kernel<16, 4>(opt, d_hidden, d_weight, d_logits);
+    return run_lm_head_ptx_cpasync_stages<16>(opt, d_hidden, d_weight, d_logits);
 }
 
 template <int WarpsPerBlock>

@@ -339,6 +339,16 @@ at the roofline so this does not show as a speedup (1.952 TB/s); it is built for
 a latency-bound backend where the register-resident variants plateau with the
 DRAM bus under-fed.
 
+The cp.async pipeline depth is exposed as `--k-unroll` (Stages 4/8/16). Little's
+law sets the target: the bytes that must be in flight to saturate the bus equal
+`bandwidth * latency`. The per-warp in-flight window is `(Stages-1)` tiles of
+512 B; chip-wide in-flight is that times the resident warp count. For a
+register-resident variant both factors are bounded by the register file. For
+`ptx_cpasync` the window lives in shared memory, so it scales with `Stages`
+independently of the 32-register occupancy footprint — the only lever that can
+match a large bandwidth-delay product. On H800, deeper Stages still nudges the
+roofline (1.952 / 1.960 / 1.965 TB/s for Stages 4 / 8 / 16).
+
 For SASS / final-ISA inspection, use:
 
 ```bash
