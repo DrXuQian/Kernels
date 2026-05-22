@@ -232,6 +232,10 @@ Local H800 result for `N=248320, K=3072`:
 | custom `shared`, 8 warps/block | 0.7927 ms | 1.926 TB/s |
 | custom `global`, 8 warps/block | 0.7897 ms | 1.933 TB/s |
 | custom `ptx_global`, 8 warps/block | 0.7868 ms | 1.940 TB/s |
+| custom `ptx_u4`, 8 warps/block, `-O3` | 0.7887 ms | 1.936 TB/s |
+| custom `ptx_r2u4`, 8 warps/block, `-O3` | 0.7888 ms | 1.935 TB/s |
+| custom `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
+| custom `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
 | cuBLAS | 0.7903 ms | ~1.932 TB/s |
 
 For LM head, cuBLAS and the dedicated kernel are both near the copy roofline.
@@ -248,6 +252,19 @@ st.global.f32   // logits write
 
 This is not meant to beat cuBLAS materially. It exists to reduce differences
 from CUDA C++ frontend optimization when comparing compiler behavior.
+
+Two more aggressive PTX variants are included for non-NVIDIA backend studies:
+
+| Variant | Idea |
+|---|---|
+| `ptx_u4` | 4-way K unroll; issue multiple packed hidden/weight loads before using them; 4 independent accumulators per lane. |
+| `ptx_r2u4` | Same 4-way K unroll, but each warp computes 2 vocab rows and reuses the hidden load across two independent weight streams. |
+
+On the local H800 these variants do not improve over `ptx_global`, and `-O1`
+does not materially change the result. That is a useful negative control:
+NVIDIA's backend already schedules the simple PTX path well. These variants are
+primarily useful on platforms where profiling shows the simple GEMV loop stalling
+on memory dependency instead of vmem pipe pressure.
 
 The in-directory cuBLAS bandwidth example is:
 
