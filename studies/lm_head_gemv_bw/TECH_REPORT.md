@@ -240,6 +240,7 @@ Local H800 result for `N=248320, K=3072`:
 | custom `ptx_r2_chunk4u2`, 8 warps/block, `-O3` | 0.7868 ms | 1.940 TB/s |
 | custom `ptx_r2_chunk4u4`, 8 warps/block, `-O3` | 0.7862 ms | 1.942 TB/s |
 | custom `ptx_r2_chunk4u2_smem`, 8 warps/block, `-O3` | 0.7871 ms | 1.940 TB/s |
+| custom `ptx_cpasync`, 8 warps/block, `-O3` | 0.7820 ms | 1.952 TB/s |
 | custom `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | custom `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | custom `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
@@ -272,6 +273,7 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 | `ptx_r2_chunk4u2` | 2 rows/warp, `chunk4` v4 loads, 2-tile unroll with all 6 v4 loads issued before any FMA. Wide-load version of `ptx_r2u8`: same ~96 bytes/lane outstanding, 6 wide loads instead of 24 narrow ones. |
 | `ptx_r2_chunk4u4` | 2 rows/warp, `chunk4` v4 loads, 4-tile unroll with all 12 v4 loads issued before any FMA. Doubles the `ptx_r2_chunk4u2` window to 192 bytes/lane; 54 registers on H800, no spills. |
 | `ptx_r2_chunk4u2_smem` | `ptx_r2_chunk4u2` with the hidden vector staged into shared memory once per block. Diagnostic: the gap vs `ptx_r2_chunk4u2` measures how much redundant hidden re-read traffic a backend pushes to DRAM. |
+| `ptx_cpasync` | Weight streamed global->shared via `cp.async` (sm_80+); in-flight load data lands in shared memory, not registers, so outstanding-window depth is decoupled from register pressure. 32 registers, `Stages`-deep software pipeline; case self-checks correctness vs the simple GEMV. |
 | `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
 | `ptx_ru` | Configurable `rows_per_warp={1,2,4,8}` and `k_unroll={4,8,16}` path for memory-outstanding sweeps. |
 
@@ -324,6 +326,18 @@ the reported bandwidth utilization near 67%. `ptx_r2_chunk4u2_smem` stages the
 hidden vector into shared memory once per block to remove that redundancy; the
 gap between it and `ptx_r2_chunk4u2` isolates how large the effect is on a given
 backend.
+
+`ptx_cpasync` targets the underlying ceiling. Every register-resident variant
+must hold each in-flight load's result in a register, so the outstanding-load
+window competes with occupancy for the register file — a deeper window means
+fewer resident warps. `ptx_cpasync` streams the weight global->shared with
+`cp.async`, so the in-flight data occupies shared memory rather than registers:
+the kernel is 32 registers irrespective of pipeline depth, and the `Stages`-deep
+ring buffer is bounded by shared memory. This is the only variant that can grow
+the in-flight window without paying occupancy for it. On H800 every variant is
+at the roofline so this does not show as a speedup (1.952 TB/s); it is built for
+a latency-bound backend where the register-resident variants plateau with the
+DRAM bus under-fed.
 
 For SASS / final-ISA inspection, use:
 

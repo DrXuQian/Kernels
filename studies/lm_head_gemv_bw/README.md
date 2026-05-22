@@ -94,6 +94,12 @@ More aggressive inline-PTX variants:
 # DRAM. Ties ptx_r2_chunk4u2 on backends that cache the hidden vector.
 ./bench_lm_head_gemv --op=ptx_r2_chunk4u2_smem --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 
+# Weight streamed global -> shared memory via cp.async (sm_80+), so in-flight
+# load data lands in smem instead of registers. Decouples the outstanding-load
+# window from register pressure: 32 registers, Stages-deep software pipeline.
+# Aimed at backends where the register-resident variants leave the bus under-fed.
+./bench_lm_head_gemv --op=ptx_cpasync --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+
 # 4 output rows per warp + consecutive chunk4 loads. Useful to test whether
 # more independent weight streams help a backend, but it has higher register pressure.
 ./bench_lm_head_gemv --op=ptx_r4_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
@@ -191,6 +197,7 @@ Local H800 PCIe, `N=248320`, `K=3072`, fp16 input/weight and fp32 logits:
 | `ptx_r2_chunk4u2`, 8 warps/block, `-O3` | 0.7868 ms | 1.940 TB/s |
 | `ptx_r2_chunk4u4`, 8 warps/block, `-O3` | 0.7862 ms | 1.942 TB/s |
 | `ptx_r2_chunk4u2_smem`, 8 warps/block, `-O3` | 0.7871 ms | 1.940 TB/s |
+| `ptx_cpasync`, 8 warps/block, `-O3` | 0.7820 ms | 1.952 TB/s |
 | `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
@@ -243,3 +250,14 @@ shape. A backend with enough cache (H800: 50 MB L2) absorbs those re-reads, so
 `ptx_r2_chunk4u2_smem` ties `ptx_r2_chunk4u2` on H800. A backend that re-reads
 hidden from DRAM does not — the gap between the two variants measures that
 otherwise-uncounted redundant traffic.
+
+`ptx_cpasync` attacks the register ceiling directly. Every other variant
+receives weight into registers, so the outstanding-load window is bounded by the
+register file — and registers spent on a deeper window are registers not spent
+on occupancy. `ptx_cpasync` streams weight global→shared with `cp.async`: the
+in-flight data lands in shared memory, the kernel stays at 32 registers
+regardless of pipeline depth, and the `Stages`-deep window is bounded by shared
+memory instead. On H800 it ties the roofline (1.952 TB/s, and the case
+self-checks correctness against the simple GEMV); it is built for a
+latency-bound backend where register-resident windows could not add in-flight
+loads without losing occupancy.

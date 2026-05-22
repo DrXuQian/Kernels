@@ -123,7 +123,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_cpasync|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
@@ -1556,6 +1556,125 @@ __global__ void lm_head_gemv_ptx_r2_chunk4u2_smem_kernel(
     }
 }
 
+__device__ __forceinline__ void cp_async_cg_16(void* smem_ptr, void const* global_ptr)
+{
+    unsigned smem_addr = static_cast<unsigned>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr), "l"(global_ptr));
+}
+
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n");
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait()
+{
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
+// cp.async-prefetched variant. The structural change vs every other variant:
+// the weight stream is copied global -> shared memory with cp.async, so the
+// in-flight load data lands in shared memory instead of registers. That
+// decouples the outstanding-load window depth from register pressure -- the
+// register-bound ceiling that caps the ptx_r2u8 / ptx_r2_chunk4u* family. The
+// kernel keeps very few registers (one accumulator + addressing), so occupancy
+// is high, while a Stages-deep software pipeline keeps Stages-1 weight tiles in
+// flight. Hidden is staged in shared memory once per block; each warp computes
+// one output row over 128-half2 weight tiles.
+template <int WarpsPerBlock, int Stages>
+__global__ void lm_head_gemv_ptx_cpasync_kernel(
+    half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
+{
+    extern __shared__ char cpasync_smem[];
+    half* s_hidden = reinterpret_cast<half*>(cpasync_smem);
+    int k2 = k / 2;
+    // Weight ring buffer starts 16-byte aligned after the staged hidden vector.
+    int ring_off = ((k * static_cast<int>(sizeof(half)) + 15) / 16) * 16;
+    half2* s_wbuf = reinterpret_cast<half2*>(cpasync_smem + ring_off);
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    for (int i = tid; i < k; i += WarpsPerBlock * 32)
+    {
+        s_hidden[i] = hidden[i];
+    }
+    __syncthreads();
+
+    int row = blockIdx.x * WarpsPerBlock + warp;
+    if (row >= n)
+    {
+        return;
+    }
+
+    half2 const* h2 = reinterpret_cast<half2 const*>(s_hidden);
+    half2 const* w2 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(row) * k);
+    half2* my_ring = s_wbuf + warp * (Stages * 128);
+
+    int full_tiles = k2 / 128;
+    float acc = 0.0f;
+
+    // Prologue: issue the first Stages-1 tile copies.
+#pragma unroll
+    for (int s = 0; s < Stages - 1; ++s)
+    {
+        if (s < full_tiles)
+        {
+            cp_async_cg_16(&my_ring[s * 128 + lane * 4], &w2[s * 128 + lane * 4]);
+        }
+        cp_async_commit();
+    }
+
+    for (int t = 0; t < full_tiles; ++t)
+    {
+        cp_async_wait<Stages - 2>();
+        __syncwarp();
+
+        int pre = t + Stages - 1;
+        if (pre < full_tiles)
+        {
+            int slot = pre % Stages;
+            cp_async_cg_16(&my_ring[slot * 128 + lane * 4], &w2[pre * 128 + lane * 4]);
+        }
+        cp_async_commit();
+
+        half2 const* wt = my_ring + (t % Stages) * 128;
+        half2 const* ht = h2 + t * 128;
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+        {
+            float2 hv = __half22float2(ht[lane + 32 * u]);
+            float2 wv = __half22float2(wt[lane + 32 * u]);
+            acc = ptx_fma_rn_f32(hv.x, wv.x, acc);
+            acc = ptx_fma_rn_f32(hv.y, wv.y, acc);
+        }
+    }
+    cp_async_wait<0>();
+
+    for (int i = full_tiles * 128 + lane; i < k2; i += 32)
+    {
+        float2 hv = __half22float2(h2[i]);
+        uint32_t w_pack = ptx_ld_global_u32(w2 + i);
+        float2 wv = __half22float2(half2_from_u32(w_pack));
+        acc = ptx_fma_rn_f32(hv.x, wv.x, acc);
+        acc = ptx_fma_rn_f32(hv.y, wv.y, acc);
+    }
+    if ((k & 1) && lane == 0)
+    {
+        int kk = k - 1;
+        acc = ptx_fma_rn_f32(
+            __half2float(s_hidden[kk]), __half2float(weight[static_cast<long long>(row) * k + kk]), acc);
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0)
+    {
+        ptx_st_global_f32(logits + row, acc);
+    }
+}
+
 template <int WarpsPerBlock, int RowsPerWarp, int KUnroll>
 __global__ void lm_head_gemv_ptx_ru_kernel(
     half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
@@ -1913,6 +2032,34 @@ float run_lm_head_ptx_r2_chunk4u2_smem(Options const& opt, half const* d_hidden,
     return run_lm_head_ptx_r2_chunk4u2_smem_kernel<16>(opt, d_hidden, d_weight, d_logits);
 }
 
+template <int WarpsPerBlock, int Stages>
+float run_lm_head_ptx_cpasync_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    int blocks = (opt.n + WarpsPerBlock - 1) / WarpsPerBlock;
+    int ring_off = ((opt.k * static_cast<int>(sizeof(half)) + 15) / 16) * 16;
+    size_t smem = static_cast<size_t>(ring_off) + static_cast<size_t>(WarpsPerBlock) * Stages * 128 * sizeof(half2);
+    return median_time_ms(
+        [&] {
+            lm_head_gemv_ptx_cpasync_kernel<WarpsPerBlock, Stages>
+                <<<blocks, threads, smem>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        },
+        opt.warmup, opt.iters);
+}
+
+float run_lm_head_ptx_cpasync(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.warps_per_block == 4)
+    {
+        return run_lm_head_ptx_cpasync_kernel<4, 4>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.warps_per_block == 8)
+    {
+        return run_lm_head_ptx_cpasync_kernel<8, 4>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_cpasync_kernel<16, 4>(opt, d_hidden, d_weight, d_logits);
+}
+
 template <int WarpsPerBlock>
 float run_lm_head_ptx_r2u4_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
 {
@@ -2268,6 +2415,61 @@ void run_gemv_r2_chunk4u2_smem_case(Options const& opt)
     CHECK_CUDA(cudaFree(d_logits));
 }
 
+void run_gemv_cpasync_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_cpasync: n=%d k=%d weight=%.3f MB logits=%.3f MB warps/block=%d\n", opt.n, opt.k,
+        weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.warps_per_block);
+
+    // Correctness check vs the simple inline-PTX GEMV: the benchmark fills the
+    // inputs with constant bytes, so every output row is identical -- logits[0]
+    // and logits[n-1] must match the reference and each other.
+    lm_head_gemv_ptx_kernel<8><<<(opt.n + 7) / 8, 256>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    float ref = 0.0f;
+    CHECK_CUDA(cudaMemcpy(&ref, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+    {
+        int ring_off = ((opt.k * static_cast<int>(sizeof(half)) + 15) / 16) * 16;
+        size_t smem = static_cast<size_t>(ring_off) + static_cast<size_t>(8) * 4 * 128 * sizeof(half2);
+        lm_head_gemv_ptx_cpasync_kernel<8, 4>
+            <<<(opt.n + 7) / 8, 256, smem>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+    float v0 = 0.0f;
+    float vn = 0.0f;
+    CHECK_CUDA(cudaMemcpy(&v0, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&vn, d_logits + (opt.n - 1), sizeof(float), cudaMemcpyDeviceToHost));
+    float tol = (ref < 0.0f ? -ref : ref) * 1.0e-3f + 1.0e-3f;
+    float d0 = (v0 - ref < 0.0f) ? ref - v0 : v0 - ref;
+    float dn = (vn - ref < 0.0f) ? ref - vn : vn - ref;
+    bool ok = d0 <= tol && dn <= tol;
+    std::printf("  cpasync verify: ref=%.4f v[0]=%.4f v[n-1]=%.4f -> %s\n", ref, v0, vn, ok ? "OK" : "MISMATCH");
+
+    float ms = run_lm_head_ptx_cpasync(opt, d_hidden, d_weight, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw("ptx_cpasync", ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
 void run_copy_case(Options const& opt)
 {
     size_t bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
@@ -2386,6 +2588,10 @@ int main(int argc, char** argv)
     else if (opt.op == "ptx_r2_chunk4u2_smem")
     {
         run_gemv_r2_chunk4u2_smem_case(opt);
+    }
+    else if (opt.op == "ptx_cpasync")
+    {
+        run_gemv_cpasync_case(opt);
     }
     else if (opt.op == "ptx_chunk4")
     {
