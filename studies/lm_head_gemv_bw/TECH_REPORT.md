@@ -234,6 +234,9 @@ Local H800 result for `N=248320, K=3072`:
 | custom `ptx_global`, 8 warps/block | 0.7868 ms | 1.940 TB/s |
 | custom `ptx_u4`, 8 warps/block, `-O3` | 0.7887 ms | 1.936 TB/s |
 | custom `ptx_r2u4`, 8 warps/block, `-O3` | 0.7888 ms | 1.935 TB/s |
+| custom `ptx_chunk4`, 8 warps/block, `-O3` | 0.7807 ms | 1.955 TB/s |
+| custom `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
+| custom `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | custom `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | custom `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
 | cuBLAS | 0.7903 ms | ~1.932 TB/s |
@@ -259,12 +262,30 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 |---|---|
 | `ptx_u4` | 4-way K unroll; issue multiple packed hidden/weight loads before using them; 4 independent accumulators per lane. |
 | `ptx_r2u4` | Same 4-way K unroll, but each warp computes 2 vocab rows and reuses the hidden load across two independent weight streams. |
+| `ptx_chunk4` | Each lane loads 4 consecutive `half2` values with `ld.global.v4.u32`, reducing load instruction count and improving contiguous memory issue. |
+| `ptx_r2_chunk4` | 2 rows/warp plus `chunk4`; tests whether more independent weight streams help after load vectorization. |
+| `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
 
-On the local H800 these variants do not improve over `ptx_global`, and `-O1`
-does not materially change the result. That is a useful negative control:
-NVIDIA's backend already schedules the simple PTX path well. These variants are
-primarily useful on platforms where profiling shows the simple GEMV loop stalling
-on memory dependency instead of vmem pipe pressure.
+On the local H800, `ptx_chunk4` is the best variant. This suggests load
+instruction count / contiguous issue still matters slightly even when the simple
+PTX loop is already near cuBLAS. The row-multiplexed variants (`r2`/`r4`) do not
+win on H800, likely because their additional registers and arithmetic scheduling
+cost offset the extra independent memory streams. They are still useful on
+platforms where profiling shows the simple GEMV loop stalling on memory
+dependency instead of vmem pipe pressure.
+
+For SASS / final-ISA inspection, use:
+
+```bash
+cd studies/lm_head_gemv_bw
+make clean && make ARCH=-arch=sm_90a
+cuobjdump --dump-sass ./bench_lm_head_gemv > /tmp/lm_head.sass
+c++filt < /tmp/lm_head.sass | grep -n "lm_head_gemv_ptx"
+```
+
+The key checks are whether `ptx_chunk4` remains a wide load sequence in final
+ISA, whether the backend introduces spills, and how many independent
+instructions separate load issue from FMA use.
 
 The in-directory cuBLAS bandwidth example is:
 

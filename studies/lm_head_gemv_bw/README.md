@@ -60,9 +60,20 @@ More aggressive inline-PTX variants:
 # 4-way K unroll, 4 independent accumulators per lane.
 ./bench_lm_head_gemv --op=ptx_u4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 
+# 4 consecutive half2 per lane using ld.global.v4.u32. This reduces load
+# instruction count and is currently the best H800 variant.
+./bench_lm_head_gemv --op=ptx_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+
 # 2 output rows per warp + 4-way K unroll. This is aimed at platforms where
 # the single-row GEMV path shows memory_dependency stalls.
 ./bench_lm_head_gemv --op=ptx_r2u4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+
+# 2 output rows per warp + consecutive chunk4 loads.
+./bench_lm_head_gemv --op=ptx_r2_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+
+# 4 output rows per warp + consecutive chunk4 loads. Useful to test whether
+# more independent weight streams help a backend, but it has higher register pressure.
+./bench_lm_head_gemv --op=ptx_r4_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 ```
 
 Compile with `-O1` if you want to reduce backend scheduling aggressiveness for
@@ -113,6 +124,9 @@ Local H800 PCIe, `N=248320`, `K=3072`, fp16 input/weight and fp32 logits:
 | `ptx_global`, 8 warps/block | 0.7868 ms | 1.940 TB/s |
 | `ptx_u4`, 8 warps/block, `-O3` | 0.7887 ms | 1.936 TB/s |
 | `ptx_r2u4`, 8 warps/block, `-O3` | 0.7888 ms | 1.935 TB/s |
+| `ptx_chunk4`, 8 warps/block, `-O3` | 0.7807 ms | 1.955 TB/s |
+| `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
+| `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |
 | cuBLAS baseline | 0.7903 ms | ~1.932 TB/s |
@@ -127,6 +141,7 @@ The `ptx_global` path fixes the critical load/FMA/store sequence with inline PTX
 (`ld.global.u32`, `fma.rn.f32`, `st.global.f32`) to reduce sensitivity to CUDA
 C++ frontend optimization differences.
 
-On H800, the more aggressive PTX variants do not beat `ptx_global`; they are
-included mainly for other backends where the simple loop may still show
-`memory_dependency` stalls.
+On H800, `ptx_chunk4` is the best variant. The multi-row variants are included
+mainly for other backends where the single-row loop may still show
+`memory_dependency` stalls; on NVIDIA, their extra register pressure does not
+pay off.
