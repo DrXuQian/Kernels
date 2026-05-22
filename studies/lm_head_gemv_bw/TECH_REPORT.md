@@ -234,6 +234,7 @@ Local H800 result for `N=248320, K=3072`:
 | custom `ptx_global`, 8 warps/block | 0.7868 ms | 1.940 TB/s |
 | custom `ptx_u4`, 8 warps/block, `-O3` | 0.7887 ms | 1.936 TB/s |
 | custom `ptx_r2u4`, 8 warps/block, `-O3` | 0.7888 ms | 1.935 TB/s |
+| custom `ptx_r2u8`, 8 warps/block, `-O3` | 0.7900 ms | 1.932 TB/s |
 | custom `ptx_chunk4`, 8 warps/block, `-O3` | 0.7807 ms | 1.955 TB/s |
 | custom `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
 | custom `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
@@ -262,6 +263,7 @@ Two more aggressive PTX variants are included for non-NVIDIA backend studies:
 |---|---|
 | `ptx_u4` | 4-way K unroll; issue multiple packed hidden/weight loads before using them; 4 independent accumulators per lane. |
 | `ptx_r2u4` | Same 4-way K unroll, but each warp computes 2 vocab rows and reuses the hidden load across two independent weight streams. |
+| `ptx_r2u8` | 2 rows/warp, 8-way K unroll, all 24 packed loads of an iteration issued before any FMA. Widens the outstanding-load window (~24 loads in flight vs ~8 for `ptx_r2u4`) for latency-bound backends idle behind `s.wait`/`vmcnt` load waits. |
 | `ptx_chunk4` | Each lane loads 4 consecutive `half2` values with `ld.global.v4.u32`, reducing load instruction count and improving contiguous memory issue. |
 | `ptx_r2_chunk4` | 2 rows/warp plus `chunk4`; tests whether more independent weight streams help after load vectorization. |
 | `ptx_r4_chunk4` | 4 rows/warp plus `chunk4`; higher memory-level parallelism but much higher register pressure. |
@@ -274,6 +276,21 @@ win on H800, likely because their additional registers and arithmetic scheduling
 cost offset the extra independent memory streams. They are still useful on
 platforms where profiling shows the simple GEMV loop stalling on memory
 dependency instead of vmem pipe pressure.
+
+`ptx_r2u8` is the explicit outstanding-load experiment. Its inner loop issues
+all 24 packed loads (8 hidden + 8 weight row0 + 8 weight row1) before any
+conversion or FMA, versus ~8 loads ahead of the first FMA in `ptx_r2u4`. On
+H800 it is a no-op: `ptxas` owns instruction scheduling and re-interleaves loads
+with FMAs regardless of source order, so the final SASS keeps only a ~9-`LDG`
+contiguous batch and `ptx_r2u8` measures the same as `ptx_r2u4` (both at the
+bandwidth roofline, both 40 registers, no spills). It is built for latency-bound
+backends whose compiler is faithful to source load grouping — the signature is a
+block timeline where the SM is idle ~50% of the time and the per-instruction
+profile is dominated by `s.wait vldcnt(N)` / `vmcnt` waits after a batch of N
+loads. There the deeper source-level load batch translates into a deeper
+hardware request queue, so more DRAM latency is overlapped and the load-wait
+stalls shrink. The value to verify after switching to `ptx_r2u8` is the sum of
+`s.wait`/`vmcnt` stall cycles and the timeline idle fraction, not raw FLOPs.
 
 For SASS / final-ISA inspection, use:
 

@@ -68,6 +68,12 @@ More aggressive inline-PTX variants:
 # the single-row GEMV path shows memory_dependency stalls.
 ./bench_lm_head_gemv --op=ptx_r2u4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 
+# 2 output rows per warp + 8-way K unroll, every packed load issued before any
+# FMA. Keeps ~24 vector loads in flight per warp (vs ~8 for ptx_r2u4) to widen
+# the outstanding-load window on backends whose block timeline shows the SM idle
+# behind s.wait / vmcnt load waits. Profile this and compare against ptx_r2u4.
+./bench_lm_head_gemv --op=ptx_r2u8 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
+
 # 2 output rows per warp + consecutive chunk4 loads.
 ./bench_lm_head_gemv --op=ptx_r2_chunk4 --n=248320 --k=3072 --warps-per-block=8 --warmup=100 --iters=200
 
@@ -162,6 +168,7 @@ Local H800 PCIe, `N=248320`, `K=3072`, fp16 input/weight and fp32 logits:
 | `ptx_global`, 8 warps/block | 0.7868 ms | 1.940 TB/s |
 | `ptx_u4`, 8 warps/block, `-O3` | 0.7887 ms | 1.936 TB/s |
 | `ptx_r2u4`, 8 warps/block, `-O3` | 0.7888 ms | 1.935 TB/s |
+| `ptx_r2u8`, 8 warps/block, `-O3` | 0.7900 ms | 1.932 TB/s |
 | `ptx_chunk4`, 8 warps/block, `-O3` | 0.7807 ms | 1.955 TB/s |
 | `ptx_r2_chunk4`, 8 warps/block, `-O3` | 0.7863 ms | 1.942 TB/s |
 | `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
@@ -183,3 +190,15 @@ On H800, `ptx_chunk4` is the best variant. The multi-row variants are included
 mainly for other backends where the single-row loop may still show
 `memory_dependency` stalls; on NVIDIA, their extra register pressure does not
 pay off.
+
+`ptx_r2u8` widens the outstanding-load window in source: all 24 packed loads of
+an iteration (8 hidden + 8 weight row0 + 8 weight row1) are issued before any
+conversion or FMA, versus ~8 for `ptx_r2u4`. On H800 this does not change
+bandwidth: `ptxas` reschedules the loop and interleaves loads with FMAs
+regardless of source order, so the final SASS keeps only a ~9-`LDG` contiguous
+batch, and the kernel is already at the bandwidth roofline. `ptx_r2u8` is meant
+for latency-bound backends whose compiler keeps the source load grouping (a
+profile that shows N loads followed by one `s.wait vldcnt(N-1)` / `vmcnt`
+instruction). There, issuing 24 loads up front gives the memory subsystem a
+deeper request queue to hide DRAM latency, which should shrink the load-wait
+stalls and the idle gaps in the block timeline.

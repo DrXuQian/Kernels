@@ -123,7 +123,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_chunk4|ptx_r2_chunk4|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r4_chunk4|ptx_ru|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
@@ -483,6 +483,187 @@ __global__ void lm_head_gemv_ptx_r2u4_kernel(
             acc13 = ptx_fma_rn_f32(h3.x, w13.x, acc13);
             acc13 = ptx_fma_rn_f32(h3.y, w13.y, acc13);
         }
+    }
+
+    float tail0 = 0.0f;
+    float tail1 = 0.0f;
+    for (; i < k2; i += 32)
+    {
+        uint32_t h_pack = ptx_ld_global_u32(h2 + i);
+        uint32_t w0_pack = ptx_ld_global_u32(w20 + i);
+        float2 h = __half22float2(half2_from_u32(h_pack));
+        float2 w0 = __half22float2(half2_from_u32(w0_pack));
+        tail0 = ptx_fma_rn_f32(h.x, w0.x, tail0);
+        tail0 = ptx_fma_rn_f32(h.y, w0.y, tail0);
+        if (has_row1)
+        {
+            uint32_t w1_pack = ptx_ld_global_u32(w21 + i);
+            float2 w1 = __half22float2(half2_from_u32(w1_pack));
+            tail1 = ptx_fma_rn_f32(h.x, w1.x, tail1);
+            tail1 = ptx_fma_rn_f32(h.y, w1.y, tail1);
+        }
+    }
+
+    float acc0 = (acc00 + acc01) + (acc02 + acc03) + tail0;
+    float acc1 = (acc10 + acc11) + (acc12 + acc13) + tail1;
+    if ((k & 1) && lane == 0)
+    {
+        int kk = k - 1;
+        float h = __half2float(hidden[kk]);
+        acc0 = ptx_fma_rn_f32(h, __half2float(weight[static_cast<long long>(row0) * k + kk]), acc0);
+        if (has_row1)
+        {
+            acc1 = ptx_fma_rn_f32(h, __half2float(weight[static_cast<long long>(row1) * k + kk]), acc1);
+        }
+    }
+
+    acc0 = warp_sum(acc0);
+    acc1 = warp_sum(acc1);
+    if (lane == 0)
+    {
+        ptx_st_global_f32(logits + row0, acc0);
+        if (has_row1)
+        {
+            ptx_st_global_f32(logits + row1, acc1);
+        }
+    }
+}
+
+// Outstanding-load study variant. Same 2-rows-per-warp mapping as ptx_r2u4, but
+// the K loop is unrolled 8x and every packed load for the iteration is issued
+// before any conversion or FMA. That keeps ~24 vector loads in flight per warp
+// (8 hidden + 8 weight row0 + 8 weight row1) versus ~8 for ptx_r2u4. It targets
+// backends whose block timeline shows the SM idle behind s.wait/vmcnt load
+// waits: more outstanding loads give the memory subsystem more parallelism to
+// hide DRAM latency. w21 is clamped to a valid row so the hot loop stays
+// branch-free and all 24 loads are unconditional.
+template <int WarpsPerBlock>
+__global__ void lm_head_gemv_ptx_r2u8_kernel(
+    half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
+{
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int row0 = (blockIdx.x * WarpsPerBlock + warp) * 2;
+    if (row0 >= n)
+    {
+        return;
+    }
+    int row1 = row0 + 1;
+    bool has_row1 = row1 < n;
+    int safe_row1 = has_row1 ? row1 : row0;
+
+    int k2 = k / 2;
+    half2 const* h2 = reinterpret_cast<half2 const*>(hidden);
+    half2 const* w20 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(row0) * k);
+    half2 const* w21 = reinterpret_cast<half2 const*>(weight + static_cast<long long>(safe_row1) * k);
+
+    float acc00 = 0.0f;
+    float acc01 = 0.0f;
+    float acc02 = 0.0f;
+    float acc03 = 0.0f;
+    float acc10 = 0.0f;
+    float acc11 = 0.0f;
+    float acc12 = 0.0f;
+    float acc13 = 0.0f;
+
+    int i = lane;
+    for (; i + 32 * 7 < k2; i += 32 * 8)
+    {
+        // Issue all 24 packed loads up front: this load batching is the only
+        // structural change versus ptx_r2u4 and is what widens the window.
+        uint32_t h_pack0 = ptx_ld_global_u32(h2 + i);
+        uint32_t h_pack1 = ptx_ld_global_u32(h2 + i + 32);
+        uint32_t h_pack2 = ptx_ld_global_u32(h2 + i + 64);
+        uint32_t h_pack3 = ptx_ld_global_u32(h2 + i + 96);
+        uint32_t h_pack4 = ptx_ld_global_u32(h2 + i + 128);
+        uint32_t h_pack5 = ptx_ld_global_u32(h2 + i + 160);
+        uint32_t h_pack6 = ptx_ld_global_u32(h2 + i + 192);
+        uint32_t h_pack7 = ptx_ld_global_u32(h2 + i + 224);
+
+        uint32_t w0_pack0 = ptx_ld_global_u32(w20 + i);
+        uint32_t w0_pack1 = ptx_ld_global_u32(w20 + i + 32);
+        uint32_t w0_pack2 = ptx_ld_global_u32(w20 + i + 64);
+        uint32_t w0_pack3 = ptx_ld_global_u32(w20 + i + 96);
+        uint32_t w0_pack4 = ptx_ld_global_u32(w20 + i + 128);
+        uint32_t w0_pack5 = ptx_ld_global_u32(w20 + i + 160);
+        uint32_t w0_pack6 = ptx_ld_global_u32(w20 + i + 192);
+        uint32_t w0_pack7 = ptx_ld_global_u32(w20 + i + 224);
+
+        uint32_t w1_pack0 = ptx_ld_global_u32(w21 + i);
+        uint32_t w1_pack1 = ptx_ld_global_u32(w21 + i + 32);
+        uint32_t w1_pack2 = ptx_ld_global_u32(w21 + i + 64);
+        uint32_t w1_pack3 = ptx_ld_global_u32(w21 + i + 96);
+        uint32_t w1_pack4 = ptx_ld_global_u32(w21 + i + 128);
+        uint32_t w1_pack5 = ptx_ld_global_u32(w21 + i + 160);
+        uint32_t w1_pack6 = ptx_ld_global_u32(w21 + i + 192);
+        uint32_t w1_pack7 = ptx_ld_global_u32(w21 + i + 224);
+
+        // Convert each packed value just before use so f32 temporaries do not
+        // pin extra registers; 4 accumulators per row absorb the FMA chain.
+        float2 h = __half22float2(half2_from_u32(h_pack0));
+        float2 a = __half22float2(half2_from_u32(w0_pack0));
+        float2 b = __half22float2(half2_from_u32(w1_pack0));
+        acc00 = ptx_fma_rn_f32(h.x, a.x, acc00);
+        acc00 = ptx_fma_rn_f32(h.y, a.y, acc00);
+        acc10 = ptx_fma_rn_f32(h.x, b.x, acc10);
+        acc10 = ptx_fma_rn_f32(h.y, b.y, acc10);
+
+        h = __half22float2(half2_from_u32(h_pack1));
+        a = __half22float2(half2_from_u32(w0_pack1));
+        b = __half22float2(half2_from_u32(w1_pack1));
+        acc01 = ptx_fma_rn_f32(h.x, a.x, acc01);
+        acc01 = ptx_fma_rn_f32(h.y, a.y, acc01);
+        acc11 = ptx_fma_rn_f32(h.x, b.x, acc11);
+        acc11 = ptx_fma_rn_f32(h.y, b.y, acc11);
+
+        h = __half22float2(half2_from_u32(h_pack2));
+        a = __half22float2(half2_from_u32(w0_pack2));
+        b = __half22float2(half2_from_u32(w1_pack2));
+        acc02 = ptx_fma_rn_f32(h.x, a.x, acc02);
+        acc02 = ptx_fma_rn_f32(h.y, a.y, acc02);
+        acc12 = ptx_fma_rn_f32(h.x, b.x, acc12);
+        acc12 = ptx_fma_rn_f32(h.y, b.y, acc12);
+
+        h = __half22float2(half2_from_u32(h_pack3));
+        a = __half22float2(half2_from_u32(w0_pack3));
+        b = __half22float2(half2_from_u32(w1_pack3));
+        acc03 = ptx_fma_rn_f32(h.x, a.x, acc03);
+        acc03 = ptx_fma_rn_f32(h.y, a.y, acc03);
+        acc13 = ptx_fma_rn_f32(h.x, b.x, acc13);
+        acc13 = ptx_fma_rn_f32(h.y, b.y, acc13);
+
+        h = __half22float2(half2_from_u32(h_pack4));
+        a = __half22float2(half2_from_u32(w0_pack4));
+        b = __half22float2(half2_from_u32(w1_pack4));
+        acc00 = ptx_fma_rn_f32(h.x, a.x, acc00);
+        acc00 = ptx_fma_rn_f32(h.y, a.y, acc00);
+        acc10 = ptx_fma_rn_f32(h.x, b.x, acc10);
+        acc10 = ptx_fma_rn_f32(h.y, b.y, acc10);
+
+        h = __half22float2(half2_from_u32(h_pack5));
+        a = __half22float2(half2_from_u32(w0_pack5));
+        b = __half22float2(half2_from_u32(w1_pack5));
+        acc01 = ptx_fma_rn_f32(h.x, a.x, acc01);
+        acc01 = ptx_fma_rn_f32(h.y, a.y, acc01);
+        acc11 = ptx_fma_rn_f32(h.x, b.x, acc11);
+        acc11 = ptx_fma_rn_f32(h.y, b.y, acc11);
+
+        h = __half22float2(half2_from_u32(h_pack6));
+        a = __half22float2(half2_from_u32(w0_pack6));
+        b = __half22float2(half2_from_u32(w1_pack6));
+        acc02 = ptx_fma_rn_f32(h.x, a.x, acc02);
+        acc02 = ptx_fma_rn_f32(h.y, a.y, acc02);
+        acc12 = ptx_fma_rn_f32(h.x, b.x, acc12);
+        acc12 = ptx_fma_rn_f32(h.y, b.y, acc12);
+
+        h = __half22float2(half2_from_u32(h_pack7));
+        a = __half22float2(half2_from_u32(w0_pack7));
+        b = __half22float2(half2_from_u32(w1_pack7));
+        acc03 = ptx_fma_rn_f32(h.x, a.x, acc03);
+        acc03 = ptx_fma_rn_f32(h.y, a.y, acc03);
+        acc13 = ptx_fma_rn_f32(h.x, b.x, acc13);
+        acc13 = ptx_fma_rn_f32(h.y, b.y, acc13);
     }
 
     float tail0 = 0.0f;
@@ -1217,6 +1398,32 @@ float run_lm_head_ptx_r2u4(Options const& opt, half const* d_hidden, half const*
 }
 
 template <int WarpsPerBlock>
+float run_lm_head_ptx_r2u8_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    int blocks = (opt.n + 2 * WarpsPerBlock - 1) / (2 * WarpsPerBlock);
+    return median_time_ms(
+        [&] {
+            lm_head_gemv_ptx_r2u8_kernel<WarpsPerBlock>
+                <<<blocks, threads>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        },
+        opt.warmup, opt.iters);
+}
+
+float run_lm_head_ptx_r2u8(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.warps_per_block == 4)
+    {
+        return run_lm_head_ptx_r2u8_kernel<4>(opt, d_hidden, d_weight, d_logits);
+    }
+    if (opt.warps_per_block == 8)
+    {
+        return run_lm_head_ptx_r2u8_kernel<8>(opt, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_r2u8_kernel<16>(opt, d_hidden, d_weight, d_logits);
+}
+
+template <int WarpsPerBlock>
 float run_lm_head_ptx_r4_chunk4_kernel(Options const& opt, half const* d_hidden, half const* d_weight, float* d_logits)
 {
     int threads = WarpsPerBlock * 32;
@@ -1411,6 +1618,33 @@ void run_gemv_ru_case(Options const& opt)
     CHECK_CUDA(cudaFree(d_logits));
 }
 
+void run_gemv_r2u8_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_r2u8: n=%d k=%d weight=%.3f MB logits=%.3f MB warps/block=%d\n", opt.n, opt.k,
+        weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.warps_per_block);
+    float ms = run_lm_head_ptx_r2u8(opt, d_hidden, d_weight, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw("ptx_r2u8", ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
 void run_copy_case(Options const& opt)
 {
     size_t bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
@@ -1513,6 +1747,10 @@ int main(int argc, char** argv)
     else if (opt.op == "ptx_r2u4")
     {
         run_gemv_cases(opt, false, false, false, false, true, false, false, false);
+    }
+    else if (opt.op == "ptx_r2u8")
+    {
+        run_gemv_r2u8_case(opt);
     }
     else if (opt.op == "ptx_chunk4")
     {
