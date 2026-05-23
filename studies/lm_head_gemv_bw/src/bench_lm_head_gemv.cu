@@ -123,7 +123,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_cpasync|ptx_r4_chunk4|ptx_ru|ptx_rlean|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_cpasync|ptx_r4_chunk4|ptx_ru|ptx_rlean|ptx_persistent|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
                         "          [--warmup N] [--iters N]\n",
@@ -1782,6 +1782,115 @@ __global__ void lm_head_gemv_ptx_rlean_kernel(
     }
 }
 
+// Persistent-style variant. Same per-row work as the lean 2-row, 8-way unroll
+// (which empirically peaked at ~60% on the latency-bound target), but each warp
+// grid-strides over many row pairs instead of doing one and exiting. Launched
+// with blocks = multiProcessorCount * factor so the grid is just enough to fill
+// the chip in one wave; warps live long, amortizing prologue/epilogue and
+// kernel-launch overhead. Expected gain is bounded by the prologue/epilogue
+// fraction of per-warp time (~3-5%) plus any cross-row pipeline benefit
+// (drains avoided at row boundaries) -- order ~5-15%, not a structural break.
+template <int WarpsPerBlock>
+__global__ void lm_head_gemv_ptx_persistent_kernel(
+    half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
+{
+    constexpr int Rows = 2;
+    constexpr int Unroll = 8;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int row_groups = (n + Rows - 1) / Rows;
+    int warp_stride = gridDim.x * WarpsPerBlock;
+    int k2 = k / 2;
+    half2 const* h2 = reinterpret_cast<half2 const*>(hidden);
+
+    for (int rg = blockIdx.x * WarpsPerBlock + warp; rg < row_groups; rg += warp_stride)
+    {
+        int row_base = rg * Rows;
+        half2 const* w2[Rows];
+        bool has_row[Rows];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r)
+        {
+            int row = row_base + r;
+            has_row[r] = row < n;
+            int safe_row = has_row[r] ? row : row_base;
+            w2[r] = reinterpret_cast<half2 const*>(weight + static_cast<long long>(safe_row) * k);
+        }
+
+        float acc[Rows];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r)
+        {
+            acc[r] = 0.0f;
+        }
+
+        int i = lane;
+        for (; i + 32 * (Unroll - 1) < k2; i += 32 * Unroll)
+        {
+            uint32_t h_pack[Unroll];
+            uint32_t w_pack[Rows][Unroll];
+#pragma unroll
+            for (int u = 0; u < Unroll; ++u)
+            {
+                h_pack[u] = ptx_ld_global_u32(h2 + i + 32 * u);
+            }
+#pragma unroll
+            for (int r = 0; r < Rows; ++r)
+            {
+#pragma unroll
+                for (int u = 0; u < Unroll; ++u)
+                {
+                    w_pack[r][u] = ptx_ld_global_u32(w2[r] + i + 32 * u);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < Unroll; ++u)
+            {
+                float2 h = __half22float2(half2_from_u32(h_pack[u]));
+#pragma unroll
+                for (int r = 0; r < Rows; ++r)
+                {
+                    float2 w = __half22float2(half2_from_u32(w_pack[r][u]));
+                    acc[r] = ptx_fma_rn_f32(h.x, w.x, acc[r]);
+                    acc[r] = ptx_fma_rn_f32(h.y, w.y, acc[r]);
+                }
+            }
+        }
+        for (; i < k2; i += 32)
+        {
+            float2 h = __half22float2(half2_from_u32(ptx_ld_global_u32(h2 + i)));
+#pragma unroll
+            for (int r = 0; r < Rows; ++r)
+            {
+                float2 w = __half22float2(half2_from_u32(ptx_ld_global_u32(w2[r] + i)));
+                acc[r] = ptx_fma_rn_f32(h.x, w.x, acc[r]);
+                acc[r] = ptx_fma_rn_f32(h.y, w.y, acc[r]);
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < Rows; ++r)
+        {
+            if (has_row[r])
+            {
+                float out = acc[r];
+                if ((k & 1) && lane == 0)
+                {
+                    int kk = k - 1;
+                    out = ptx_fma_rn_f32(__half2float(hidden[kk]),
+                        __half2float(weight[static_cast<long long>(row_base + r) * k + kk]), out);
+                }
+                out = warp_sum(out);
+                if (lane == 0)
+                {
+                    ptx_st_global_f32(logits + row_base + r, out);
+                }
+            }
+        }
+    }
+}
+
 template <int WarpsPerBlock, int RowsPerWarp, int KUnroll>
 __global__ void lm_head_gemv_ptx_ru_kernel(
     half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
@@ -2384,6 +2493,33 @@ float run_lm_head_ptx_rlean(Options const& opt, half const* d_hidden, half const
     return run_lm_head_ptx_rlean_warps<16>(opt, d_hidden, d_weight, d_logits);
 }
 
+template <int WarpsPerBlock>
+float run_lm_head_ptx_persistent_kernel(
+    Options const& opt, int blocks, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    return median_time_ms(
+        [&] {
+            lm_head_gemv_ptx_persistent_kernel<WarpsPerBlock>
+                <<<blocks, threads>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        },
+        opt.warmup, opt.iters);
+}
+
+float run_lm_head_ptx_persistent(
+    Options const& opt, int blocks, half const* d_hidden, half const* d_weight, float* d_logits)
+{
+    if (opt.warps_per_block == 4)
+    {
+        return run_lm_head_ptx_persistent_kernel<4>(opt, blocks, d_hidden, d_weight, d_logits);
+    }
+    if (opt.warps_per_block == 8)
+    {
+        return run_lm_head_ptx_persistent_kernel<8>(opt, blocks, d_hidden, d_weight, d_logits);
+    }
+    return run_lm_head_ptx_persistent_kernel<16>(opt, blocks, d_hidden, d_weight, d_logits);
+}
+
 void print_bw(char const* name, float ms, double bytes)
 {
     double gbps = bytes / (ms * 1.0e-3) / 1.0e9;
@@ -2518,6 +2654,39 @@ void run_gemv_rlean_case(Options const& opt)
     char name[64];
     std::snprintf(name, sizeof(name), "ptx_rlean_r%d_u%d", opt.rows_per_warp, opt.k_unroll);
     print_bw(name, ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
+void run_gemv_persistent_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    cudaDeviceProp prop{};
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    int persistent_factor = 4;
+    int blocks = prop.multiProcessorCount * persistent_factor;
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_persistent: n=%d k=%d weight=%.3f MB logits=%.3f MB warps/block=%d blocks=%d (sms=%d)\n",
+        opt.n, opt.k, weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.warps_per_block, blocks,
+        prop.multiProcessorCount);
+    float ms = run_lm_head_ptx_persistent(opt, blocks, d_hidden, d_weight, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw("ptx_persistent", ms, mandatory_traffic);
 
     CHECK_CUDA(cudaFree(d_hidden));
     CHECK_CUDA(cudaFree(d_weight));
@@ -2829,6 +2998,10 @@ int main(int argc, char** argv)
     else if (opt.op == "ptx_rlean")
     {
         run_gemv_rlean_case(opt);
+    }
+    else if (opt.op == "ptx_persistent")
+    {
+        run_gemv_persistent_case(opt);
     }
     else if (opt.op == "copy" || opt.op == "copy_u8")
     {
