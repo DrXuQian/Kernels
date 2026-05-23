@@ -129,7 +129,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_cpasync|ptx_r4_chunk4|ptx_ru|ptx_rlean|ptx_persistent|ptx_tma_ws|cublas|copy|copy_u8]\n"
+            std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_cpasync|ptx_r4_chunk4|ptx_ru|ptx_rlean|ptx_persistent|ptx_tma_ws|ptx_tma_ws_r32|ptx_tma_ws_persistent|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
                         "          [--warmup N] [--iters N] [--no-verify]\n",
@@ -2082,6 +2082,140 @@ __global__ void lm_head_gemv_tma_ws_kernel(
     }
 }
 
+// Persistent TMA + warp-specialization. Launch with blocks = SMs * factor so
+// the grid fills the chip in one wave; each block grid-strides over many row
+// groups. mbarrier phase is tracked by a global tile counter (global_t) that
+// keeps incrementing across outer iterations, so the producer/consumer pipeline
+// runs continuously without re-init.
+template <int WarpsPerBlock, int RowsPerBlock, int TileKHalf2, int Stages, int NConsumers>
+__global__ void lm_head_gemv_tma_ws_persistent_kernel(
+    half const* __restrict__ hidden,
+    __grid_constant__ CUtensorMap const tensor_map_weight,
+    float* __restrict__ logits, int n, int k)
+{
+    static_assert(NConsumers >= 1, "need at least one consumer");
+    static_assert(NConsumers + 1 <= WarpsPerBlock, "need 1 producer + NConsumers consumers <= WarpsPerBlock");
+    static_assert(RowsPerBlock % NConsumers == 0, "RowsPerBlock must split evenly across consumers");
+    constexpr int RowsPerConsumer = RowsPerBlock / NConsumers;
+    constexpr int TileBytes = RowsPerBlock * TileKHalf2 * static_cast<int>(sizeof(half2));
+
+    extern __shared__ char smem_raw[];
+    int hidden_align = ((k * static_cast<int>(sizeof(half)) + 127) / 128) * 128;
+    half* s_hidden = reinterpret_cast<half*>(smem_raw);
+    half2* s_weight = reinterpret_cast<half2*>(smem_raw + hidden_align);
+    int ring_bytes = Stages * RowsPerBlock * TileKHalf2 * static_cast<int>(sizeof(half2));
+    uint64_t* mbar_full = reinterpret_cast<uint64_t*>(smem_raw + hidden_align + ring_bytes);
+    uint64_t* mbar_empty = mbar_full + Stages;
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int block_threads = WarpsPerBlock * 32;
+
+    if (tid < Stages)
+    {
+        mbarrier_init_b64(&mbar_full[tid], 1);
+    }
+    if (tid >= Stages && tid < Stages * 2)
+    {
+        mbarrier_init_b64(&mbar_empty[tid - Stages], NConsumers * 32);
+    }
+
+    int k2 = k / 2;
+    half2 const* g_h2 = reinterpret_cast<half2 const*>(hidden);
+    half2* s_h2 = reinterpret_cast<half2*>(s_hidden);
+    for (int i = tid; i < k2; i += block_threads)
+    {
+        s_h2[i] = g_h2[i];
+    }
+    __syncthreads();
+
+    int row_groups = (n + RowsPerBlock - 1) / RowsPerBlock;
+    int num_tiles = (k2 + TileKHalf2 - 1) / TileKHalf2;
+    int block_stride = gridDim.x;
+
+    if (warp == 0)
+    {
+        if (lane == 0)
+        {
+            int global_t = 0;
+            for (int rg = blockIdx.x; rg < row_groups; rg += block_stride)
+            {
+                int row_base = rg * RowsPerBlock;
+                for (int t = 0; t < num_tiles; ++t)
+                {
+                    int s = global_t % Stages;
+                    if (global_t >= Stages)
+                    {
+                        uint32_t phase = ((global_t - Stages) / Stages) & 1;
+                        mbarrier_wait_parity(&mbar_empty[s], phase);
+                    }
+                    int coord_c = t * TileKHalf2 * 2;
+                    int coord_n = row_base;
+                    mbarrier_arrive_expect_tx(&mbar_full[s], TileBytes);
+                    cp_async_bulk_tensor_2d(&s_weight[s * RowsPerBlock * TileKHalf2],
+                        &tensor_map_weight, coord_c, coord_n, &mbar_full[s]);
+                    ++global_t;
+                }
+            }
+        }
+    }
+    else if (warp <= NConsumers)
+    {
+        int cons_id = warp - 1;
+        int my_row_start = cons_id * RowsPerConsumer;
+        int global_t = 0;
+
+        for (int rg = blockIdx.x; rg < row_groups; rg += block_stride)
+        {
+            int row_base = rg * RowsPerBlock;
+
+            float acc[RowsPerConsumer];
+#pragma unroll
+            for (int r = 0; r < RowsPerConsumer; ++r)
+            {
+                acc[r] = 0.0f;
+            }
+
+            for (int t = 0; t < num_tiles; ++t)
+            {
+                int s = global_t % Stages;
+                uint32_t phase = (global_t / Stages) & 1;
+                mbarrier_wait_parity(&mbar_full[s], phase);
+
+                half2 const* w = &s_weight[s * RowsPerBlock * TileKHalf2];
+                half2 const* h = reinterpret_cast<half2 const*>(s_hidden) + t * TileKHalf2;
+#pragma unroll
+                for (int u = lane; u < TileKHalf2; u += 32)
+                {
+                    float2 hv = __half22float2(h[u]);
+#pragma unroll
+                    for (int r = 0; r < RowsPerConsumer; ++r)
+                    {
+                        float2 wv = __half22float2(w[(my_row_start + r) * TileKHalf2 + u]);
+                        acc[r] = ptx_fma_rn_f32(hv.x, wv.x, acc[r]);
+                        acc[r] = ptx_fma_rn_f32(hv.y, wv.y, acc[r]);
+                    }
+                }
+
+                mbarrier_arrive_b64(&mbar_empty[s]);
+                ++global_t;
+            }
+
+#pragma unroll
+            for (int r = 0; r < RowsPerConsumer; ++r)
+            {
+                float out = warp_sum(acc[r]);
+                int row = row_base + my_row_start + r;
+                if (lane == 0 && row < n)
+                {
+                    logits[row] = out;
+                }
+            }
+        }
+    }
+}
+
 template <int WarpsPerBlock, int RowsPerWarp, int KUnroll>
 __global__ void lm_head_gemv_ptx_ru_kernel(
     half const* __restrict__ hidden, half const* __restrict__ weight, float* __restrict__ logits, int n, int k)
@@ -2748,6 +2882,57 @@ float run_lm_head_ptx_tma_ws(
     return run_lm_head_ptx_tma_ws_kernel<5, 16, 128, 16, 4>(opt, weight_map, d_hidden, d_logits);
 }
 
+float run_lm_head_ptx_tma_ws_r32(
+    Options const& opt, CUtensorMap const& weight_map, half const* d_hidden, float* d_logits)
+{
+    // R=32 variant: each block computes 32 output rows (vs 16). Halves the block
+    // count, doubles TMA tile size; 8 rows/consumer instead of 4.
+    if (opt.k_unroll == 4)
+    {
+        return run_lm_head_ptx_tma_ws_kernel<5, 32, 128, 4, 4>(opt, weight_map, d_hidden, d_logits);
+    }
+    if (opt.k_unroll == 8)
+    {
+        return run_lm_head_ptx_tma_ws_kernel<5, 32, 128, 8, 4>(opt, weight_map, d_hidden, d_logits);
+    }
+    return run_lm_head_ptx_tma_ws_kernel<5, 32, 128, 16, 4>(opt, weight_map, d_hidden, d_logits);
+}
+
+template <int WarpsPerBlock, int RowsPerBlock, int TileKHalf2, int Stages, int NConsumers>
+float run_lm_head_ptx_tma_ws_persistent_kernel(Options const& opt, int blocks, CUtensorMap const& weight_map,
+    half const* d_hidden, float* d_logits)
+{
+    int threads = WarpsPerBlock * 32;
+    int hidden_align = ((opt.k * static_cast<int>(sizeof(half)) + 127) / 128) * 128;
+    int ring_bytes = Stages * RowsPerBlock * TileKHalf2 * static_cast<int>(sizeof(half2));
+    int mbar_bytes = 2 * Stages * static_cast<int>(sizeof(uint64_t));
+    size_t smem = static_cast<size_t>(hidden_align + ring_bytes + mbar_bytes);
+    CHECK_CUDA(cudaFuncSetAttribute(
+        lm_head_gemv_tma_ws_persistent_kernel<WarpsPerBlock, RowsPerBlock, TileKHalf2, Stages, NConsumers>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+    return median_time_ms(
+        [&] {
+            lm_head_gemv_tma_ws_persistent_kernel<WarpsPerBlock, RowsPerBlock, TileKHalf2, Stages, NConsumers>
+                <<<blocks, threads, smem>>>(d_hidden, weight_map, d_logits, opt.n, opt.k);
+        },
+        opt.warmup, opt.iters);
+}
+
+float run_lm_head_ptx_tma_ws_persistent(
+    Options const& opt, int blocks, CUtensorMap const& weight_map, half const* d_hidden, float* d_logits)
+{
+    // Persistent TMA+WS: fixed R=16, NCons=4, WPB=5; --k-unroll picks Stages.
+    if (opt.k_unroll == 4)
+    {
+        return run_lm_head_ptx_tma_ws_persistent_kernel<5, 16, 128, 4, 4>(opt, blocks, weight_map, d_hidden, d_logits);
+    }
+    if (opt.k_unroll == 8)
+    {
+        return run_lm_head_ptx_tma_ws_persistent_kernel<5, 16, 128, 8, 4>(opt, blocks, weight_map, d_hidden, d_logits);
+    }
+    return run_lm_head_ptx_tma_ws_persistent_kernel<5, 16, 128, 16, 4>(opt, blocks, weight_map, d_hidden, d_logits);
+}
+
 static CUtensorMap make_weight_tensormap(
     half* d_weight, int n, int k, uint32_t tile_k_halves, uint32_t rows_per_tile)
 {
@@ -3003,6 +3188,145 @@ void run_gemv_tma_ws_case(Options const& opt)
     float ms = run_lm_head_ptx_tma_ws(opt, weight_map, d_hidden, d_logits);
     CHECK_CUDA(cudaGetLastError());
     print_bw("ptx_tma_ws", ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
+void run_gemv_tma_ws_r32_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    // R=32 tensormap: TileK=256 halves, RowsPerTile=32. Each TMA fetches a
+    // 32x256 weight tile = 16 KB. Smem ring = Stages * 16 KB; with Stages=4 the
+    // ring is 64 KB, total smem ~72 KB (needs cudaFuncSetAttribute opt-in).
+    CUtensorMap weight_map
+        = make_weight_tensormap(d_weight, opt.n, opt.k, /*tile_k_halves=*/256, /*rows_per_tile=*/32);
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_tma_ws_r32: n=%d k=%d weight=%.3f MB logits=%.3f MB R=32 TileK=256 Stages=%d NCons=4 WPB=5\n",
+        opt.n, opt.k, weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.k_unroll);
+
+    if (opt.verify)
+    {
+        lm_head_gemv_ptx_kernel<8><<<(opt.n + 7) / 8, 256>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaDeviceSynchronize());
+        float ref = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&ref, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+        {
+            int blocks = (opt.n + 31) / 32;
+            int threads = 5 * 32;
+            int hidden_align = ((opt.k * static_cast<int>(sizeof(half)) + 127) / 128) * 128;
+            int ring_bytes = 4 * 32 * 128 * static_cast<int>(sizeof(half2));
+            int mbar_bytes = 2 * 4 * static_cast<int>(sizeof(uint64_t));
+            size_t smem = static_cast<size_t>(hidden_align + ring_bytes + mbar_bytes);
+            CHECK_CUDA(cudaFuncSetAttribute(lm_head_gemv_tma_ws_kernel<5, 32, 128, 4, 4>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+            lm_head_gemv_tma_ws_kernel<5, 32, 128, 4, 4>
+                <<<blocks, threads, smem>>>(d_hidden, weight_map, d_logits, opt.n, opt.k);
+            CHECK_CUDA(cudaGetLastError());
+            CHECK_CUDA(cudaDeviceSynchronize());
+        }
+        float v0 = 0.0f;
+        float vn = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&v0, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&vn, d_logits + (opt.n - 1), sizeof(float), cudaMemcpyDeviceToHost));
+        float tol = (ref < 0.0f ? -ref : ref) * 1.0e-3f + 1.0e-3f;
+        float d0 = (v0 - ref < 0.0f) ? ref - v0 : v0 - ref;
+        float dn = (vn - ref < 0.0f) ? ref - vn : vn - ref;
+        bool ok = d0 <= tol && dn <= tol;
+        std::printf("  tma_ws_r32 verify: ref=%.4f v[0]=%.4f v[n-1]=%.4f -> %s\n", ref, v0, vn, ok ? "OK" : "MISMATCH");
+    }
+
+    float ms = run_lm_head_ptx_tma_ws_r32(opt, weight_map, d_hidden, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw("ptx_tma_ws_r32", ms, mandatory_traffic);
+
+    CHECK_CUDA(cudaFree(d_hidden));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_logits));
+}
+
+void run_gemv_tma_ws_persistent_case(Options const& opt)
+{
+    size_t hidden_bytes = static_cast<size_t>(opt.k) * sizeof(half);
+    size_t weight_bytes = static_cast<size_t>(opt.n) * opt.k * sizeof(half);
+    size_t logits_bytes = static_cast<size_t>(opt.n) * sizeof(float);
+    half* d_hidden = nullptr;
+    half* d_weight = nullptr;
+    float* d_logits = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_hidden, hidden_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
+    CHECK_CUDA(cudaMalloc(&d_logits, logits_bytes));
+    CHECK_CUDA(cudaMemset(d_hidden, 0x3a, hidden_bytes));
+    CHECK_CUDA(cudaMemset(d_weight, 0x1d, weight_bytes));
+    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+
+    // R=16 tensormap (same as ptx_tma_ws). Persistent only changes the grid: launch
+    // SMs * factor blocks and grid-stride inside.
+    CUtensorMap weight_map
+        = make_weight_tensormap(d_weight, opt.n, opt.k, /*tile_k_halves=*/256, /*rows_per_tile=*/16);
+
+    cudaDeviceProp prop{};
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    int persistent_factor = 4;
+    int blocks = prop.multiProcessorCount * persistent_factor;
+
+    double mandatory_traffic = static_cast<double>(weight_bytes + logits_bytes);
+    std::printf("lm_head ptx_tma_ws_persistent: n=%d k=%d weight=%.3f MB logits=%.3f MB R=16 TileK=256 "
+                "Stages=%d NCons=4 WPB=5 blocks=%d (sms=%d)\n",
+        opt.n, opt.k, weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.k_unroll, blocks, prop.multiProcessorCount);
+
+    if (opt.verify)
+    {
+        lm_head_gemv_ptx_kernel<8><<<(opt.n + 7) / 8, 256>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaDeviceSynchronize());
+        float ref = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&ref, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+        {
+            int threads = 5 * 32;
+            int hidden_align = ((opt.k * static_cast<int>(sizeof(half)) + 127) / 128) * 128;
+            int ring_bytes = 4 * 16 * 128 * static_cast<int>(sizeof(half2));
+            int mbar_bytes = 2 * 4 * static_cast<int>(sizeof(uint64_t));
+            size_t smem = static_cast<size_t>(hidden_align + ring_bytes + mbar_bytes);
+            CHECK_CUDA(cudaFuncSetAttribute(lm_head_gemv_tma_ws_persistent_kernel<5, 16, 128, 4, 4>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+            lm_head_gemv_tma_ws_persistent_kernel<5, 16, 128, 4, 4>
+                <<<blocks, threads, smem>>>(d_hidden, weight_map, d_logits, opt.n, opt.k);
+            CHECK_CUDA(cudaGetLastError());
+            CHECK_CUDA(cudaDeviceSynchronize());
+        }
+        float v0 = 0.0f;
+        float vn = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&v0, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&vn, d_logits + (opt.n - 1), sizeof(float), cudaMemcpyDeviceToHost));
+        float tol = (ref < 0.0f ? -ref : ref) * 1.0e-3f + 1.0e-3f;
+        float d0 = (v0 - ref < 0.0f) ? ref - v0 : v0 - ref;
+        float dn = (vn - ref < 0.0f) ? ref - vn : vn - ref;
+        bool ok = d0 <= tol && dn <= tol;
+        std::printf("  tma_ws_persistent verify: ref=%.4f v[0]=%.4f v[n-1]=%.4f -> %s\n", ref, v0, vn,
+            ok ? "OK" : "MISMATCH");
+    }
+
+    float ms = run_lm_head_ptx_tma_ws_persistent(opt, blocks, weight_map, d_hidden, d_logits);
+    CHECK_CUDA(cudaGetLastError());
+    print_bw("ptx_tma_ws_persistent", ms, mandatory_traffic);
 
     CHECK_CUDA(cudaFree(d_hidden));
     CHECK_CUDA(cudaFree(d_weight));
@@ -3325,6 +3649,14 @@ int main(int argc, char** argv)
     else if (opt.op == "ptx_tma_ws")
     {
         run_gemv_tma_ws_case(opt);
+    }
+    else if (opt.op == "ptx_tma_ws_r32")
+    {
+        run_gemv_tma_ws_r32_case(opt);
+    }
+    else if (opt.op == "ptx_tma_ws_persistent")
+    {
+        run_gemv_tma_ws_persistent_case(opt);
     }
     else if (opt.op == "copy" || opt.op == "copy_u8")
     {
