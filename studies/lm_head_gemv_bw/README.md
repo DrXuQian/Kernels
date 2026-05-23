@@ -220,6 +220,7 @@ Local H800 PCIe, `N=248320`, `K=3072`, fp16 input/weight and fp32 logits:
 | `ptx_r2_chunk4u4`, 8 warps/block, `-O3` | 0.7862 ms | 1.942 TB/s |
 | `ptx_r2_chunk4u2_smem`, 8 warps/block, `-O3` | 0.7871 ms | 1.940 TB/s |
 | `ptx_cpasync`, 8 warps/block, `-O3` | 0.7820 ms | 1.952 TB/s |
+| `ptx_tma_ws` (1 producer + 4 consumers, R=16, Stages=4) | 0.7807 ms | 1.956 TB/s |
 | `ptx_r4_chunk4`, 8 warps/block, `-O3` | 0.7885 ms | 1.936 TB/s |
 | `ptx_u4`, 8 warps/block, `-O1` | 0.7883 ms | 1.937 TB/s |
 | `ptx_r2u4`, 8 warps/block, `-O1` | 0.7886 ms | 1.936 TB/s |

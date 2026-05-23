@@ -15,7 +15,7 @@ CFLAGS ?= -O3 -std=c++17 --expt-relaxed-constexpr
 all: bench_lm_head_gemv
 
 bench_lm_head_gemv: src/bench_lm_head_gemv.cu
-	$(NVCC) $(CFLAGS) $(ARCH) $< -o $@ -lcublas
+	$(NVCC) $(CFLAGS) $(ARCH) $< -o $@ -lcublas -lcuda
 
 clean:
 	rm -f bench_lm_head_gemv *.o
