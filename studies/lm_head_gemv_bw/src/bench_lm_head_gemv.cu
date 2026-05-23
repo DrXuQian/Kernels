@@ -1916,14 +1916,20 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* bar, uint32_
 
 __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* bar, uint32_t phase)
 {
+    // Loop in C++ instead of PTX labels: NVCC expands `%=` to `$NNN`, but some
+    // non-NVIDIA PTX consumers (e.g. PPU) reject `$` in identifiers.
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile("{\n"
-                 "  .reg .pred p;\n"
-                 "WAITLOOP_%=: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-                 "  @p bra DONE_%=;\n"
-                 "  bra WAITLOOP_%=;\n"
-                 "DONE_%=:\n"
-                 "}\n" ::"r"(addr), "r"(phase));
+    uint32_t done = 0;
+    while (!done)
+    {
+        asm volatile("{\n"
+                     "  .reg .pred p;\n"
+                     "  mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+                     "  selp.b32 %0, 1, 0, p;\n"
+                     "}\n"
+                     : "=r"(done)
+                     : "r"(addr), "r"(phase));
+    }
 }
 
 __device__ __forceinline__ void cp_async_bulk_tensor_2d(
