@@ -2724,10 +2724,17 @@ float run_lm_head_ptx_tma_ws_kernel(
 float run_lm_head_ptx_tma_ws(
     Options const& opt, CUtensorMap const& weight_map, half const* d_hidden, float* d_logits)
 {
-    // Baseline TMA+WS config: 5 warps (1 producer + 4 consumers), 16 rows/block,
-    // 128 half2 (=256 halves) per tile, 4 stages.
-    return run_lm_head_ptx_tma_ws_kernel</*WPB=*/5, /*Rows=*/16, /*TileK=*/128, /*Stages=*/4, /*NCons=*/4>(
-        opt, weight_map, d_hidden, d_logits);
+    // --k-unroll selects pipeline Stages (4/8/16). Other dims fixed:
+    // WPB=5 (1 producer + 4 consumers), Rows=16, TileK=128 half2.
+    if (opt.k_unroll == 4)
+    {
+        return run_lm_head_ptx_tma_ws_kernel<5, 16, 128, 4, 4>(opt, weight_map, d_hidden, d_logits);
+    }
+    if (opt.k_unroll == 8)
+    {
+        return run_lm_head_ptx_tma_ws_kernel<5, 16, 128, 8, 4>(opt, weight_map, d_hidden, d_logits);
+    }
+    return run_lm_head_ptx_tma_ws_kernel<5, 16, 128, 16, 4>(opt, weight_map, d_hidden, d_logits);
 }
 
 static CUtensorMap make_weight_tensormap(
