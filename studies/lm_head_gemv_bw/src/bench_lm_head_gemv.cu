@@ -46,6 +46,7 @@ struct Options
     int k_unroll = 4;
     int warmup = 100;
     int iters = 200;
+    bool verify = true;
 };
 
 bool starts_with(char const* s, char const* prefix)
@@ -122,12 +123,16 @@ Options parse_args(int argc, char** argv)
         {
             opt.iters = std::atoi(argv[++i]);
         }
+        else if (std::strcmp(argv[i], "--no-verify") == 0)
+        {
+            opt.verify = false;
+        }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
             std::printf("Usage: %s [--op all|shared|global|ptx|ptx_u4|ptx_r2u4|ptx_r2u8|ptx_chunk4|ptx_r2_chunk4|ptx_r2_chunk4u2|ptx_r2_chunk4u4|ptx_r2_chunk4u2_smem|ptx_cpasync|ptx_r4_chunk4|ptx_ru|ptx_rlean|ptx_persistent|ptx_tma_ws|cublas|copy|copy_u8]\n"
                         "          [--n vocab] [--k hidden] [--warps-per-block 4|8|16]\n"
                         "          [--rows-per-warp 1|2|4|8] [--k-unroll 4|8|16]\n"
-                        "          [--warmup N] [--iters N]\n",
+                        "          [--warmup N] [--iters N] [--no-verify]\n",
                 argv[0]);
             std::exit(0);
         }
@@ -2960,37 +2965,40 @@ void run_gemv_tma_ws_case(Options const& opt)
     std::printf("lm_head ptx_tma_ws: n=%d k=%d weight=%.3f MB logits=%.3f MB R=16 TileK=256 Stages=4 NCons=4 WPB=5\n",
         opt.n, opt.k, weight_bytes / 1.0e6, logits_bytes / 1.0e6);
 
-    // Correctness check vs the simple inline-PTX GEMV: constant inputs make
-    // every output row identical -- logits[0] and logits[n-1] must match.
-    lm_head_gemv_ptx_kernel<8><<<(opt.n + 7) / 8, 256>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-    float ref = 0.0f;
-    CHECK_CUDA(cudaMemcpy(&ref, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+    if (opt.verify)
     {
-        int blocks = (opt.n + 15) / 16;
-        int threads = 5 * 32;
-        int hidden_align = ((opt.k * static_cast<int>(sizeof(half)) + 127) / 128) * 128;
-        int ring_bytes = 4 * 16 * 128 * static_cast<int>(sizeof(half2));
-        int mbar_bytes = 2 * 4 * static_cast<int>(sizeof(uint64_t));
-        size_t smem = static_cast<size_t>(hidden_align + ring_bytes + mbar_bytes);
-        CHECK_CUDA(cudaFuncSetAttribute(lm_head_gemv_tma_ws_kernel<5, 16, 128, 4, 4>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-        lm_head_gemv_tma_ws_kernel<5, 16, 128, 4, 4>
-            <<<blocks, threads, smem>>>(d_hidden, weight_map, d_logits, opt.n, opt.k);
+        // Correctness check vs the simple inline-PTX GEMV: constant inputs make
+        // every output row identical -- logits[0] and logits[n-1] must match.
+        lm_head_gemv_ptx_kernel<8><<<(opt.n + 7) / 8, 256>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
+        float ref = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&ref, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+        {
+            int blocks = (opt.n + 15) / 16;
+            int threads = 5 * 32;
+            int hidden_align = ((opt.k * static_cast<int>(sizeof(half)) + 127) / 128) * 128;
+            int ring_bytes = 4 * 16 * 128 * static_cast<int>(sizeof(half2));
+            int mbar_bytes = 2 * 4 * static_cast<int>(sizeof(uint64_t));
+            size_t smem = static_cast<size_t>(hidden_align + ring_bytes + mbar_bytes);
+            CHECK_CUDA(cudaFuncSetAttribute(lm_head_gemv_tma_ws_kernel<5, 16, 128, 4, 4>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+            lm_head_gemv_tma_ws_kernel<5, 16, 128, 4, 4>
+                <<<blocks, threads, smem>>>(d_hidden, weight_map, d_logits, opt.n, opt.k);
+            CHECK_CUDA(cudaGetLastError());
+            CHECK_CUDA(cudaDeviceSynchronize());
+        }
+        float v0 = 0.0f;
+        float vn = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&v0, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&vn, d_logits + (opt.n - 1), sizeof(float), cudaMemcpyDeviceToHost));
+        float tol = (ref < 0.0f ? -ref : ref) * 1.0e-3f + 1.0e-3f;
+        float d0 = (v0 - ref < 0.0f) ? ref - v0 : v0 - ref;
+        float dn = (vn - ref < 0.0f) ? ref - vn : vn - ref;
+        bool ok = d0 <= tol && dn <= tol;
+        std::printf("  tma_ws verify: ref=%.4f v[0]=%.4f v[n-1]=%.4f -> %s\n", ref, v0, vn, ok ? "OK" : "MISMATCH");
     }
-    float v0 = 0.0f;
-    float vn = 0.0f;
-    CHECK_CUDA(cudaMemcpy(&v0, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(&vn, d_logits + (opt.n - 1), sizeof(float), cudaMemcpyDeviceToHost));
-    float tol = (ref < 0.0f ? -ref : ref) * 1.0e-3f + 1.0e-3f;
-    float d0 = (v0 - ref < 0.0f) ? ref - v0 : v0 - ref;
-    float dn = (vn - ref < 0.0f) ? ref - vn : vn - ref;
-    bool ok = d0 <= tol && dn <= tol;
-    std::printf("  tma_ws verify: ref=%.4f v[0]=%.4f v[n-1]=%.4f -> %s\n", ref, v0, vn, ok ? "OK" : "MISMATCH");
 
     float ms = run_lm_head_ptx_tma_ws(opt, weight_map, d_hidden, d_logits);
     CHECK_CUDA(cudaGetLastError());
@@ -3128,32 +3136,35 @@ void run_gemv_cpasync_case(Options const& opt)
     std::printf("lm_head ptx_cpasync: n=%d k=%d weight=%.3f MB logits=%.3f MB warps/block=%d\n", opt.n, opt.k,
         weight_bytes / 1.0e6, logits_bytes / 1.0e6, opt.warps_per_block);
 
-    // Correctness check vs the simple inline-PTX GEMV: the benchmark fills the
-    // inputs with constant bytes, so every output row is identical -- logits[0]
-    // and logits[n-1] must match the reference and each other.
-    lm_head_gemv_ptx_kernel<8><<<(opt.n + 7) / 8, 256>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-    float ref = 0.0f;
-    CHECK_CUDA(cudaMemcpy(&ref, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+    if (opt.verify)
     {
-        int ring_off = ((opt.k * static_cast<int>(sizeof(half)) + 15) / 16) * 16;
-        size_t smem = static_cast<size_t>(ring_off) + static_cast<size_t>(8) * 4 * 128 * sizeof(half2);
-        lm_head_gemv_ptx_cpasync_kernel<8, 4>
-            <<<(opt.n + 7) / 8, 256, smem>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+        // Correctness check vs the simple inline-PTX GEMV: the benchmark fills the
+        // inputs with constant bytes, so every output row is identical -- logits[0]
+        // and logits[n-1] must match the reference and each other.
+        lm_head_gemv_ptx_kernel<8><<<(opt.n + 7) / 8, 256>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
+        float ref = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&ref, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemset(d_logits, 0, logits_bytes));
+        {
+            int ring_off = ((opt.k * static_cast<int>(sizeof(half)) + 15) / 16) * 16;
+            size_t smem = static_cast<size_t>(ring_off) + static_cast<size_t>(8) * 4 * 128 * sizeof(half2);
+            lm_head_gemv_ptx_cpasync_kernel<8, 4>
+                <<<(opt.n + 7) / 8, 256, smem>>>(d_hidden, d_weight, d_logits, opt.n, opt.k);
+            CHECK_CUDA(cudaGetLastError());
+            CHECK_CUDA(cudaDeviceSynchronize());
+        }
+        float v0 = 0.0f;
+        float vn = 0.0f;
+        CHECK_CUDA(cudaMemcpy(&v0, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&vn, d_logits + (opt.n - 1), sizeof(float), cudaMemcpyDeviceToHost));
+        float tol = (ref < 0.0f ? -ref : ref) * 1.0e-3f + 1.0e-3f;
+        float d0 = (v0 - ref < 0.0f) ? ref - v0 : v0 - ref;
+        float dn = (vn - ref < 0.0f) ? ref - vn : vn - ref;
+        bool ok = d0 <= tol && dn <= tol;
+        std::printf("  cpasync verify: ref=%.4f v[0]=%.4f v[n-1]=%.4f -> %s\n", ref, v0, vn, ok ? "OK" : "MISMATCH");
     }
-    float v0 = 0.0f;
-    float vn = 0.0f;
-    CHECK_CUDA(cudaMemcpy(&v0, d_logits, sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(&vn, d_logits + (opt.n - 1), sizeof(float), cudaMemcpyDeviceToHost));
-    float tol = (ref < 0.0f ? -ref : ref) * 1.0e-3f + 1.0e-3f;
-    float d0 = (v0 - ref < 0.0f) ? ref - v0 : v0 - ref;
-    float dn = (vn - ref < 0.0f) ? ref - vn : vn - ref;
-    bool ok = d0 <= tol && dn <= tol;
-    std::printf("  cpasync verify: ref=%.4f v[0]=%.4f v[n-1]=%.4f -> %s\n", ref, v0, vn, ok ? "OK" : "MISMATCH");
 
     float ms = run_lm_head_ptx_cpasync(opt, d_hidden, d_weight, d_logits);
     CHECK_CUDA(cudaGetLastError());
