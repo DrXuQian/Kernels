@@ -20,58 +20,77 @@ OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_logs/bench_$BENCH_RUN_ID}"
 PYTHON_BIN="${PYTHON:-$(command -v python3 || true)}"
 ATTN_BENCH_WARMUP="${ATTN_BENCH_WARMUP:-0}"
 ATTN_BENCH_ITERS="${ATTN_BENCH_ITERS:-1}"
+QUANTIZED_GEMM_DTYPE="${QUANTIZED_GEMM_DTYPE:-fp16}"
+QUANTIZED_GEMM_LABEL_KIND="${QUANTIZED_GEMM_LABEL_KIND:-w4a16}"
 
-PREFILL_TOKENS=3823
-DECODE_TOKENS=1
+MODEL_NAME="${MODEL_NAME:-Qwen3.5-122B-A10B-GPTQ}"
+PREFILL_TOKENS="${PREFILL_TOKENS:-3823}"
+DECODE_TOKENS="${DECODE_TOKENS:-1}"
 CTX_LEN="${CTX_LEN:-3823}"
-LINEAR_DIM=12288
-HIDDEN_DIM=3072
-CONV_WIDTH=4
-LINEAR_Q_HEADS=16
-LINEAR_V_HEADS=64
-LINEAR_HEAD_DIM=128
-LINEAR_SMALL_PROJ_N=64
+LINEAR_DIM="${LINEAR_DIM:-12288}"
+HIDDEN_DIM="${HIDDEN_DIM:-3072}"
+CONV_WIDTH="${CONV_WIDTH:-4}"
+LINEAR_Q_HEADS="${LINEAR_Q_HEADS:-16}"
+LINEAR_V_HEADS="${LINEAR_V_HEADS:-64}"
+LINEAR_HEAD_DIM="${LINEAR_HEAD_DIM:-128}"
+LINEAR_SMALL_PROJ_N="${LINEAR_SMALL_PROJ_N:-64}"
 
-MOE_EXPERTS=8
-MOE_ROUTER_EXPERTS=256
-MOE_TOPK=8
-MOE_GROUP=128
-MOE_INTERMEDIATE=1024
-MOE_GATE_N=2048
-MOE_GATE_K=3072
-MOE_DOWN_N=3072
-MOE_DOWN_K=1024
-MOE_SHARED_HIDDEN=3072
+MOE_EXPERTS="${MOE_EXPERTS:-8}"
+MOE_ROUTER_EXPERTS="${MOE_ROUTER_EXPERTS:-256}"
+MOE_TOPK="${MOE_TOPK:-8}"
+MOE_GROUP="${MOE_GROUP:-128}"
+MOE_INTERMEDIATE="${MOE_INTERMEDIATE:-1024}"
+MOE_GATE_N="${MOE_GATE_N:-2048}"
+MOE_GATE_K="${MOE_GATE_K:-3072}"
+MOE_DOWN_N="${MOE_DOWN_N:-3072}"
+MOE_DOWN_K="${MOE_DOWN_K:-1024}"
+MOE_SHARED_HIDDEN="${MOE_SHARED_HIDDEN:-3072}"
 
-W4A16_LINEAR_QKV_N=12288
-W4A16_LINEAR_QKV_K=3072
-W4A16_LINEAR_Z_N=8192
-W4A16_LINEAR_Z_K=3072
-W4A16_LINEAR_OUT_N=3072
-W4A16_LINEAR_OUT_K=8192
-W4A16_FULL_ATTN_Q_PROJ_GATE_N=16384
-W4A16_FULL_ATTN_Q_PROJ_GATE_K=3072
-W4A16_FULL_ATTN_K_PROJ_N=512
-W4A16_FULL_ATTN_K_PROJ_K=3072
-W4A16_FULL_ATTN_V_PROJ_N=512
-W4A16_FULL_ATTN_V_PROJ_K=3072
-W4A16_FULL_ATTN_O_PROJ_N=3072
-W4A16_FULL_ATTN_O_PROJ_K=8192
-FULL_ATTN_Q_HEADS=32
-FULL_ATTN_KV_HEADS=2
-FULL_ATTN_HEAD_DIM=256
-W4A16_CONSISTENT_EXPERT_UP_N=2048
-W4A16_CONSISTENT_EXPERT_UP_K=3072
-W4A16_CONSISTENT_EXPERT_DOWN_N=3072
-W4A16_CONSISTENT_EXPERT_DOWN_K=1024
+W4A16_GROUP="${W4A16_GROUP:-128}"
+W4A16_LINEAR_QKV_N="${W4A16_LINEAR_QKV_N:-12288}"
+W4A16_LINEAR_QKV_K="${W4A16_LINEAR_QKV_K:-3072}"
+W4A16_LINEAR_Z_N="${W4A16_LINEAR_Z_N:-8192}"
+W4A16_LINEAR_Z_K="${W4A16_LINEAR_Z_K:-3072}"
+W4A16_LINEAR_OUT_N="${W4A16_LINEAR_OUT_N:-3072}"
+W4A16_LINEAR_OUT_K="${W4A16_LINEAR_OUT_K:-8192}"
+W4A16_FULL_ATTN_Q_PROJ_GATE_N="${W4A16_FULL_ATTN_Q_PROJ_GATE_N:-16384}"
+W4A16_FULL_ATTN_Q_PROJ_GATE_K="${W4A16_FULL_ATTN_Q_PROJ_GATE_K:-3072}"
+W4A16_FULL_ATTN_K_PROJ_N="${W4A16_FULL_ATTN_K_PROJ_N:-512}"
+W4A16_FULL_ATTN_K_PROJ_K="${W4A16_FULL_ATTN_K_PROJ_K:-3072}"
+W4A16_FULL_ATTN_V_PROJ_N="${W4A16_FULL_ATTN_V_PROJ_N:-512}"
+W4A16_FULL_ATTN_V_PROJ_K="${W4A16_FULL_ATTN_V_PROJ_K:-3072}"
+W4A16_FULL_ATTN_O_PROJ_N="${W4A16_FULL_ATTN_O_PROJ_N:-3072}"
+W4A16_FULL_ATTN_O_PROJ_K="${W4A16_FULL_ATTN_O_PROJ_K:-8192}"
+FULL_ATTN_Q_HEADS="${FULL_ATTN_Q_HEADS:-32}"
+FULL_ATTN_KV_HEADS="${FULL_ATTN_KV_HEADS:-2}"
+FULL_ATTN_HEAD_DIM="${FULL_ATTN_HEAD_DIM:-256}"
+W4A16_CONSISTENT_EXPERT_UP_N="${W4A16_CONSISTENT_EXPERT_UP_N:-2048}"
+W4A16_CONSISTENT_EXPERT_UP_K="${W4A16_CONSISTENT_EXPERT_UP_K:-3072}"
+W4A16_CONSISTENT_EXPERT_DOWN_N="${W4A16_CONSISTENT_EXPERT_DOWN_N:-3072}"
+W4A16_CONSISTENT_EXPERT_DOWN_K="${W4A16_CONSISTENT_EXPERT_DOWN_K:-1024}"
 
-SAMPLING_VOCAB=248320
-SAMPLING_TOPK=50
-SAMPLING_TOPP=0.9
+DENSE_FFN_INTERMEDIATE="${DENSE_FFN_INTERMEDIATE:-17408}"
+DENSE_FFN_GATE_N="${DENSE_FFN_GATE_N:-$((2 * DENSE_FFN_INTERMEDIATE))}"
+DENSE_FFN_GATE_K="${DENSE_FFN_GATE_K:-$HIDDEN_DIM}"
+DENSE_FFN_DOWN_N="${DENSE_FFN_DOWN_N:-$HIDDEN_DIM}"
+DENSE_FFN_DOWN_K="${DENSE_FFN_DOWN_K:-$DENSE_FFN_INTERMEDIATE}"
+
+SAMPLING_VOCAB="${SAMPLING_VOCAB:-248320}"
+SAMPLING_TOPK="${SAMPLING_TOPK:-50}"
+SAMPLING_TOPP="${SAMPLING_TOPP:-0.9}"
+
+ENABLE_LINEAR_ATTN="${ENABLE_LINEAR_ATTN:-1}"
+ENABLE_FULL_ATTN="${ENABLE_FULL_ATTN:-1}"
+ENABLE_MOE_FFN="${ENABLE_MOE_FFN:-1}"
+ENABLE_DENSE_FFN="${ENABLE_DENSE_FFN:-0}"
+ENABLE_SHARED_EXPERT="${ENABLE_SHARED_EXPERT:-1}"
+ENABLE_SAMPLING="${ENABLE_SAMPLING:-1}"
+USE_W4A16_MOE_SHARED_EXPERT="${USE_W4A16_MOE_SHARED_EXPERT:-1}"
 
 MODEL_LAYERS="${MODEL_LAYERS:-48}"
 MODEL_FULL_ATTN_LAYERS="${MODEL_FULL_ATTN_LAYERS:-12}"
 MODEL_LINEAR_ATTN_LAYERS="${MODEL_LINEAR_ATTN_LAYERS:-36}"
+MODEL_DENSE_FFN_LAYERS="${MODEL_DENSE_FFN_LAYERS:-0}"
 MODEL_MOE_FFN_LAYERS="${MODEL_MOE_FFN_LAYERS:-48}"
 MODEL_SAMPLING_PREFILL_COUNT="${MODEL_SAMPLING_PREFILL_COUNT:-1}"
 MODEL_SAMPLING_DECODE_COUNT="${MODEL_SAMPLING_DECODE_COUNT:-1}"
@@ -80,6 +99,7 @@ MODEL_SUMMARY_ARGS=(
   --model-layers "$MODEL_LAYERS"
   --full-attn-layers "$MODEL_FULL_ATTN_LAYERS"
   --linear-attn-layers "$MODEL_LINEAR_ATTN_LAYERS"
+  --dense-ffn-layers "$MODEL_DENSE_FFN_LAYERS"
   --moe-ffn-layers "$MODEL_MOE_FFN_LAYERS"
   --sampling-prefill-count "$MODEL_SAMPLING_PREFILL_COUNT"
   --sampling-decode-count "$MODEL_SAMPLING_DECODE_COUNT"
@@ -127,6 +147,7 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
 DECODE_CUBLAS_BACKEND="${DECODE_CUBLAS_BACKEND:-cuda_core}"
 DECODE_MOE_BACKEND="${DECODE_MOE_BACKEND:-vllm}"
+MOE_GEMM_BACKEND="${MOE_GEMM_BACKEND:-trtllm}"
 
 declare -A DEDUPE_LABEL_BY_KEY=()
 declare -A DEDUPE_LOG_BY_KEY=()
@@ -169,6 +190,14 @@ Environment variables:
   BENCH_DEDUPE             Set to 0 to rerun duplicate benchmark commands/shapes.
                            Default: 1. Duplicate case logs point at the first
                            case that measured the same key.
+  QUANTIZED_GEMM_DTYPE     Dense cuBLAS baseline input dtype for quantized
+                           projection shapes. Default: fp16. MiniMax wrappers
+                           set fp8 explicitly; this is still a dense baseline,
+                           not block-wise scaled FP8.
+  QUANTIZED_GEMM_LABEL_KIND Label family for dense replacement projections.
+                           Default: w4a16. Dense model wrappers set dense.
+  MOE_GEMM_BACKEND         trtllm or cublas for routed MoE GEMM bodies.
+                           Default: trtllm. cublas is a dense baseline path.
   DECODE_CUBLAS_BACKEND    cublas or cuda_core for non-lm-head decode dense GEMM. Default: cuda_core.
   DECODE_MOE_BACKEND       vllm or trtllm for decode routed MoE pipeline. Default: vllm.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
@@ -176,6 +205,7 @@ Environment variables:
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
   MODEL_FULL_ATTN_LAYERS   Model summary full-attention multiplier. Default: 12.
   MODEL_LINEAR_ATTN_LAYERS Model summary linear-attention multiplier. Default: 36.
+  MODEL_DENSE_FFN_LAYERS   Model summary dense-FFN multiplier. Default: 0.
   MODEL_MOE_FFN_LAYERS     Model summary MoE-FFN multiplier. Default: 48.
   MODEL_SAMPLING_PREFILL_COUNT Model summary prefill sampling count. Default: 1.
   MODEL_SAMPLING_DECODE_COUNT  Model summary decode sampling count. Default: 1.
@@ -753,9 +783,9 @@ run_w4a16_prefill_gemm_cublas_case() {
   local n="$3"
   local k="$4"
 
-  # GPTQ W4A16 prefill projection benchmarked as a dense cuBLAS FP16 GEMM
+  # GPTQ W4A16 prefill projection benchmarked as a dense cuBLAS GEMM
   # instead of the Machete/CUTLASS55 W4A16 kernel.
-  run_cublas_gemm_case "$label" "$m" "$n" "$k" fp16
+  run_cublas_gemm_case "$(quantized_cublas_label "$label")" "$m" "$n" "$k" fp16 "$QUANTIZED_GEMM_DTYPE"
 }
 
 run_w4a16_decode_gemv_cublas_case() {
@@ -764,9 +794,25 @@ run_w4a16_decode_gemv_cublas_case() {
   local n="$3"
   local k="$4"
 
-  # GPTQ W4A16 decode projection benchmarked as a dense cuBLAS FP16 GEMM
+  # GPTQ W4A16 decode projection benchmarked as a dense cuBLAS GEMM
   # instead of the TensorRT-LLM fpA_intB W4A16 GEMV kernel.
-  run_cublas_gemm_case "$label" "$m" "$n" "$k" fp16
+  run_cublas_gemm_case "$(quantized_cublas_label "$label")" "$m" "$n" "$k" fp16 "$QUANTIZED_GEMM_DTYPE"
+}
+
+quantized_cublas_label() {
+  local label="$1"
+  if [[ "$QUANTIZED_GEMM_DTYPE" == fp8* ]]; then
+    label="${label/w4a16_/fp8_}"
+    label="${label/_trtllm/_cublas}"
+    label="${label/_vllm/_cublas}"
+    if [[ "$label" != fp8_* ]]; then
+      label="fp8_${label}"
+    fi
+    label="${label/_cublas/_cublas_baseline}"
+  elif [[ "$QUANTIZED_GEMM_LABEL_KIND" == "dense" ]]; then
+    label="${label/w4a16_/dense_}"
+  fi
+  printf '%s\n' "$label"
 }
 
 run_rmsnorm_case() {
@@ -821,11 +867,12 @@ run_cublas_gemm_case() {
   local n="$3"
   local k="$4"
   local out_dtype="${5:-fp16}"
+  local input_dtype="${6:-fp16}"
 
   run_case "$label" \
-    --dedupe-key "cublas-gemm:$m,$n,$k,fp16,$out_dtype" \
+    --dedupe-key "cublas-gemm:$m,$n,$k,$input_dtype,$out_dtype" \
     "$CUBLAS_GEMM_BIN" \
-    --m="$m" --n="$n" --k="$k" --dtype fp16 --out-dtype "$out_dtype" \
+    --m="$m" --n="$n" --k="$k" --dtype "$input_dtype" --out-dtype "$out_dtype" \
     --bench 0 1
 }
 
@@ -887,6 +934,14 @@ run_moe_trtllm_gemm_case() {
   local n="$3"
   local k="$4"
 
+  if [[ "$MOE_GEMM_BACKEND" == "cublas" ]]; then
+    local total_m=$((m_per_expert * MOE_EXPERTS))
+    local cublas_label="${label/_trtllm/_cublas}"
+    cublas_label="$(quantized_cublas_label "$cublas_label")"
+    run_cublas_gemm_case "$cublas_label" "$total_m" "$n" "$k" fp16 "$QUANTIZED_GEMM_DTYPE"
+    return
+  fi
+
   if [[ "$m_per_expert" == "1" ]]; then
     run_case "$label" \
       "$MOE_TRTLLM_BIN" \
@@ -913,6 +968,22 @@ run_linear_dense_case() {
   local out_dim="$4"
 
   run_cublas_gemm_case "$label" "$tokens" "$out_dim" "$HIDDEN_DIM" fp16
+}
+
+run_dense_ffn_cases() {
+  local phase="$1"
+  local tokens="$2"
+
+  run_cublas_gemm_case "dense_ffn_${phase}_gate_up_cublas" \
+    "$tokens" "$DENSE_FFN_GATE_N" "$DENSE_FFN_GATE_K" fp16
+
+  run_case "dense_ffn_${phase}_gated_activation" \
+    --dedupe-key "dense-ffn-gated:$tokens,$DENSE_FFN_INTERMEDIATE,fp16" \
+    "$MOE_TRTLLM_AUX_DIR/bench_gated_activation" "$tokens" 1 "$DENSE_FFN_INTERMEDIATE" fp16 \
+    --bench 0 1
+
+  run_cublas_gemm_case "dense_ffn_${phase}_down_cublas" \
+    "$tokens" "$DENSE_FFN_DOWN_N" "$DENSE_FFN_DOWN_K" fp16
 }
 
 run_residual_add_case() {
@@ -954,7 +1025,7 @@ if [[ "$LIST_CASES" == 1 ]]; then
   echo "Available benchmark cases:"
 else
   echo "============================================================"
-  echo "Qwen3.5-122B-A10B (GPTQ) standalone kernel benchmark suite -- cuBLAS GEMM variant"
+  echo "$MODEL_NAME standalone kernel benchmark suite -- cuBLAS dense GEMM variant"
   echo "repo: $ROOT_DIR"
   echo "run dir: $RUN_DIR"
   echo "logs: $OUT_DIR"
@@ -963,9 +1034,11 @@ else
   echo "ctx len:        $CTX_LEN"
   echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     $DECODE_MOE_BACKEND components"
+  echo "moe gemm:       $MOE_GEMM_BACKEND"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
-  echo "w4a16 linear:   cuBLAS dense FP16 GEMM (GPTQ shapes, no W4A16 kernel)"
-  echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
+  echo "quant gemm:     cuBLAS dense $QUANTIZED_GEMM_DTYPE GEMM baseline"
+  echo "enabled:        linear_attn=$ENABLE_LINEAR_ATTN full_attn=$ENABLE_FULL_ATTN moe_ffn=$ENABLE_MOE_FFN dense_ffn=$ENABLE_DENSE_FFN shared_expert=$ENABLE_SHARED_EXPERT sampling=$ENABLE_SAMPLING"
+  echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS dense_ffn=$MODEL_DENSE_FFN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
     echo "case filters:   ${CASE_FILTERS[*]}"
   fi
@@ -990,6 +1063,7 @@ else
   echo "============================================================"
 fi
 
+if [[ "$ENABLE_LINEAR_ATTN" == 1 ]]; then
 run_rmsnorm_case "linear_attn_decode_rmsnorm" "$LINEAR_RMSNORM_BIN" "$DECODE_TOKENS"
 run_rmsnorm_case "linear_attn_prefill_rmsnorm" "$LINEAR_RMSNORM_BIN" "$PREFILL_TOKENS"
 
@@ -1013,18 +1087,6 @@ run_case "linear_prefill_conv1d_fwd" \
 run_case "linear_prefill_flashinfer_gdn" \
   linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
-run_linear_fused_rms_gate_case "linear_attn_decode_fused_rms_norm_gate" "$LINEAR_V_HEADS"
-run_linear_fused_rms_gate_case "linear_attn_prefill_fused_rms_norm_gate" "$((PREFILL_TOKENS * LINEAR_V_HEADS))"
-
-run_residual_add_case "linear_attn_decode_residual_add" "$DECODE_TOKENS"
-run_residual_add_case "linear_attn_prefill_residual_add" "$PREFILL_TOKENS"
-
-run_rmsnorm_case "flash_attn_decode_rmsnorm" "$FLASH_RMSNORM_BIN" "$DECODE_TOKENS"
-run_rmsnorm_case "flash_attn_prefill_rmsnorm" "$FLASH_RMSNORM_BIN" "$PREFILL_TOKENS"
-
-run_residual_add_case "flash_attn_decode_residual_add" "$DECODE_TOKENS"
-run_residual_add_case "flash_attn_prefill_residual_add" "$PREFILL_TOKENS"
-
 run_w4a16_prefill_gemm_cublas_case "w4a16_prefill_linear_attn_in_proj_qkv_cublas" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"
 
@@ -1042,6 +1104,20 @@ run_w4a16_decode_gemv_cublas_case "w4a16_decode_linear_attn_in_proj_z_cublas" \
 
 run_w4a16_decode_gemv_cublas_case "w4a16_decode_linear_attn_out_proj_cublas" \
   "$DECODE_TOKENS" "$W4A16_LINEAR_OUT_N" "$W4A16_LINEAR_OUT_K"
+
+run_linear_fused_rms_gate_case "linear_attn_decode_fused_rms_norm_gate" "$LINEAR_V_HEADS"
+run_linear_fused_rms_gate_case "linear_attn_prefill_fused_rms_norm_gate" "$((PREFILL_TOKENS * LINEAR_V_HEADS))"
+
+run_residual_add_case "linear_attn_decode_residual_add" "$DECODE_TOKENS"
+run_residual_add_case "linear_attn_prefill_residual_add" "$PREFILL_TOKENS"
+fi
+
+if [[ "$ENABLE_FULL_ATTN" == 1 ]]; then
+run_rmsnorm_case "flash_attn_decode_rmsnorm" "$FLASH_RMSNORM_BIN" "$DECODE_TOKENS"
+run_rmsnorm_case "flash_attn_prefill_rmsnorm" "$FLASH_RMSNORM_BIN" "$PREFILL_TOKENS"
+
+run_residual_add_case "flash_attn_decode_residual_add" "$DECODE_TOKENS"
+run_residual_add_case "flash_attn_prefill_residual_add" "$PREFILL_TOKENS"
 
 run_w4a16_prefill_gemm_cublas_case "w4a16_prefill_full_attn_q_proj_gate_cublas" \
   "$PREFILL_TOKENS" "$W4A16_FULL_ATTN_Q_PROJ_GATE_N" "$W4A16_FULL_ATTN_Q_PROJ_GATE_K"
@@ -1084,7 +1160,9 @@ run_flash_attn_core_case "flash_attn_decode_full_attn" \
 
 run_w4a16_decode_gemv_cublas_case "w4a16_decode_full_attn_o_proj_cublas" \
   "$DECODE_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"
+fi
 
+if [[ "$ENABLE_SHARED_EXPERT" == 1 ]]; then
 run_w4a16_prefill_gemm_cublas_case "w4a16_prefill_consistent_expert_up_cublas" \
   "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_UP_N" "$W4A16_CONSISTENT_EXPERT_UP_K"
 
@@ -1092,9 +1170,6 @@ run_moe_shared_expert_activation_case "moe_shared_expert_activation_prefill_trtl
 
 run_w4a16_prefill_gemm_cublas_case "w4a16_prefill_consistent_expert_down_cublas" \
   "$PREFILL_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
-
-run_cublas_gemm_case "moe_router_gate_prefill_cublas" \
-  "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$HIDDEN_DIM" fp16
 
 run_cublas_gemm_case "moe_shared_expert_gate_prefill_cublas" \
   "$PREFILL_TOKENS" 1 "$HIDDEN_DIM" fp16
@@ -1109,19 +1184,35 @@ run_moe_shared_expert_activation_case "moe_shared_expert_activation_decode_trtll
 run_w4a16_decode_gemv_cublas_case "w4a16_decode_consistent_expert_down_cublas" \
   "$DECODE_TOKENS" "$W4A16_CONSISTENT_EXPERT_DOWN_N" "$W4A16_CONSISTENT_EXPERT_DOWN_K"
 
-run_decode_dense_gemm_case "moe_router_gate_decode_cublas" "moe_router_gate_decode_cuda_core" \
-  "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$HIDDEN_DIM" fp16
-
 run_decode_dense_gemm_case "moe_shared_expert_gate_decode_cublas" "moe_shared_expert_gate_decode_cuda_core" \
   "$DECODE_TOKENS" 1 "$HIDDEN_DIM" fp16
 
 run_moe_shared_expert_case "moe_shared_expert_fusion_decode" "sigmoid_mul_add" "$DECODE_TOKENS"
+fi
 
+if [[ "$ENABLE_DENSE_FFN" == 1 ]]; then
+run_rmsnorm_case "dense_ffn_decode_rmsnorm" "$MOE_RMSNORM_BIN" "$DECODE_TOKENS"
+run_rmsnorm_case "dense_ffn_prefill_rmsnorm" "$MOE_RMSNORM_BIN" "$PREFILL_TOKENS"
+
+run_dense_ffn_cases "decode" "$DECODE_TOKENS"
+run_dense_ffn_cases "prefill" "$PREFILL_TOKENS"
+
+run_residual_add_case "dense_ffn_decode_residual_add" "$DECODE_TOKENS"
+run_residual_add_case "dense_ffn_prefill_residual_add" "$PREFILL_TOKENS"
+fi
+
+if [[ "$ENABLE_MOE_FFN" == 1 ]]; then
 run_rmsnorm_case "moe_ffn_decode_rmsnorm" "$MOE_RMSNORM_BIN" "$DECODE_TOKENS"
 run_rmsnorm_case "moe_ffn_prefill_rmsnorm" "$MOE_RMSNORM_BIN" "$PREFILL_TOKENS"
 
 run_residual_add_case "moe_ffn_decode_residual_add" "$DECODE_TOKENS"
 run_residual_add_case "moe_ffn_prefill_residual_add" "$PREFILL_TOKENS"
+
+run_cublas_gemm_case "moe_router_gate_prefill_cublas" \
+  "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$HIDDEN_DIM" fp16
+
+run_decode_dense_gemm_case "moe_router_gate_decode_cublas" "moe_router_gate_decode_cuda_core" \
+  "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$HIDDEN_DIM" fp16
 
 run_case "moe_routing_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
@@ -1198,12 +1289,15 @@ else
     "$MOE_VLLM_AUX_DIR/bench_moe_sum" "$DECODE_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" \
     --bench 0 1
 fi
+fi
 
+if [[ "$ENABLE_SAMPLING" == 1 ]]; then
 run_cublas_gemm_case "sampling_lm_head_gemm" \
   "$DECODE_TOKENS" "$SAMPLING_VOCAB" "$HIDDEN_DIM" fp32
 run_sampling_case "sampling_topk_mask_logits" "topk_mask"
 run_sampling_case "sampling_softmax" "softmax"
 run_sampling_case "sampling_top_p" "top_p"
+fi
 
 if [[ "$LIST_CASES" == 1 ]]; then
   exit 0

@@ -4,8 +4,9 @@ This is the repo-level command reference. It is organized by module:
 
 1. Flash-Attn
 2. Linear-Attn
-3. MoE-FFN
-4. Sampling
+3. Dense-FFN
+4. MoE-FFN
+5. Sampling
 
 All commands are run from the repo root unless noted otherwise.
 
@@ -51,6 +52,18 @@ Build everything used by the default benchmark suite:
 ./compile.sh build all
 ```
 
+Model wrapper scripts:
+
+```bash
+./bench_all.sh --list                                  # Qwen3.5-122B-A10B default
+./run_all_qwen3.5-122B-A10B_GPTQ.sh --list             # dense cuBLAS baseline variant
+./bench_Qwen3.5-122B-A10B-GPTQ_TP2.sh --list           # Qwen3.5-122B-A10B-GPTQ TP=2
+./bench_Qwen3.5_27B.sh --list                          # Qwen3.5-27B dense model
+./bench_MiniMax-M2.7_TP1.sh --list                     # MiniMax-M2.7 TP=1
+./bench_MiniMax-M2.7_TP2.sh --list                     # MiniMax-M2.7 TP=2
+./bench_MiniMax-M2.7_TP4.sh --list                     # MiniMax-M2.7 TP=4
+```
+
 Benchmark runner common options:
 
 | Option | Meaning |
@@ -75,6 +88,15 @@ Useful log/runtime variables:
 | `PERFRAWLOG_POSTPROCESS` | Set `0` to skip perfrawlog post-processing. | `1` |
 | `BENCH_DEDUPE` | Set `0` to rerun duplicate commands/shapes. | `1` |
 | `PERF_STATISTICS_GHZ` | Clock used for perfstatistics latency summary. | `1.5` |
+
+## Benchmark Policy
+
+- Reuse the Qwen3.5 kernels for models whose operator semantics and shapes match.
+- For MiniMax or other non-Qwen gaps, use the best available vLLM or TensorRT-LLM CUDA implementation before adding a local kernel. Do not silently replace a missing quantized kernel with a different dtype/quantization path.
+- MiniMax-M2.7 uses FP8 E4M3 block-wise weight quantization. Its quantized GEMM/MoE path must not be labeled or benchmarked as W4A16. Non-quantized modules such as router gate and `lm_head` stay dense.
+- Any configuration found by search must be serialized to a tactic/cache file. Final benchmark scripts should load cache entries and should not hide search inside timing.
+- `nsys` latency means CUDA kernel duration. Do not use CPU wall time or launch overhead for kernel latency.
+- Run profiling cases serially. Do not run independent performance benchmarks concurrently.
 
 ## Flash-Attn
 
@@ -138,6 +160,26 @@ linear_attn/bench_gated_delta_net 1 64 128 1 --bench 0 1
 linear_attn/bench_gdn_prefill 3823 16 64 128 1 --bench 0 1
 linear_attn/bench_fused_rms_norm_gate 64 128 --bench 0 1
 linear_attn/bench_fused_rms_norm_gate $((3823 * 64)) 128 --bench 0 1
+```
+
+## Dense-FFN
+
+Dense FFN cases are enabled by model wrappers such as `bench_Qwen3.5_27B.sh`.
+They use dense cuBLAS GEMM for gate/up and down projections plus the same
+standalone gated activation used by the MoE auxiliary path.
+
+Run all dense FFN cases:
+
+```bash
+./bench_Qwen3.5_27B.sh --case dense_ffn
+```
+
+Run selected single cases:
+
+```bash
+./bench_Qwen3.5_27B.sh --case dense_ffn_prefill_gate_up_cublas
+./bench_Qwen3.5_27B.sh --case dense_ffn_prefill_gated_activation
+./bench_Qwen3.5_27B.sh --case dense_ffn_prefill_down_cublas
 ```
 
 ## MoE-FFN

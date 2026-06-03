@@ -25,7 +25,7 @@ bench_rmsnorm: bench_rmsnorm.cu ../include/bench_timer.h
 	$(NVCC) $(CFLAGS) $(ARCH) $(CUDA_CCCL_INC) $(INCLUDES) $< -o $@
 
 bench_cublas_gemm: bench_cublas_gemm.cu ../include/bench_timer.h
-	$(NVCC) $(CFLAGS) $(ARCH) $(CUDA_CCCL_INC) $(INCLUDES) $< -o $@ -lcublas
+	$(NVCC) $(CFLAGS) $(ARCH) $(CUDA_CCCL_INC) $(INCLUDES) $< -o $@ -lcublas -lcublasLt
 
 bench_cuda_core_gemv: bench_cuda_core_gemv.cu ../include/bench_timer.h
 	$(NVCC) $(CFLAGS) $(ARCH) $(CUDA_CCCL_INC) $(INCLUDES) $< -o $@

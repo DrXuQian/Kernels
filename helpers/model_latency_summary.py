@@ -14,12 +14,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-MODULES = ("Flash-Attn", "Linear-Attn", "MoE-FFN", "Sampling", "Other")
+MODULES = ("Flash-Attn", "Linear-Attn", "Dense-FFN", "MoE-FFN", "Sampling", "Other")
 PHASES = ("prefill", "decode", "unknown")
 
 MODULE_COLORS = {
     "Flash-Attn": "#4E79A7",
     "Linear-Attn": "#F28E2B",
+    "Dense-FFN": "#B07AA1",
     "MoE-FFN": "#59A14F",
     "Sampling": "#E15759",
     "Other": "#9C755F",
@@ -31,6 +32,7 @@ OPERATOR_COLORS = {
     "MoE grouped GEMM (TRT-LLM)": "#59A14F",
     "MoE GEMM (vLLM Marlin)": "#8CD17D",
     "FP16 GEMM (vLLM/cuBLASLt)": "#B07AA1",
+    "FP8 GEMM baseline": "#AF7AA1",
     "LM head GEMM (vLLM/cuBLASLt)": "#FF9DA7",
     "RMSNorm": "#9C755F",
     "Q/K RMSNorm": "#BAB0AC",
@@ -43,6 +45,7 @@ OPERATOR_COLORS = {
     "MoE expert metadata/align": "#B6992D",
     "MoE expand rows": "#499894",
     "MoE gated activation": "#D37295",
+    "Dense FFN gated activation": "#D37295",
     "MoE finalize/sum": "#FABFD2",
     "Shared expert activation": "#79706E",
     "Shared expert fusion": "#D4A6C8",
@@ -55,6 +58,7 @@ DEFAULT_MODEL_CONFIG = {
     "model_layers": 48,
     "full_attn_layers": 12,
     "linear_attn_layers": 36,
+    "dense_ffn_layers": 0,
     "moe_ffn_layers": 48,
     "sampling_prefill_count": 1,
     "sampling_decode_count": 1,
@@ -80,7 +84,9 @@ def classify_module(case: str) -> str:
         return "Flash-Attn"
     if lower.startswith("linear_") or "linear_attn" in lower:
         return "Linear-Attn"
-    if lower.startswith("moe_") or lower.startswith("moe_ffn_") or "consistent_expert" in lower:
+    if lower.startswith("dense_ffn_"):
+        return "Dense-FFN"
+    if lower.startswith("moe_") or lower.startswith("moe_ffn_") or lower.startswith("fp8_moe_") or "consistent_expert" in lower:
         return "MoE-FFN"
     return "Other"
 
@@ -108,6 +114,8 @@ def classify_operator(case: str) -> str:
         return "MoE GEMM (vLLM Marlin)"
     if base in {"sampling_lm_head_gemm", "sampling_lm_head_vllm_linear"}:
         return "LM head GEMM (vLLM/cuBLASLt)"
+    if base.startswith("fp8_") and "_cublas" in base:
+        return "FP8 GEMM baseline"
     if base.endswith("_cuda_core"):
         return "FP16 GEMV (CUDA core)"
     if base.endswith("_cublas") or base.endswith("_vllm_linear"):
@@ -134,6 +142,8 @@ def classify_operator(case: str) -> str:
         return "MoE expand rows"
     if base in {"moe_gated_prefill_trtllm", "moe_gated_decode_trtllm", "moe_gated_decode_vllm"}:
         return "MoE gated activation"
+    if base in {"dense_ffn_prefill_gated_activation", "dense_ffn_decode_gated_activation"}:
+        return "Dense FFN gated activation"
     if base in {"moe_finalize_prefill_trtllm", "moe_finalize_decode_trtllm", "moe_finalize_decode_vllm"}:
         return "MoE finalize/sum"
     if "shared_expert_activation" in base:
@@ -289,6 +299,8 @@ def model_multiplier(module: str, config: dict[str, int]) -> int:
         return config["full_attn_layers"]
     if module == "Linear-Attn":
         return config["linear_attn_layers"]
+    if module == "Dense-FFN":
+        return config["dense_ffn_layers"]
     if module == "MoE-FFN":
         return config["moe_ffn_layers"]
     return 1
@@ -638,7 +650,7 @@ def write_markdown_report(
         f"Source: `{source_name}`.",
         "",
         "This report contains two views: the raw covered-case subtotal from the selected benchmark cases, and a "
-        "Qwen3.5-122B-A10B model estimate that applies layer-count multipliers.",
+        "model estimate that applies layer-count multipliers.",
         "",
         "## Model Configuration",
         "",
@@ -648,6 +660,7 @@ def write_markdown_report(
                 ["model_layers", str(model_config["model_layers"])],
                 ["full_attention_layers", str(model_config["full_attn_layers"])],
                 ["linear_attention_layers", str(model_config["linear_attn_layers"])],
+                ["dense_ffn_layers", str(model_config["dense_ffn_layers"])],
                 ["moe_ffn_layers", str(model_config["moe_ffn_layers"])],
                 ["prefill_sampling", str(model_config["sampling_prefill_count"])],
                 ["decode_sampling", str(model_config["sampling_decode_count"])],

@@ -6,8 +6,9 @@ The docs use the same module order everywhere:
 
 1. Flash-Attn
 2. Linear-Attn
-3. MoE-FFN
-4. Sampling
+3. Dense-FFN
+4. MoE-FFN
+5. Sampling
 
 Shared kernels such as RMSNorm, cuBLAS GEMM, and W4A16 GEMM live under
 `general/`, but they are documented under the module that uses them.

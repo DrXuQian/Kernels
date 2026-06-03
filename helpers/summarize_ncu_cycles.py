@@ -37,6 +37,7 @@ MODEL_CONFIG_ARGS = (
     ("model_layers", "model_layers"),
     ("full_attn_layers", "full_attn_layers"),
     ("linear_attn_layers", "linear_attn_layers"),
+    ("dense_ffn_layers", "dense_ffn_layers"),
     ("moe_ffn_layers", "moe_ffn_layers"),
     ("sampling_prefill_count", "sampling_prefill_count"),
     ("sampling_decode_count", "sampling_decode_count"),
@@ -47,6 +48,7 @@ def add_model_config_args(parser):
     parser.add_argument("--model-layers", dest="model_layers", type=int, help="Total transformer layers.")
     parser.add_argument("--full-attn-layers", dest="full_attn_layers", type=int, help="Full-attention layer count.")
     parser.add_argument("--linear-attn-layers", dest="linear_attn_layers", type=int, help="Linear-attention layer count.")
+    parser.add_argument("--dense-ffn-layers", dest="dense_ffn_layers", type=int, help="Dense-FFN layer count.")
     parser.add_argument("--moe-ffn-layers", dest="moe_ffn_layers", type=int, help="MoE-FFN layer count.")
     parser.add_argument("--sampling-prefill-count", dest="sampling_prefill_count", type=int, help="Prefill sampling count.")
     parser.add_argument("--sampling-decode-count", dest="sampling_decode_count", type=int, help="Decode sampling count.")

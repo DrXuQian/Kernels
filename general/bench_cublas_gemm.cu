@@ -1,9 +1,10 @@
-// Generic cuBLAS FP16/BF16 GEMM benchmark.
+// Generic cuBLAS FP16/BF16/FP8 GEMM benchmark.
 //
 // Computes row-major C[M,N] = A[M,K] * B[K,N].
 //
 // Usage:
 //   general/bench_cublas_gemm --m=3823 --n=64 --k=3072 --dtype=fp16 --bench 0 1
+//   general/bench_cublas_gemm --m=3823 --n=6144 --k=3072 --dtype=fp8 --out-dtype=fp16 --bench 0 1
 //   general/bench_cublas_gemm --m=1 --n=248320 --k=3072 --dtype=fp16 --out-dtype=fp32 --bench 0 1
 
 #include <algorithm>
@@ -13,8 +14,10 @@
 #include <string>
 #include <vector>
 
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -115,7 +118,7 @@ Options parse_args(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::printf("Usage: %s --m M --n N --k K [--dtype fp16|bf16] [--out-dtype same|fp16|bf16|fp32]"
+            std::printf("Usage: %s --m M --n N --k K [--dtype fp16|bf16|fp8] [--out-dtype same|fp16|bf16|fp32]"
                         " [--bench W I]\n",
                 argv[0]);
             std::exit(0);
@@ -132,14 +135,18 @@ Options parse_args(int argc, char** argv)
         std::fprintf(stderr, "m, n, and k must be positive\n");
         std::exit(1);
     }
-    if (opt.dtype != "fp16" && opt.dtype != "bf16")
+    if (opt.dtype == "fp8_e4m3")
     {
-        std::fprintf(stderr, "dtype must be fp16 or bf16\n");
+        opt.dtype = "fp8";
+    }
+    if (opt.dtype != "fp16" && opt.dtype != "bf16" && opt.dtype != "fp8")
+    {
+        std::fprintf(stderr, "dtype must be fp16, bf16, or fp8\n");
         std::exit(1);
     }
     if (opt.out_dtype == "same")
     {
-        opt.out_dtype = opt.dtype;
+        opt.out_dtype = (opt.dtype == "fp8") ? "fp16" : opt.dtype;
     }
     if (opt.out_dtype != "fp16" && opt.out_dtype != "bf16" && opt.out_dtype != "fp32")
     {
@@ -162,6 +169,12 @@ template <>
 __nv_bfloat16 host_from_float<__nv_bfloat16>(float value)
 {
     return __float2bfloat16(value);
+}
+
+template <>
+__nv_fp8_e4m3 host_from_float<__nv_fp8_e4m3>(float value)
+{
+    return __nv_fp8_e4m3(value);
 }
 
 template <typename T>
@@ -252,6 +265,93 @@ int run_gemm(Options const& opt, BenchTimer& timer)
     return 0;
 }
 
+int run_gemm_lt_fp8(Options const& opt, BenchTimer& timer)
+{
+    using T = __nv_fp8_e4m3;
+    T* d_a = nullptr;
+    T* d_b = nullptr;
+    void* d_c = nullptr;
+    void* d_workspace = nullptr;
+    long long a_elems = static_cast<long long>(opt.m) * opt.k;
+    long long b_elems = static_cast<long long>(opt.k) * opt.n;
+    long long c_elems = static_cast<long long>(opt.m) * opt.n;
+    size_t workspace_size = 32ULL * 1024 * 1024;
+
+    CHECK_CUDA(cudaMalloc(&d_a, a_elems * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_b, b_elems * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_c, c_elems * out_type_size(opt.out_dtype)));
+    CHECK_CUDA(cudaMalloc(&d_workspace, workspace_size));
+
+    std::vector<T> h_a(static_cast<size_t>(a_elems));
+    std::vector<T> h_b(static_cast<size_t>(b_elems));
+    fill_tensor_host(h_a, 0.25f);
+    fill_tensor_host(h_b, 0.03125f);
+    CHECK_CUDA(cudaMemcpy(d_a, h_a.data(), a_elems * sizeof(T), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, h_b.data(), b_elems * sizeof(T), cudaMemcpyHostToDevice));
+
+    cublasLtHandle_t handle = nullptr;
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatrixLayout_t d_desc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+
+    CHECK_CUBLAS(cublasLtCreate(&handle));
+    CHECK_CUBLAS(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+    cublasOperation_t trans = CUBLAS_OP_N;
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans, sizeof(trans)));
+
+    cudaDataType_t c_type = out_cuda_type(opt.out_dtype);
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_8F_E4M3, opt.m, opt.k, opt.k));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_8F_E4M3, opt.k, opt.n, opt.k));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&c_desc, c_type, opt.m, opt.n, opt.n));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&d_desc, c_type, opt.m, opt.n, opt.n));
+
+    cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+    CHECK_CUBLAS(cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    CHECK_CUBLAS(cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+    CHECK_CUBLAS(cublasLtMatrixLayoutSetAttribute(d_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
+
+    CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
+    CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
+
+    cublasLtMatmulHeuristicResult_t heuristic = {};
+    int returned_results = 0;
+    CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(
+        handle, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned_results));
+    if (returned_results == 0)
+    {
+        std::fprintf(stderr, "cublasLtMatmulAlgoGetHeuristic returned no FP8 algorithm\n");
+        std::exit(1);
+    }
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    timer.run([&] {
+        CHECK_CUBLAS(cublasLtMatmul(handle, op_desc, &alpha, d_a, a_desc, d_b, b_desc, &beta, d_c, c_desc, d_c,
+            d_desc, &heuristic.algo, d_workspace, workspace_size, 0));
+    });
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUBLAS(cublasLtMatmulPreferenceDestroy(pref));
+    CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(d_desc));
+    CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(c_desc));
+    CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(b_desc));
+    CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(a_desc));
+    CHECK_CUBLAS(cublasLtMatmulDescDestroy(op_desc));
+    CHECK_CUBLAS(cublasLtDestroy(handle));
+    CHECK_CUDA(cudaFree(d_workspace));
+    CHECK_CUDA(cudaFree(d_a));
+    CHECK_CUDA(cudaFree(d_b));
+    CHECK_CUDA(cudaFree(d_c));
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -269,5 +369,9 @@ int main(int argc, char** argv)
     {
         return run_gemm<half>(opt, timer);
     }
-    return run_gemm<__nv_bfloat16>(opt, timer);
+    if (opt.dtype == "bf16")
+    {
+        return run_gemm<__nv_bfloat16>(opt, timer);
+    }
+    return run_gemm_lt_fp8(opt, timer);
 }
