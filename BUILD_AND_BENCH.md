@@ -75,6 +75,7 @@ Benchmark runner common options:
 | `--run-dir DIR` | Run every benchmark with `DIR` as current working directory. |
 | `--perf-model-dir DIR` | Alias for `--run-dir`. |
 | `--ncu-cycles` | Run selected cases under Nsight Compute and summarize cycles. |
+| `--ncu-bandwidth` | Run selected cases under Nsight Compute with DRAM byte/throughput metrics and summarize bandwidth utilization. |
 | `--ncu-launch-skip N` | Forward `--launch-skip N` to Nsight Compute. |
 | `--ncu-launch-count N` | Forward `--launch-count N` to Nsight Compute. |
 
@@ -88,6 +89,7 @@ Useful log/runtime variables:
 | `PERFRAWLOG_POSTPROCESS` | Set `0` to skip perfrawlog post-processing. | `1` |
 | `BENCH_DEDUPE` | Set `0` to rerun duplicate commands/shapes. | `1` |
 | `PERF_STATISTICS_GHZ` | Clock used for perfstatistics latency summary. | `1.5` |
+| `NCU_PEAK_GBPS` | Peak DRAM GB/s used by `--ncu-bandwidth` when NCU peak-percent metric is unavailable. | `3350` |
 
 ## Benchmark Policy
 
@@ -97,6 +99,18 @@ Useful log/runtime variables:
 - Any configuration found by search must be serialized to a tactic/cache file. Final benchmark scripts should load cache entries and should not hide search inside timing.
 - `nsys` latency means CUDA kernel duration. Do not use CPU wall time or launch overhead for kernel latency.
 - Run profiling cases serially. Do not run independent performance benchmarks concurrently.
+- Bandwidth conclusions should come from `--ncu-bandwidth` or equivalent NCU DRAM byte/throughput metrics, not from inferred wall-clock timing alone.
+- If local `ncu` is unavailable or lacks permission, use `nsys` as a kernel-duration fallback only. Mark bandwidth utilization as unverified until NCU DRAM counters are available.
+
+Qwen3.5-27B wrapper status:
+
+- Dense GEMM/GEMV payloads use fp16.
+- Linear-attention conv1d and fused RMSNorm gate run with `LINEAR_ATTN_DTYPE=fp16`.
+- `linear_decode_gdn` still uses the existing float recurrent-state CUDA kernel, and `linear_prefill_flashinfer_gdn` is currently the extracted FlashInfer bf16-only prefill path. Do not treat those two as completed fp16 extractions until a matching fp16 implementation is added or selected from upstream.
+
+MiniMax-M2.7 wrapper status:
+
+- MiniMax-M2.7 published weights are FP8 E4M3 block-wise. Current wrapper labels quantized GEMM/MoE shapes as `fp8_*_cublas_baseline`; this is an explicit dense FP8 baseline, not the final block-wise FP8 vLLM/TRT-LLM kernel extraction.
 
 ## Flash-Attn
 

@@ -91,10 +91,10 @@ make bench_linear_ops
 
 ```bash
 # Conv1d prefill
-./bench_conv1d_fwd [seq_len] [dim] [width] [batch]         # default: 3823 12288 4 1
+./bench_conv1d_fwd [seq_len] [dim] [width] [batch] --dtype fp16 # default dtype: bf16
 
 # Conv1d decode
-./bench_conv1d_update [dim] [width] [batch]                 # default: 12288 4 1
+./bench_conv1d_update [dim] [width] [batch] --dtype fp16        # default dtype: bf16
 
 # GDN 递推 (decode: n_tokens=1, prefill: n_tokens>1)
 ./bench_gated_delta_net [n_tokens] [heads] [head_dim] [n_seqs]  # default: 1 64 128 1
@@ -102,6 +102,7 @@ make bench_linear_ops
 # FP16/BF16 dense adjuncts.
 ../general/bench_cublas_gemm --m=3823 --n=64 --k=3072 --dtype fp16 --bench 0 1
 ./bench_linear_ops --op=residual_add --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
+./bench_fused_rms_norm_gate 64 128 --dtype fp16 --bench 0 1
 
 # cuLA chunked prefill (Hopper only)
 ./bench_kda_prefill [seq_len] [num_heads] [head_dim] [num_seqs] # default: 3823 64 128 1

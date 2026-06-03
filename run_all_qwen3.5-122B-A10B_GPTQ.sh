@@ -34,6 +34,7 @@ LINEAR_Q_HEADS="${LINEAR_Q_HEADS:-16}"
 LINEAR_V_HEADS="${LINEAR_V_HEADS:-64}"
 LINEAR_HEAD_DIM="${LINEAR_HEAD_DIM:-128}"
 LINEAR_SMALL_PROJ_N="${LINEAR_SMALL_PROJ_N:-64}"
+LINEAR_ATTN_DTYPE="${LINEAR_ATTN_DTYPE:-bf16}"
 
 MOE_EXPERTS="${MOE_EXPERTS:-8}"
 MOE_ROUTER_EXPERTS="${MOE_ROUTER_EXPERTS:-256}"
@@ -141,7 +142,15 @@ RESUME_FROM=""
 RESUME_SEEN=1
 RESUME_FOUND=0
 NCU_CYCLES=0
+NCU_BANDWIDTH=0
+if [[ -n "${NCU_METRICS+x}" ]]; then
+  NCU_METRICS_ENV_SET=1
+else
+  NCU_METRICS_ENV_SET=0
+fi
 NCU_METRICS="${NCU_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum}"
+NCU_BANDWIDTH_METRICS="${NCU_BANDWIDTH_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.avg,dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed}"
+NCU_PEAK_GBPS="${NCU_PEAK_GBPS:-3350}"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
@@ -162,6 +171,7 @@ Usage:
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh --resume-from LABEL     # skip cases before LABEL, then continue
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh --run-dir DIR           # run every benchmark with DIR as cwd
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh --ncu-cycles            # run selected cases under Nsight Compute
+  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --ncu-bandwidth         # ncu cycles + DRAM bandwidth metrics
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings. Examples:
@@ -211,6 +221,8 @@ Environment variables:
   MODEL_SAMPLING_DECODE_COUNT  Model summary decode sampling count. Default: 1.
   NCU_METRICS              Nsight Compute metrics for --ncu-cycles.
                            Default: sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum
+  NCU_BANDWIDTH_METRICS    Nsight Compute metrics for --ncu-bandwidth.
+  NCU_PEAK_GBPS            Peak DRAM GB/s used for computed bandwidth utilization. Default: 3350.
   NCU_LAUNCH_SKIP          Optional Nsight Compute --launch-skip value.
   NCU_LAUNCH_COUNT         Optional Nsight Compute --launch-count value.
 EOF
@@ -254,6 +266,15 @@ while [[ $# -gt 0 ]]; do
     --ncu-cycles|--ncu)
       NCU_CYCLES=1
       PERFRAWLOG_POSTPROCESS=0
+      shift
+      ;;
+    --ncu-bandwidth)
+      NCU_CYCLES=1
+      NCU_BANDWIDTH=1
+      PERFRAWLOG_POSTPROCESS=0
+      if [[ "$NCU_METRICS_ENV_SET" == 0 ]]; then
+        NCU_METRICS="$NCU_BANDWIDTH_METRICS"
+      fi
       shift
       ;;
     --ncu-launch-skip)
@@ -749,7 +770,7 @@ summarize_ncu_cycles() {
     return
   fi
 
-  local ncu_dir summary_log model_summary_dir
+  local ncu_dir summary_log model_summary_dir bandwidth_log
   ncu_dir="$OUT_DIR/ncu"
   if [[ ! -d "$ncu_dir" ]]; then
     echo "[run_all] no Nsight Compute output directory found, skip ncu summary."
@@ -775,6 +796,23 @@ summarize_ncu_cycles() {
   fi
   echo "[run_all] ncu cycles summary: $summary_log"
   echo "[run_all] ncu model latency summary: $model_summary_dir/model_latency_summary.md"
+
+  if [[ "$NCU_BANDWIDTH" == 1 ]]; then
+    bandwidth_log="$OUT_DIR/ncu_bandwidth_summary.md"
+    echo
+    echo "=== Nsight Compute bandwidth summary ==="
+    set +e
+    python "$ROOT_DIR/helpers/summarize_ncu_bandwidth.py" "$ncu_dir" \
+      --peak-gbps "$NCU_PEAK_GBPS" \
+      --detail 2>&1 | tee "$bandwidth_log"
+    local bandwidth_status=${PIPESTATUS[0]}
+    set -e
+    if [[ "$bandwidth_status" != 0 ]]; then
+      echo "[run_all][warn] ncu bandwidth summary did not find any DRAM metric rows."
+      return
+    fi
+    echo "[run_all] ncu bandwidth summary: $bandwidth_log"
+  fi
 }
 
 run_w4a16_prefill_gemm_cublas_case() {
@@ -1002,8 +1040,8 @@ run_linear_fused_rms_gate_case() {
   local rows="$2"
 
   run_case "$label" \
-    --dedupe-key "linear-fused-rms-gate:$rows,$LINEAR_HEAD_DIM,bf16" \
-    "$LINEAR_FUSED_RMS_GATE_BIN" "$rows" "$LINEAR_HEAD_DIM" --bench 0 1
+    --dedupe-key "linear-fused-rms-gate:$rows,$LINEAR_HEAD_DIM,$LINEAR_ATTN_DTYPE" \
+    "$LINEAR_FUSED_RMS_GATE_BIN" "$rows" "$LINEAR_HEAD_DIM" --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 }
 
 if [[ "$LIST_CASES" != 1 ]]; then
@@ -1076,13 +1114,13 @@ run_linear_dense_case "linear_attn_prefill_in_proj_a_cublas" "in_proj_a" "$PREFI
 run_linear_dense_case "linear_attn_prefill_in_proj_b_cublas" "in_proj_b" "$PREFILL_TOKENS" "$LINEAR_SMALL_PROJ_N"
 
 run_case "linear_decode_conv1d_update" \
-  linear_attn/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --bench 0 1
+  linear_attn/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_decode_gdn" \
   linear_attn/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
 
 run_case "linear_prefill_conv1d_fwd" \
-  linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --bench 0 1
+  linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_prefill_flashinfer_gdn" \
   linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
