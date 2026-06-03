@@ -76,6 +76,7 @@ Benchmark runner common options:
 | `--perf-model-dir DIR` | Alias for `--run-dir`. |
 | `--ncu-cycles` | Run selected cases under Nsight Compute and summarize cycles. |
 | `--ncu-bandwidth` | Run selected cases under Nsight Compute with DRAM byte/throughput metrics and summarize bandwidth utilization. |
+| `--nsys-latency` | Run selected cases under Nsight Systems and summarize CUDA kernel duration. Use this when local NCU counters are unavailable. |
 | `--ncu-launch-skip N` | Forward `--launch-skip N` to Nsight Compute. |
 | `--ncu-launch-count N` | Forward `--launch-count N` to Nsight Compute. |
 
@@ -295,6 +296,8 @@ sampling/bench_sampling \
 H800 nsys single-case capture:
 
 ```bash
+./bench_MiniMax-M2.7_TP1.sh --nsys-latency --case fp8_block_prefill_full_attn_q_proj_gate_cutlass
+
 RUN_ID=case_$(date +%Y%m%d_%H%M%S)
 BENCH_RUN_ID="$RUN_ID" \
 PERFRAWLOG_POSTPROCESS=0 \
@@ -311,6 +314,12 @@ nsys stats ".bench_profiles/$RUN_ID.nsys-rep" \
   --format csv \
   --output ".bench_profiles/${RUN_ID}_trace"
 ```
+
+`--nsys-latency` writes `.nsys-rep` files under `<OUT_DIR>/nsys/`, a
+case-level kernel-duration table at `<OUT_DIR>/nsys_latency_summary.md`, and a
+model-level latency report at `<OUT_DIR>/model_latency_nsys/model_latency_summary.md`.
+It intentionally does not print bandwidth utilization; use `--ncu-bandwidth`
+on a machine with NCU performance-counter permission for DRAM metrics.
 
 H800 Nsight Compute cycles:
 

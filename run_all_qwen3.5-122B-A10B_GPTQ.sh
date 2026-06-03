@@ -144,6 +144,7 @@ RESUME_SEEN=1
 RESUME_FOUND=0
 NCU_CYCLES=0
 NCU_BANDWIDTH=0
+NSYS_LATENCY=0
 if [[ -n "${NCU_METRICS+x}" ]]; then
   NCU_METRICS_ENV_SET=1
 else
@@ -173,6 +174,7 @@ Usage:
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh --run-dir DIR           # run every benchmark with DIR as cwd
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh --ncu-cycles            # run selected cases under Nsight Compute
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh --ncu-bandwidth         # ncu cycles + DRAM bandwidth metrics
+  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --nsys-latency          # nsys kernel-duration fallback
   ./run_all_qwen3.5-122B-A10B_GPTQ.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings. Examples:
@@ -226,6 +228,10 @@ Environment variables:
   NCU_PEAK_GBPS            Peak DRAM GB/s used for computed bandwidth utilization. Default: 3350.
   NCU_LAUNCH_SKIP          Optional Nsight Compute --launch-skip value.
   NCU_LAUNCH_COUNT         Optional Nsight Compute --launch-count value.
+
+Profiler note:
+  Use --nsys-latency for Nsight Systems kernel duration when NCU counters are
+  unavailable. This does not produce bandwidth utilization.
 EOF
 }
 
@@ -276,6 +282,11 @@ while [[ $# -gt 0 ]]; do
       if [[ "$NCU_METRICS_ENV_SET" == 0 ]]; then
         NCU_METRICS="$NCU_BANDWIDTH_METRICS"
       fi
+      shift
+      ;;
+    --nsys-latency|--nsys)
+      NSYS_LATENCY=1
+      PERFRAWLOG_POSTPROCESS=0
       shift
       ;;
     --ncu-launch-skip)
@@ -534,8 +545,16 @@ run_case() {
   fi
 
   require_bin "${cmd[0]}"
+  if [[ "$NCU_CYCLES" == 1 && "$NSYS_LATENCY" == 1 ]]; then
+    echo "[run_all][error] choose only one profiler: --ncu-cycles/--ncu-bandwidth or --nsys-latency" >&2
+    exit 1
+  fi
   if [[ "$NCU_CYCLES" == 1 ]] && ! command -v ncu >/dev/null 2>&1; then
     echo "[run_all][error] --ncu-cycles requested but ncu is not in PATH" >&2
+    exit 1
+  fi
+  if [[ "$NSYS_LATENCY" == 1 ]] && ! command -v nsys >/dev/null 2>&1; then
+    echo "[run_all][error] --nsys-latency requested but nsys is not in PATH" >&2
     exit 1
   fi
   local required_file
@@ -636,6 +655,28 @@ run_case() {
     } >>"$log"
 
     (cd "$RUN_DIR" && "${ncu_cmd[@]}" "${cmd[@]}") 2>&1 | tee -a "$log" | tee "$ncu_log"
+    status=${PIPESTATUS[0]}
+  elif [[ "$NSYS_LATENCY" == 1 ]]; then
+    local nsys_dir nsys_base nsys_report
+    local -a nsys_cmd
+    nsys_dir="$OUT_DIR/nsys"
+    nsys_base="$nsys_dir/$safe"
+    nsys_report="$nsys_base.nsys-rep"
+    mkdir -p "$nsys_dir"
+    nsys_cmd=(nsys profile --force-overwrite=true --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=none --output "$nsys_base")
+
+    echo "[run_all] nsys report: $nsys_report"
+    printf '[run_all] nsys command:'
+    printf ' %q' "${nsys_cmd[@]}" "${cmd[@]}"
+    echo
+    {
+      echo "nsys_report: $nsys_report"
+      printf 'nsys_command:'
+      printf ' %q' "${nsys_cmd[@]}" "${cmd[@]}"
+      echo
+    } >>"$log"
+
+    (cd "$RUN_DIR" && "${nsys_cmd[@]}" "${cmd[@]}") 2>&1 | tee -a "$log"
     status=${PIPESTATUS[0]}
   else
     (cd "$RUN_DIR" && "${cmd[@]}") 2>&1 | tee -a "$log"
@@ -814,6 +855,39 @@ summarize_ncu_cycles() {
     fi
     echo "[run_all] ncu bandwidth summary: $bandwidth_log"
   fi
+}
+
+summarize_nsys_latency() {
+  if [[ "$NSYS_LATENCY" != 1 ]]; then
+    return
+  fi
+
+  local nsys_dir summary_log model_summary_dir
+  nsys_dir="$OUT_DIR/nsys"
+  if [[ ! -d "$nsys_dir" ]]; then
+    echo "[run_all] no Nsight Systems output directory found, skip nsys summary."
+    return
+  fi
+
+  summary_log="$OUT_DIR/nsys_latency_summary.md"
+  model_summary_dir="$OUT_DIR/model_latency_nsys"
+  echo
+  echo "=== Nsight Systems latency summary ==="
+  set +e
+  python "$ROOT_DIR/helpers/summarize_nsys_kernels.py" "$nsys_dir" \
+    --detail \
+    --bench-out-dir "$OUT_DIR" \
+    --model-summary-dir "$model_summary_dir" \
+    "${MODEL_SUMMARY_ARGS[@]}" 2>&1 | tee "$summary_log"
+  local status=${PIPESTATUS[0]}
+  set -e
+  if [[ "$status" != 0 ]]; then
+    echo "[run_all][warn] nsys latency summary did not find any CUDA kernel rows."
+    return
+  fi
+  echo "[run_all] nsys latency summary: $summary_log"
+  echo "[run_all] nsys model latency summary: $model_summary_dir/model_latency_summary.md"
+  echo "[run_all][note] nsys is latency-only here; bandwidth utilization requires NCU DRAM counters."
 }
 
 run_w4a16_prefill_gemm_cublas_case() {
@@ -1134,6 +1208,10 @@ else
       echo "ncu count:      $NCU_LAUNCH_COUNT"
     fi
   fi
+  if [[ "$NSYS_LATENCY" == 1 ]]; then
+    echo "nsys latency:   enabled"
+    echo "bandwidth:      unavailable from nsys; use --ncu-bandwidth when counters are accessible"
+  fi
   if [[ "$BENCH_DEDUPE" != 0 ]]; then
     echo "dedupe:         enabled"
   else
@@ -1408,5 +1486,6 @@ echo "============================================================"
 
 summarize_perfstatistics
 summarize_ncu_cycles
+summarize_nsys_latency
 
 exit "$FAILED"
