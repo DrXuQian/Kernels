@@ -117,6 +117,7 @@ repo_path() {
 
 CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
 CUDA_CORE_GEMV_BIN="$(repo_path "general/bench_cuda_core_gemv")"
+BLOCK_FP8_GEMM_BIN="$(repo_path "general/bench_cutlass_block_fp8_gemm")"
 MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
 MOE_TRTLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/trtllm/auxiliary")"
 MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
@@ -821,6 +822,11 @@ run_w4a16_prefill_gemm_cublas_case() {
   local n="$3"
   local k="$4"
 
+  if [[ "$QUANTIZED_GEMM_DTYPE" == fp8* ]]; then
+    run_block_fp8_gemm_case "$(quantized_block_fp8_label "$label")" "$m" "$n" "$k"
+    return
+  fi
+
   # GPTQ W4A16 prefill projection benchmarked as a dense cuBLAS GEMM
   # instead of the Machete/CUTLASS55 W4A16 kernel.
   run_cublas_gemm_case "$(quantized_cublas_label "$label")" "$m" "$n" "$k" fp16 "$QUANTIZED_GEMM_DTYPE"
@@ -832,9 +838,26 @@ run_w4a16_decode_gemv_cublas_case() {
   local n="$3"
   local k="$4"
 
+  if [[ "$QUANTIZED_GEMM_DTYPE" == fp8* ]]; then
+    run_block_fp8_gemm_case "$(quantized_block_fp8_label "$label")" "$m" "$n" "$k"
+    return
+  fi
+
   # GPTQ W4A16 decode projection benchmarked as a dense cuBLAS GEMM
   # instead of the TensorRT-LLM fpA_intB W4A16 GEMV kernel.
   run_cublas_gemm_case "$(quantized_cublas_label "$label")" "$m" "$n" "$k" fp16 "$QUANTIZED_GEMM_DTYPE"
+}
+
+quantized_block_fp8_label() {
+  local label="$1"
+  label="${label/w4a16_/fp8_block_}"
+  label="${label/_cublas/_cutlass}"
+  label="${label/_trtllm/_cutlass}"
+  label="${label/_vllm/_cutlass}"
+  if [[ "$label" != fp8_block_* ]]; then
+    label="fp8_block_${label}"
+  fi
+  printf '%s\n' "$label"
 }
 
 quantized_cublas_label() {
@@ -911,6 +934,20 @@ run_cublas_gemm_case() {
     --dedupe-key "cublas-gemm:$m,$n,$k,$input_dtype,$out_dtype" \
     "$CUBLAS_GEMM_BIN" \
     --m="$m" --n="$n" --k="$k" --dtype "$input_dtype" --out-dtype "$out_dtype" \
+    --bench 0 1
+}
+
+run_block_fp8_gemm_case() {
+  local label="$1"
+  local m="$2"
+  local n="$3"
+  local k="$4"
+  local out_dtype="${5:-fp16}"
+
+  run_case "$label" \
+    --dedupe-key "block-fp8-gemm:$m,$n,$k,$out_dtype" \
+    "$BLOCK_FP8_GEMM_BIN" \
+    --m="$m" --n="$n" --k="$k" --out-dtype "$out_dtype" \
     --bench 0 1
 }
 
@@ -1074,7 +1111,11 @@ else
   echo "moe decode:     $DECODE_MOE_BACKEND components"
   echo "moe gemm:       $MOE_GEMM_BACKEND"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
-  echo "quant gemm:     cuBLAS dense $QUANTIZED_GEMM_DTYPE GEMM baseline"
+  if [[ "$QUANTIZED_GEMM_DTYPE" == fp8* ]]; then
+    echo "quant gemm:     CUTLASS block-FP8 dense projection; MoE body remains explicit baseline unless overridden"
+  else
+    echo "quant gemm:     cuBLAS dense $QUANTIZED_GEMM_DTYPE GEMM baseline"
+  fi
   echo "enabled:        linear_attn=$ENABLE_LINEAR_ATTN full_attn=$ENABLE_FULL_ATTN moe_ffn=$ENABLE_MOE_FFN dense_ffn=$ENABLE_DENSE_FFN shared_expert=$ENABLE_SHARED_EXPERT sampling=$ENABLE_SAMPLING"
   echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS dense_ffn=$MODEL_DENSE_FFN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then

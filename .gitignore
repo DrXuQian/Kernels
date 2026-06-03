@@ -23,6 +23,7 @@ bench_layernorm
 bench_rmsnorm
 bench_cublas_gemm
 bench_cuda_core_gemv
+bench_cutlass_block_fp8_gemm
 bench_sampling
 bench_linear_ops
 bench_shared_expert

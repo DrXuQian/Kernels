@@ -110,7 +110,13 @@ Qwen3.5-27B wrapper status:
 
 MiniMax-M2.7 wrapper status:
 
-- MiniMax-M2.7 published weights are FP8 E4M3 block-wise. Current wrapper labels quantized GEMM/MoE shapes as `fp8_*_cublas_baseline`; this is an explicit dense FP8 baseline, not the final block-wise FP8 vLLM/TRT-LLM kernel extraction.
+- MiniMax-M2.7 published weights are FP8 E4M3 block-wise with
+  `weight_block_size=[128,128]`; this is not MXFP8.
+- Dense quantized projections now use the standalone vLLM/CUTLASS SM90
+  block-FP8 path (`fp8_block_*_cutlass`).
+- Routed MoE FP8 bodies are still marked as `fp8_moe_*_cublas_baseline`; the
+  grouped vLLM/TRT-LLM FP8 MoE extraction is still pending and must not be
+  treated as final MiniMax coverage.
 
 ## Flash-Attn
 
