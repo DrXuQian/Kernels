@@ -25,6 +25,7 @@ LINEAR_Q_HEADS=16
 LINEAR_V_HEADS=64
 LINEAR_HEAD_DIM=128
 LINEAR_SMALL_PROJ_N=64
+LINEAR_ATTN_DTYPE="${LINEAR_ATTN_DTYPE:-bf16}"
 
 MOE_EXPERTS=8
 MOE_ROUTER_EXPERTS=256
@@ -1013,16 +1014,16 @@ run_linear_dense_case "linear_attn_prefill_in_proj_a_cublas" "in_proj_a" "$PREFI
 run_linear_dense_case "linear_attn_prefill_in_proj_b_cublas" "in_proj_b" "$PREFILL_TOKENS" "$LINEAR_SMALL_PROJ_N"
 
 run_case "linear_decode_conv1d_update" \
-  linear_attn/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --bench 0 1
+  linear_attn/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_decode_gdn" \
-  linear_attn/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+  linear_attn/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_prefill_conv1d_fwd" \
-  linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --bench 0 1
+  linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_prefill_flashinfer_gdn" \
-  linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+  linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_linear_fused_rms_gate_case "linear_attn_decode_fused_rms_norm_gate" "$LINEAR_V_HEADS"
 run_linear_fused_rms_gate_case "linear_attn_prefill_fused_rms_norm_gate" "$((PREFILL_TOKENS * LINEAR_V_HEADS))"

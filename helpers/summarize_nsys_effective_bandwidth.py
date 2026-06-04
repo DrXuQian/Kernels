@@ -279,20 +279,29 @@ def gated_delta_net_bytes(opts, log_text):
     heads = pos_int(pos, 1)
     head_dim = pos_int(pos, 2)
     seqs = pos_int(pos, 3, 1)
+    dtype = str_opt(opts, "dtype", "float")
     if None in (tokens, heads, head_dim):
-        match = re.search(r"bench gated_delta_net: tokens=(\d+) heads=(\d+) dim=(\d+) seqs=(\d+)", log_text)
+        match = re.search(
+            r"bench gated_delta_net: tokens=(\d+) heads=(\d+) dim=(\d+) seqs=(\d+)(?: dtype=([A-Za-z0-9_]+))?",
+            log_text,
+        )
         if match:
             tokens = int(match.group(1))
             heads = int(match.group(2))
             head_dim = int(match.group(3))
             seqs = int(match.group(4))
+            if match.group(5):
+                dtype = match.group(5)
     if None in (tokens, heads, head_dim, seqs):
         return math.nan, ""
+    b = dtype_nbytes(dtype)
+    if math.isnan(b):
+        return math.nan, f"unsupported gated_delta_net dtype: {dtype}"
     qkv = head_dim * heads * tokens * seqs
     gb = heads * tokens * seqs
     state = seqs * heads * head_dim * head_dim
-    total = (3 * qkv + qkv + 2 * gb + 2 * state) * 4
-    return total, f"gated_delta_net(tokens={tokens},heads={heads},dim={head_dim},seqs={seqs},fp32,lower_bound)"
+    total = (3 * qkv + qkv) * b + (2 * gb + 2 * state) * 4
+    return total, f"gated_delta_net(tokens={tokens},heads={heads},dim={head_dim},seqs={seqs},dtype={dtype},fp32_state,lower_bound)"
 
 
 def flash_attn_bytes(opts, log_text):

@@ -1294,13 +1294,13 @@ run_case "linear_decode_conv1d_update" \
   linear_attn/bench_conv1d_update "$LINEAR_DIM" "$CONV_WIDTH" "$DECODE_TOKENS" --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_decode_gdn" \
-  linear_attn/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+  linear_attn/bench_gated_delta_net "$DECODE_TOKENS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_prefill_conv1d_fwd" \
   linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_case "linear_prefill_flashinfer_gdn" \
-  linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --bench 0 1
+  linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_w4a16_prefill_gemm_cublas_case "w4a16_prefill_linear_attn_in_proj_qkv_cublas" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"

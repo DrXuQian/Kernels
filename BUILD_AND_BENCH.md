@@ -53,12 +53,12 @@ Use the H800 bandwidth wrapper for final bandwidth-utilization evidence:
 ./bench_h800_bandwidth.sh --models minimax-tp4 --case moe_gate_up_decode_fp8_trtllm
 ```
 
-`bench_h800_bandwidth.sh` runs `helpers/ncu_bandwidth_preflight.sh` first, then
-serially runs the selected model wrappers. Default `--backend auto` uses NCU
-DRAM counters when available; if NCU is blocked by `ERR_NVGPUCTRPERM`, it falls
-back to nsys kernel duration and computes effective bandwidth from the
-standalone benchmark shapes. Force either path with `--backend ncu` or
-`--backend nsys`.
+`bench_h800_bandwidth.sh` serially runs the selected model wrappers. The
+default backend is `nsys`: it records CUDA kernel duration and computes
+effective bandwidth from the standalone benchmark shapes. This is the local
+fallback/default when NCU counters are unavailable or not permitted. Use
+`--backend ncu` for hardware-counter DRAM bandwidth, or `--backend auto` to run
+`helpers/ncu_bandwidth_preflight.sh`, try NCU first, then fall back to nsys.
 
 ## Common Setup
 
@@ -151,14 +151,17 @@ Useful log/runtime variables:
 - Any configuration found by search must be serialized to a tactic/cache file. Final benchmark scripts should load cache entries and should not hide search inside timing.
 - `nsys` latency means CUDA kernel duration. Do not use CPU wall time or launch overhead for kernel latency.
 - Run profiling cases serially. Do not run independent performance benchmarks concurrently.
-- Prefer `--ncu-bandwidth` when NCU DRAM byte/throughput counters are available.
-- If local `ncu` is unavailable or lacks permission, use `bench_h800_bandwidth.sh` in its default `--backend auto` mode. It falls back to nsys kernel duration and reports effective bandwidth from benchmark traffic estimates. Treat this as an inferred fallback, not a hardware DRAM-counter measurement.
+- Prefer `--ncu-bandwidth` or `bench_h800_bandwidth.sh --backend ncu` when NCU DRAM byte/throughput counters are available.
+- Locally, use `bench_h800_bandwidth.sh` with its default `nsys` backend. It reports effective bandwidth from benchmark traffic estimates divided by nsys kernel duration. Treat this as an inferred fallback, not a hardware DRAM-counter measurement.
 
 Qwen3.5-27B wrapper status:
 
 - Dense GEMM/GEMV payloads use fp16.
-- Linear-attention conv1d and fused RMSNorm gate run with `LINEAR_ATTN_DTYPE=fp16`.
-- `linear_decode_gdn` still uses the existing float recurrent-state CUDA kernel, and `linear_prefill_flashinfer_gdn` is currently the extracted FlashInfer bf16-only prefill path. Do not treat those two as completed fp16 extractions until a matching fp16 implementation is added or selected from upstream.
+- Linear-attention conv1d, fused RMSNorm gate, GDN decode input/output, and
+  FlashInfer GDN prefill run with `LINEAR_ATTN_DTYPE=fp16`.
+- `linear_decode_gdn` uses the existing CUDA recurrent-state kernel from
+  llama.cpp. That kernel keeps the recurrent state and math in fp32 by design,
+  while Q/K/V and output tensors follow `LINEAR_ATTN_DTYPE`.
 
 MiniMax-M2.7 wrapper status:
 
@@ -404,17 +407,14 @@ case-level aggregate at `<OUT_DIR>/ncu_cycles_summary.md`, and a model-level
 latency report with SVG charts at
 `<OUT_DIR>/model_latency_ncu/model_latency_summary.md`.
 
-H800 decode effective-bandwidth sanity run, using nsys fallback because local
-NCU counters returned `ERR_NVGPUCTRPERM`:
+H800 decode effective-bandwidth sanity run, using the default nsys backend:
 
 ```bash
 BENCH_RUN_ID_PREFIX=h800_decode_bw_20260604 PERFRAWLOG_POSTPROCESS=0 \
-  ./bench_h800_bandwidth.sh --backend nsys --skip-preflight \
-  --models qwen27,minimax --phase decode --continue-on-error
+  ./bench_h800_bandwidth.sh --models qwen27,minimax --phase decode --continue-on-error
 
 BENCH_RUN_ID_PREFIX=h800_decode_bw_20260604 PERFRAWLOG_POSTPROCESS=0 \
-  ./bench_h800_bandwidth.sh --backend nsys --skip-preflight \
-  --models qwen122-tp2 --phase decode --continue-on-error
+  ./bench_h800_bandwidth.sh --models qwen122-tp2 --phase decode --continue-on-error
 ```
 
 The run writes one directory per wrapper under `.bench_logs/`. `latency_us` is
@@ -425,8 +425,8 @@ because their estimated traffic is tiny.
 
 | model wrapper | output directory | decode latency us | representative high-bandwidth kernels |
 |---|---|---:|---|
-| Qwen3.5-27B fp16 | `.bench_logs/bench_h800_decode_bw_20260604_qwen27__decode_` | 28614.032 | dense FFN gate/up cuBLAS: 1944.795 GB/s, 58.054%; dense FFN down cuBLAS: 1876.715 GB/s, 56.021%; dense linear-attn qkv cuBLAS: 1841.471 GB/s, 54.969% |
-| Qwen3.5-122B-A10B-GPTQ TP2 dense-baseline decode | `.bench_logs/bench_h800_decode_bw_20260604_qwen122_tp2__decode_` | 5730.384 | linear-attn qkv cuBLAS: 2682.327 GB/s, 80.069%; linear-attn z cuBLAS: 2538.323 GB/s, 75.771%; linear-attn out cuBLAS: 2138.261 GB/s, 63.829%; MoE gate/up vLLM Marlin: 914.885 GB/s, 27.310% |
+| Qwen3.5-27B fp16 | `.bench_logs/bench_h800_decode_bw_20260604_fp16gdn_qwen27__decode_` | 28619.520 | dense FFN gate/up cuBLAS: 1948.845 GB/s, 58.174%; dense FFN down cuBLAS: 1874.801 GB/s, 55.964%; dense linear-attn qkv cuBLAS: 1813.892 GB/s, 54.146%; linear decode GDN fp16: 1611.024 GB/s, 48.090% |
+| Qwen3.5-122B-A10B-GPTQ TP2 dense-baseline decode | `.bench_logs/bench_h800_decode_bw_20260604_bf16gdn_qwen122_tp2__decode_` | 5769.732 | linear-attn qkv cuBLAS: 2616.905 GB/s, 78.117%; linear-attn z cuBLAS: 2459.000 GB/s, 73.403%; linear-attn out cuBLAS: 2132.466 GB/s, 63.656%; linear decode GDN bf16: 1376.083 GB/s, 41.077%; MoE gate/up vLLM Marlin: 916.498 GB/s, 27.358% |
 | MiniMax-M2.7 TP1 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp1__decode_` | 14987.012 | MoE gate/up FP8 TRT-LLM: 1239.741 GB/s, 37.007%; MoE down FP8 TRT-LLM: 1228.982 GB/s, 36.686%; FP8 q/gate projection: 1054.907 GB/s, 31.490% |
 | MiniMax-M2.7 TP2 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp2__decode_` | 10277.120 | MoE gate/up FP8 TRT-LLM: 1276.719 GB/s, 38.111%; MoE down FP8 TRT-LLM: 950.065 GB/s, 28.360%; FP8 q/gate projection: 524.995 GB/s, 15.671% |
 | MiniMax-M2.7 TP4 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp4__decode_` | 9523.200 | MoE gate/up FP8 TRT-LLM: 1243.467 GB/s, 37.118%; MoE down FP8 TRT-LLM: 666.774 GB/s, 19.904%; FP8 o projection: 424.948 GB/s, 12.685% |

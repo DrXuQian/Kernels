@@ -97,7 +97,7 @@ make bench_linear_ops
 ./bench_conv1d_update [dim] [width] [batch] --dtype fp16        # default dtype: bf16
 
 # GDN 递推 (decode: n_tokens=1, prefill: n_tokens>1)
-./bench_gated_delta_net [n_tokens] [heads] [head_dim] [n_seqs]  # default: 1 64 128 1
+./bench_gated_delta_net [n_tokens] [heads] [head_dim] [n_seqs] --dtype fp16  # default dtype: float
 
 # FP16/BF16 dense adjuncts.
 ../general/bench_cublas_gemm --m=3823 --n=64 --k=3072 --dtype fp16 --bench 0 1
@@ -108,7 +108,8 @@ make bench_linear_ops
 ./bench_kda_prefill [seq_len] [num_heads] [head_dim] [num_seqs] # default: 3823 64 128 1
 
 # FlashInfer GDN prefill (Hopper only, Qwen3.5 GVA fast path)
-./bench_gdn_prefill [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs] # default: 3823 16 64 128 1
+./bench_gdn_prefill [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs] --dtype bf16 # default: 3823 16 64 128 1
+./bench_gdn_prefill 3823 16 48 128 1 --dtype fp16 --bench 0 1 # Qwen3.5-27B fp16 GVA path
 
 # vLLM Triton GDN prefill after causal_conv1d
 python3 src/bench_vllm_triton_gdn_prefill.py [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs]

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MODELS="qwen27,minimax-tp1,minimax-tp2,minimax-tp4"
 PHASE="decode"
-BACKEND="auto"
+BACKEND="${BANDWIDTH_BACKEND:-nsys}"
 RUN_PREFLIGHT=1
 CONTINUE_ON_ERROR=0
 EXTRA_ARGS=()
@@ -16,8 +16,10 @@ Usage:
   ./bench_h800_bandwidth.sh [options] [-- extra wrapper args]
 
 Runs model benchmark wrappers serially for H800 bandwidth-utilization
-collection. By default it tries NCU DRAM counters first and falls back to nsys
-kernel duration plus theoretical benchmark bytes when counters are unavailable.
+collection. By default it uses nsys kernel duration plus theoretical benchmark
+bytes, which works on local machines without NCU counter permission. Use
+--backend ncu for hardware DRAM counters, or --backend auto to try NCU first
+and fall back to nsys.
 
 Options:
   --models LIST        Comma-separated models. Default:
@@ -26,7 +28,7 @@ Options:
                        minimax-tp1, minimax-tp2, minimax-tp4, all
   --phase PHASE        decode, prefill, or all. Default: decode
   --case LABEL         Forward a more specific case filter instead of PHASE.
-  --backend BACKEND    auto, ncu, or nsys. Default: auto
+  --backend BACKEND    auto, ncu, or nsys. Default: nsys
   --skip-preflight     Skip helpers/ncu_bandwidth_preflight.sh.
   --continue-on-error  Continue remaining model wrappers after a failure.
   -h, --help           Show this help.
@@ -45,6 +47,7 @@ Environment:
                        Default: .bench_logs
   NCU_PEAK_GBPS        Peak DRAM GB/s for bandwidth summary. Default inherited
                        by run_all wrapper, currently 3350.
+  BANDWIDTH_BACKEND    Default backend when --backend is omitted. Default: nsys.
 EOF
 }
 
