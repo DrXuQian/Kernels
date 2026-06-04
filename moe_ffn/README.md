@@ -13,6 +13,8 @@ Standalone kernels for MoE/FFN layer components.
 | `w4a16/machete/` | SM90 grouped Machete MoE prefill GEMM benchmark |
 | `w4a16/vllm/marlin/` | vLLM Marlin MoE W4A16 GEMM |
 | `w4a16/vllm/auxiliary/` | vLLM topk, align, activation, finalize helpers |
+| `fp8/trtllm_cutlass_standalone/` | TensorRT-LLM/CUTLASS block-FP8 grouped MoE GEMM |
+| `fp8/flashinfer_cutlass/` | FlashInfer Python reference path for CUTLASS FP8 fused MoE |
 
 ## Build
 
@@ -27,6 +29,13 @@ make -C moe_ffn
 targets plus the TensorRT-LLM MoE GEMM and Machete MoE prefill CMake targets.
 It does not build every vLLM decode auxiliary used by the default benchmark
 suite.
+
+MiniMax FP8 MoE GEMM is intentionally a separate target because it is a Hopper
+block-FP8 path:
+
+```bash
+./compile.sh build moe-fp8-trtllm
+```
 
 ## Decode Backend Switch
 

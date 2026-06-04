@@ -119,6 +119,7 @@ CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
 CUDA_CORE_GEMV_BIN="$(repo_path "general/bench_cuda_core_gemv")"
 BLOCK_FP8_GEMM_BIN="$(repo_path "general/bench_cutlass_block_fp8_gemm")"
 FLASHINFER_FP8_MOE_SCRIPT="$(repo_path "moe_ffn/fp8/flashinfer_cutlass/bench_flashinfer_cutlass_fp8_moe.py")"
+MOE_FP8_TRTLLM_BIN="$(repo_path "moe_ffn/fp8/trtllm_cutlass_standalone/build_cmake_release/bench_moe_fp8_blockscale_gemm")"
 MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
 MOE_TRTLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/trtllm/auxiliary")"
 MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
@@ -134,6 +135,7 @@ SAMPLING_BIN="$(repo_path "sampling/bench_sampling")"
 
 MOE_TRTLLM_TACTIC="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache")"
 FLASHINFER_FP8_MOE_TACTIC="${FLASHINFER_FP8_MOE_TACTIC:-$(repo_path "moe_ffn/fp8/flashinfer_cutlass/tactics_h800_minimax.json")}"
+MOE_FP8_TRTLLM_TACTIC="${MOE_FP8_TRTLLM_TACTIC:-$(repo_path "moe_ffn/fp8/trtllm_cutlass_standalone/tactics_h800_minimax.cache")}"
 
 FAILED=0
 LIST_CASES=0
@@ -210,9 +212,11 @@ Environment variables:
                            CUTLASS block-FP8 dense GEMM path.
   QUANTIZED_GEMM_LABEL_KIND Label family for dense replacement projections.
                            Default: w4a16. Dense model wrappers set dense.
-  MOE_GEMM_BACKEND         trtllm, cublas, fp8_block_dense, or flashinfer_fp8
+  MOE_GEMM_BACKEND         trtllm, cublas, fp8_trtllm, fp8_block_dense, or flashinfer_fp8
                            for routed MoE bodies. Default: trtllm. cublas is
-                           a dense baseline path. fp8_block_dense uses the
+                           a dense baseline path. fp8_trtllm uses the
+                           standalone TRT-LLM/CUTLASS block-FP8 grouped MoE
+                           GEMM. fp8_block_dense uses the
                            repo-owned CUTLASS block-FP8 dense GEMM on expanded
                            tokens as a standalone MiniMax path.
                            flashinfer_fp8 uses FlashInfer CUTLASS block-FP8
@@ -373,10 +377,10 @@ case "$DECODE_MOE_BACKEND" in
 esac
 
 case "$MOE_GEMM_BACKEND" in
-  trtllm|cublas|fp8_block_dense|flashinfer_fp8)
+  trtllm|cublas|fp8_trtllm|fp8_block_dense|flashinfer_fp8)
     ;;
   *)
-    echo "[run_all][error] MOE_GEMM_BACKEND must be trtllm, cublas, fp8_block_dense, or flashinfer_fp8, got: $MOE_GEMM_BACKEND" >&2
+    echo "[run_all][error] MOE_GEMM_BACKEND must be trtllm, cublas, fp8_trtllm, fp8_block_dense, or flashinfer_fp8, got: $MOE_GEMM_BACKEND" >&2
     exit 1
     ;;
 esac
@@ -1110,6 +1114,17 @@ run_moe_trtllm_gemm_case() {
     local total_m=$((m_per_expert * MOE_EXPERTS))
     local fp8_label="${label/_trtllm/_fp8_block_dense}"
     run_block_fp8_gemm_case "$fp8_label" "$total_m" "$n" "$k" bf16
+    return
+  fi
+
+  if [[ "$MOE_GEMM_BACKEND" == "fp8_trtllm" ]]; then
+    local fp8_label="${label/_trtllm/_fp8_trtllm}"
+    run_case "$fp8_label" \
+      --dedupe-key "trtllm-fp8-moe-gemm:$MOE_EXPERTS,$m_per_expert,$n,$k" \
+      --require-tactic-entry "$MOE_FP8_TRTLLM_TACTIC" "$MOE_EXPERTS,$m_per_expert,$n,$k,1x128,128x128|" \
+      "$MOE_FP8_TRTLLM_BIN" \
+      --experts="$MOE_EXPERTS" --m_per_expert="$m_per_expert" --n="$n" --k="$k" \
+      --bench 0 1
     return
   fi
 

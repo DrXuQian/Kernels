@@ -13,10 +13,11 @@ the CUDA kernels come from the installed FlashInfer package. It is only a
 reference path for the SM90 CUTLASS backend; the final target for this repo is a
 fully extracted C++/CUDA standalone binary.
 
-The default MiniMax benchmark wrappers do not use this path. They use
-`MOE_GEMM_BACKEND=fp8_block_dense`, which is repo-owned standalone code on
-expanded expert tokens. That path is still a transition path until the
-FlashInfer/vLLM grouped fused MoE source is extracted or reimplemented locally.
+The default MiniMax benchmark wrappers do not use this path. The standalone
+extraction track lives in `../trtllm_cutlass_standalone/`, which uses the
+TensorRT-LLM/CUTLASS block-FP8 grouped GEMM kernel layer directly. This
+FlashInfer directory remains a reference harness for comparing against the
+package-selected fused path.
 
 Generate or update the FlashInfer autotuner tactic cache explicitly:
 

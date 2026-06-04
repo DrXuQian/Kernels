@@ -1,0 +1,4 @@
+build*/
+*.o
+*.a
+bench_moe_fp8_blockscale_gemm

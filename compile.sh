@@ -80,6 +80,7 @@ Targets:
   moe-trtllm           moe_ffn/w4a16/trtllm/moe_w4a16_standalone/
   moe-trtllm-auxiliary moe_ffn/w4a16/trtllm/auxiliary/
   moe-machete          moe_ffn/w4a16/machete/ SM90 per-expert Machete MoE prefill
+  moe-fp8-trtllm       moe_ffn/fp8/trtllm_cutlass_standalone/
   moe                  moe-ffn + moe-trtllm + moe-machete
 
   w4a16-marlin         general/w4a16_gemm/marlin_standalone/
@@ -515,6 +516,12 @@ configure_target() {
         "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME" \
         cuda_arch_number
       ;;
+    moe-fp8-trtllm)
+      configure_cmake_target \
+        moe_ffn/fp8/trtllm_cutlass_standalone \
+        "moe_ffn/fp8/trtllm_cutlass_standalone/$BUILD_DIR_NAME" \
+        gpu_arch
+      ;;
     w4a16-fpa)
       configure_cmake_target \
         general/w4a16_gemm/fpA_intB_standalone \
@@ -576,6 +583,13 @@ build_target() {
         "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME" \
         cuda_arch_number \
         test_moe_w4a16_gemm
+      ;;
+    moe-fp8-trtllm)
+      build_cmake_target \
+        moe_ffn/fp8/trtllm_cutlass_standalone \
+        "moe_ffn/fp8/trtllm_cutlass_standalone/$BUILD_DIR_NAME" \
+        gpu_arch \
+        bench_moe_fp8_blockscale_gemm
       ;;
     moe-trtllm-auxiliary)
       build_make_dir moe_ffn/w4a16/trtllm/auxiliary "$GPU_ARCH"
@@ -652,6 +666,9 @@ clean_target() {
     moe-trtllm)
       clean_cmake_dir "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/$BUILD_DIR_NAME"
       ;;
+    moe-fp8-trtllm)
+      clean_cmake_dir "moe_ffn/fp8/trtllm_cutlass_standalone/$BUILD_DIR_NAME"
+      ;;
     moe-trtllm-auxiliary)
       clean_make_dir moe_ffn/w4a16/trtllm/auxiliary
       ;;
@@ -688,7 +705,7 @@ expand_one_target() {
     all)
       printf '%s\n' \
         general linear_attn flash_attn sampling flashinfer-gdn \
-        moe-ffn moe-trtllm moe-machete \
+        moe-ffn moe-trtllm moe-machete moe-fp8-trtllm \
         w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;
     moe)
@@ -723,6 +740,9 @@ expand_one_target() {
       ;;
     trtllm-moe|moe_w4a16_standalone)
       printf '%s\n' moe-trtllm
+      ;;
+    fp8-moe|moe-fp8|moe-fp8-trtllm|fp8-trtllm-moe|minimax-fp8-moe)
+      printf '%s\n' moe-fp8-trtllm
       ;;
     machete-moe|moe-machete|moe_machete)
       printf '%s\n' moe-machete

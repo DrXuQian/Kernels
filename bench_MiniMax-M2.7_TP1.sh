@@ -3,9 +3,10 @@
 #
 # Source: MiniMaxAI/MiniMax-M2.7 config.
 # MiniMax-M2.7 uses FP8 E4M3 block-wise quantized weights. Dense projections use
-# repo-owned CUTLASS block-FP8. Routed MoE defaults to the repo-owned
-# fp8_block_dense expanded-token standalone path; set MOE_GEMM_BACKEND=flashinfer_fp8
-# explicitly to run the FlashInfer fused reference path.
+# repo-owned CUTLASS block-FP8. Routed MoE defaults to the standalone
+# TensorRT-LLM/CUTLASS block-FP8 grouped GEMM path; set
+# MOE_GEMM_BACKEND=flashinfer_fp8 explicitly to run the FlashInfer fused
+# reference path.
 # Shape policy: per-rank TP shape. TP=1 keeps full dimensions.
 
 set -Eeuo pipefail
@@ -52,7 +53,7 @@ export ENABLE_MOE_FFN=1
 export ENABLE_SHARED_EXPERT=0
 export ENABLE_SAMPLING=1
 export QUANTIZED_GEMM_DTYPE=fp8
-export MOE_GEMM_BACKEND="${MOE_GEMM_BACKEND:-fp8_block_dense}"
+export MOE_GEMM_BACKEND="${MOE_GEMM_BACKEND:-fp8_trtllm}"
 export DECODE_MOE_BACKEND=trtllm
 
 exec "$ROOT_DIR/run_all_qwen3.5-122B-A10B_GPTQ.sh" "$@"
