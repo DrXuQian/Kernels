@@ -404,6 +404,150 @@ def expert_map_bytes(opts, log_text):
     return total, f"expert_map(tokens={tokens},experts={experts},topk={topk},mode={mode},lower_bound)"
 
 
+def vllm_topk_gating_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = pos_int(pos, 0)
+    experts = pos_int(pos, 1)
+    topk = pos_int(pos, 2)
+    if None in (tokens, experts, topk):
+        match = re.search(r"bench topk_gating: tokens=(\d+) experts=(\d+) topk=(\d+)", log_text)
+        if match:
+            tokens = int(match.group(1))
+            experts = int(match.group(2))
+            topk = int(match.group(3))
+    if None in (tokens, experts, topk):
+        return math.nan, ""
+    total = tokens * experts * 4 + tokens * topk * 4 + tokens * topk * 4
+    return total, f"vllm_topk_gating(tokens={tokens},experts={experts},topk={topk},fp32,lower_bound)"
+
+
+def vllm_moe_align_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = pos_int(pos, 0)
+    experts = pos_int(pos, 1)
+    topk = pos_int(pos, 2)
+    block = pos_int(pos, 3, 16)
+    if None in (tokens, experts, topk):
+        match = re.search(r"bench moe_align: tokens=(\d+) experts=(\d+) topk=(\d+) block=(\d+)", log_text)
+        if match:
+            tokens = int(match.group(1))
+            experts = int(match.group(2))
+            topk = int(match.group(3))
+            block = int(match.group(4))
+    if None in (tokens, experts, topk, block):
+        return math.nan, ""
+    expanded = tokens * topk
+    padded = round_up(expanded, block)
+    total = (
+        expanded * 4  # selected expert ids
+        + padded * 4  # sorted token ids
+        + padded * 4  # sorted expert ids / block ids lower bound
+        + (experts + 1) * 4  # expert offsets/counts
+        + 4  # total token count
+    )
+    return total, f"vllm_moe_align(tokens={tokens},experts={experts},topk={topk},block={block},lower_bound)"
+
+
+def vllm_marlin_moe_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = pos_int(pos, 0)
+    experts = pos_int(pos, 1)
+    topk = pos_int(pos, 2)
+    k = pos_int(pos, 3)
+    n = pos_int(pos, 4)
+    group_size = int_opt(opts, "group-size", int_opt(opts, "group_size", 128))
+    mul_topk = "no-topk-weights" not in opts
+    if None in (tokens, experts, topk, k, n):
+        match = re.search(
+            r"Marlin MoE W4A16 bench: M=(\d+) experts=(\d+) top_k=(\d+) K=(\d+) N=(\d+) group=(\d+).* mul_topk=(\d+)",
+            log_text,
+        )
+        if match:
+            tokens = int(match.group(1))
+            experts = int(match.group(2))
+            topk = int(match.group(3))
+            k = int(match.group(4))
+            n = int(match.group(5))
+            group_size = int(match.group(6))
+            mul_topk = bool(int(match.group(7)))
+    if None in (tokens, experts, topk, k, n, group_size):
+        return math.nan, ""
+    groups = round_up(k, group_size) // group_size
+    active_rows = tokens * topk
+    total = (
+        tokens * k * 2  # activation, shared across selected experts
+        + active_rows * k * n // 2  # selected int4 expert weights lower bound
+        + active_rows * n * 2  # output rows
+        + active_rows * n * groups * 2  # per-group scales lower bound
+        + active_rows * 4  # routing metadata
+    )
+    if mul_topk:
+        total += active_rows * 4
+    return (
+        total,
+        f"vllm_marlin_moe(tokens={tokens},experts={experts},topk={topk},n={n},k={k},group={group_size},lower_bound)",
+    )
+
+
+def vllm_silu_and_mul_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = pos_int(pos, 0)
+    topk = pos_int(pos, 1)
+    hidden = pos_int(pos, 2)
+    dtype = str_opt(opts, "dtype", "fp16")
+    if None in (tokens, topk, hidden):
+        match = re.search(r"bench silu_and_mul: tokens=(\d+) top_k=(\d+) rows=\d+ hidden=(\d+)", log_text)
+        if match:
+            tokens = int(match.group(1))
+            topk = int(match.group(2))
+            hidden = int(match.group(3))
+    b = dtype_nbytes(dtype)
+    if None in (tokens, topk, hidden) or math.isnan(b):
+        return math.nan, ""
+    total = 3 * tokens * topk * hidden * b
+    return total, f"vllm_silu_and_mul(tokens={tokens},topk={topk},hidden={hidden},dtype={dtype})"
+
+
+def vllm_moe_sum_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = pos_int(pos, 0)
+    topk = pos_int(pos, 1)
+    hidden = pos_int(pos, 2)
+    dtype = str_opt(opts, "dtype", "fp16")
+    if None in (tokens, topk, hidden):
+        match = re.search(r"bench moe_sum: tokens=(\d+) topk=(\d+) hidden=(\d+)", log_text)
+        if match:
+            tokens = int(match.group(1))
+            topk = int(match.group(2))
+            hidden = int(match.group(3))
+    b = dtype_nbytes(dtype)
+    if None in (tokens, topk, hidden) or math.isnan(b):
+        return math.nan, ""
+    total = tokens * topk * hidden * b + tokens * hidden * b
+    return total, f"vllm_moe_sum(tokens={tokens},topk={topk},hidden={hidden},dtype={dtype})"
+
+
+def shared_expert_activation_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = pos_int(pos, 0)
+    inter = pos_int(pos, 1)
+    dtype = pos[2] if len(pos) >= 3 else str_opt(opts, "dtype", "fp16")
+    if None in (tokens, inter):
+        match = re.search(
+            r"bench trtllm shared_expert_activation: tokens=(\d+) rows=\d+ inter=(\d+) dtype=([A-Za-z0-9_]+)",
+            log_text,
+        )
+        if match:
+            tokens = int(match.group(1))
+            inter = int(match.group(2))
+            dtype = match.group(3)
+    b = dtype_nbytes(dtype)
+    if None in (tokens, inter) or math.isnan(b):
+        return math.nan, ""
+    total = 3 * tokens * inter * b
+    return total, f"trtllm_shared_expert_activation(tokens={tokens},inter={inter},dtype={dtype})"
+
+
 def shared_expert_bytes(opts, log_text):
     op = str_opt(opts, "op", "")
     tokens = int_opt(opts, "tokens", int_opt(opts, "batch"))
@@ -492,6 +636,18 @@ def estimate_bytes(exe, opts, log_text):
         return custom_moe_routing_bytes(opts, log_text)
     if exe == "bench_expert_map":
         return expert_map_bytes(opts, log_text)
+    if exe == "bench_topk_gating":
+        return vllm_topk_gating_bytes(opts, log_text)
+    if exe == "bench_moe_align":
+        return vllm_moe_align_bytes(opts, log_text)
+    if exe == "bench_marlin_moe":
+        return vllm_marlin_moe_bytes(opts, log_text)
+    if exe == "bench_silu_and_mul":
+        return vllm_silu_and_mul_bytes(opts, log_text)
+    if exe == "bench_moe_sum":
+        return vllm_moe_sum_bytes(opts, log_text)
+    if exe == "bench_shared_expert_activation":
+        return shared_expert_activation_bytes(opts, log_text)
     if exe == "bench_shared_expert":
         return shared_expert_bytes(opts, log_text)
     if exe == "bench_sampling":
