@@ -106,7 +106,7 @@ Model wrapper scripts:
 
 ```bash
 ./bench_all.sh --list                                  # Qwen3.5-122B-A10B default
-./run_all_qwen3.5-122B-A10B_GPTQ.sh --list             # dense cuBLAS baseline variant
+./bench_Qwen3.5-122B-A10B-GPTQ.sh --list             # dense cuBLAS baseline variant
 ./bench_Qwen3.5-122B-A10B-GPTQ_TP2.sh --list           # Qwen3.5-122B-A10B-GPTQ TP=2
 ./bench_Qwen3.5_27B.sh --list                          # Qwen3.5-27B dense model
 ./bench_MiniMax-M2.7_TP1.sh --list                     # MiniMax-M2.7 TP=1

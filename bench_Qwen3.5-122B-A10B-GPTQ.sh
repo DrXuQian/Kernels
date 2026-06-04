@@ -170,22 +170,22 @@ declare -A DEDUPE_LOG_BY_KEY=()
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh                         # run all benchmark cases
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --list                  # list available case labels
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --case LABEL            # run one case
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --kernel LABEL          # alias for --case
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --resume-from LABEL     # skip cases before LABEL, then continue
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --run-dir DIR           # run every benchmark with DIR as cwd
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --ncu-cycles            # run selected cases under Nsight Compute
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --ncu-bandwidth         # ncu cycles + DRAM bandwidth metrics
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --nsys-latency          # nsys kernel-duration fallback
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh LABEL [LABEL ...]       # run selected cases
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh                         # run all benchmark cases
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --list                  # list available case labels
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case LABEL            # run one case
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --kernel LABEL          # alias for --case
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --resume-from LABEL     # skip cases before LABEL, then continue
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --run-dir DIR           # run every benchmark with DIR as cwd
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --ncu-cycles            # run selected cases under Nsight Compute
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --ncu-bandwidth         # ncu cycles + DRAM bandwidth metrics
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --nsys-latency          # nsys kernel-duration fallback
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings. Examples:
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh w4a16_decode_linear_attn_in_proj_qkv_cublas
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --case moe_gate_up_decode_vllm
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh decode_vllm
-  ./run_all_qwen3.5-122B-A10B_GPTQ.sh --resume-from w4a16_prefill_linear_attn_out_proj_cublas
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh w4a16_decode_linear_attn_in_proj_qkv_cublas
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case moe_gate_up_decode_vllm
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh decode_vllm
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --resume-from w4a16_prefill_linear_attn_out_proj_cublas
 
 Resume matching accepts an exact label or its sanitized form from --list.
 
@@ -344,7 +344,7 @@ while [[ $# -gt 0 ]]; do
       done
       ;;
     -*)
-      echo "[run_all][error] unknown option: $1" >&2
+      echo "[bench][error] unknown option: $1" >&2
       usage >&2
       exit 1
       ;;
@@ -363,7 +363,7 @@ case "$DECODE_CUBLAS_BACKEND" in
   cublas|cuda_core)
     ;;
   *)
-    echo "[run_all][error] DECODE_CUBLAS_BACKEND must be cublas or cuda_core, got: $DECODE_CUBLAS_BACKEND" >&2
+    echo "[bench][error] DECODE_CUBLAS_BACKEND must be cublas or cuda_core, got: $DECODE_CUBLAS_BACKEND" >&2
     exit 1
     ;;
 esac
@@ -372,7 +372,7 @@ case "$DECODE_MOE_BACKEND" in
   vllm|trtllm)
     ;;
   *)
-    echo "[run_all][error] DECODE_MOE_BACKEND must be vllm or trtllm, got: $DECODE_MOE_BACKEND" >&2
+    echo "[bench][error] DECODE_MOE_BACKEND must be vllm or trtllm, got: $DECODE_MOE_BACKEND" >&2
     exit 1
     ;;
 esac
@@ -381,7 +381,7 @@ case "$MOE_GEMM_BACKEND" in
   trtllm|cublas|fp8_trtllm|fp8_block_dense|flashinfer_fp8)
     ;;
   *)
-    echo "[run_all][error] MOE_GEMM_BACKEND must be trtllm, cublas, fp8_trtllm, fp8_block_dense, or flashinfer_fp8, got: $MOE_GEMM_BACKEND" >&2
+    echo "[bench][error] MOE_GEMM_BACKEND must be trtllm, cublas, fp8_trtllm, fp8_block_dense, or flashinfer_fp8, got: $MOE_GEMM_BACKEND" >&2
     exit 1
     ;;
 esac
@@ -389,8 +389,8 @@ esac
 require_bin() {
   local path="$1"
   if [[ ! -x "$path" ]]; then
-    echo "[run_all][error] missing executable: $path" >&2
-    echo "[run_all][hint] build required targets first, for example:" >&2
+    echo "[bench][error] missing executable: $path" >&2
+    echo "[bench][hint] build required targets first, for example:" >&2
     echo "  ./compile.sh build linear_attn flash_attn sampling moe-ffn moe-trtllm w4a16-machete w4a16-fpa" >&2
     exit 1
   fi
@@ -399,7 +399,7 @@ require_bin() {
 require_file() {
   local path="$1"
   if [[ ! -f "$path" ]]; then
-    echo "[run_all][error] missing file: $path" >&2
+    echo "[bench][error] missing file: $path" >&2
     exit 1
   fi
 }
@@ -408,12 +408,12 @@ require_tactic_entry() {
   local path="$1"
   local key="$2"
   if [[ ! -f "$path" ]]; then
-    echo "[run_all][error] missing tactic cache: $path" >&2
+    echo "[bench][error] missing tactic cache: $path" >&2
     exit 1
   fi
   if ! grep -qF "$key" "$path"; then
-    echo "[run_all][error] tactic cache missing shape: $key" >&2
-    echo "[run_all][error] cache file: $path" >&2
+    echo "[bench][error] tactic cache missing shape: $key" >&2
+    echo "[bench][error] cache file: $path" >&2
     exit 1
   fi
 }
@@ -566,15 +566,15 @@ run_case() {
 
   require_bin "${cmd[0]}"
   if [[ "$NCU_CYCLES" == 1 && "$NSYS_LATENCY" == 1 ]]; then
-    echo "[run_all][error] choose only one profiler: --ncu-cycles/--ncu-bandwidth or --nsys-latency" >&2
+    echo "[bench][error] choose only one profiler: --ncu-cycles/--ncu-bandwidth or --nsys-latency" >&2
     exit 1
   fi
   if [[ "$NCU_CYCLES" == 1 ]] && ! command -v ncu >/dev/null 2>&1; then
-    echo "[run_all][error] --ncu-cycles requested but ncu is not in PATH" >&2
+    echo "[bench][error] --ncu-cycles requested but ncu is not in PATH" >&2
     exit 1
   fi
   if [[ "$NSYS_LATENCY" == 1 ]] && ! command -v nsys >/dev/null 2>&1; then
-    echo "[run_all][error] --nsys-latency requested but nsys is not in PATH" >&2
+    echo "[bench][error] --nsys-latency requested but nsys is not in PATH" >&2
     exit 1
   fi
   local required_file
@@ -602,9 +602,9 @@ run_case() {
 
     echo
     echo "=== $label ==="
-    echo "[run_all] skipped duplicate of: $first_label"
-    echo "[run_all] first log: $first_log"
-    echo "[run_all] log: $log"
+    echo "[bench] skipped duplicate of: $first_label"
+    echo "[bench] first log: $first_log"
+    echo "[bench] log: $log"
 
     {
       echo "label: $label"
@@ -620,7 +620,7 @@ run_case() {
       echo "started_at: $(date -Is)"
       echo "finished_at: $(date -Is)"
     } >"$log"
-    printf '[run_all] %-34s skipped duplicate\n' "$label"
+    printf '[bench] %-34s skipped duplicate\n' "$label"
     return
   fi
 
@@ -628,11 +628,11 @@ run_case() {
 
   echo
   echo "=== $label ==="
-  printf '[run_all] command:'
+  printf '[bench] command:'
   printf ' cd %q &&' "$RUN_DIR"
   printf ' %q' "${cmd[@]}"
   echo
-  echo "[run_all] log: $log"
+  echo "[bench] log: $log"
 
   {
     echo "label: $label"
@@ -663,8 +663,8 @@ run_case() {
       ncu_cmd+=(--launch-count "$NCU_LAUNCH_COUNT")
     fi
 
-    echo "[run_all] ncu log: $ncu_log"
-    printf '[run_all] ncu command:'
+    echo "[bench] ncu log: $ncu_log"
+    printf '[bench] ncu command:'
     printf ' %q' "${ncu_cmd[@]}" "${cmd[@]}"
     echo
     {
@@ -685,8 +685,8 @@ run_case() {
     mkdir -p "$nsys_dir"
     nsys_cmd=(nsys profile --force-overwrite=true --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=none --output "$nsys_base")
 
-    echo "[run_all] nsys report: $nsys_report"
-    printf '[run_all] nsys command:'
+    echo "[bench] nsys report: $nsys_report"
+    printf '[bench] nsys command:'
     printf ' %q' "${nsys_cmd[@]}" "${cmd[@]}"
     echo
     {
@@ -711,17 +711,17 @@ run_case() {
         DEDUPE_LABEL_BY_KEY["$dedupe_key"]="$label"
         DEDUPE_LOG_BY_KEY["$dedupe_key"]="$log"
       fi
-      printf '[run_all] %-34s ok\n' "$label"
+      printf '[bench] %-34s ok\n' "$label"
     else
       local post_status=$?
-      printf '[run_all] %-34s failed perfstatistics_status=%s\n' "$label" "$post_status" >&2
+      printf '[bench] %-34s failed perfstatistics_status=%s\n' "$label" "$post_status" >&2
       FAILED=1
     fi
   else
     echo "failed_at: $(date -Is)" >>"$log"
     echo "exit_status: $status" >>"$log"
-    printf '[run_all] %-34s failed exit_status=%s\n' "$label" "$status" >&2
-    echo "[run_all][error] last lines from $log:" >&2
+    printf '[bench] %-34s failed exit_status=%s\n' "$label" "$status" >&2
+    echo "[bench][error] last lines from $log:" >&2
     tail -80 "$log" >&2 || true
     FAILED=1
   fi
@@ -733,13 +733,13 @@ run_perfrawlog_postprocess() {
   local -a cmd=("$@")
 
   if [[ "${PERFRAWLOG_POSTPROCESS:-1}" == 0 ]]; then
-    echo "[run_all] PERFRAWLOG_POSTPROCESS=0, skip perfrawlog post-processing."
+    echo "[bench] PERFRAWLOG_POSTPROCESS=0, skip perfrawlog post-processing."
     return
   fi
 
   local perfrawlog_path="${PERFRAWLOG_PATH:-$RUN_DIR/perfrawlog}"
   if [[ ! -e "$perfrawlog_path" ]]; then
-    echo "[run_all] no perfrawlog found under run dir, skip perf statistics generation."
+    echo "[bench] no perfrawlog found under run dir, skip perf statistics generation."
     return
   fi
 
@@ -755,10 +755,10 @@ run_perfrawlog_postprocess() {
 
   echo
   echo "=== perfrawlog statistics ==="
-  echo "[run_all] run_dir: $RUN_DIR"
-  echo "[run_all] perfrawlog: $perfrawlog_path"
-  echo "[run_all] report_dir: $report_dir"
-  echo "[run_all] log: $log"
+  echo "[bench] run_dir: $RUN_DIR"
+  echo "[bench] perfrawlog: $perfrawlog_path"
+  echo "[bench] report_dir: $report_dir"
+  echo "[bench] log: $log"
 
   {
     echo "report_dir: $report_dir"
@@ -802,7 +802,7 @@ summarize_perfstatistics() {
   local report_base summary_log model_summary_dir
   report_base="$(perfstatistics_base_dir)"
   if [[ ! -d "$report_base" ]]; then
-    echo "[run_all] no per-case perfstatistics directory found, skip summary."
+    echo "[bench] no per-case perfstatistics directory found, skip summary."
     return
   fi
 
@@ -820,11 +820,11 @@ summarize_perfstatistics() {
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
-    echo "[run_all][warn] perfstatistics summary did not find any compute_cycles."
+    echo "[bench][warn] perfstatistics summary did not find any compute_cycles."
     return
   fi
-  echo "[run_all] perfstatistics summary: $summary_log"
-  echo "[run_all] perfstatistics model latency summary: $model_summary_dir/model_latency_summary.md"
+  echo "[bench] perfstatistics summary: $summary_log"
+  echo "[bench] perfstatistics model latency summary: $model_summary_dir/model_latency_summary.md"
 }
 
 summarize_ncu_cycles() {
@@ -835,7 +835,7 @@ summarize_ncu_cycles() {
   local ncu_dir summary_log model_summary_dir bandwidth_log
   ncu_dir="$OUT_DIR/ncu"
   if [[ ! -d "$ncu_dir" ]]; then
-    echo "[run_all] no Nsight Compute output directory found, skip ncu summary."
+    echo "[bench] no Nsight Compute output directory found, skip ncu summary."
     return
   fi
 
@@ -853,11 +853,11 @@ summarize_ncu_cycles() {
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
-    echo "[run_all][warn] ncu cycles summary did not find any metric rows."
+    echo "[bench][warn] ncu cycles summary did not find any metric rows."
     return
   fi
-  echo "[run_all] ncu cycles summary: $summary_log"
-  echo "[run_all] ncu model latency summary: $model_summary_dir/model_latency_summary.md"
+  echo "[bench] ncu cycles summary: $summary_log"
+  echo "[bench] ncu model latency summary: $model_summary_dir/model_latency_summary.md"
 
   if [[ "$NCU_BANDWIDTH" == 1 ]]; then
     bandwidth_log="$OUT_DIR/ncu_bandwidth_summary.md"
@@ -870,10 +870,10 @@ summarize_ncu_cycles() {
     local bandwidth_status=${PIPESTATUS[0]}
     set -e
     if [[ "$bandwidth_status" != 0 ]]; then
-      echo "[run_all][warn] ncu bandwidth summary did not find any DRAM metric rows."
+      echo "[bench][warn] ncu bandwidth summary did not find any DRAM metric rows."
       return
     fi
-    echo "[run_all] ncu bandwidth summary: $bandwidth_log"
+    echo "[bench] ncu bandwidth summary: $bandwidth_log"
   fi
 }
 
@@ -885,7 +885,7 @@ summarize_nsys_latency() {
   local nsys_dir summary_log model_summary_dir
   nsys_dir="$OUT_DIR/nsys"
   if [[ ! -d "$nsys_dir" ]]; then
-    echo "[run_all] no Nsight Systems output directory found, skip nsys summary."
+    echo "[bench] no Nsight Systems output directory found, skip nsys summary."
     return
   fi
 
@@ -902,12 +902,12 @@ summarize_nsys_latency() {
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
-    echo "[run_all][warn] nsys latency summary did not find any CUDA kernel rows."
+    echo "[bench][warn] nsys latency summary did not find any CUDA kernel rows."
     return
   fi
-  echo "[run_all] nsys latency summary: $summary_log"
-  echo "[run_all] nsys model latency summary: $model_summary_dir/model_latency_summary.md"
-  echo "[run_all][note] nsys records kernel duration. Use bench_h800_bandwidth.sh for nsys-derived effective bandwidth, or --ncu-bandwidth for DRAM-counter bandwidth."
+  echo "[bench] nsys latency summary: $summary_log"
+  echo "[bench] nsys model latency summary: $model_summary_dir/model_latency_summary.md"
+  echo "[bench][note] nsys records kernel duration. Use bench_h800_bandwidth.sh for nsys-derived effective bandwidth, or --ncu-bandwidth for DRAM-counter bandwidth."
 }
 
 run_w4a16_prefill_gemm_cublas_case() {
@@ -1215,7 +1215,7 @@ run_linear_fused_rms_gate_case() {
 
 if [[ "$LIST_CASES" != 1 ]]; then
   if [[ ! -d "$RUN_DIR" ]]; then
-    echo "[run_all][error] run dir does not exist: $RUN_DIR" >&2
+    echo "[bench][error] run dir does not exist: $RUN_DIR" >&2
     exit 1
   fi
   RUN_DIR="$(cd "$RUN_DIR" && pwd)"
@@ -1529,14 +1529,14 @@ if [[ "$LIST_CASES" == 1 ]]; then
 fi
 
 if [[ -n "$RESUME_FROM" && "$RESUME_FOUND" == 0 ]]; then
-  echo "[run_all][error] resume label was not found: $RESUME_FROM" >&2
-  echo "[run_all][hint] run ./run_all_qwen3.5-122B-A10B_GPTQ.sh --list to see available labels." >&2
+  echo "[bench][error] resume label was not found: $RESUME_FROM" >&2
+  echo "[bench][hint] run ./bench_Qwen3.5-122B-A10B-GPTQ.sh --list to see available labels." >&2
   exit 1
 fi
 
 if [[ ${#CASE_FILTERS[@]} -gt 0 && "$MATCHED_CASES" == 0 ]]; then
-  echo "[run_all][error] no benchmark case matched: ${CASE_FILTERS[*]}" >&2
-  echo "[run_all][hint] run ./run_all_qwen3.5-122B-A10B_GPTQ.sh --list to see available labels." >&2
+  echo "[bench][error] no benchmark case matched: ${CASE_FILTERS[*]}" >&2
+  echo "[bench][hint] run ./bench_Qwen3.5-122B-A10B-GPTQ.sh --list to see available labels." >&2
   exit 1
 fi
 

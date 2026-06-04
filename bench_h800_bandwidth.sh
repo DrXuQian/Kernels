@@ -46,7 +46,7 @@ Environment:
   BANDWIDTH_OUT_ROOT   Parent directory for per-wrapper output dirs.
                        Default: .bench_logs
   NCU_PEAK_GBPS        Peak DRAM GB/s for bandwidth summary. Default inherited
-                       by run_all wrapper, currently 3350.
+                       by bench wrapper, currently 3350.
   BANDWIDTH_BACKEND    Default backend when --backend is omitted. Default: nsys.
 EOF
 }

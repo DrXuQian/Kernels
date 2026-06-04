@@ -65,4 +65,4 @@ export ENABLE_SAMPLING=1
 export DECODE_CUBLAS_BACKEND="${DECODE_CUBLAS_BACKEND:-cuda_core}"
 export QUANTIZED_GEMM_LABEL_KIND=dense
 
-exec "$ROOT_DIR/run_all_qwen3.5-122B-A10B_GPTQ.sh" "$@"
+exec "$ROOT_DIR/bench_Qwen3.5-122B-A10B-GPTQ.sh" "$@"

@@ -56,4 +56,4 @@ export QUANTIZED_GEMM_DTYPE=fp8
 export MOE_GEMM_BACKEND="${MOE_GEMM_BACKEND:-fp8_trtllm}"
 export DECODE_MOE_BACKEND=trtllm
 
-exec "$ROOT_DIR/run_all_qwen3.5-122B-A10B_GPTQ.sh" "$@"
+exec "$ROOT_DIR/bench_Qwen3.5-122B-A10B-GPTQ.sh" "$@"

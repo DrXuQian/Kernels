@@ -66,4 +66,4 @@ export ENABLE_MOE_FFN=1
 export ENABLE_SHARED_EXPERT=1
 export ENABLE_SAMPLING=1
 
-exec "$ROOT_DIR/run_all_qwen3.5-122B-A10B_GPTQ.sh" "$@"
+exec "$ROOT_DIR/bench_Qwen3.5-122B-A10B-GPTQ.sh" "$@"
