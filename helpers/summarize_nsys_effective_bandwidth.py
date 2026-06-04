@@ -228,6 +228,73 @@ def gated_activation_bytes(opts, log_text):
     return total, f"gated_activation(tokens={tokens},topk={topk},inter={inter},dtype={dtype})"
 
 
+def fused_rms_norm_gate_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    n = pos_int(pos, 0)
+    d = pos_int(pos, 1)
+    dtype = str_opt(opts, "dtype", "bf16")
+    if n is None or d is None:
+        match = re.search(r"bench fused_rms_norm_gate: N=(\d+) D=(\d+) dtype=([A-Za-z0-9_]+)", log_text)
+        if match:
+            n = int(match.group(1))
+            d = int(match.group(2))
+            dtype = match.group(3)
+    b = dtype_nbytes(dtype)
+    if None in (n, d) or math.isnan(b):
+        return math.nan, ""
+    total = 5 * n * d * b
+    return total, f"fused_rms_norm_gate(N={n},D={d},dtype={dtype},kernel_load_model)"
+
+
+def conv1d_update_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    dim = pos_int(pos, 0)
+    width = pos_int(pos, 1)
+    batch = pos_int(pos, 2)
+    dtype = str_opt(opts, "dtype", "bf16")
+    if None in (dim, width, batch):
+        match = re.search(r"bench conv1d_update: dim=(\d+) width=(\d+) batch=(\d+) dtype=([A-Za-z0-9_]+)", log_text)
+        if match:
+            dim = int(match.group(1))
+            width = int(match.group(2))
+            batch = int(match.group(3))
+            dtype = match.group(4)
+    b = dtype_nbytes(dtype)
+    if None in (dim, width, batch) or math.isnan(b):
+        return math.nan, ""
+    state_len = max(width - 1, 0)
+    total = (
+        batch * dim * b  # x
+        + dim * width * b  # depthwise weights
+        + dim * b  # bias
+        + 2 * batch * dim * state_len * b  # state read/write lower bound
+        + batch * dim * b  # output
+    )
+    return total, f"conv1d_update(dim={dim},width={width},batch={batch},dtype={dtype},lower_bound)"
+
+
+def gated_delta_net_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = pos_int(pos, 0)
+    heads = pos_int(pos, 1)
+    head_dim = pos_int(pos, 2)
+    seqs = pos_int(pos, 3, 1)
+    if None in (tokens, heads, head_dim):
+        match = re.search(r"bench gated_delta_net: tokens=(\d+) heads=(\d+) dim=(\d+) seqs=(\d+)", log_text)
+        if match:
+            tokens = int(match.group(1))
+            heads = int(match.group(2))
+            head_dim = int(match.group(3))
+            seqs = int(match.group(4))
+    if None in (tokens, heads, head_dim, seqs):
+        return math.nan, ""
+    qkv = head_dim * heads * tokens * seqs
+    gb = heads * tokens * seqs
+    state = seqs * heads * head_dim * head_dim
+    total = (3 * qkv + qkv + 2 * gb + 2 * state) * 4
+    return total, f"gated_delta_net(tokens={tokens},heads={heads},dim={head_dim},seqs={seqs},fp32,lower_bound)"
+
+
 def flash_attn_bytes(opts, log_text):
     pos = opts.get("_positional", [])
     script_index = next((i for i, value in enumerate(pos) if value.endswith("bench_flash_attn.py")), None)
@@ -411,6 +478,12 @@ def estimate_bytes(exe, opts, log_text):
         return linear_ops_bytes(opts, log_text)
     if exe == "bench_gated_activation":
         return gated_activation_bytes(opts, log_text)
+    if exe == "bench_fused_rms_norm_gate":
+        return fused_rms_norm_gate_bytes(opts, log_text)
+    if exe == "bench_conv1d_update":
+        return conv1d_update_bytes(opts, log_text)
+    if exe == "bench_gated_delta_net":
+        return gated_delta_net_bytes(opts, log_text)
     if exe == "bench_expand_input_rows":
         return expand_input_rows_bytes(opts, log_text)
     if exe == "bench_finalize_moe_routing":

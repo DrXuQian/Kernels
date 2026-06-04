@@ -404,6 +404,28 @@ case-level aggregate at `<OUT_DIR>/ncu_cycles_summary.md`, and a model-level
 latency report with SVG charts at
 `<OUT_DIR>/model_latency_ncu/model_latency_summary.md`.
 
+H800 decode effective-bandwidth sanity run, using nsys fallback because local
+NCU counters returned `ERR_NVGPUCTRPERM`:
+
+```bash
+BENCH_RUN_ID_PREFIX=h800_decode_bw_20260604 PERFRAWLOG_POSTPROCESS=0 \
+  ./bench_h800_bandwidth.sh --backend nsys --skip-preflight \
+  --models qwen27,minimax --phase decode --continue-on-error
+```
+
+The run writes one directory per wrapper under `.bench_logs/`. `latency_us` is
+model-level decode latency from `nsys_latency_summary.md`; bandwidth is
+effective traffic divided by nsys kernel duration, not a DRAM-counter reading.
+Small metadata and elementwise kernels are expected to show low peak-percent
+because their estimated traffic is tiny.
+
+| model wrapper | output directory | decode latency us | representative high-bandwidth kernels |
+|---|---|---:|---|
+| Qwen3.5-27B fp16 | `.bench_logs/bench_h800_decode_bw_20260604_qwen27__decode_` | 28614.032 | dense FFN gate/up cuBLAS: 1944.795 GB/s, 58.054%; dense FFN down cuBLAS: 1876.715 GB/s, 56.021%; dense linear-attn qkv cuBLAS: 1841.471 GB/s, 54.969% |
+| MiniMax-M2.7 TP1 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp1__decode_` | 14987.012 | MoE gate/up FP8 TRT-LLM: 1239.741 GB/s, 37.007%; MoE down FP8 TRT-LLM: 1228.982 GB/s, 36.686%; FP8 q/gate projection: 1054.907 GB/s, 31.490% |
+| MiniMax-M2.7 TP2 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp2__decode_` | 10277.120 | MoE gate/up FP8 TRT-LLM: 1276.719 GB/s, 38.111%; MoE down FP8 TRT-LLM: 950.065 GB/s, 28.360%; FP8 q/gate projection: 524.995 GB/s, 15.671% |
+| MiniMax-M2.7 TP4 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp4__decode_` | 9523.200 | MoE gate/up FP8 TRT-LLM: 1243.467 GB/s, 37.118%; MoE down FP8 TRT-LLM: 666.774 GB/s, 19.904%; FP8 o projection: 424.948 GB/s, 12.685% |
+
 perfrawlog post-processing:
 
 ```bash

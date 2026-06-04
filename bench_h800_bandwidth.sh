@@ -51,17 +51,24 @@ EOF
 add_models() {
   local value="$1"
   value="${value// /}"
-  case "$value" in
-    all)
-      MODELS="qwen27,qwen122-tp2,minimax-tp1,minimax-tp2,minimax-tp4"
-      ;;
-    minimax)
-      MODELS="minimax-tp1,minimax-tp2,minimax-tp4"
-      ;;
-    *)
-      MODELS="$value"
-      ;;
-  esac
+  local -a requested expanded
+  local item
+  IFS=',' read -r -a requested <<< "$value"
+  for item in "${requested[@]}"; do
+    case "$item" in
+      "" ) ;;
+      all)
+        expanded+=(qwen27 qwen122-tp2 minimax-tp1 minimax-tp2 minimax-tp4)
+        ;;
+      minimax)
+        expanded+=(minimax-tp1 minimax-tp2 minimax-tp4)
+        ;;
+      *)
+        expanded+=("$item")
+        ;;
+    esac
+  done
+  MODELS="$(IFS=,; echo "${expanded[*]}")"
 }
 
 CASE_FILTER=""
