@@ -191,12 +191,6 @@ template <typename T>
 cudaDataType_t cuda_type();
 
 template <>
-cudaDataType_t cuda_type<half>()
-{
-    return CUDA_R_16F;
-}
-
-template <>
 cudaDataType_t cuda_type<__nv_bfloat16>()
 {
     return CUDA_R_16BF;
@@ -218,6 +212,37 @@ cudaDataType_t out_cuda_type(std::string const& dtype)
 size_t out_type_size(std::string const& dtype)
 {
     return dtype == "fp32" ? sizeof(float) : sizeof(half);
+}
+
+template <typename T>
+void launch_cublas_gemm(cublasHandle_t handle, Options const& opt, T const* d_a, T const* d_b, void* d_c)
+{
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cudaDataType_t c_type = out_cuda_type(opt.out_dtype);
+    CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, opt.n, opt.m, opt.k, &alpha, d_b,
+        cuda_type<T>(), opt.n, d_a, cuda_type<T>(), opt.k, &beta, d_c, c_type, opt.n, CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+template <>
+void launch_cublas_gemm<half>(cublasHandle_t handle, Options const& opt, half const* d_a, half const* d_b, void* d_c)
+{
+    if (opt.out_dtype == "fp16")
+    {
+        half alpha_h = __float2half(1.0f);
+        half beta_h = __float2half(0.0f);
+        CHECK_CUBLAS(cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, opt.n, opt.m, opt.k, &alpha_h,
+            d_b, opt.n, d_a, opt.k, &beta_h, static_cast<half*>(d_c), opt.n));
+        return;
+    }
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cudaDataType_t c_type = out_cuda_type(opt.out_dtype);
+    CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, opt.n, opt.m, opt.k, &alpha, d_b,
+        CUDA_R_16F, opt.n, d_a, CUDA_R_16F, opt.k, &beta, d_c, c_type, opt.n, CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 template <typename T>
@@ -245,15 +270,10 @@ int run_gemm(Options const& opt, BenchTimer& timer)
     CHECK_CUBLAS(cublasCreate(&handle));
     CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
 
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    cudaDataType_t c_type = out_cuda_type(opt.out_dtype);
     timer.run([&] {
         // Row-major C[M,N] = A[M,K] * B[K,N].
         // cuBLAS sees column-major C^T[N,M] = B^T[N,K] * A^T[K,M].
-        CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, opt.n, opt.m, opt.k, &alpha, d_b,
-            cuda_type<T>(), opt.n, d_a, cuda_type<T>(), opt.k, &beta, d_c, c_type, opt.n, CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        launch_cublas_gemm<T>(handle, opt, d_a, d_b, d_c);
     });
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
