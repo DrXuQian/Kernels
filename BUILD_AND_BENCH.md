@@ -47,6 +47,7 @@ Run a model benchmark wrapper. The wrappers use the same selection interface as
 Use NCU bandwidth mode for the final H800 bandwidth-utilization evidence:
 
 ```bash
+helpers/ncu_bandwidth_preflight.sh
 ./bench_Qwen3.5_27B.sh --ncu-bandwidth --case decode
 ./bench_MiniMax-M2.7_TP1.sh --ncu-bandwidth --case decode
 ```
@@ -374,10 +375,17 @@ on a machine with NCU performance-counter permission for DRAM metrics.
 H800 Nsight Compute cycles:
 
 ```bash
+helpers/ncu_bandwidth_preflight.sh
 ./bench_all.sh --ncu-cycles --case sampling_lm_head_gemm
 ./bench_all.sh --ncu-cycles --ncu-launch-skip 1 --ncu-launch-count 1 \
   --case sampling_topk_mask_logits
 ```
+
+`helpers/ncu_bandwidth_preflight.sh` runs a tiny GEMV under the same DRAM
+bandwidth metrics used by `--ncu-bandwidth`. If it fails with
+`ERR_NVGPUCTRPERM`, the current H800/container cannot produce bandwidth
+utilization evidence; use `--nsys-latency` only for kernel duration and rerun
+`--ncu-bandwidth` on a machine with performance-counter permission.
 
 `--ncu-cycles` writes the raw per-case CSV files under `<OUT_DIR>/ncu/`, a
 case-level aggregate at `<OUT_DIR>/ncu_cycles_summary.md`, and a model-level
