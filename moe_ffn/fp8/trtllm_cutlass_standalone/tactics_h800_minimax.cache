@@ -3,5 +3,13 @@
 # experts,m_per_expert,n,k,scale_a,scale_b|tile=...
 8,1,3072,3072,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
 8,1,3072,1536,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,1,1536,3072,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,1,3072,768,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,1,768,3072,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,1,3072,384,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
 8,3823,3072,3072,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
 8,3823,3072,1536,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,3823,1536,3072,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,3823,3072,768,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,3823,768,3072,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
+8,3823,3072,384,1x128,128x128|tile=128x64x128,layoutA=row,layoutB=col,layoutD=row,output=bf16,deep_gemm=0
