@@ -9,7 +9,14 @@ hidden = 3072
 dtype = fp16 input/weight, fp32 output
 ```
 
-It is intentionally not wired into the main `compile.sh` or `bench_all.sh`.
+It is wired into the model benchmark scripts as `sampling_lm_head_gemv_tma`
+using the TMA warp-specialized path:
+
+```bash
+studies/lm_head_gemv_bw/bench_lm_head_gemv \
+  --op=ptx_tma_ws --n 248320 --k 3072 --k-unroll=8 \
+  --warmup=0 --iters=1 --no-verify
+```
 
 The optimized kernel assumes row-major weight layout `weight[N, K]`, so each
 warp computes one vocab row and loads the K dimension coalesced as `half2`.

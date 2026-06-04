@@ -94,6 +94,7 @@ MACHETE_BIN="$(repo_path "general/w4a16_gemm/machete_standalone/build_cmake_rele
 FPA_BIN="$(repo_path "general/w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm")"
 CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
 CUDA_CORE_GEMV_BIN="$(repo_path "general/bench_cuda_core_gemv")"
+LM_HEAD_GEMV_BIN="$(repo_path "studies/lm_head_gemv_bw/bench_lm_head_gemv")"
 MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
 MOE_TRTLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/trtllm/auxiliary")"
 MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
@@ -127,6 +128,8 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
 DECODE_CUBLAS_BACKEND="${DECODE_CUBLAS_BACKEND:-cuda_core}"
 DECODE_MOE_BACKEND="${DECODE_MOE_BACKEND:-vllm}"
+LM_HEAD_GEMV_OP="${LM_HEAD_GEMV_OP:-ptx_tma_ws}"
+LM_HEAD_GEMV_K_UNROLL="${LM_HEAD_GEMV_K_UNROLL:-8}"
 
 declare -A DEDUPE_LABEL_BY_KEY=()
 declare -A DEDUPE_LOG_BY_KEY=()
@@ -171,6 +174,8 @@ Environment variables:
                            case that measured the same key.
   DECODE_CUBLAS_BACKEND    cublas or cuda_core for non-lm-head decode dense GEMM. Default: cuda_core.
   DECODE_MOE_BACKEND       vllm or trtllm for decode routed MoE pipeline. Default: vllm.
+  LM_HEAD_GEMV_OP          Local lm_head GEMV op. Default: ptx_tma_ws.
+  LM_HEAD_GEMV_K_UNROLL    Local lm_head GEMV --k-unroll. Default: 8.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
@@ -828,6 +833,15 @@ run_sampling_case() {
     --bench 0 1
 }
 
+run_lm_head_gemv_tma_case() {
+  run_case "sampling_lm_head_gemv_tma" \
+    --dedupe-key "lm-head-gemv:$LM_HEAD_GEMV_OP,$SAMPLING_VOCAB,$HIDDEN_DIM,$LM_HEAD_GEMV_K_UNROLL" \
+    "$LM_HEAD_GEMV_BIN" \
+    --op="$LM_HEAD_GEMV_OP" --n "$SAMPLING_VOCAB" --k "$HIDDEN_DIM" \
+    --k-unroll="$LM_HEAD_GEMV_K_UNROLL" \
+    --warmup=0 --iters=1 --no-verify
+}
+
 run_cublas_gemm_case() {
   local label="$1"
   local m="$2"
@@ -977,6 +991,7 @@ else
   echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     $DECODE_MOE_BACKEND components"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
+  echo "lm head:        $LM_HEAD_GEMV_OP k_unroll=$LM_HEAD_GEMV_K_UNROLL"
   echo "model repeats:  full_attn=$MODEL_FULL_ATTN_LAYERS linear_attn=$MODEL_LINEAR_ATTN_LAYERS moe_ffn=$MODEL_MOE_FFN_LAYERS sampling_prefill=$MODEL_SAMPLING_PREFILL_COUNT sampling_decode=$MODEL_SAMPLING_DECODE_COUNT"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
     echo "case filters:   ${CASE_FILTERS[*]}"
@@ -1211,8 +1226,7 @@ else
     --bench 0 1
 fi
 
-run_cublas_gemm_case "sampling_lm_head_gemm" \
-  "$DECODE_TOKENS" "$SAMPLING_VOCAB" "$HIDDEN_DIM" fp32
+run_lm_head_gemv_tma_case
 run_sampling_case "sampling_topk_mask_logits" "topk_mask"
 run_sampling_case "sampling_softmax" "softmax"
 run_sampling_case "sampling_top_p" "top_p"

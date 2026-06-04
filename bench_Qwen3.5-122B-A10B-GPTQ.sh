@@ -118,6 +118,7 @@ repo_path() {
 CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
 CUDA_CORE_GEMV_BIN="$(repo_path "general/bench_cuda_core_gemv")"
 BLOCK_FP8_GEMM_BIN="$(repo_path "general/bench_cutlass_block_fp8_gemm")"
+LM_HEAD_GEMV_BIN="$(repo_path "studies/lm_head_gemv_bw/bench_lm_head_gemv")"
 FLASHINFER_FP8_MOE_SCRIPT="$(repo_path "moe_ffn/fp8/flashinfer_cutlass/bench_flashinfer_cutlass_fp8_moe.py")"
 MOE_FP8_TRTLLM_BIN="$(repo_path "moe_ffn/fp8/trtllm_cutlass_standalone/build_cmake_release/bench_moe_fp8_blockscale_gemm")"
 MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
@@ -163,6 +164,8 @@ BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
 DECODE_CUBLAS_BACKEND="${DECODE_CUBLAS_BACKEND:-cuda_core}"
 DECODE_MOE_BACKEND="${DECODE_MOE_BACKEND:-vllm}"
 MOE_GEMM_BACKEND="${MOE_GEMM_BACKEND:-trtllm}"
+LM_HEAD_GEMV_OP="${LM_HEAD_GEMV_OP:-ptx_tma_ws}"
+LM_HEAD_GEMV_K_UNROLL="${LM_HEAD_GEMV_K_UNROLL:-8}"
 
 declare -A DEDUPE_LABEL_BY_KEY=()
 declare -A DEDUPE_LOG_BY_KEY=()
@@ -223,6 +226,8 @@ Environment variables:
                            fused MoE as a reference, not final standalone.
   DECODE_CUBLAS_BACKEND    cublas or cuda_core for non-lm-head decode dense GEMM. Default: cuda_core.
   DECODE_MOE_BACKEND       vllm or trtllm for decode routed MoE pipeline. Default: vllm.
+  LM_HEAD_GEMV_OP          Local lm_head GEMV op. Default: ptx_tma_ws.
+  LM_HEAD_GEMV_K_UNROLL    Local lm_head GEMV --k-unroll. Default: 8.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
@@ -1016,6 +1021,15 @@ run_sampling_case() {
     --bench 0 1
 }
 
+run_lm_head_gemv_tma_case() {
+  run_case "sampling_lm_head_gemv_tma" \
+    --dedupe-key "lm-head-gemv:$LM_HEAD_GEMV_OP,$SAMPLING_VOCAB,$HIDDEN_DIM,$LM_HEAD_GEMV_K_UNROLL" \
+    "$LM_HEAD_GEMV_BIN" \
+    --op="$LM_HEAD_GEMV_OP" --n "$SAMPLING_VOCAB" --k "$HIDDEN_DIM" \
+    --k-unroll="$LM_HEAD_GEMV_K_UNROLL" \
+    --warmup=0 --iters=1 --no-verify
+}
+
 run_cublas_gemm_case() {
   local label="$1"
   local m="$2"
@@ -1243,6 +1257,7 @@ else
   echo "moe decode:     $DECODE_MOE_BACKEND components"
   echo "moe gemm:       $MOE_GEMM_BACKEND"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
+  echo "lm head:        $LM_HEAD_GEMV_OP k_unroll=$LM_HEAD_GEMV_K_UNROLL"
   if [[ "$QUANTIZED_GEMM_DTYPE" == fp8* ]]; then
     echo "quant gemm:     CUTLASS block-FP8 dense projection; moe gemm backend=$MOE_GEMM_BACKEND"
   else
@@ -1517,8 +1532,7 @@ fi
 fi
 
 if [[ "$ENABLE_SAMPLING" == 1 ]]; then
-run_cublas_gemm_case "sampling_lm_head_gemm" \
-  "$DECODE_TOKENS" "$SAMPLING_VOCAB" "$HIDDEN_DIM" fp32
+run_lm_head_gemv_tma_case
 run_sampling_case "sampling_topk_mask_logits" "topk_mask"
 run_sampling_case "sampling_softmax" "softmax"
 run_sampling_case "sampling_top_p" "top_p"

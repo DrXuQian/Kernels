@@ -34,6 +34,7 @@ OPERATOR_COLORS = {
     "FP16 GEMM (vLLM/cuBLASLt)": "#B07AA1",
     "FP8 GEMM baseline": "#AF7AA1",
     "LM head GEMM (vLLM/cuBLASLt)": "#FF9DA7",
+    "LM head GEMV (TMA)": "#E15759",
     "RMSNorm": "#9C755F",
     "Q/K RMSNorm": "#BAB0AC",
     "FlashAttention core": "#EDC948",
@@ -112,6 +113,8 @@ def classify_operator(case: str) -> str:
         return "MoE grouped GEMM (TRT-LLM)"
     if base in {"moe_gate_up_decode_vllm", "moe_down_decode_vllm"}:
         return "MoE GEMM (vLLM Marlin)"
+    if base == "sampling_lm_head_gemv_tma":
+        return "LM head GEMV (TMA)"
     if base in {"sampling_lm_head_gemm", "sampling_lm_head_vllm_linear"}:
         return "LM head GEMM (vLLM/cuBLASLt)"
     if base.startswith("fp8_") and "_cublas" in base:

@@ -144,7 +144,7 @@ Sampling is decode-only.
 
 | Order | Kernel | Shape | Status | Implementation | `bench_all.sh` case / note |
 |---:|---|---:|---|---|---|
-| 1 | `lm_head` FP16 GEMM | `(1,3072)->(1,248320)` | covered | `general/bench_cublas_gemm`, fp32 output | `sampling_lm_head_gemm` |
+| 1 | `lm_head` FP16 GEMV | `(1,3072)->(1,248320)` | covered | `studies/lm_head_gemv_bw/bench_lm_head_gemv --op=ptx_tma_ws --k-unroll=8`, fp32 output | `sampling_lm_head_gemv_tma` |
 | 2 | Top-K mask logits | `(1,248320)->(1,248320)` | covered | `sampling/bench_sampling`, vendored FlashInfer kernel headers | `sampling_topk_mask_logits` |
 | 3 | Softmax | `(1,248320)->(1,248320)` | covered | `sampling/bench_sampling`, vendored FlashInfer kernel headers | `sampling_softmax` |
 | 4 | Top-P sample | `(1,248320)->(1,)` | covered | `sampling/bench_sampling`, vendored FlashInfer kernel headers | `sampling_top_p` |
@@ -157,7 +157,8 @@ No Sampling kernels are used in prefill.
 
 | Backend | Implementation | Used by |
 |---|---|---|
-| FP16/BF16 GEMM | `general/bench_cublas_gemm` | Linear-Attn, MoE-FFN, Sampling |
+| FP16/BF16 GEMM | `general/bench_cublas_gemm` | Linear-Attn, MoE-FFN |
+| FP16 lm_head GEMV | `studies/lm_head_gemv_bw/bench_lm_head_gemv`, TMA warp-specialized path | Sampling |
 | FP16/BF16 decode GEMV | `general/bench_cuda_core_gemv` | Linear-Attn and MoE-FFN decode dense projections except `lm_head` |
 | RMSNorm | `general/bench_rmsnorm.cu`, built into category folders | Flash-Attn, Linear-Attn, MoE-FFN |
 | W4A16 prefill GEMM | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | Flash-Attn, Linear-Attn, MoE-FFN |

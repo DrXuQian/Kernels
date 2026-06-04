@@ -71,6 +71,7 @@ Targets:
   linear_attn          linear_attn/
   flash_attn           flash_attn/ category-local shared attention ops
   sampling             sampling/ decode sampling stages
+  lm-head-gemv         studies/lm_head_gemv_bw/ TMA/CUDA-core lm_head GEMV
   flashinfer-gdn       linear_attn/src/flashinfer_gdn/
 
   moe-ffn              moe_ffn/ category-local shared FFN ops + CUDA MoE pieces
@@ -501,7 +502,7 @@ clean_w4a16_cublas() {
 
 configure_target() {
   case "$1" in
-    default|general|linear_attn|flash_attn|sampling|flashinfer-gdn|moe-ffn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
+    default|general|linear_attn|flash_attn|sampling|lm-head-gemv|flashinfer-gdn|moe-ffn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
       log "$1 uses a Makefile or direct nvcc build; no CMake configure step."
       ;;
     moe-machete)
@@ -564,6 +565,12 @@ build_target() {
     sampling)
       build_make_dir sampling "$GPU_ARCH"
       verify_ppu_elf_version "$ROOT_DIR/sampling/bench_sampling"
+      build_make_dir studies/lm_head_gemv_bw "$GPU_ARCH"
+      verify_ppu_elf_version "$ROOT_DIR/studies/lm_head_gemv_bw/bench_lm_head_gemv"
+      ;;
+    lm-head-gemv)
+      build_make_dir studies/lm_head_gemv_bw "$GPU_ARCH"
+      verify_ppu_elf_version "$ROOT_DIR/studies/lm_head_gemv_bw/bench_lm_head_gemv"
       ;;
     flashinfer-gdn)
       build_flashinfer_gdn
@@ -650,6 +657,10 @@ clean_target() {
       ;;
     sampling)
       clean_make_dir sampling
+      clean_make_dir studies/lm_head_gemv_bw
+      ;;
+    lm-head-gemv)
+      clean_make_dir studies/lm_head_gemv_bw
       ;;
     flashinfer-gdn)
       clean_make_dir linear_attn/src/flashinfer_gdn
@@ -725,6 +736,9 @@ expand_one_target() {
       ;;
     sample|sampling)
       printf '%s\n' sampling
+      ;;
+    lm-head|lm-head-gemv|lm_head|lm_head_gemv)
+      printf '%s\n' lm-head-gemv
       ;;
     flashinfer|gdn|flashinfer_gdn)
       printf '%s\n' flashinfer-gdn
