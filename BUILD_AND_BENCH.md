@@ -10,6 +10,47 @@ This is the repo-level command reference. It is organized by module:
 
 All commands are run from the repo root unless noted otherwise.
 
+## Delivery Interface
+
+The intended handoff has two stable entry points.
+
+Compile every standalone target used by the model wrappers:
+
+```bash
+./compile.sh build all
+```
+
+If a non-default toolkit is required, keep it as one command:
+
+```bash
+./compile.sh build all --cuda-root <CUDA_ROOT> --ppu-root <COMPANION_SDK_ROOT> --cutlass-dir third_party/cutlass -j <N>
+```
+
+Run a model benchmark wrapper. The wrappers use the same selection interface as
+`bench_all.sh`: `--list`, `--case`, `--kernel`, `--resume-from`,
+`--ncu-cycles`, `--ncu-bandwidth`, and `--nsys-latency`.
+
+```bash
+./bench_Qwen3.5_27B.sh --list
+./bench_Qwen3.5_27B.sh --case decode
+./bench_Qwen3.5_27B.sh --case prefill
+./bench_Qwen3.5_27B.sh --case dense_decode_full_attn_q_proj_gate_cublas
+
+./bench_MiniMax-M2.7_TP1.sh --list
+./bench_MiniMax-M2.7_TP1.sh --case decode
+./bench_MiniMax-M2.7_TP1.sh --case prefill
+./bench_MiniMax-M2.7_TP1.sh --case moe_gate_up_decode_fp8_trtllm
+./bench_MiniMax-M2.7_TP2.sh --case decode
+./bench_MiniMax-M2.7_TP4.sh --case decode
+```
+
+Use NCU bandwidth mode for the final H800 bandwidth-utilization evidence:
+
+```bash
+./bench_Qwen3.5_27B.sh --ncu-bandwidth --case decode
+./bench_MiniMax-M2.7_TP1.sh --ncu-bandwidth --case decode
+```
+
 ## Common Setup
 
 ```bash
@@ -115,17 +156,18 @@ MiniMax-M2.7 wrapper status:
   `weight_block_size=[128,128]`; this is not MXFP8.
 - Dense quantized projections now use the standalone vLLM/CUTLASS SM90
   block-FP8 path (`fp8_block_*_cutlass`).
-- Routed MoE FP8 bodies default to `MOE_GEMM_BACKEND=fp8_block_dense`, which
-  uses the repo-owned CUTLASS block-FP8 dense GEMM on expanded expert tokens.
-  This keeps the benchmark standalone, but it is a transition path rather than
-  the final grouped/fused MoE implementation.
+- Routed MoE FP8 bodies default to `MOE_GEMM_BACKEND=fp8_trtllm`, the
+  standalone TensorRT-LLM/CUTLASS block-FP8 grouped MoE GEMM extraction.
+  The fixed tactic cache is
+  `moe_ffn/fp8/trtllm_cutlass_standalone/tactics_h800_minimax.cache`.
+- `MOE_GEMM_BACKEND=fp8_block_dense` remains available only as a dense
+  expanded-token standalone baseline.
 - `MOE_GEMM_BACKEND=flashinfer_fp8` runs the FlashInfer SM90 CUTLASS fused MoE
   reference with a checked-in tactic cache. This path validates the expected
   upstream kernel choice, but it depends on the installed FlashInfer package and
   is not final standalone coverage.
-- Final MiniMax MoE work item: extract or reimplement the SM90 grouped/fused
-  block-FP8 MoE source into a repo-owned C++/CUDA binary, then regenerate cache
-  and bandwidth numbers.
+- The standalone FP8 MoE GEMM benchmark profiles the GEMM layer only. Routing,
+  expand, activation, and finalize stay as separate MoE-FFN auxiliary cases.
 
 ## Flash-Attn
 
