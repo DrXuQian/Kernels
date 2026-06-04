@@ -906,7 +906,7 @@ summarize_nsys_latency() {
   fi
   echo "[run_all] nsys latency summary: $summary_log"
   echo "[run_all] nsys model latency summary: $model_summary_dir/model_latency_summary.md"
-  echo "[run_all][note] nsys is latency-only here; bandwidth utilization requires NCU DRAM counters."
+  echo "[run_all][note] nsys records kernel duration. Use bench_h800_bandwidth.sh for nsys-derived effective bandwidth, or --ncu-bandwidth for DRAM-counter bandwidth."
 }
 
 run_w4a16_prefill_gemm_cublas_case() {
@@ -1267,7 +1267,7 @@ else
   fi
   if [[ "$NSYS_LATENCY" == 1 ]]; then
     echo "nsys latency:   enabled"
-    echo "bandwidth:      unavailable from nsys; use --ncu-bandwidth when counters are accessible"
+    echo "bandwidth:      nsys duration only here; bench_h800_bandwidth.sh can derive effective bandwidth from shapes"
   fi
   if [[ "$BENCH_DEDUPE" != 0 ]]; then
     echo "dedupe:         enabled"

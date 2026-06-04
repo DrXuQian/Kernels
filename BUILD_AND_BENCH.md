@@ -44,13 +44,21 @@ Run a model benchmark wrapper. The wrappers use the same selection interface as
 ./bench_MiniMax-M2.7_TP4.sh --case decode
 ```
 
-Use NCU bandwidth mode for the final H800 bandwidth-utilization evidence:
+Use the H800 bandwidth wrapper for final bandwidth-utilization evidence:
 
 ```bash
-helpers/ncu_bandwidth_preflight.sh
-./bench_Qwen3.5_27B.sh --ncu-bandwidth --case decode
-./bench_MiniMax-M2.7_TP1.sh --ncu-bandwidth --case decode
+./bench_h800_bandwidth.sh
+./bench_h800_bandwidth.sh --models qwen27 --phase decode
+./bench_h800_bandwidth.sh --models minimax --phase decode
+./bench_h800_bandwidth.sh --models minimax-tp4 --case moe_gate_up_decode_fp8_trtllm
 ```
+
+`bench_h800_bandwidth.sh` runs `helpers/ncu_bandwidth_preflight.sh` first, then
+serially runs the selected model wrappers. Default `--backend auto` uses NCU
+DRAM counters when available; if NCU is blocked by `ERR_NVGPUCTRPERM`, it falls
+back to nsys kernel duration and computes effective bandwidth from the
+standalone benchmark shapes. Force either path with `--backend ncu` or
+`--backend nsys`.
 
 ## Common Setup
 
@@ -104,6 +112,7 @@ Model wrapper scripts:
 ./bench_MiniMax-M2.7_TP1.sh --list                     # MiniMax-M2.7 TP=1
 ./bench_MiniMax-M2.7_TP2.sh --list                     # MiniMax-M2.7 TP=2
 ./bench_MiniMax-M2.7_TP4.sh --list                     # MiniMax-M2.7 TP=4
+./bench_h800_bandwidth.sh --help                       # H800 bandwidth collection wrapper
 ```
 
 Benchmark runner common options:
@@ -383,9 +392,10 @@ helpers/ncu_bandwidth_preflight.sh
 
 `helpers/ncu_bandwidth_preflight.sh` runs a tiny GEMV under the same DRAM
 bandwidth metrics used by `--ncu-bandwidth`. If it fails with
-`ERR_NVGPUCTRPERM`, the current H800/container cannot produce bandwidth
-utilization evidence; use `--nsys-latency` only for kernel duration and rerun
-`--ncu-bandwidth` on a machine with performance-counter permission.
+`ERR_NVGPUCTRPERM`, `bench_h800_bandwidth.sh --backend auto` falls back to
+`--nsys-latency` and writes `nsys_effective_bandwidth_summary.md` for supported
+standalone benchmark commands. NCU remains the hardware-counter path; nsys
+fallback is an effective-bandwidth estimate from theoretical benchmark traffic.
 
 `--ncu-cycles` writes the raw per-case CSV files under `<OUT_DIR>/ncu/`, a
 case-level aggregate at `<OUT_DIR>/ncu_cycles_summary.md`, and a model-level

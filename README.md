@@ -75,6 +75,7 @@ git submodule update --init third_party/cutlass
 ./bench_all.sh --case flash_attn_decode_full_attn
 ./bench_Qwen3.5_27B.sh --case decode
 ./bench_MiniMax-M2.7_TP1.sh --case decode
+./bench_h800_bandwidth.sh --models qwen27 --phase decode
 ```
 
 Use [BUILD_AND_BENCH.md](BUILD_AND_BENCH.md) for module-specific commands.
