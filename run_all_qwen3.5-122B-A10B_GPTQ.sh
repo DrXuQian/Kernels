@@ -118,6 +118,7 @@ repo_path() {
 CUBLAS_GEMM_BIN="$(repo_path "general/bench_cublas_gemm")"
 CUDA_CORE_GEMV_BIN="$(repo_path "general/bench_cuda_core_gemv")"
 BLOCK_FP8_GEMM_BIN="$(repo_path "general/bench_cutlass_block_fp8_gemm")"
+FLASHINFER_FP8_MOE_SCRIPT="$(repo_path "moe_ffn/fp8/flashinfer_cutlass/bench_flashinfer_cutlass_fp8_moe.py")"
 MOE_TRTLLM_BIN="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm")"
 MOE_TRTLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/trtllm/auxiliary")"
 MOE_VLLM_MARLIN_BIN="$(repo_path "moe_ffn/w4a16/vllm/marlin/bench_marlin_moe")"
@@ -132,6 +133,7 @@ MOE_SHARED_EXPERT_BIN="$(repo_path "moe_ffn/bench_shared_expert")"
 SAMPLING_BIN="$(repo_path "sampling/bench_sampling")"
 
 MOE_TRTLLM_TACTIC="$(repo_path "moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache")"
+FLASHINFER_FP8_MOE_TACTIC="${FLASHINFER_FP8_MOE_TACTIC:-$(repo_path "moe_ffn/fp8/flashinfer_cutlass/tactics_h800_minimax.json")}"
 
 FAILED=0
 LIST_CASES=0
@@ -203,14 +205,18 @@ Environment variables:
   BENCH_DEDUPE             Set to 0 to rerun duplicate benchmark commands/shapes.
                            Default: 1. Duplicate case logs point at the first
                            case that measured the same key.
-  QUANTIZED_GEMM_DTYPE     Dense cuBLAS baseline input dtype for quantized
-                           projection shapes. Default: fp16. MiniMax wrappers
-                           set fp8 explicitly; this is still a dense baseline,
-                           not block-wise scaled FP8.
+  QUANTIZED_GEMM_DTYPE     Quantized projection dtype family. Default: fp16.
+                           MiniMax wrappers set fp8 and use the repo-owned
+                           CUTLASS block-FP8 dense GEMM path.
   QUANTIZED_GEMM_LABEL_KIND Label family for dense replacement projections.
                            Default: w4a16. Dense model wrappers set dense.
-  MOE_GEMM_BACKEND         trtllm or cublas for routed MoE GEMM bodies.
-                           Default: trtllm. cublas is a dense baseline path.
+  MOE_GEMM_BACKEND         trtllm, cublas, fp8_block_dense, or flashinfer_fp8
+                           for routed MoE bodies. Default: trtllm. cublas is
+                           a dense baseline path. fp8_block_dense uses the
+                           repo-owned CUTLASS block-FP8 dense GEMM on expanded
+                           tokens as a standalone MiniMax path.
+                           flashinfer_fp8 uses FlashInfer CUTLASS block-FP8
+                           fused MoE as a reference, not final standalone.
   DECODE_CUBLAS_BACKEND    cublas or cuda_core for non-lm-head decode dense GEMM. Default: cuda_core.
   DECODE_MOE_BACKEND       vllm or trtllm for decode routed MoE pipeline. Default: vllm.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
@@ -362,6 +368,15 @@ case "$DECODE_MOE_BACKEND" in
     ;;
   *)
     echo "[run_all][error] DECODE_MOE_BACKEND must be vllm or trtllm, got: $DECODE_MOE_BACKEND" >&2
+    exit 1
+    ;;
+esac
+
+case "$MOE_GEMM_BACKEND" in
+  trtllm|cublas|fp8_block_dense|flashinfer_fp8)
+    ;;
+  *)
+    echo "[run_all][error] MOE_GEMM_BACKEND must be trtllm, cublas, fp8_block_dense, or flashinfer_fp8, got: $MOE_GEMM_BACKEND" >&2
     exit 1
     ;;
 esac
@@ -1091,6 +1106,13 @@ run_moe_trtllm_gemm_case() {
     return
   fi
 
+  if [[ "$MOE_GEMM_BACKEND" == "fp8_block_dense" ]]; then
+    local total_m=$((m_per_expert * MOE_EXPERTS))
+    local fp8_label="${label/_trtllm/_fp8_block_dense}"
+    run_block_fp8_gemm_case "$fp8_label" "$total_m" "$n" "$k" bf16
+    return
+  fi
+
   if [[ "$m_per_expert" == "1" ]]; then
     run_case "$label" \
       "$MOE_TRTLLM_BIN" \
@@ -1108,6 +1130,26 @@ run_moe_trtllm_gemm_case() {
       --tactic="$MOE_TRTLLM_TACTIC" \
       --warmup=0 --iters=1
   fi
+}
+
+run_flashinfer_fp8_moe_case() {
+  local label="$1"
+  local tokens="$2"
+
+  require_file "$FLASHINFER_FP8_MOE_SCRIPT"
+  run_case "$label" \
+    --dedupe-key "flashinfer-fp8-moe:$tokens,$MOE_EXPERTS,$MOE_TOPK,$HIDDEN_DIM,$MOE_INTERMEDIATE,bf16,$FLASHINFER_FP8_MOE_TACTIC" \
+    --require-file "$FLASHINFER_FP8_MOE_TACTIC" \
+    "$PYTHON_BIN" "$FLASHINFER_FP8_MOE_SCRIPT" \
+    --tokens "$tokens" \
+    --hidden "$HIDDEN_DIM" \
+    --intermediate "$MOE_INTERMEDIATE" \
+    --experts "$MOE_EXPERTS" \
+    --topk "$MOE_TOPK" \
+    --tactic-cache "$FLASHINFER_FP8_MOE_TACTIC" \
+    --warmup 0 \
+    --iters 1 \
+    --skip-check
 }
 
 run_linear_dense_case() {
@@ -1174,7 +1216,7 @@ if [[ "$LIST_CASES" == 1 ]]; then
   echo "Available benchmark cases:"
 else
   echo "============================================================"
-  echo "$MODEL_NAME standalone kernel benchmark suite -- cuBLAS dense GEMM variant"
+  echo "$MODEL_NAME standalone kernel benchmark suite"
   echo "repo: $ROOT_DIR"
   echo "run dir: $RUN_DIR"
   echo "logs: $OUT_DIR"
@@ -1186,7 +1228,7 @@ else
   echo "moe gemm:       $MOE_GEMM_BACKEND"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
   if [[ "$QUANTIZED_GEMM_DTYPE" == fp8* ]]; then
-    echo "quant gemm:     CUTLASS block-FP8 dense projection; MoE body remains explicit baseline unless overridden"
+    echo "quant gemm:     CUTLASS block-FP8 dense projection; moe gemm backend=$MOE_GEMM_BACKEND"
   else
     echo "quant gemm:     cuBLAS dense $QUANTIZED_GEMM_DTYPE GEMM baseline"
   fi
@@ -1375,6 +1417,9 @@ run_case "moe_routing_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
   --bench 0 1
 
+if [[ "$MOE_GEMM_BACKEND" == "flashinfer_fp8" ]]; then
+run_flashinfer_fp8_moe_case "moe_fused_prefill_flashinfer_cutlass_fp8" "$PREFILL_TOKENS"
+else
 run_case "moe_expert_map_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_expert_map" "$PREFILL_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" auto \
   --bench 0 1
@@ -1394,8 +1439,15 @@ run_moe_trtllm_gemm_case "moe_down_prefill_trtllm" "$PREFILL_TOKENS" "$MOE_DOWN_
 run_case "moe_finalize_prefill_trtllm" \
   "$MOE_TRTLLM_AUX_DIR/bench_finalize_moe_routing" "$PREFILL_TOKENS" "$MOE_TOPK" "$MOE_DOWN_N" fp16 \
   --bench 0 1
+fi
 
-if [[ "$DECODE_MOE_BACKEND" == "trtllm" ]]; then
+if [[ "$MOE_GEMM_BACKEND" == "flashinfer_fp8" ]]; then
+  run_case "moe_routing_decode_trtllm" \
+    "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
+    --bench 0 1
+
+  run_flashinfer_fp8_moe_case "moe_fused_decode_flashinfer_cutlass_fp8" "$DECODE_TOKENS"
+elif [[ "$DECODE_MOE_BACKEND" == "trtllm" ]]; then
   run_case "moe_routing_decode_trtllm" \
     "$MOE_TRTLLM_AUX_DIR/bench_custom_moe_routing" "$DECODE_TOKENS" "$MOE_ROUTER_EXPERTS" "$MOE_TOPK" fp16 \
     --bench 0 1

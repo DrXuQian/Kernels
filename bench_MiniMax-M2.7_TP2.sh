@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # MiniMax-M2.7 TP=2 standalone benchmark wrapper.
 #
-# MiniMax-M2.7 uses FP8 E4M3 block-wise quantized weights. Until the
-# standalone vLLM/TRT-LLM block-wise FP8 kernels are extracted, quantized GEMM
-# labels are explicit fp8 cuBLAS baselines, not W4A16 kernels.
+# MiniMax-M2.7 uses FP8 E4M3 block-wise quantized weights. Dense projections use
+# repo-owned CUTLASS block-FP8. Routed MoE defaults to the repo-owned
+# fp8_block_dense expanded-token standalone path; set MOE_GEMM_BACKEND=flashinfer_fp8
+# explicitly to run the FlashInfer fused reference path.
 
 set -Eeuo pipefail
 
@@ -49,7 +50,7 @@ export ENABLE_MOE_FFN=1
 export ENABLE_SHARED_EXPERT=0
 export ENABLE_SAMPLING=1
 export QUANTIZED_GEMM_DTYPE=fp8
-export MOE_GEMM_BACKEND=cublas
+export MOE_GEMM_BACKEND="${MOE_GEMM_BACKEND:-fp8_block_dense}"
 export DECODE_MOE_BACKEND=trtllm
 
 exec "$ROOT_DIR/run_all_qwen3.5-122B-A10B_GPTQ.sh" "$@"

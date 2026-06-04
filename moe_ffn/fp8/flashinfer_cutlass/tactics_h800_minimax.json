@@ -1,0 +1,57 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.6.9",
+    "cuda_version": "12.8",
+    "cublas_version": "12.8.4",
+    "cudnn_version": "91002",
+    "gpu": "NVIDIA H800 PCIe"
+  },
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((1, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
+    "MoERunner",
+    1
+  ],
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((1, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
+    "MoERunner",
+    2
+  ],
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((1, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
+    "MoERunner",
+    2
+  ],
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((3823, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
+    "MoERunner",
+    11
+  ],
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((3823, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
+    "MoERunner",
+    1
+  ],
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((3823, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
+    "MoERunner",
+    2
+  ],
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((1, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
+    "MoERunner",
+    16
+  ],
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((1, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
+    "MoERunner",
+    17
+  ],
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((1, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
+    "MoERunner",
+    19
+  ],
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((3823, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
+    "MoERunner",
+    20
+  ],
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((3823, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
+    "MoERunner",
+    20
+  ],
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((3823, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
+    "MoERunner",
+    21
+  ]
+}

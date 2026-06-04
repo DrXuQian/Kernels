@@ -115,9 +115,17 @@ MiniMax-M2.7 wrapper status:
   `weight_block_size=[128,128]`; this is not MXFP8.
 - Dense quantized projections now use the standalone vLLM/CUTLASS SM90
   block-FP8 path (`fp8_block_*_cutlass`).
-- Routed MoE FP8 bodies are still marked as `fp8_moe_*_cublas_baseline`; the
-  grouped vLLM/TRT-LLM FP8 MoE extraction is still pending and must not be
-  treated as final MiniMax coverage.
+- Routed MoE FP8 bodies default to `MOE_GEMM_BACKEND=fp8_block_dense`, which
+  uses the repo-owned CUTLASS block-FP8 dense GEMM on expanded expert tokens.
+  This keeps the benchmark standalone, but it is a transition path rather than
+  the final grouped/fused MoE implementation.
+- `MOE_GEMM_BACKEND=flashinfer_fp8` runs the FlashInfer SM90 CUTLASS fused MoE
+  reference with a checked-in tactic cache. This path validates the expected
+  upstream kernel choice, but it depends on the installed FlashInfer package and
+  is not final standalone coverage.
+- Final MiniMax MoE work item: extract or reimplement the SM90 grouped/fused
+  block-FP8 MoE source into a repo-owned C++/CUDA binary, then regenerate cache
+  and bandwidth numbers.
 
 ## Flash-Attn
 
