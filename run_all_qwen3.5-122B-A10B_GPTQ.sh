@@ -241,7 +241,8 @@ Environment variables:
 
 Profiler note:
   Use --nsys-latency for Nsight Systems kernel duration when NCU counters are
-  unavailable. This does not produce bandwidth utilization.
+  unavailable. Use bench_h800_bandwidth.sh for the default H800 bandwidth flow:
+  it falls back to nsys effective bandwidth when NCU DRAM counters are blocked.
 EOF
 }
 
@@ -1267,7 +1268,7 @@ else
   fi
   if [[ "$NSYS_LATENCY" == 1 ]]; then
     echo "nsys latency:   enabled"
-    echo "bandwidth:      nsys duration only here; bench_h800_bandwidth.sh can derive effective bandwidth from shapes"
+    echo "bandwidth:      nsys duration only here; bench_h800_bandwidth.sh derives effective bandwidth from shapes"
   fi
   if [[ "$BENCH_DEDUPE" != 0 ]]; then
     echo "dedupe:         enabled"

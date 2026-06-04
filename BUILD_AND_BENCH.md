@@ -151,8 +151,8 @@ Useful log/runtime variables:
 - Any configuration found by search must be serialized to a tactic/cache file. Final benchmark scripts should load cache entries and should not hide search inside timing.
 - `nsys` latency means CUDA kernel duration. Do not use CPU wall time or launch overhead for kernel latency.
 - Run profiling cases serially. Do not run independent performance benchmarks concurrently.
-- Bandwidth conclusions should come from `--ncu-bandwidth` or equivalent NCU DRAM byte/throughput metrics, not from inferred wall-clock timing alone.
-- If local `ncu` is unavailable or lacks permission, use `nsys` as a kernel-duration fallback only. Mark bandwidth utilization as unverified until NCU DRAM counters are available.
+- Prefer `--ncu-bandwidth` when NCU DRAM byte/throughput counters are available.
+- If local `ncu` is unavailable or lacks permission, use `bench_h800_bandwidth.sh` in its default `--backend auto` mode. It falls back to nsys kernel duration and reports effective bandwidth from benchmark traffic estimates. Treat this as an inferred fallback, not a hardware DRAM-counter measurement.
 
 Qwen3.5-27B wrapper status:
 
@@ -378,8 +378,10 @@ nsys stats ".bench_profiles/$RUN_ID.nsys-rep" \
 `--nsys-latency` writes `.nsys-rep` files under `<OUT_DIR>/nsys/`, a
 case-level kernel-duration table at `<OUT_DIR>/nsys_latency_summary.md`, and a
 model-level latency report at `<OUT_DIR>/model_latency_nsys/model_latency_summary.md`.
-It intentionally does not print bandwidth utilization; use `--ncu-bandwidth`
-on a machine with NCU performance-counter permission for DRAM metrics.
+It intentionally does not compute traffic itself. Use `bench_h800_bandwidth.sh`
+to run the same nsys capture and derive effective bandwidth from the benchmark
+shape metadata, or use `--ncu-bandwidth` on a machine with NCU
+performance-counter permission for hardware DRAM metrics.
 
 H800 Nsight Compute cycles:
 

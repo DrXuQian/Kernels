@@ -104,6 +104,13 @@ def str_opt(opts, name, default=None):
     return opts.get(name, default)
 
 
+def pos_int(pos, index, default=None):
+    try:
+        return int(pos[index])
+    except (IndexError, TypeError, ValueError):
+        return default
+
+
 def gemm_bytes(opts, allow_fp8=False):
     m = int_opt(opts, "m")
     n = int_opt(opts, "n")
@@ -221,9 +228,179 @@ def gated_activation_bytes(opts, log_text):
     return total, f"gated_activation(tokens={tokens},topk={topk},inter={inter},dtype={dtype})"
 
 
+def flash_attn_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    script_index = next((i for i, value in enumerate(pos) if value.endswith("bench_flash_attn.py")), None)
+    mode = seq = heads = kv_heads = head_dim = None
+    if script_index is not None and len(pos) >= script_index + 6:
+        mode = pos[script_index + 1]
+        seq = pos_int(pos, script_index + 2)
+        heads = pos_int(pos, script_index + 3)
+        kv_heads = pos_int(pos, script_index + 4)
+        head_dim = pos_int(pos, script_index + 5)
+    else:
+        match = re.search(
+            r"bench flash_attn (decode|prefill): heads=(\d+) kv_heads=(\d+) dim=(\d+) seq=(\d+)", log_text
+        )
+        if match:
+            mode = match.group(1)
+            heads = int(match.group(2))
+            kv_heads = int(match.group(3))
+            head_dim = int(match.group(4))
+            seq = int(match.group(5))
+
+    if None in (mode, seq, heads, kv_heads, head_dim):
+        return math.nan, ""
+    b = 2
+    if mode == "decode":
+        total = heads * head_dim * b + 2 * seq * kv_heads * head_dim * b + heads * head_dim * b
+    elif mode == "prefill":
+        total = seq * heads * head_dim * b + 2 * seq * kv_heads * head_dim * b + seq * heads * head_dim * b
+    else:
+        return math.nan, f"unsupported flash attention mode: {mode}"
+    return total, f"flash_attn_{mode}_lower_bound(seq={seq},heads={heads},kv={kv_heads},dim={head_dim},fp16)"
+
+
+def expand_input_rows_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = topk = hidden = None
+    dtype = "fp16"
+    if len(pos) >= 4:
+        tokens, topk, hidden, dtype = pos_int(pos, 0), pos_int(pos, 1), pos_int(pos, 2), pos[3]
+    else:
+        match = re.search(r"expand_input_rows: tokens=(\d+) topk=(\d+) hidden=(\d+) dtype=([A-Za-z0-9_]+)", log_text)
+        if match:
+            tokens, topk, hidden, dtype = int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4)
+    b = dtype_nbytes(dtype)
+    if None in (tokens, topk, hidden) or math.isnan(b):
+        return math.nan, ""
+    total = tokens * hidden * b + tokens * topk * hidden * b + tokens * topk * 4
+    return total, f"expand_input_rows(tokens={tokens},topk={topk},hidden={hidden},dtype={dtype})"
+
+
+def finalize_moe_routing_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = topk = hidden = None
+    dtype = "fp16"
+    if len(pos) >= 4:
+        tokens, topk, hidden, dtype = pos_int(pos, 0), pos_int(pos, 1), pos_int(pos, 2), pos[3]
+    else:
+        match = re.search(
+            r"finalize_moe_routing: tokens=(\d+) topk=(\d+) hidden=(\d+) dtype=([A-Za-z0-9_]+).* scales=(\d+)",
+            log_text,
+        )
+        if match:
+            tokens, topk, hidden, dtype = int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4)
+    b = dtype_nbytes(dtype)
+    if None in (tokens, topk, hidden) or math.isnan(b):
+        return math.nan, ""
+    total = (
+        tokens * topk * hidden * b  # expanded rows
+        + tokens * hidden * b  # final output
+        + tokens * topk * 4  # scales
+        + tokens * topk * 4  # token_selected_experts
+        + tokens * topk * 4  # row mapping
+    )
+    return total, f"finalize_moe_routing(tokens={tokens},topk={topk},hidden={hidden},dtype={dtype},lower_bound)"
+
+
+def custom_moe_routing_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = experts = topk = None
+    dtype = "fp16"
+    if len(pos) >= 4:
+        tokens, experts, topk, dtype = pos_int(pos, 0), pos_int(pos, 1), pos_int(pos, 2), pos[3]
+    else:
+        match = re.search(r"custom_moe_routing: tokens=(\d+) experts=(\d+) topk=(\d+) dtype=([A-Za-z0-9_]+)", log_text)
+        if match:
+            tokens, experts, topk, dtype = int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4)
+    b = dtype_nbytes(dtype)
+    if None in (tokens, experts, topk) or math.isnan(b):
+        return math.nan, ""
+    total = tokens * experts * b + tokens * topk * 4 + tokens * topk * 4
+    return total, f"custom_moe_routing(tokens={tokens},experts={experts},topk={topk},dtype={dtype},lower_bound)"
+
+
+def expert_map_bytes(opts, log_text):
+    pos = opts.get("_positional", [])
+    tokens = experts = topk = None
+    mode = "auto"
+    if len(pos) >= 4:
+        tokens, experts, topk, mode = pos_int(pos, 0), pos_int(pos, 1), pos_int(pos, 2), pos[3]
+    else:
+        match = re.search(r"moe_expert_map: tokens=(\d+) experts=(\d+) topk=(\d+).* selected=([A-Za-z0-9_]+)", log_text)
+        if match:
+            tokens, experts, topk, mode = int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4)
+    if None in (tokens, experts, topk):
+        return math.nan, ""
+    total = tokens * topk * 4 + 2 * tokens * topk * 4 + (experts + 1) * 8
+    return total, f"expert_map(tokens={tokens},experts={experts},topk={topk},mode={mode},lower_bound)"
+
+
+def shared_expert_bytes(opts, log_text):
+    op = str_opt(opts, "op", "")
+    tokens = int_opt(opts, "tokens", int_opt(opts, "batch"))
+    hidden = int_opt(opts, "hidden", int_opt(opts, "embed"))
+    out_dim = int_opt(opts, "out-dim", int_opt(opts, "experts", 1))
+    dtype = str_opt(opts, "dtype", "fp16")
+    if tokens is None or hidden is None:
+        match = re.search(
+            r"bench shared_expert: op=([A-Za-z0-9_]+) tokens=(\d+) hidden=(\d+)(?: out_dim=(\d+))? dtype=([A-Za-z0-9_]+)",
+            log_text,
+        )
+        if match:
+            op = match.group(1)
+            tokens = int(match.group(2))
+            hidden = int(match.group(3))
+            if match.group(4):
+                out_dim = int(match.group(4))
+            dtype = match.group(5)
+    b = dtype_nbytes(dtype)
+    if None in (tokens, hidden) or math.isnan(b):
+        return math.nan, ""
+    if op in {"gate_gemv", "router_gate_gemm"}:
+        total = tokens * hidden * b + hidden * out_dim * b + tokens * out_dim * b
+    elif op == "sigmoid_mul_add":
+        total = tokens * hidden * b * 4
+    else:
+        return math.nan, f"unsupported shared_expert op: {op}"
+    return total, f"shared_expert_{op}(tokens={tokens},hidden={hidden},out={out_dim},dtype={dtype})"
+
+
+def sampling_bytes(opts, log_text):
+    op = str_opt(opts, "op", str_opt(opts, "kernel", ""))
+    hidden = int_opt(opts, "hidden")
+    vocab = int_opt(opts, "vocab")
+    top_k = int_opt(opts, "top-k", int_opt(opts, "top_k", 50))
+    if hidden is None or vocab is None:
+        match = re.search(r"sampling bench: op=([A-Za-z0-9_]+) hidden=(\d+) vocab=(\d+) top_k=(\d+)", log_text)
+        if match:
+            op = match.group(1)
+            hidden = int(match.group(2))
+            vocab = int(match.group(3))
+            top_k = int(match.group(4))
+    if vocab is None:
+        return math.nan, ""
+    if op == "lm_head":
+        if hidden is None:
+            return math.nan, ""
+        total = hidden * 2 + hidden * vocab * 2 + vocab * 4
+    elif op in {"softmax", "topk_mask"}:
+        total = 2 * vocab * 4
+    elif op == "top_p":
+        total = vocab * 4 + 8
+    else:
+        return math.nan, f"unsupported sampling op: {op}"
+    return total, f"sampling_{op}(hidden={hidden},vocab={vocab},top_k={top_k},lower_bound)"
+
+
 def estimate_bytes(exe, opts, log_text):
-    if exe in {"bench_cublas_gemm", "bench_cuda_core_gemv"}:
+    if exe in {"bench_cublas_gemm", "bench_cuda_core_gemv", "bench_vllm_linear"}:
         return gemm_bytes(opts, allow_fp8=True)
+    if exe in {"python3", "python"}:
+        pos = opts.get("_positional", [])
+        if any(value.endswith("bench_flash_attn.py") for value in pos):
+            return flash_attn_bytes(opts, log_text)
     if exe == "bench_cutlass_block_fp8_gemm":
         return block_fp8_bytes(opts)
     if exe == "bench_moe_fp8_blockscale_gemm":
@@ -234,6 +411,18 @@ def estimate_bytes(exe, opts, log_text):
         return linear_ops_bytes(opts, log_text)
     if exe == "bench_gated_activation":
         return gated_activation_bytes(opts, log_text)
+    if exe == "bench_expand_input_rows":
+        return expand_input_rows_bytes(opts, log_text)
+    if exe == "bench_finalize_moe_routing":
+        return finalize_moe_routing_bytes(opts, log_text)
+    if exe == "bench_custom_moe_routing":
+        return custom_moe_routing_bytes(opts, log_text)
+    if exe == "bench_expert_map":
+        return expert_map_bytes(opts, log_text)
+    if exe == "bench_shared_expert":
+        return shared_expert_bytes(opts, log_text)
+    if exe == "bench_sampling":
+        return sampling_bytes(opts, log_text)
     return math.nan, f"unsupported executable: {exe}"
 
 
@@ -241,8 +430,14 @@ def parse_nsys_aggregate(summary_path):
     rows = {}
     if not summary_path.exists():
         return rows
+    in_case_aggregate = False
     for line in summary_path.read_text(errors="replace").splitlines():
         stripped = line.strip()
+        if stripped.startswith("## "):
+            in_case_aggregate = stripped == "## Nsight Systems Case Aggregate"
+            continue
+        if not in_case_aggregate:
+            continue
         if not stripped.startswith("| `"):
             continue
         parts = [part.strip() for part in stripped.strip("|").split("|")]
