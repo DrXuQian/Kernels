@@ -15,6 +15,8 @@ from model_latency_summary import write_model_latency_summary
 
 
 COMPUTE_CYCLES_RE = re.compile(r"\bcompute_cycles\s*=\s*([0-9][0-9,]*)")
+MEMORY_READ_BYTES_RE = re.compile(r"\bmemory_read_bytes\s*=\s*([0-9][0-9,]*)")
+MEMORY_WRITE_BYTES_RE = re.compile(r"\bmemory_write_bytes\s*=\s*([0-9][0-9,]*)")
 
 MODEL_CONFIG_ARGS = (
     ("model_layers", "model_layers"),
@@ -60,12 +62,17 @@ def parse_metadata(path: Path) -> dict[str, str]:
     return metadata
 
 
-def parse_compute_cycles(log_path: Path) -> list[int]:
+def _parse_int_metric(pattern: re.Pattern[str], text: str) -> list[int]:
+    return [int(m.group(1).replace(",", "")) for m in pattern.finditer(text)]
+
+
+def parse_perf_metrics(log_path: Path) -> dict[str, list[int]]:
     text = log_path.read_text(errors="replace")
-    cycles: list[int] = []
-    for match in COMPUTE_CYCLES_RE.finditer(text):
-        cycles.append(int(match.group(1).replace(",", "")))
-    return cycles
+    return {
+        "compute_cycles": _parse_int_metric(COMPUTE_CYCLES_RE, text),
+        "memory_read_bytes": _parse_int_metric(MEMORY_READ_BYTES_RE, text),
+        "memory_write_bytes": _parse_int_metric(MEMORY_WRITE_BYTES_RE, text),
+    }
 
 
 def shorten_executable(path: str) -> str:
@@ -85,13 +92,12 @@ def discover_default_root() -> Path:
     return Path(".")
 
 
-def format_table(rows: list[dict[str, object]], latency_header: str) -> str:
-    headers = ["case", "executable", "compute_cycles", latency_header, "report_dir"]
+def format_table(rows: list[dict[str, object]], headers: list[str]) -> str:
     widths = {header: len(header) for header in headers}
 
     for row in rows:
         for header in headers:
-            widths[header] = max(widths[header], len(str(row[header])))
+            widths[header] = max(widths[header], len(str(row.get(header, ""))))
 
     def render(values: list[str]) -> str:
         return "  ".join(value.ljust(widths[header]) for value, header in zip(values, headers))
@@ -101,7 +107,7 @@ def format_table(rows: list[dict[str, object]], latency_header: str) -> str:
         render(["-" * widths[header] for header in headers]),
     ]
     for row in rows:
-        lines.append(render([str(row[header]) for header in headers]))
+        lines.append(render([str(row.get(header, "")) for header in headers]))
     return "\n".join(lines)
 
 
@@ -114,6 +120,7 @@ def main() -> int:
         help="perfstatistics root(s) or individual report directories. Default: latest .bench_logs/bench_*/perfstatistics",
     )
     parser.add_argument("--ghz", type=float, default=1.5, help="Clock frequency for latency conversion. Default: 1.5")
+    parser.add_argument("--peak-gbps", type=float, default=0.0, help="Peak memory bandwidth in GB/s for utilization calculation.")
     parser.add_argument("--tsv", action="store_true", help="Print TSV instead of a padded table.")
     parser.add_argument("--model-summary-dir", type=Path, help="Write model-level latency tables and SVG charts here.")
     parser.add_argument(
@@ -137,30 +144,53 @@ def main() -> int:
     rows: list[dict[str, object]] = []
     model_rows: list[dict[str, object]] = []
     latency_header = f"latency_us@{args.ghz:g}GHz"
+    has_bandwidth = False
     bench_out_dir = args.bench_out_dir
     for log_path in sorted(set(log_paths)):
         report_dir = log_path.parent
         if bench_out_dir is None and report_dir.parent.name == "perfstatistics":
             bench_out_dir = report_dir.parent.parent
-        cycles = parse_compute_cycles(log_path)
-        if not cycles:
+        metrics = parse_perf_metrics(log_path)
+        cycles_list = metrics["compute_cycles"]
+        if not cycles_list:
             continue
 
         metadata = parse_metadata(report_dir)
         label = metadata.get("label") or report_dir.name
         executable = shorten_executable(metadata.get("executable", ""))
-        selected_cycles = cycles[-1]
+        selected_cycles = cycles_list[-1]
         latency_us = selected_cycles / (args.ghz * 1000.0)
 
-        rows.append(
-            {
-                "case": label,
-                "executable": executable or "-",
-                "compute_cycles": selected_cycles,
-                latency_header: f"{latency_us:.3f}",
-                "report_dir": str(report_dir),
-            }
-        )
+        read_bytes_list = metrics["memory_read_bytes"]
+        write_bytes_list = metrics["memory_write_bytes"]
+        read_bytes = read_bytes_list[-1] if read_bytes_list else 0
+        write_bytes = write_bytes_list[-1] if write_bytes_list else 0
+        total_bytes = read_bytes + write_bytes
+
+        achieved_gbps = ""
+        bw_util = ""
+        if total_bytes > 0 and selected_cycles > 0:
+            gbps = total_bytes * args.ghz / selected_cycles
+            achieved_gbps = f"{gbps:.3f}"
+            has_bandwidth = True
+            if args.peak_gbps > 0:
+                bw_util = f"{gbps / args.peak_gbps * 100.0:.2f}"
+
+        row: dict[str, object] = {
+            "case": label,
+            "executable": executable or "-",
+            "compute_cycles": selected_cycles,
+            latency_header: f"{latency_us:.3f}",
+            "read_bytes": read_bytes if total_bytes > 0 else "",
+            "write_bytes": write_bytes if total_bytes > 0 else "",
+            "total_bytes": total_bytes if total_bytes > 0 else "",
+            "achieved_GBps": achieved_gbps,
+            "report_dir": str(report_dir),
+        }
+        if args.peak_gbps > 0:
+            row["bw_util%"] = bw_util
+        rows.append(row)
+
         model_rows.append(
             {
                 "case": label,
@@ -176,13 +206,19 @@ def main() -> int:
 
     rows.sort(key=lambda row: str(row["case"]))
 
+    headers = ["case", "executable", "compute_cycles", latency_header]
+    if has_bandwidth:
+        headers.extend(["read_bytes", "write_bytes", "total_bytes", "achieved_GBps"])
+        if args.peak_gbps > 0:
+            headers.append("bw_util%")
+    headers.append("report_dir")
+
     if args.tsv:
-        headers = ["case", "executable", "compute_cycles", latency_header, "report_dir"]
         print("\t".join(headers))
         for row in rows:
-            print("\t".join(str(row[header]) for header in headers))
+            print("\t".join(str(row.get(header, "")) for header in headers))
     else:
-        print(format_table(rows, latency_header))
+        print(format_table(rows, headers))
 
     if args.model_summary_dir:
         report_path, summary_text = write_model_latency_summary(

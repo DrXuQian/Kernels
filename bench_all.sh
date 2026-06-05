@@ -170,6 +170,7 @@ Environment variables:
   PERF_STATISTICS_DIR      Root directory for per-case perf statistics reports.
   PERF_STATISTICS_MP       perf_statistics_gen --mp value. Default: 16
   PERF_STATISTICS_GHZ      Clock used for latency summary. Default: 1.5.
+  PERF_STATISTICS_PEAK_GBPS  Peak memory bandwidth in GB/s for perfstatistics utilization.
   PERF_STATISTICS_SUMMARY  Set to 0 to skip the final perfstatistics table.
   PERFRAWLOG_CLEAR         Set to 0 to keep an existing perfrawlog before each case.
   PERFRAWLOG_POSTPROCESS   Set to 0 to skip perfrawlog post-processing.
@@ -740,9 +741,14 @@ summarize_perfstatistics() {
   echo
   echo "=== perfstatistics summary ==="
   set +e
+  local peak_gbps_args=()
+  if [[ -n "${PERF_STATISTICS_PEAK_GBPS:-}" ]]; then
+    peak_gbps_args=(--peak-gbps "$PERF_STATISTICS_PEAK_GBPS")
+  fi
   python "$ROOT_DIR/helpers/summarize_perfstatistics.py" \
     "$report_base" \
     --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
+    "${peak_gbps_args[@]}" \
     --bench-out-dir "$OUT_DIR" \
     --model-summary-dir "$model_summary_dir" \
     "${MODEL_SUMMARY_ARGS[@]}" 2>&1 | tee "$summary_log"

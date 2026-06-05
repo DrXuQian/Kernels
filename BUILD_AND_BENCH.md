@@ -141,6 +141,7 @@ Useful log/runtime variables:
 | `PERFRAWLOG_POSTPROCESS` | Set `0` to skip perfrawlog post-processing. | `1` |
 | `BENCH_DEDUPE` | Set `0` to rerun duplicate commands/shapes. | `1` |
 | `PERF_STATISTICS_GHZ` | Clock used for perfstatistics latency summary. | `1.5` |
+| `PERF_STATISTICS_PEAK_GBPS` | Peak memory bandwidth in GB/s for perfstatistics bandwidth utilization. | _(disabled)_ |
 | `NCU_PEAK_GBPS` | Peak DRAM GB/s used by `--ncu-bandwidth` when NCU peak-percent metric is unavailable. | `3350` |
 
 ## Benchmark Policy
