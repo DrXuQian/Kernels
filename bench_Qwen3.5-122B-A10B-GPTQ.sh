@@ -140,6 +140,9 @@ MOE_FP8_TRTLLM_TACTIC="${MOE_FP8_TRTLLM_TACTIC:-$(repo_path "moe_ffn/fp8/trtllm_
 
 FAILED=0
 LIST_CASES=0
+LIST_HEADER_PRINTED=0
+LIST_MISSING_BINS=0
+LIST_TOTAL_CASES=0
 MATCHED_CASES=0
 RAN_CASES=0
 SKIPPED_CASES=0
@@ -175,6 +178,7 @@ usage() {
 Usage:
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh                         # run all benchmark cases
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --list                  # list available case labels
+                                                             # plus executable existence
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case LABEL            # run one case
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --kernel LABEL          # alias for --case
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --resume-from LABEL     # skip cases before LABEL, then continue
@@ -446,6 +450,15 @@ label_matches_filter() {
   local safe_label
   safe_label="$(safe_name "$label")"
 
+  if [[ "$filter" == "decode" ]]; then
+    [[ "$label" == *decode* || "$label" == sampling_* ]]
+    return
+  fi
+  if [[ "$filter" == "prefill" ]]; then
+    [[ "$label" == *prefill* ]]
+    return
+  fi
+
   [[ "$label" == "$filter" || "$safe_label" == "$filter" || "$label" == *"$filter"* ]]
 }
 
@@ -520,25 +533,34 @@ clear_perfrawlog_for_case() {
   fi
 }
 
+print_list_header() {
+  if [[ "$LIST_HEADER_PRINTED" == 0 ]]; then
+    printf '%-8s  %-48s  %s\n' "binary" "case" "executable"
+    printf '%-8s  %-48s  %s\n' "------" "----" "----------"
+    LIST_HEADER_PRINTED=1
+  fi
+}
+
+list_case_binary() {
+  local label="$1"
+  local binary="$2"
+  local status="missing"
+
+  if [[ -n "$binary" && -x "$binary" ]]; then
+    status="ok"
+  else
+    LIST_MISSING_BINS=$((LIST_MISSING_BINS + 1))
+  fi
+  LIST_TOTAL_CASES=$((LIST_TOTAL_CASES + 1))
+
+  print_list_header
+  printf '%-8s  %-48s  %s\n' "$status" "$label" "${binary:-<empty>}"
+}
+
 run_case() {
   local label="$1"
   shift 1
   local dedupe_key=""
-
-  if [[ "$LIST_CASES" == 1 ]]; then
-    echo "$label"
-    return
-  fi
-
-  if ! case_after_resume_point "$label"; then
-    return
-  fi
-
-  if ! case_selected "$label"; then
-    return
-  fi
-
-  MATCHED_CASES=$((MATCHED_CASES + 1))
 
   local required_files=()
   local required_tactic_files=()
@@ -567,6 +589,21 @@ run_case() {
   local -a cmd=("$@")
   if [[ "${cmd[0]}" != /* ]]; then
     cmd[0]="$(repo_path "${cmd[0]}")"
+  fi
+
+  if ! case_after_resume_point "$label"; then
+    return
+  fi
+
+  if ! case_selected "$label"; then
+    return
+  fi
+
+  MATCHED_CASES=$((MATCHED_CASES + 1))
+
+  if [[ "$LIST_CASES" == 1 ]]; then
+    list_case_binary "$label" "${cmd[0]:-}"
+    return
   fi
 
   require_bin "${cmd[0]}"
@@ -1539,6 +1576,18 @@ run_sampling_case "sampling_top_p" "top_p"
 fi
 
 if [[ "$LIST_CASES" == 1 ]]; then
+  if [[ ${#CASE_FILTERS[@]} -gt 0 && "$MATCHED_CASES" == 0 ]]; then
+    echo "[bench][error] no benchmark case matched: ${CASE_FILTERS[*]}" >&2
+    exit 1
+  fi
+  if [[ "$LIST_TOTAL_CASES" -gt 0 ]]; then
+    echo
+    echo "[bench] listed cases: $LIST_TOTAL_CASES"
+    echo "[bench] missing binaries: $LIST_MISSING_BINS"
+  fi
+  if [[ "$LIST_MISSING_BINS" -gt 0 ]]; then
+    exit 1
+  fi
   exit 0
 fi
 
