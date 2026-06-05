@@ -213,6 +213,33 @@ def main() -> int:
             headers.append("bw_util%")
     headers.append("report_dir")
 
+    if has_bandwidth:
+        total_read = sum(r["read_bytes"] for r in rows if isinstance(r["read_bytes"], int))
+        total_write = sum(r["write_bytes"] for r in rows if isinstance(r["write_bytes"], int))
+        total_all = total_read + total_write
+        total_cycles = sum(r["compute_cycles"] for r in rows if isinstance(r.get("read_bytes"), int))
+        summary_gbps = ""
+        summary_util = ""
+        if total_all > 0 and total_cycles > 0:
+            gbps = total_all * args.ghz / total_cycles
+            summary_gbps = f"{gbps:.3f}"
+            if args.peak_gbps > 0:
+                summary_util = f"{gbps / args.peak_gbps * 100.0:.2f}"
+        total_row: dict[str, object] = {
+            "case": "TOTAL",
+            "executable": "",
+            "compute_cycles": total_cycles,
+            latency_header: f"{total_cycles / (args.ghz * 1000.0):.3f}",
+            "read_bytes": total_read,
+            "write_bytes": total_write,
+            "total_bytes": total_all,
+            "achieved_GBps": summary_gbps,
+            "report_dir": "",
+        }
+        if args.peak_gbps > 0:
+            total_row["bw_util%"] = summary_util
+        rows.append(total_row)
+
     if args.tsv:
         print("\t".join(headers))
         for row in rows:
