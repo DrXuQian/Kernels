@@ -71,6 +71,24 @@ moe_ffn/fp8/trtllm_cutlass_standalone/build_cmake_release/bench_moe_fp8_blocksca
 
 Decode-one-token variants use `--m_per_expert=1`.
 
+Load a serialized static-tile tactic:
+
+```bash
+moe_ffn/fp8/trtllm_cutlass_standalone/build_cmake_release/bench_moe_fp8_blockscale_gemm \
+  --experts=8 --m_per_expert=1 --n=3072 --k=3072 \
+  --tactic=moe_ffn/fp8/trtllm_cutlass_standalone/tactics_h800_minimax.cache \
+  --bench 0 1
+```
+
+Search the small static-TMA tile space and append the best config to a tactic
+cache:
+
+```bash
+moe_ffn/fp8/trtllm_cutlass_standalone/build_cmake_release/bench_moe_fp8_blockscale_gemm \
+  --experts=8 --m_per_expert=1 --n=3072 --k=3072 \
+  --sweep_configs --tactic=/tmp/fp8_moe.cache --bench 0 3
+```
+
 For bandwidth utilization, run the binary under NCU on H800 with counter
 permissions. Local `nsys` is still useful for kernel latency and launch-count
 checks, but it cannot prove DRAM bandwidth utilization.
@@ -91,3 +109,46 @@ layout D = row-major
 
 This matches the fixed block-FP8 config selected in the FlashInfer/TRT-LLM
 DeepSeek block-scale binding path before any optional DeepGEMM JIT override.
+
+The standalone static fallback now exposes a small tactic space:
+
+```text
+tile_m = 64 or 128
+tile_n = 64 or 128
+tile_k = 128
+```
+
+`--tactic` loads entries with the same cache format used by
+`tactics_h800_minimax.cache`; `--sweep_configs` measures the four static
+configs and can append the best entry. DeepGEMM remains a separate optional
+path selected only by `--deep-gemm`; it is not part of this static tactic
+search.
+
+Without an explicit `--tile_*` or tactic entry, the static fallback uses the
+same default heuristic as the recorded best MiniMax path:
+
+- decode-like `m_per_expert <= 64`: `64x128x128`
+- prefill-like `m_per_expert > 64`: `128x64x128`
+
+## TP1 Decode Static-Tile Result
+
+On the local H800 PCIe, using nsys kernel duration and the PCIe H800 2.0 TB/s
+bandwidth reference:
+
+| MiniMax-M2.7 TP1 decode GEMM | old tile | new tile | old nsys latency | new nsys latency | effective bandwidth |
+|---|---|---|---:|---:|---:|
+| gate/up `(experts=8,m=1,n=3072,k=3072)` | `128x64x128` | `64x128x128` | 60.992 us | 50.879 us | 1.486 TB/s |
+| down `(experts=8,m=1,n=3072,k=1536)` | `128x64x128` | `64x128x128` | 30.783 us | 20.352 us | 1.859 TB/s |
+
+For TP1 prefill (`m_per_expert=3823`), the sweep kept the original
+`128x64x128` tile for both gate/up and down.
+
+An extra decode-only study tried adding `tile_n=32` to the grouped-GEMM static
+search space. It was slower for both TP1 decode shapes on the same H800:
+
+| candidate | gate/up median | down median |
+|---|---:|---:|
+| `64x32x128` | 66.4 us | 40.9 us |
+| `64x128x128` | 51.8 us | 24.2 us |
+
+So `tile_n=32` is intentionally omitted from the committed tactic search space.

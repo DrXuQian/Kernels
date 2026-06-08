@@ -10,6 +10,22 @@ RUN_PREFLIGHT=1
 CONTINUE_ON_ERROR=0
 EXTRA_ARGS=()
 
+detect_peak_gbps() {
+  local name
+  name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true)"
+  case "$name" in
+    *"H800 PCIe"*|*"H100 PCIe"*)
+      echo 2000
+      ;;
+    *)
+      echo 3350
+      ;;
+  esac
+}
+
+NCU_PEAK_GBPS="${NCU_PEAK_GBPS:-$(detect_peak_gbps)}"
+export NCU_PEAK_GBPS
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -45,8 +61,8 @@ Environment:
                        wrapper only; each wrapper normally gets its own OUT_DIR.
   BANDWIDTH_OUT_ROOT   Parent directory for per-wrapper output dirs.
                        Default: .bench_logs
-  NCU_PEAK_GBPS        Peak DRAM GB/s for bandwidth summary. Default inherited
-                       by bench wrapper, currently 3350.
+  NCU_PEAK_GBPS        Peak DRAM GB/s for bandwidth summary. Default auto:
+                       2000 for H800/H100 PCIe, otherwise 3350.
   BANDWIDTH_BACKEND    Default backend when --backend is omitted. Default: nsys.
 EOF
 }
@@ -243,7 +259,7 @@ for model in "${MODEL_LIST[@]}"; do
     echo "=== Nsight Systems effective bandwidth summary ==="
     set +e
     python "$ROOT_DIR/helpers/summarize_nsys_effective_bandwidth.py" "$out_dir" \
-      --peak-gbps "${NCU_PEAK_GBPS:-3350}" 2>&1 | tee "$summary"
+      --peak-gbps "$NCU_PEAK_GBPS" 2>&1 | tee "$summary"
     summary_status=${PIPESTATUS[0]}
     set -e
     if [[ "$summary_status" != 0 ]]; then

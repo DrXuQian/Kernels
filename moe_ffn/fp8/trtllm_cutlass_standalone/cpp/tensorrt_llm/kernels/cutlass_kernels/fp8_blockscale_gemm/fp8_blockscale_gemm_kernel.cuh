@@ -19,6 +19,7 @@
 #include <cutlass/arch/reg_reconfig.h>
 
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <cub/cub.cuh>
 #include <cute/arch/cluster_sm90.hpp>
@@ -1171,6 +1172,18 @@ bool getDeepGemmEnabled() {
 
 static bool kDeepGemmEnabled = []() -> bool { return getDeepGemmEnabled(); }();
 
+int get_fp8_static_tile_env(char const* name, int default_value) {
+  char const* value = std::getenv(name);
+  if (!value || value[0] == '\0') {
+    return default_value;
+  }
+  int parsed = std::atoi(value);
+  if (parsed == 64 || parsed == 128) {
+    return parsed;
+  }
+  return default_value;
+}
+
 void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x,
                   int shape_y, cudaStream_t stream) {
   if (kNumDeviceSMs < 0) {
@@ -1501,6 +1514,48 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
   }
 }
 
+template <int TILE_M, int TILE_N>
+void static_grouped_gemm_dispatch(__nv_fp8_e4m3* fp8_mat_a, __nv_fp8_e4m3* fp8_mat_b,
+                                  __nv_bfloat16* mat_d, int num_problems,
+                                  int64_t const* problem_m_offsets, int64_t max_shape_m,
+                                  int64_t max_shape_m_padded, int shape_n, int shape_k,
+                                  float* scales_a, float* scales_b, cudaStream_t stream) {
+  using GemmType = Fp8Gemm<__nv_fp8_e4m3, Layout::RowMajor, __nv_fp8_e4m3, Layout::ColMajor,
+                           __nv_bfloat16, Layout::RowMajor, float, float, float, TILE_M, TILE_N,
+                           128, ScaleType::PerSubChannel, ScaleType::PerBlock, 1, 128, 128, 128>;
+  GemmType::run(fp8_mat_a, fp8_mat_b, mat_d, scales_a, scales_b, num_problems, problem_m_offsets,
+                shape_n, shape_k, static_cast<int>(max_shape_m), stream, 128,
+                static_cast<int>(max_shape_m_padded));
+}
+
+void static_grouped_gemm_dispatch(__nv_fp8_e4m3* fp8_mat_a, __nv_fp8_e4m3* fp8_mat_b,
+                                  __nv_bfloat16* mat_d, int num_problems,
+                                  int64_t const* problem_m_offsets, int64_t max_shape_m,
+                                  int64_t max_shape_m_padded, int shape_n, int shape_k,
+                                  float* scales_a, float* scales_b, cudaStream_t stream) {
+  int const default_tile_m = max_shape_m <= 64 ? 64 : 128;
+  int const default_tile_n = max_shape_m <= 64 ? 128 : 64;
+  int const tile_m = get_fp8_static_tile_env("TRTLLM_FP8_STATIC_TILE_M", default_tile_m);
+  int const tile_n = get_fp8_static_tile_env("TRTLLM_FP8_STATIC_TILE_N", default_tile_n);
+  if (tile_m == 64 && tile_n == 64) {
+    static_grouped_gemm_dispatch<64, 64>(fp8_mat_a, fp8_mat_b, mat_d, num_problems,
+                                         problem_m_offsets, max_shape_m, max_shape_m_padded,
+                                         shape_n, shape_k, scales_a, scales_b, stream);
+  } else if (tile_m == 64 && tile_n == 128) {
+    static_grouped_gemm_dispatch<64, 128>(fp8_mat_a, fp8_mat_b, mat_d, num_problems,
+                                          problem_m_offsets, max_shape_m, max_shape_m_padded,
+                                          shape_n, shape_k, scales_a, scales_b, stream);
+  } else if (tile_m == 128 && tile_n == 128) {
+    static_grouped_gemm_dispatch<128, 128>(fp8_mat_a, fp8_mat_b, mat_d, num_problems,
+                                           problem_m_offsets, max_shape_m, max_shape_m_padded,
+                                           shape_n, shape_k, scales_a, scales_b, stream);
+  } else {
+    static_grouped_gemm_dispatch<128, 64>(fp8_mat_a, fp8_mat_b, mat_d, num_problems,
+                                          problem_m_offsets, max_shape_m, max_shape_m_padded,
+                                          shape_n, shape_k, scales_a, scales_b, stream);
+  }
+}
+
 void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a,
                           __nv_bfloat16 const* mat_b, __nv_fp8_e4m3* fp8_mat_b, float* scales_b,
                           __nv_bfloat16* mat_d, int64_t const* problem_m_offsets, int num_problems,
@@ -1552,12 +1607,9 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
                           max_shape_m, max_shape_m_padded, shape_n, shape_k, scales_a, scales_b,
                           stream);
   } else {
-    using GemmType = Fp8Gemm<__nv_fp8_e4m3, Layout::RowMajor, __nv_fp8_e4m3, Layout::ColMajor,
-                             __nv_bfloat16, Layout::RowMajor, float, float, float, 128, 64, 128,
-                             ScaleType::PerSubChannel, ScaleType::PerBlock, 1, 128, 128, 128>;
-    GemmType::run(fp8_mat_a, fp8_mat_b, mat_d, scales_a, scales_b, num_problems, problem_m_offsets,
-                  shape_n, shape_k, static_cast<int>(max_shape_m), stream, 128,
-                  static_cast<int>(max_shape_m_padded));
+    static_grouped_gemm_dispatch(fp8_mat_a, fp8_mat_b, mat_d, num_problems, problem_m_offsets,
+                                 max_shape_m, max_shape_m_padded, shape_n, shape_k, scales_a,
+                                 scales_b, stream);
   }
 }
 

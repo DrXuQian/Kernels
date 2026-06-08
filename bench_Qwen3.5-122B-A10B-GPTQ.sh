@@ -23,6 +23,19 @@ ATTN_BENCH_ITERS="${ATTN_BENCH_ITERS:-1}"
 QUANTIZED_GEMM_DTYPE="${QUANTIZED_GEMM_DTYPE:-fp16}"
 QUANTIZED_GEMM_LABEL_KIND="${QUANTIZED_GEMM_LABEL_KIND:-w4a16}"
 
+detect_peak_gbps() {
+  local name
+  name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true)"
+  case "$name" in
+    *"H800 PCIe"*|*"H100 PCIe"*)
+      echo 2000
+      ;;
+    *)
+      echo 3350
+      ;;
+  esac
+}
+
 MODEL_NAME="${MODEL_NAME:-Qwen3.5-122B-A10B-GPTQ}"
 PREFILL_TOKENS="${PREFILL_TOKENS:-3823}"
 DECODE_TOKENS="${DECODE_TOKENS:-1}"
@@ -160,7 +173,7 @@ else
 fi
 NCU_METRICS="${NCU_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.sum}"
 NCU_BANDWIDTH_METRICS="${NCU_BANDWIDTH_METRICS:-sm__cycles_elapsed.avg,sm__cycles_elapsed.max,gpu__time_duration.avg,dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed}"
-NCU_PEAK_GBPS="${NCU_PEAK_GBPS:-3350}"
+NCU_PEAK_GBPS="${NCU_PEAK_GBPS:-$(detect_peak_gbps)}"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-}"
 BENCH_DEDUPE="${BENCH_DEDUPE:-1}"
@@ -1176,6 +1189,7 @@ run_moe_trtllm_gemm_case() {
       --require-tactic-entry "$MOE_FP8_TRTLLM_TACTIC" "$MOE_EXPERTS,$m_per_expert,$n,$k,1x128,128x128|" \
       "$MOE_FP8_TRTLLM_BIN" \
       --experts="$MOE_EXPERTS" --m_per_expert="$m_per_expert" --n="$n" --k="$k" \
+      --tactic="$MOE_FP8_TRTLLM_TACTIC" \
       --bench 0 1
     return
   fi
