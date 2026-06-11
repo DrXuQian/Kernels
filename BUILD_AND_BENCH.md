@@ -448,9 +448,11 @@ python helpers/summarize_ncu_cycles.py <OUT_DIR>/ncu --detail \
 The model-level reports split latency into prefill and decode, then into
 Flash-Attn, Linear-Attn, MoE-FFN, and Sampling. They also report total covered
 model latency and generate phase/module/operator pie and bar charts. When
-`BENCH_DEDUPE=1` skips an identical logical case, the model summary expands the
-skipped case by reusing the measured source-case latency so the model total is
-not undercounted.
+`BENCH_DEDUPE=1` skips an identical logical case, and
+`helpers/summarize_perfstatistics.py` expands the skipped label by reusing the
+measured source-case latency. The top-level per-case table marks those rows as
+`deduped from <source>`, and the model summary uses the expanded logical cases
+so the model total is not undercounted.
 
 ## Tactic Cache Checks
 

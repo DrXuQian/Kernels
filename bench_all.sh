@@ -563,6 +563,7 @@ run_case() {
       echo "run_dir: $RUN_DIR"
       echo "status: skipped_duplicate"
       echo "duplicate_of: $first_label"
+      echo "dedupe_duplicate_of: $first_label"
       echo "duplicate_log: $first_log"
       echo "dedupe_key: $dedupe_key"
       printf 'command:'

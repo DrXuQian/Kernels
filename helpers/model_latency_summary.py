@@ -212,15 +212,18 @@ def parse_case_log_metadata(path: Path) -> dict[str, str]:
             continue
         key, value = line.split(":", 1)
         metadata[key.strip()] = value.strip()
+    if "duplicate_of" in metadata and "dedupe_duplicate_of" not in metadata:
+        metadata["dedupe_duplicate_of"] = metadata["duplicate_of"]
     return metadata
 
 
 def expand_deduped_cases(cases: list[dict[str, object]], bench_out_dir: Path | None) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
     """Add logical cases skipped by bench_all.sh dedupe.
 
-    bench_all.sh writes a top-level log for skipped duplicates with
-    `dedupe_duplicate_of: <case>`. The measured case is still a valid proxy for
-    the logical duplicate, so model totals should include both labels.
+    bench scripts write a top-level log for skipped duplicates with
+    `duplicate_of: <case>` (older summaries also accept
+    `dedupe_duplicate_of: <case>`). The measured case is still a valid proxy
+    for the logical duplicate, so model totals should include both labels.
     """
 
     expanded = [dict(row) for row in cases if finite(row.get("latency_us"))]

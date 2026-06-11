@@ -11,7 +11,7 @@ import argparse
 import re
 from pathlib import Path
 
-from model_latency_summary import write_model_latency_summary
+from model_latency_summary import parse_case_log_metadata, write_model_latency_summary
 
 
 COMPUTE_CYCLES_RE = re.compile(r"\bcompute_cycles\s*=\s*([0-9][0-9,]*)")
@@ -111,6 +111,40 @@ def format_table(rows: list[dict[str, object]], headers: list[str]) -> str:
     return "\n".join(lines)
 
 
+def expand_deduped_summary_rows(
+    rows: list[dict[str, object]],
+    bench_out_dir: Path | None,
+) -> list[dict[str, object]]:
+    """Add skipped duplicate cases to the printed per-case table.
+
+    `write_model_latency_summary` already expands deduped cases for model totals.
+    This helper mirrors that behavior for the top-level perfstatistics table,
+    while leaving the model-summary input unchanged to avoid double counting.
+    """
+
+    expanded = [dict(row) for row in rows]
+    by_case = {str(row["case"]): row for row in expanded}
+    if bench_out_dir is None or not bench_out_dir.is_dir():
+        return expanded
+
+    for log_path in sorted(bench_out_dir.glob("*.log")):
+        metadata = parse_case_log_metadata(log_path)
+        label = metadata.get("label")
+        duplicate_of = metadata.get("dedupe_duplicate_of")
+        if not label or not duplicate_of or label in by_case:
+            continue
+        source = by_case.get(duplicate_of)
+        if source is None:
+            continue
+        copied = dict(source)
+        copied["case"] = label
+        copied["report_dir"] = f"deduped from {duplicate_of}"
+        by_case[label] = copied
+        expanded.append(copied)
+
+    return expanded
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -204,6 +238,7 @@ def main() -> int:
         print("No perfstatistics.log with compute_cycles was found.")
         return 1
 
+    rows = expand_deduped_summary_rows(rows, bench_out_dir)
     rows.sort(key=lambda row: str(row["case"]))
 
     headers = ["case", "executable", "compute_cycles", latency_header]
