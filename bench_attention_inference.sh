@@ -81,7 +81,10 @@ Environment variables:
   OUT_DIR                 Log output directory. Default: .bench_logs/attention_<timestamp>
   TRITON_CACHE_DIR        Triton JIT cache. Default: .triton_cache
   PREFILL_TOKENS          Default: 3823
-  CTX_LEN                 FlashAttention decode KV cache length. Default: 3823
+  CTX_LEN                 FlashAttention KV cache / context length, used for the
+                          decode case and as the prefill context length (the
+                          PREFILL_TOKENS new tokens attend to CTX_LEN context).
+                          Default: 3823
   BENCH_WARMUP            Default: 0
   BENCH_ITERS             Default: 1
   TRITON_DTYPE            fp16 or bf16. Default: bf16
@@ -555,6 +558,7 @@ run_python_case "flash_attn_decode_full_attn" \
 run_python_case "flash_attn_prefill_full_attn" \
   "flash_attn/bench_flash_attn.py" \
   prefill "$PREFILL_TOKENS" "$FULL_ATTN_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
+  --ctx "$CTX_LEN" \
   --bench "$BENCH_WARMUP" "$BENCH_ITERS"
 
 if [[ "$LIST_CASES" == 1 ]]; then

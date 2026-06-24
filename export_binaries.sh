@@ -362,8 +362,16 @@ run_flash_attn_core_case() {
     echo "[runner][error] python3 not found; cannot run $label" >&2
     exit 1
   fi
-  run_case "$label" flash_attn "$phase" "FlashAttention core seq=$seq q_heads=32 kv_heads=2 head_dim=256" \
-    "$PYTHON_BIN" "$FLASH_ATTN_SCRIPT" "$phase" "$seq" "$FULL_ATTN_Q_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" --bench 0 1
+  # Prefill models chunked prefill: seq new query tokens attend to a CTX_LEN
+  # context. Decode already passes CTX_LEN as its seq.
+  local ctx_args=()
+  local ctx_desc=""
+  if [[ "$phase" == "prefill" ]]; then
+    ctx_args=(--ctx "$CTX_LEN")
+    ctx_desc=" ctx=$CTX_LEN"
+  fi
+  run_case "$label" flash_attn "$phase" "FlashAttention core seq=$seq$ctx_desc q_heads=32 kv_heads=2 head_dim=256" \
+    "$PYTHON_BIN" "$FLASH_ATTN_SCRIPT" "$phase" "$seq" "$FULL_ATTN_Q_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" "${ctx_args[@]}" --bench 0 1
 }
 
 run_moe_trtllm_gemm_case() {

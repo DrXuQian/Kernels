@@ -857,11 +857,21 @@ run_flash_attn_core_case() {
   local mode="$2"
   local seq_len="$3"
 
+  # Prefill models chunked prefill: seq_len new query tokens attend to a
+  # CTX_LEN-long context. Decode already passes CTX_LEN as its seq_len.
+  local ctx_args=()
+  local ctx_key=""
+  if [[ "$mode" == "prefill" ]]; then
+    ctx_args=(--ctx "$CTX_LEN")
+    ctx_key=",ctx=$CTX_LEN"
+  fi
+
   run_case "$label" \
     --require-file "$FLASH_ATTN_SCRIPT" \
-    --dedupe-key "flash-attn-core:$mode,$seq_len,$FULL_ATTN_Q_HEADS,$FULL_ATTN_KV_HEADS,$FULL_ATTN_HEAD_DIM" \
+    --dedupe-key "flash-attn-core:$mode,$seq_len$ctx_key,$FULL_ATTN_Q_HEADS,$FULL_ATTN_KV_HEADS,$FULL_ATTN_HEAD_DIM" \
     "$PYTHON_BIN" "$FLASH_ATTN_SCRIPT" \
     "$mode" "$seq_len" "$FULL_ATTN_Q_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
+    "${ctx_args[@]}" \
     --bench "$ATTN_BENCH_WARMUP" "$ATTN_BENCH_ITERS"
 }
 
