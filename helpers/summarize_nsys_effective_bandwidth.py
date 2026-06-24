@@ -307,16 +307,18 @@ def gated_delta_net_bytes(opts, log_text):
 def flash_attn_bytes(opts, log_text):
     pos = opts.get("_positional", [])
     script_index = next((i for i, value in enumerate(pos) if value.endswith("bench_flash_attn.py")), None)
-    mode = seq = heads = kv_heads = head_dim = None
+    mode = seq = heads = kv_heads = head_dim = ctx = None
     if script_index is not None and len(pos) >= script_index + 6:
         mode = pos[script_index + 1]
         seq = pos_int(pos, script_index + 2)
         heads = pos_int(pos, script_index + 3)
         kv_heads = pos_int(pos, script_index + 4)
         head_dim = pos_int(pos, script_index + 5)
+        ctx = int_opt(opts, "ctx", int_opt(opts, "context-len", None))
     else:
         match = re.search(
-            r"bench flash_attn (decode|prefill): heads=(\d+) kv_heads=(\d+) dim=(\d+) seq=(\d+)", log_text
+            r"bench flash_attn (decode|prefill): heads=(\d+) kv_heads=(\d+) dim=(\d+) seq=(\d+)(?: ctx=(\d+))?",
+            log_text,
         )
         if match:
             mode = match.group(1)
@@ -324,17 +326,22 @@ def flash_attn_bytes(opts, log_text):
             kv_heads = int(match.group(3))
             head_dim = int(match.group(4))
             seq = int(match.group(5))
+            ctx = int(match.group(6)) if match.group(6) else None
 
     if None in (mode, seq, heads, kv_heads, head_dim):
         return math.nan, ""
+    # K/V length defaults to seq_len; --ctx (chunked prefill) makes it larger.
+    if ctx is None:
+        ctx = seq
     b = 2
     if mode == "decode":
-        total = heads * head_dim * b + 2 * seq * kv_heads * head_dim * b + heads * head_dim * b
+        total = heads * head_dim * b + 2 * ctx * kv_heads * head_dim * b + heads * head_dim * b
     elif mode == "prefill":
-        total = seq * heads * head_dim * b + 2 * seq * kv_heads * head_dim * b + seq * heads * head_dim * b
+        total = seq * heads * head_dim * b + 2 * ctx * kv_heads * head_dim * b + seq * heads * head_dim * b
     else:
         return math.nan, f"unsupported flash attention mode: {mode}"
-    return total, f"flash_attn_{mode}_lower_bound(seq={seq},heads={heads},kv={kv_heads},dim={head_dim},fp16)"
+    ctx_label = f",ctx={ctx}" if ctx != seq else ""
+    return total, f"flash_attn_{mode}_lower_bound(seq={seq}{ctx_label},heads={heads},kv={kv_heads},dim={head_dim},fp16)"
 
 
 def expand_input_rows_bytes(opts, log_text):
