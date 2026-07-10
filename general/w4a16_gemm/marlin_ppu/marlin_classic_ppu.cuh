@@ -593,15 +593,22 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
         }
       }
 #ifdef MARLIN_BENCH_NOREDUCE
-      // SPEED-ONLY, RESULT IS WRONG ON PURPOSE. Skips the entire serial reduce (barrier_acquire -> global_reduce ->
-      // barrier_release) and lets every slice race to write C. It answers exactly one question, cheaply, before anyone
-      // builds a split-K-parallel path: with the barrier gone, how fast is the mainloop at a large grid?
+      // SPEED-ONLY PROBE, RESULT IS WRONG ON PURPOSE (no reduce ever runs). Models a splitk_PARALLEL mainloop: skip
+      // barrier_acquire/global_reduce/barrier_release, and have each slice write its own gmem slot. The slot offset is
+      // the whole C plane, so slices never touch the same cache line.
       //
-      // t ~ slice_count^1.5 (measured) says the barrier is what kills a big decode grid. But decode also shows
-      // Instruction Fetch 0.981, and if THAT is the real ceiling then a partial-buffer + reduce-kernel rewrite buys
-      // nothing. This flag separates the two. The timing here is a faithful upper bound for a splitk_parallel mainloop
-      // (writing per-slice partials is slightly MORE traffic than this racy single write).
-      write_result();
+      // The slot is what makes this a valid probe. v1 of this flag let every slice race to write the SAME C, which for
+      // slice_count=112 put 112 CTAs on one cache line -- and measured identical to the barrier (7961.06 vs 7960.59 us).
+      // That proved only that a racy write serializes as badly as a barrier, not that splitk_parallel would. Traffic and
+      // contention are different quantities; the v1 comment conflated them.
+      //
+      // Caller must size C as slice_count * (prob_m * prob_n / 8) int4. bench_marlin over-allocates when NOREDUCE is on.
+      {
+        int4* C_save = C;
+        C += (long long) slice_idx * prob_m * (prob_n / 8);
+        write_result();
+        C = C_save;
+      }
 #else
       if (slice_count > 1) {
         barrier_acquire(&locks[slice_col], slice_idx);

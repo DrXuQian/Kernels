@@ -53,13 +53,23 @@ static double compulsory_bytes(int M, int N, int K) {
          + (double) N * 2;         // scales: fp16, one per column
 }
 
+// -DMARLIN_BENCH_NOREDUCE makes each split-K slice write its OWN C plane (slot = slice_idx). Results are wrong by
+// design -- no reduce runs -- but the timing models a splitk_parallel mainloop without cache-line contention. Slots
+// needed = max slice_count = ceildiv(k_tiles, iters); worst case in our sweeps is 112 (N=4096 K=14336, blocks=3584).
+// 128 slots costs 1 MB and cannot be overrun by any grid we probe. Too few slots = out-of-bounds writes, not a bad number.
+#ifdef MARLIN_BENCH_NOREDUCE
+static const int C_SLOTS = 128;
+#else
+static const int C_SLOTS = 1;
+#endif
+
 static double bench_one(int M, int N, int K, int iters) {
     const int max_par = get_max_par();
     const size_t A_i4 = (size_t) M * K / 8, B_i4 = (size_t) (K / 16) * (N * 16 / 32), C_i4 = (size_t) M * N / 8, S_h = (size_t) N;
     // locks: one per (n-tile, par). Worst case is thread_n=128 (the M<=16 configs) -> N/128 n-tiles, NOT N/256.
     const size_t WS = (size_t) (N / 128 + 1) * max_par;
     int4 *dA, *dB, *dC, *dS; int * dWS;
-    if (cudaMalloc(&dA, A_i4 * 16) || cudaMalloc(&dB, B_i4 * 16) || cudaMalloc(&dC, C_i4 * 16) ||
+    if (cudaMalloc(&dA, A_i4 * 16) || cudaMalloc(&dB, B_i4 * 16) || cudaMalloc(&dC, C_i4 * 16 * C_SLOTS) ||
         cudaMalloc(&dS, (S_h / 8 + 1) * 16) || cudaMalloc(&dWS, WS * 4)) { printf("  alloc fail\n"); return -1; }
     cudaMemset(dA, 1, A_i4 * 16); cudaMemset(dB, 1, B_i4 * 16); cudaMemset(dS, 0x3c, (S_h / 8) * 16);   // s~=1.0 (0x3c00)
     cudaMemset(dWS, 0, WS * 4);
