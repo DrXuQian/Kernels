@@ -15,6 +15,7 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>   // getenv / atoi for the MARLIN_* runtime knobs
 #include <iostream>
 
 namespace marlin_classic_ppu {
@@ -675,6 +676,12 @@ static int marlin_cuda(const void* A, const void* B, void* C, void* s, int prob_
   // already fill the machine. MARLIN_NOSPLITK / MARLIN_SPLITK force either way.
   static const bool force_nosplit = getenv("MARLIN_NOSPLITK") != nullptr;
   static const bool force_split   = getenv("MARLIN_SPLITK")   != nullptr;
+  // MARLIN_BLOCKS overrides the grid outright. Safe at any size: the kernel derives
+  // iters = ceildiv(k_tiles*n_tiles*par, gridDim.x), and init_slice() retires any CTA whose slice_col_par lands past
+  // n_tiles*par, so an oversized grid just idles the extras. `locks` is indexed by slice_col < n_tiles, so the
+  // workspace does NOT scale with this (unlike max_par). Useful for decode, where the grid is the whole problem:
+  // M<=16 uses thread_n=128, so there are only N/128 output tiles -- 32 for N=4096 against 72 CUs (0.44x).
+  static const char* blocks_env = getenv("MARLIN_BLOCKS");
   int cols = prob_n / thread_n;
   if (prob_n % thread_n != 0 || prob_k % thread_k != 0 || (group_blocks != -1 && prob_k % group_blocks != 0)) return 1;
   if (prob_m == 0 || prob_n == 0 || prob_k == 0) return 0;
@@ -689,6 +696,7 @@ static int marlin_cuda(const void* A, const void* B, void* C, void* s, int prob_
       prob_m = 16 * MB * par; i += MB * (par - 1); thread_m_blocks = MB; }
     int tiles = cols * par;                // one CTA per output tile -> full-K, no split
     blocks = (force_nosplit || (!force_split && tiles >= sms)) ? tiles : sms;
+    if (blocks_env) blocks = atoi(blocks_env);
     if (false) {}
     // Only instantiate configs the dispatcher can actually reach (thread_m_blocks <= MARLIN_MAX_MB). Otherwise the
     // unreachable (3,·)/(4,·) kernels still get compiled and their spill/stack-frame lines pollute -Xptxas -v.
