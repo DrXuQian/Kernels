@@ -72,12 +72,6 @@ Current observation: `MARLIN_MIN_BLOCKS=2` was best in the `2048 x 4096 x 14336`
 
 So dequant amortization is not worth register pressure here; do not spend effort splitting `frag_c` to reach `MB=4`.
 
-## Not yet mirrored here
-
-`bench_marlin.cu`, `dequant_smoke.cu`, `marlin_ppu.cuh`, and `test_marlin_ppu.cu` are referenced by the `Makefile`
-but are not in this directory yet; they still live only in the llama.cpp PPU fork on the build box. `make bench_marlin`
-and `make dequant_smoke` will fail here until they are copied over.
-
 ## Known caveats
 
 - `bench_marlin` uses random data and is for performance only; correctness is validated separately by `test_marlin_classic_num` and `test_marlin_classic_splitk`.
