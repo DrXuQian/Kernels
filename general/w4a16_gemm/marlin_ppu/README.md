@@ -8,9 +8,7 @@ Standalone Marlin W4A16 GEMM experiments for the T-Head PPU (ppu001 / ACOMPUTE 1
   - Fuses two NVIDIA `m16n8k16` MMAs into one PPU `m16n16k16` MMA.
   - Uses the verified PPU C fragment layout for result stores and global reduce.
   - `write_result` stages the output tile through shared memory in row-major order and streams it out as `int4`
-    (8 halves per store). Worth ~1% end-to-end, not more: the epilogue runs once per CTA while the mainloop runs
-    `k_tiles` iterations, so the 8x drop in store *instructions* only ever bought the ~2.8% of runtime that the
-    scattered writes actually cost in DRAM traffic. Kept for the cleaner epilogue, not for speed. The PPU C layout (`col = lane%4 + 4*(l%4)`) makes a lane's columns stride-4, so the direct
+    (8 halves per store). The PPU C layout (`col = lane%4 + 4*(l%4)`) makes a lane's columns stride-4, so the direct
     store issued one 2-byte global store per accumulator float. `-DMARLIN_WRITE_DIRECT` restores that old path for
     A/B bisection. The row stride carries a `+1 int4` pad, which drops the staging bank conflicts from 16-way to 2-way.
   - Keeps the classic cp.async pipeline, dispatcher, dequant path, and K-warp reduction structure.
@@ -73,6 +71,35 @@ Current observation: `MARLIN_MIN_BLOCKS=2` was best in the `2048 x 4096 x 14336`
 | 4096 x 4096 x 4096 | 262.9 TFLOP/s | 231.4 |
 
 So dequant amortization is not worth register pressure here; do not spend effort splitting `frag_c` to reach `MB=4`.
+
+## Decode: use `gemv_w4a16`, not Marlin
+
+Marlin is a GEMM. Its tile is 16x128 and decode (M=1) uses one of those 16 rows, and its (tile, k) split obeys
+`blocks * iters ~= n_tiles * k_tiles`, so grid size and pipeline depth trade against each other. Decode therefore tops
+out around 37% of peak no matter how the knobs are set. `gemv_w4a16_ppu.cu` has no such conservation law: a block owns
+64 columns and walks all of K, so block count and loop length are independent.
+
+It reads **the same packed weight tensor** Marlin uses -- the B layout turns out to be independent of
+`thread_n_blocks`, so prefill and decode share one copy.
+
+| shape (M=1)      | Marlin decode | `gemv_w4a16` | speedup |
+|------------------|---------------|--------------|---------|
+| N=4096  K=4096   | 17.98 us      | **5.79 us**  | 3.11x   |
+| N=14336 K=4096   | 16.46 us      | **11.40 us** | 1.44x   |
+| N=4096  K=14336  | 27.34 us      | **11.12 us** | 2.46x   |
+
+```sh
+make NVCC=<ppu-nvcc> gemv_w4a16
+./gemv_w4a16                      # self-checking sweep, reports GB/s and %HBM
+```
+
+`SPLIT_K` is chosen automatically (targets ~896 blocks, capped at 8 for the fused reduce). `GEMV_SPLIT_K`,
+`GEMV_UNROLL`, `GEMV_SEPARATE_REDUCE` and `GEMV_BW_ONLY` exist for sweeps. The kernel contains no `ppu.*` asm, so it
+also builds and self-checks on stock CUDA.
+
+**Caveat on every %HBM figure in this directory:** the weight stream fits in LLC (the `GEMV_BW_ONLY` probe reported
+112.9% of HBM peak on N=14336), so those percentages are inflated and absolute bandwidth is unmeasured. Same-buffer
+comparisons remain valid.
 
 ## Known caveats
 
