@@ -12,6 +12,8 @@
 //               ./bench_marlin M N K [iters]   # one shape, e.g.  ./bench_marlin 2048 4096 14336
 // env:          MARLIN_NOSPLITK=1 / MARLIN_SPLITK=1   force the split-K choice (default auto: no-split if tiles>=SMs)
 //               MARLIN_MAX_PAR=<n>                    m-tiles per launch (default 128); scales the locks workspace
+//               MARLIN_BLOCKS=<n>                     override gridDim outright (decode: only N/128 output tiles exist)
+//               MARLIN_HBM_GBS=<n>                    HBM peak for the %HBM column (default 2700)
 //
 // Shape constraints (else ret=1): N % thread_n == 0 and K % thread_k == 0, where the config is picked by M:
 //   M <= 16  -> thread_n=128, thread_k=128      M > 16  -> thread_n=256, thread_k=64
@@ -34,6 +36,22 @@
 //
 // The locks workspace scales with max_par -- see marlin_cuda's WORKSPACE CONTRACT. Keep them in sync or it writes OOB.
 static int get_max_par() { const char* e = getenv("MARLIN_MAX_PAR"); int v = e ? atoi(e) : 128; return v > 0 ? v : 128; }
+
+// PPU HBM peak, GB/s. Override with MARLIN_HBM_GBS.
+static double get_hbm_gbs() { const char* e = getenv("MARLIN_HBM_GBS"); double v = e ? atof(e) : 2700.0; return v > 0 ? v : 2700.0; }
+
+// COMPULSORY traffic: every byte the problem must touch at least once. Excludes split-K's global_reduce, which
+// re-reads and re-writes C once per extra slice -- so on a split-K path the reported %HBM UNDERSTATES real traffic.
+//
+// Which number to read: prefill (M>=2048) is compute bound, look at TFLOP/s. Decode (M=1) is weight-bandwidth bound --
+// 2*M*N*K FLOPs over a stream of N*K/2 INT4 weight bytes gives an arithmetic intensity of ~4*M flop/byte, so at M=1 the
+// tensor cores are idle by construction and TFLOP/s says nothing. Read %HBM. A tuned bf16 GEMV on this part hits ~82%.
+static double compulsory_bytes(int M, int N, int K) {
+    return (double) N * K / 2      // B: INT4 weights -- dominates at M=1
+         + (double) M * K * 2      // A: fp16 activations
+         + (double) M * N * 2      // C: fp16 output
+         + (double) N * 2;         // scales: fp16, one per column
+}
 
 static double bench_one(int M, int N, int K, int iters) {
     const int max_par = get_max_par();
@@ -66,7 +84,9 @@ static double bench_one(int M, int N, int K, int iters) {
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
     double us = ms * 1e3, tflops = 2.0 * M * N * K / (ms * 1e9);
-    printf("  M=%-5d N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s\n", M, N, K, us, tflops);
+    double gbs = compulsory_bytes(M, N, K) / (ms * 1e6);          // bytes / (ms*1e-3) / 1e9
+    printf("  M=%-5d N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM\n",
+           M, N, K, us, tflops, gbs, 100.0 * gbs / get_hbm_gbs());
     cudaEventDestroy(a); cudaEventDestroy(b);
     cleanup();
     return us;
