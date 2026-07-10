@@ -14,6 +14,7 @@
 //               MARLIN_MAX_PAR=<n>                    m-tiles per launch (default 128); scales the locks workspace
 //               MARLIN_BLOCKS=<n>                     override gridDim outright (decode: only N/128 output tiles exist)
 //               MARLIN_HBM_GBS=<n>                    HBM peak for the %HBM column (default 2700)
+//               MARLIN_WORKSET_MB=<n>                 rotate n MB of B copies so the loop misses LLC (see get_rot)
 //
 // Shape constraints (else ret=1): N % thread_n == 0 and K % thread_k == 0, where the config is picked by M:
 //   M <= 16  -> thread_n=128, thread_k=128      M > 16  -> thread_n=256, thread_k=64
@@ -36,6 +37,19 @@
 //
 // The locks workspace scales with max_par -- see marlin_cuda's WORKSPACE CONTRACT. Keep them in sync or it writes OOB.
 static int get_max_par() { const char* e = getenv("MARLIN_MAX_PAR"); int v = e ? atoi(e) : 128; return v > 0 ? v : 128; }
+
+// A 200-iteration loop over ONE B buffer measures cache, not HBM: the INT4 weights are 8-29 MB for the decode shapes
+// and the LLC swallows them, so only iteration 0 touches DRAM. MARLIN_WORKSET_MB=<n> allocates ceil(n MB / sizeof(B))
+// identical copies and rotates through them, so consecutive iterations cannot reuse each other's lines. Shape, kernel
+// and grid are untouched. Verified off-box: on a 128 MB-L2 5090, a 4096x4096 GEMV goes 2045 -> 1036 GB/s once the
+// working set passes 128 MB, and stops moving after that.
+static int get_rot(size_t b_bytes) {
+    const char* e = getenv("MARLIN_WORKSET_MB");
+    if (!e) return 1;
+    size_t want = (size_t) atoi(e) << 20;
+    int r = (int) ((want + b_bytes - 1) / b_bytes);
+    return r < 1 ? 1 : r;
+}
 
 // PPU HBM peak, GB/s. Override with MARLIN_HBM_GBS.
 static double get_hbm_gbs() { const char* e = getenv("MARLIN_HBM_GBS"); double v = e ? atof(e) : 2700.0; return v > 0 ? v : 2700.0; }
@@ -68,15 +82,19 @@ static double bench_one(int M, int N, int K, int iters) {
     const size_t A_i4 = (size_t) M * K / 8, B_i4 = (size_t) (K / 16) * (N * 16 / 32), C_i4 = (size_t) M * N / 8, S_h = (size_t) N;
     // locks: one per (n-tile, par). Worst case is thread_n=128 (the M<=16 configs) -> N/128 n-tiles, NOT N/256.
     const size_t WS = (size_t) (N / 128 + 1) * max_par;
+    const size_t b_bytes = B_i4 * 16;
+    const int rot = get_rot(b_bytes);
     int4 *dA, *dB, *dC, *dS; int * dWS;
-    if (cudaMalloc(&dA, A_i4 * 16) || cudaMalloc(&dB, B_i4 * 16) || cudaMalloc(&dC, C_i4 * 16 * C_SLOTS) ||
+    if (cudaMalloc(&dA, A_i4 * 16) || cudaMalloc(&dB, b_bytes * rot) || cudaMalloc(&dC, C_i4 * 16 * C_SLOTS) ||
         cudaMalloc(&dS, (S_h / 8 + 1) * 16) || cudaMalloc(&dWS, WS * 4)) { printf("  alloc fail\n"); return -1; }
-    cudaMemset(dA, 1, A_i4 * 16); cudaMemset(dB, 1, B_i4 * 16); cudaMemset(dS, 0x3c, (S_h / 8) * 16);   // s~=1.0 (0x3c00)
+    cudaMemset(dA, 1, A_i4 * 16); cudaMemset(dB, 1, b_bytes * rot); cudaMemset(dS, 0x3c, (S_h / 8) * 16);   // s~=1.0 (0x3c00)
     cudaMemset(dWS, 0, WS * 4);
 
-    auto run = [&] { return marlin_classic_ppu::marlin_cuda(dA, dB, dC, dS, M, N, K, dWS, -1,
+    auto Brot = [&](int i) { return (const int4*) ((char*) dB + (size_t) (i % rot) * b_bytes); };
+    auto run_i = [&](int i) { return marlin_classic_ppu::marlin_cuda(dA, Brot(i), dC, dS, M, N, K, dWS, -1,
                                                             /*dev=*/0, /*stream=*/0, /*thread_k=*/-1, /*thread_n=*/-1,
                                                             /*sms=*/-1, max_par); };
+    auto run = [&] { return run_i(0); };
     auto cleanup = [&] { cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS); };
 
     int ret = run(); cudaError_t e = cudaDeviceSynchronize();
@@ -86,17 +104,17 @@ static double bench_one(int M, int N, int K, int iters) {
     }
 
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    for (int i = 0; i < 5; ++i) run();
+    for (int i = 0; i < 5; ++i) run_i(i);
     cudaDeviceSynchronize();
     cudaMemset(dWS, 0, WS * 4);              // locks must be 0 before each launch set
     cudaEventRecord(a);
-    for (int i = 0; i < iters; ++i) { cudaMemset(dWS, 0, WS * 4); run(); }
+    for (int i = 0; i < iters; ++i) { cudaMemset(dWS, 0, WS * 4); run_i(i); }
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
     double us = ms * 1e3, tflops = 2.0 * M * N * K / (ms * 1e9);
     double gbs = compulsory_bytes(M, N, K) / (ms * 1e6);          // bytes / (ms*1e-3) / 1e9
-    printf("  M=%-5d N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM\n",
-           M, N, K, us, tflops, gbs, 100.0 * gbs / get_hbm_gbs());
+    printf("  M=%-5d N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (wset=%zu MB)\n",
+           M, N, K, us, tflops, gbs, 100.0 * gbs / get_hbm_gbs(), (b_bytes * rot) >> 20);
     cudaEventDestroy(a); cudaEventDestroy(b);
     cleanup();
     return us;

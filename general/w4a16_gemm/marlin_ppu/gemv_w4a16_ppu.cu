@@ -286,6 +286,20 @@ static int auto_split_k(int N, int K) {
     while (sk > 1 && (K / 16) % (sk * (GEMV_THREADS / 32))) sk /= 2;   // keep ktiles/slice a multiple of 4
     return sk;
 }
+// The weight stream fits in LLC (BW_ONLY reported 112.9% of HBM peak on N=14336's 29.4 MB), so a 200-iteration loop
+// over ONE B buffer measures cache, not HBM: only iteration 0 touches DRAM. Every %HBM number in this file is therefore
+// optimistic -- real decode re-reads weights that nothing kept warm.
+//
+// GEMV_WORKSET_MB=<n> allocates ceil(n MB / sizeof(B)) identical copies of B and rotates through them, so consecutive
+// iterations cannot hit each other's lines. Shape and kernel are untouched. Set it past the LLC (256 is a safe start).
+static int get_rot(size_t b_bytes) {
+    const char* e = getenv("GEMV_WORKSET_MB");
+    if (!e) return 1;
+    size_t want = (size_t) atoi(e) << 20;
+    int r = (int) ((want + b_bytes - 1) / b_bytes);
+    return r < 1 ? 1 : r;
+}
+
 static int get_split_k(int N, int K) { const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 0; return v > 0 ? v : auto_split_k(N, K); }
 static int SPLIT_K = 8;
 
@@ -332,15 +346,19 @@ static double bench_one(int N, int K, int iters, bool check) {
     for (auto& x : Bdeq) x = (rand() & 0xf) - 8;
     pack_B(Bdeq, hB, N, K);
 
+    const size_t b_bytes = hB.size() * 4;
+    const int rot = get_rot(b_bytes);
     int4 *dB; half *dA, *dS, *dC; float* dP; int* dCnt;
-    CUDA_CHECK(cudaMalloc(&dB, hB.size() * 4));
+    CUDA_CHECK(cudaMalloc(&dB, b_bytes * rot));
     CUDA_CHECK(cudaMalloc(&dA, hA.size() * 2));
     CUDA_CHECK(cudaMalloc(&dS, hS.size() * 2));
     CUDA_CHECK(cudaMalloc(&dC, hC.size() * 2));
     CUDA_CHECK(cudaMalloc(&dP, (size_t) 32 * N * 4));   // max SPLIT_K
     CUDA_CHECK(cudaMalloc(&dCnt, (size_t) (N / N_PER_BLOCK) * 4));
     CUDA_CHECK(cudaMemset(dCnt, 0, (size_t) (N / N_PER_BLOCK) * 4));   // the winning CTA rearms it each launch
-    CUDA_CHECK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, hB.data(), b_bytes, cudaMemcpyHostToDevice));
+    for (int r = 1; r < rot; r++)   // identical copies; correctness is unaffected, cache residency is not
+        CUDA_CHECK(cudaMemcpy((char*) dB + (size_t) r * b_bytes, dB, b_bytes, cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
 
@@ -384,11 +402,12 @@ static double bench_one(int N, int K, int iters, bool check) {
         return 0;
     }
 
+    auto Brot = [&](int i) { return (const int4*) ((char*) dB + (size_t) (i % rot) * b_bytes); };
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    for (int i = 0; i < 10; i++) launch(dB, dA, dS, dP, dC, dCnt, N, K);
+    for (int i = 0; i < 10; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K);
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaEventRecord(a);
-    for (int i = 0; i < iters; i++) launch(dB, dA, dS, dP, dC, dCnt, N, K);
+    for (int i = 0; i < iters; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K);
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
     if (check && !verify("post-bench")) { printf("  counter leaked across launches\n"); return -1; }
@@ -397,8 +416,9 @@ static double bench_one(int N, int K, int iters, bool check) {
     double peak = e ? atof(e) : 2700.0;
     double bytes = (double) N * K / 2 + (double) K * 2 + (double) N * 2 + (double) N * 2;  // B + A + C + scales
     double gbs = bytes / (ms * 1e6);
-    printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (sk=%d, %d blocks)\n",
-           N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K);
+    printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (sk=%d, %d blocks, wset=%zu MB)\n",
+           N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak, SPLIT_K,
+           (N / N_PER_BLOCK) * SPLIT_K, (b_bytes * rot) >> 20);
 
     cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
     cudaEventDestroy(a); cudaEventDestroy(b);
