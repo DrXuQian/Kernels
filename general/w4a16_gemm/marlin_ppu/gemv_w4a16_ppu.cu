@@ -162,10 +162,25 @@ __global__ void gemv_reduce(const float* __restrict__ partial, const half* __res
 
 // ---------------------------------------------------------------------------------------------------------------
 
-// SPLIT_K trades block count against per-thread loop length, exactly the tension that caps Marlin -- except here the
-// two are NOT tied to the tile decomposition, so we can sit anywhere on the curve. grid = (N/64) x SPLIT_K, and each
-// warp walks (K/16/SPLIT_K)/4 int4s. N=4096 gives only 64 blocks per slice, so it needs a larger SPLIT_K than N=14336.
-static int get_split_k() { const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 8; return v > 0 ? v : 8; }
+// SPLIT_K trades block count against per-thread loop length -- the same tension that caps Marlin, except here the two
+// are NOT tied to a tile decomposition, so we can sit anywhere on the curve. grid = (N/64) x SPLIT_K.
+//
+// Measured optima on the box land at the SAME block count, not the same SPLIT_K:
+//     N=4096  best sk=16 ->  64 * 16 = 1024 blocks   (6.96 us, == the BW_ONLY bound of 6.93)
+//     N=14336 best sk=4  -> 224 *  4 =  896 blocks   (11.40 us)
+// i.e. ~1000 blocks, ~13 per CU. So pick sk to hit that, rather than tuning per shape. Longer K also needs a shorter
+// fp16 accumulator chain, and a larger sk shortens it -- the two wants agree.
+//
+// Clamped to a power of two in [1,32]; K/16/sk must stay divisible by the 4 warps.
+static const int GEMV_TARGET_BLOCKS = 1024;
+static int auto_split_k(int N, int K) {
+    int want = GEMV_TARGET_BLOCKS / (N / N_PER_BLOCK);
+    int sk = 1;
+    while (sk * 2 <= want && sk < 32) sk *= 2;
+    while (sk > 1 && (K / 16) % (sk * (GEMV_THREADS / 32))) sk /= 2;   // keep ktiles/slice a multiple of 4
+    return sk;
+}
+static int get_split_k(int N, int K) { const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 0; return v > 0 ? v : auto_split_k(N, K); }
 static int SPLIT_K = 8;
 
 static void launch(const int4* B, const half* A, const half* s, float* partial, half* C, int N, int K) {
@@ -200,7 +215,7 @@ static void pack_B(const std::vector<int>& Bdeq, std::vector<int>& hB, int N, in
 }
 
 static double bench_one(int N, int K, int iters, bool check) {
-    SPLIT_K = get_split_k();
+    SPLIT_K = get_split_k(N, K);
     // each slice needs a whole number of ktiles, and the 4 warps must divide them evenly
     if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
         printf("  N=%d K=%d SPLIT_K=%d unsupported (N%%64, K%%%d, ktiles/slice %% 4)\n", N, K, SPLIT_K, 16 * SPLIT_K); return -1; }
@@ -256,8 +271,8 @@ static double bench_one(int N, int K, int iters, bool check) {
     double peak = e ? atof(e) : 2700.0;
     double bytes = (double) N * K / 2 + (double) K * 2 + (double) N * 2 + (double) N * 2;  // B + A + C + scales
     double gbs = bytes / (ms * 1e6);
-    printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM\n",
-           N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak);
+    printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (sk=%d, %d blocks)\n",
+           N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K);
 
     cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP);
     cudaEventDestroy(a); cudaEventDestroy(b);
@@ -268,10 +283,10 @@ int main(int argc, char** argv) {
     if (argc >= 3) {
         int N = atoi(argv[1]), K = atoi(argv[2]);
         int iters = (argc >= 4) ? atoi(argv[3]) : 200;
-        printf("W4A16 GEMV (Marlin B format), SPLIT_K=%d:\n", get_split_k());
+        printf("W4A16 GEMV (Marlin B format), SPLIT_K=auto:\n");
         return bench_one(N, K, iters, true) < 0 ? 1 : 0;
     }
-    printf("W4A16 GEMV (Marlin B format), SPLIT_K=%d, 200 iters:\n", get_split_k());
+    printf("W4A16 GEMV (Marlin B format), SPLIT_K=auto, 200 iters:\n");
     int shapes[][2] = { {4096, 4096}, {14336, 4096}, {4096, 14336} };
     for (auto& s : shapes) if (bench_one(s[0], s[1], 200, true) < 0) return 1;
     return 0;
