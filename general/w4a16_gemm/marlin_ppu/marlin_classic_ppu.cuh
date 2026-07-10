@@ -498,21 +498,38 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
   //      Staged tile: (16*thread_m_blocks) rows x (2*thread_n_blocks + 1) int4. The trailing +1 int4 (8 halves) pads
   //      the row stride so the strided smem writes don't all land in the same banks. Only the N-warps hold the reduced
   //      frag_c, so only they write; every thread participates in the read-out.
-  //      Per-column scale: FIXME (frag_s->col mapping is NVIDIA; the tests use scale=1).
+  //      PER-COLUMN SCALE (group_blocks == -1). This used to be dropped on the floor -- frag_s was loaded into
+  //      registers and never multiplied in -- and every test passed because they all set s = 1.0, the multiplicative
+  //      identity. The kernel therefore returned unscaled results for any real quantized weight.
+  //
+  //      We do NOT use NVIDIA's frag_s lane mapping (its C layout gives each lane two ADJACENT columns; PPU's gives
+  //      four stride-4 columns, so the mapping does not carry over). Read the scale straight out of sh_s instead:
+  //      the host stages sh_s[i] = s[s_sh_stride*slice_col + i] with s_sh_stride = 2*thread_n_blocks int4, i.e.
+  //      16*thread_n_blocks halves -- exactly one tile's worth of columns, in column order. So
+  //          ((const half*) sh_s)[column_within_tile]
+  //      is the scale for that column, for any C layout. group_blocks != -1 already scales inside matmul().
+  //      -DMARLIN_SKIP_WRITE_SCALE restores the old (wrong) behaviour, to demonstrate the tests now catch it.
   auto write_result = [&] () {
 #ifdef MARLIN_WRITE_DIRECT
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
       const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warp_n = warp % (thread_n_blocks / 4);
       half* Ch = reinterpret_cast<half*>(C);
+      const half* sh_s_h = reinterpret_cast<const half*>(sh_s);
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++)
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-          const int ncol0 = (slice_col * thread_n_blocks + warp_n * 4 + j) * 16;
+          const int ncol_t = (warp_n * 4 + j) * 16;                       // column within the tile -> indexes sh_s
+          const int ncol0  = slice_col * thread_n_blocks * 16 + ncol_t;   // global column -> indexes C
           #pragma unroll
           for (int l = 0; l < 8; l++) {
-            int r = 16 * i + acc_i(lane, l), cc = ncol0 + acc_j(lane, l);
-            if (r < prob_m) Ch[(long long) r * prob_n + cc] = __float2half(frag_c[i][j][l]);   // scale=1 (FIXME per-col)
+            const int cj = acc_j(lane, l);
+            int r = 16 * i + acc_i(lane, l), cc = ncol0 + cj;
+            float v = frag_c[i][j][l];
+#ifndef MARLIN_SKIP_WRITE_SCALE
+            if (group_blocks == -1) v *= __half2float(sh_s_h[ncol_t + cj]);
+#endif
+            if (r < prob_m) Ch[(long long) r * prob_n + cc] = __float2half(v);
           }
         }
     }
@@ -530,6 +547,9 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
     const int c_gl_wr_delta = c_gl_stride * c_rows_per_iter;
     const int c_gl_wr_end = c_gl_stride * prob_m;   // row >= prob_m overshoots this -> the OOB guard, as in NVIDIA marlin
 
+    // Read the scales BEFORE sh is repurposed: the staging area overlaps sh_a/sh_b, not sh_s (which lives at
+    // stages*(a_sh_stage + b_sh_stage)), but keep the load ahead of the barrier so the dependency is obvious.
+    const half* sh_s_h = reinterpret_cast<const half*>(sh_s);
     __syncthreads();   // sh is thread_block_reduce's scratch; take it over only once every warp is done reading it
     half* sh_h = reinterpret_cast<half*>(sh);
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
@@ -540,9 +560,14 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
         for (int j = 0; j < 4; j++) {
           const int ncol0 = (warp_n * 4 + j) * 16;   // column INSIDE the tile -- slice_col is folded into c_gl_wr
           #pragma unroll
-          for (int l = 0; l < 8; l++)
-            sh_h[(16 * i + acc_i(lane, l)) * c_sh_stride_h + ncol0 + acc_j(lane, l)]
-                = __float2half(frag_c[i][j][l]);     // scale=1 (FIXME per-col)
+          for (int l = 0; l < 8; l++) {
+            const int cj = acc_j(lane, l);
+            float v = frag_c[i][j][l];
+#ifndef MARLIN_SKIP_WRITE_SCALE
+            if (group_blocks == -1) v *= __half2float(sh_s_h[ncol0 + cj]);
+#endif
+            sh_h[(16 * i + acc_i(lane, l)) * c_sh_stride_h + ncol0 + cj] = __float2half(v);
+          }
         }
     }
     __syncthreads();
@@ -585,13 +610,10 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       bool last = slice_idx == slice_count - 1;
       if (group_blocks == -1 && last) { if (s_sh_wr_pred) cp_async4_stream(&sh_s[s_sh_wr], &s[s_gl_rd]); cp_async_fence(); }
       thread_block_reduce();
-      if (group_blocks == -1 && last) {
-        cp_async_wait<0>(); __syncthreads();
-        if (threadIdx.x / 32 < thread_n_blocks / 4) {
-          reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
-          reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
-        }
-      }
+      // Land the scales in sh_s and make them visible; write_result indexes them by column, so no frag_s staging is
+      // needed on PPU. (NVIDIA loaded frag_s here via s_sh_rd, whose lane mapping assumes NVIDIA's C layout. We used to
+      // do the same and then never multiply by it -- the load was dead, and s = 1.0 in every test hid that.)
+      if (group_blocks == -1 && last) { cp_async_wait<0>(); __syncthreads(); }
 #ifdef MARLIN_BENCH_NOREDUCE
       // SPEED-ONLY PROBE, RESULT IS WRONG ON PURPOSE (no reduce ever runs). Models a splitk_PARALLEL mainloop: skip
       // barrier_acquire/global_reduce/barrier_release, and have each slice write its own gmem slot. The slot offset is

@@ -18,10 +18,14 @@ int main() {
     const int M = 16, N = 128, K = 128, groupsize = -1, max_par = 128;   // must match marlin_cuda's default (workspace contract)
     const int NWN = 2, NWK = 4;                        // thread_n_blocks/4=2, warps_k=4  (config 1,8,8)
 
-    std::vector<half> hA(M * K), hS(N, __float2half(1.0f)), hC(M * N, __float2half(0.f));
+    std::vector<half> hA(M * K), hS(N), hC(M * N, __float2half(0.f));
     std::vector<int>  Bdeq(N * K), hB((size_t) (K / 16) * (N * 16 / 32) * 4);   // int4 buffer as ints
     srand(1234);
     for (auto & x : hA) x = __float2half(0.05f * (rand() % 40 - 20));
+    // NON-TRIVIAL per-column scales. They used to be all 1.0, which is the multiplicative identity -- so a kernel that
+    // never applies them passed anyway. write_result did exactly that (it read frag_s and dropped it), and this test
+    // could not see it. Any scale test must use values that are not 1.
+    for (auto & x : hS) x = __float2half(0.5f + (rand() % 100) / 100.0f);   // [0.5, 1.49]
     for (auto & x : Bdeq) x = (rand() & 0xf) - 8;
 
     auto Bu = [&](int n, int k) { return (Bdeq[n * K + k] + 8) & 0xf; };
@@ -42,7 +46,7 @@ int main() {
     std::vector<float> ref(M * N);
     for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
         float acc = 0; for (int k = 0; k < K; ++k) acc += __half2float(hA[m * K + k]) * (float) Bdeq[n * K + k];
-        ref[m * N + n] = acc;
+        ref[m * N + n] = acc * __half2float(hS[n]);   // C = (A @ dequant(B)) * s   (groupsize=-1: per-column)
     }
 
     half * dA, * dC, * dS; int * dB, * dWS;
