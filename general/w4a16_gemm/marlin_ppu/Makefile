@@ -42,6 +42,11 @@ bench_marlin: bench_marlin.cu marlin_classic_ppu.cuh .flags
 dump_ldmatrix: dump_ldmatrix.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# W4A16 GEMV for decode: reads Marlin's B format in place, no ppu.* asm (so it also builds on stock CUDA).
+# Self-checking (packs B on the host, compares against a CPU dot product) and reports GB/s + %HBM.
+gemv_w4a16: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 
 clean:
-	rm -f dequant_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk bench_marlin *.o .flags
+	rm -f dequant_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk bench_marlin gemv_w4a16 *.o .flags
