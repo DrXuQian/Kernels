@@ -68,6 +68,18 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         const float a3 = __half2float(A[kb + 9]);
 
         const unsigned q[4] = { (unsigned) q4.x, (unsigned) q4.y, (unsigned) q4.z, (unsigned) q4.w };
+#ifdef GEMV_BW_ONLY
+        // SPEED-ONLY, RESULT IS WRONG. Same addresses, same loop, same reduce -- but the dequant is replaced by the
+        // cheapest arithmetic that still consumes every loaded byte (so the loads cannot be optimized away). It answers
+        // one question before anyone rewrites dequant: is this kernel bandwidth bound or ALU bound?
+        //
+        // The current dequant costs ~5 instructions per weight (shr, and, integer sub, int->float convert, fma) = ~160
+        // per int4, i.e. 0.1 bytes consumed per instruction. If BW_ONLY lands far above the real kernel, the lop3 +
+        // __hfma2 rewrite (which Marlin already has, and whose output order matches ours exactly) is worth doing.
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[j][0] += (float) (q[j] ^ __float_as_uint(a0));
+        acc[0][1] += a1 + a2 + a3;
+#else
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             const unsigned qq = q[j];
@@ -81,6 +93,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
                        + (int((qq >> 24) & 0xf) - 8) * a1
                        + (int((qq >> 28) & 0xf) - 8) * a3;
         }
+#endif
     }
 
     // A column n is held by the 4 lanes sharing lane/4 (they differ only in k phase). Fold them.
@@ -187,6 +200,10 @@ static double bench_one(int N, int K, int iters, bool check) {
     launch(dB, dA, dS, dP, dC, N, K);
     CUDA_CHECK(cudaDeviceSynchronize());
 
+#ifdef GEMV_BW_ONLY
+    if (check) printf("  (GEMV_BW_ONLY: dequant replaced by a stub -- results are WRONG on purpose, timing only)\n");
+    check = false;
+#endif
     if (check) {
         CUDA_CHECK(cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost));
         double max_abs = 0, ref_max = 0;
