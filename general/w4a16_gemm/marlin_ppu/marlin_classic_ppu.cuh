@@ -613,7 +613,19 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
   }
 }
 
-static const int THREADS = 256, STAGES = 4;
+// STAGES = cp.async pipeline depth. asys puts Stall Sync at 0.142 -- the wait_for_stage() __syncthreads(), and the
+// 2nd-largest addressable stall after Compute Dependency. A deeper pipeline gives cp.async more slack before the
+// barrier, at the cost of shared memory. The whole pipeline (wait_for_stage, pipe % stages, start_pipes) is already
+// written against the `stages` template param, so this is the only constant that was pinned.
+//
+// Budget (per CU: 256 KB shared; __launch_bounds__(threads, MARLIN_MIN_BLOCKS=2) wants 2 resident blocks):
+//   (2,16,4):  STAGES=4 -> 51200 B/blk (2 blk = 100 KB)   5 -> 64000 (125 KB)   6 -> 76800 (150 KB)   all fit
+// Occupancy is NOT the concern here (asys: Not Selected 0.225, warps are already idle-ready) -- the concern is only
+// that 2 blocks still fit, since MARLIN_MIN_BLOCKS=2 is what keeps the register budget at 256/thread and spills at 0.
+#ifndef MARLIN_STAGES
+#define MARLIN_STAGES 4
+#endif
+static const int THREADS = 256, STAGES = MARLIN_STAGES;
 // hggc's SROA gives up on an alloca of >= 512 bytes: frag_c is thread_m_blocks*4*8 floats, so MB=4 (512 B) is NEVER
 // promoted to registers -- ptxas says "516 bytes stack frame, 0 spilled VReg" (0 spilled = never promoted, NOT a
 // register-budget spill) and the SASS round-trips all 8 acc floats to local memory around every single mma. MB=3
