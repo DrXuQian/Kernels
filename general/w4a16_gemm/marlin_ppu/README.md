@@ -88,15 +88,23 @@ enough copies of B to miss it. **Both columns matter, and they say different thi
 
 | shape (M=1)     | | cache-resident | HBM-resident (wset 256 MB) |
 |-----------------|---|----------------|----------------------------|
-| N=4096  K=4096  | Marlin / GEMV | 17.86 / **5.82 us** = 3.07x | 18.72 / **9.88 us** = 1.89x |
-| N=14336 K=4096  | Marlin / GEMV | 16.56 / **11.40 us** = 1.45x | 18.81 / 19.06 us = **1.00x** |
+| N=4096  K=4096  | Marlin / GEMV | 17.86 / **5.82 us** = 3.07x | 18.72 / **9.29 us** = 2.02x |
+| N=14336 K=4096  | Marlin / GEMV | 16.56 / **11.40 us** = 1.45x | 18.81 / **18.40 us** = 1.02x |
 
 Losing the cache costs GEMV ~70% and Marlin only 5-14%: Marlin decode never saturated bandwidth in the first place
 (471 GB/s, 17.4% of peak) -- it is structure-bound -- while GEMV was fast partly because the weights were warm. On a
-served model, weights are cold. **GEMV is a clear win at N=4096 and a wash at N=14336.**
+served model, weights are cold. **GEMV is a 2x win at N=4096 and a wash at N=14336.**
 
-Note that all of GEMV's tuning (`auto_split_k`, `GEMV_UNROLL`, the fused reduce) was calibrated cache-resident and has
-not been re-swept against HBM, where the limiter appears to be concurrency rather than the ALU.
+Every knob flips between the two regimes, so the defaults follow the HBM column:
+
+| | cache-resident optimum | HBM-resident optimum (default) |
+|---|---|---|
+| reduce | fused (last-CTA) | **separate** (two kernels) |
+| `auto_split_k` target | 896 blocks, sk capped at 8 | **1024 blocks, no cap** |
+| `GEMV_UNROLL` | 2 (+3.6% over U=1) | 2 (+10.5% over U=1) |
+
+Cold weights need more blocks to cover DRAM latency (N=4096 moves sk 8 -> 16), and at that sk the fused reduce's
+contention costs more than the launch it saves. `-DGEMV_FUSED_REDUCE` restores fusion for genuinely resident weights.
 
 ```sh
 make NVCC=<ppu-nvcc> gemv_w4a16

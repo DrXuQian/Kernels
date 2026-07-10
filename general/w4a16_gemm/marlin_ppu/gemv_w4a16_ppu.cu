@@ -209,7 +209,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         return;
     }
 
-#ifdef GEMV_SEPARATE_REDUCE
+#ifndef GEMV_FUSED_REDUCE
     if (threadIdx.x < N_PER_BLOCK) partial[(long long) slice * N + n] = mine;
 #else
     // Last-CTA reduce: the final slice to finish this nb_group folds the partials in place, so the second kernel (and
@@ -256,28 +256,30 @@ __global__ void gemv_reduce(const float* __restrict__ partial, const half* __res
 // SPLIT_K trades block count against per-thread loop length -- the same tension that caps Marlin, except here the two
 // are NOT tied to a tile decomposition, so we can sit anywhere on the curve. grid = (N/64) x SPLIT_K.
 //
-// SPLIT_K also sets the fused reduce's contention: SPLIT_K CTAs race on counter[nb_group], and every block pays a
-// device-scope __threadfence(). Measured A/B on the box (same code, U=2, only the reduce path switched):
+// SPLIT_K sets both the block count and (on the fused path) the contention on counter[nb_group].
 //
-//   N=4096  K=4096   sk=2 fused 7.97 / sep 9.05 | sk=4 5.88 / 7.03 | sk=8 5.83 / 6.85 | sk=16 8.80 / 7.44
-//   N=14336 K=4096   sk=2 fused 11.87 / sep 12.69 | sk=4 11.41 / 11.78 | sk=8 14.88 / 13.87
+// THE OPTIMUM DEPENDS ON WHETHER THE WEIGHTS ARE IN CACHE, and the two answers disagree on every knob. The PPU LLC is
+// 64-128 MB, so all decode shapes (8.4-29.4 MB of weights) are LLC-resident in a naive benchmark loop. A served model
+// reads cold weights, so the HBM-resident column is the one that matters. Measured (U=2, GEMV_WORKSET_MB=256):
 //
-// The second launch is worth ~1.1 us -- NOT the 2.1 us measured for marlin's big kernels, which is a different
-// quantity that I wrongly carried over. Fusion pays that back while sk <= 8, then loses to contention: the curves cross.
+//                      cache-resident            HBM-resident
+//   N=4096   sk=8   fused 5.83 / sep 6.85     fused 9.92  / sep 10.61
+//            sk=16  fused 8.80 / sep 7.44     fused 10.13 / sep  9.29   <- HBM optimum
+//            sk=32                            fused 14.63 / sep 10.64
+//   N=14336  sk=4   fused 11.41 / sep 11.78   fused 18.98 / sep 18.40   <- HBM optimum
+//            sk=8   fused 14.88 / sep 13.87   fused 23.01 / sep 19.20
 //
-// So the optimum is not a fixed block count, it is the largest sk whose contention stays cheap:
-//     N=4096  best sk=8 ->  64 * 8 = 512 blocks   (5.83 us)
-//     N=14336 best sk=4 -> 224 * 4 = 896 blocks   (11.41 us)
-// Targeting 896 blocks reproduces both. Longer K also wants a shorter fp16 accumulator chain, which a larger sk gives,
-// so those two constraints agree rather than fight.
+// Cold weights need MORE blocks to cover DRAM latency (N=4096 moves sk 8 -> 16), and at that sk the fused reduce's
+// contention already costs more than the launch it saves. So the crossover moves left and SEPARATE wins outright.
+// Defaults follow the HBM column: separate reduce, ~1024 blocks, no sk cap. -DGEMV_FUSED_REDUCE restores the fused
+// path, which is the better choice only when the weights genuinely stay resident.
 //
-// Clamped to a power of two; K/16/sk must stay divisible by the 4 warps. The fused path caps sk at 8 (sk=16 measured
-// 1.4-2.4 us worse than separate); the separate path has no contention, so it keeps the full range.
-static const int GEMV_TARGET_BLOCKS = 896;
-#ifdef GEMV_SEPARATE_REDUCE
-static const int GEMV_MAX_SPLIT_K = 32;
+// Clamped to a power of two; K/16/sk must stay divisible by the 4 warps.
+static const int GEMV_TARGET_BLOCKS = 1024;
+#ifdef GEMV_FUSED_REDUCE
+static const int GEMV_MAX_SPLIT_K = 8;    // fused contention grows with sk
 #else
-static const int GEMV_MAX_SPLIT_K = 8;
+static const int GEMV_MAX_SPLIT_K = 32;   // separate reduce has no contention
 #endif
 static int auto_split_k(int N, int K) {
     int want = GEMV_TARGET_BLOCKS / (N / N_PER_BLOCK);
@@ -311,8 +313,7 @@ static void launch(const int4* B, const half* A, const half* s, float* partial, 
         default: printf("  GEMV_SPLIT_K=%d unsupported (1/2/4/8/16/32)\n", SPLIT_K); exit(1);
     }
     #undef GEMV_CASE
-#ifdef GEMV_SEPARATE_REDUCE
-    // The original two-kernel path, kept so the fused reduce can be A/B'd against it.
+#ifndef GEMV_FUSED_REDUCE
     if (SPLIT_K > 1) gemv_reduce<<<(N + 255) / 256, 256>>>(partial, s, C, N, SPLIT_K);
 #endif
 }
@@ -433,6 +434,9 @@ int main(int argc, char** argv) {
         return bench_one(N, K, iters, true) < 0 ? 1 : 0;
     }
     printf("W4A16 GEMV (Marlin B format), SPLIT_K=auto, 200 iters:\n");
+    if (!getenv("GEMV_WORKSET_MB"))
+        printf("  NOTE: weights are LLC-resident (PPU LLC is 64-128 MB). Set GEMV_WORKSET_MB=256 for cold-weight,\n"
+               "        HBM-bound timings -- the regime a served model actually runs in.\n");
     int shapes[][2] = { {4096, 4096}, {14336, 4096}, {4096, 14336} };
     for (auto& s : shapes) if (bench_one(s[0], s[1], 200, true) < 0) return 1;
     return 0;
