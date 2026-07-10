@@ -82,11 +82,21 @@ out around 37% of peak no matter how the knobs are set. `gemv_w4a16_ppu.cu` has 
 It reads **the same packed weight tensor** Marlin uses -- the B layout turns out to be independent of
 `thread_n_blocks`, so prefill and decode share one copy.
 
-| shape (M=1)      | Marlin decode | `gemv_w4a16` | speedup |
-|------------------|---------------|--------------|---------|
-| N=4096  K=4096   | 17.98 us      | **5.79 us**  | 3.11x   |
-| N=14336 K=4096   | 16.46 us      | **11.40 us** | 1.44x   |
-| N=4096  K=14336  | 27.34 us      | **11.12 us** | 2.46x   |
+The PPU's LLC is between 64 and 128 MB, and every decode shape's weights (8.4-29.4 MB) fit inside it. A benchmark
+loop over one weight buffer therefore measures cache, not HBM. `GEMV_WORKSET_MB` / `MARLIN_WORKSET_MB` rotate through
+enough copies of B to miss it. **Both columns matter, and they say different things:**
+
+| shape (M=1)     | | cache-resident | HBM-resident (wset 256 MB) |
+|-----------------|---|----------------|----------------------------|
+| N=4096  K=4096  | Marlin / GEMV | 17.86 / **5.82 us** = 3.07x | 18.72 / **9.88 us** = 1.89x |
+| N=14336 K=4096  | Marlin / GEMV | 16.56 / **11.40 us** = 1.45x | 18.81 / 19.06 us = **1.00x** |
+
+Losing the cache costs GEMV ~70% and Marlin only 5-14%: Marlin decode never saturated bandwidth in the first place
+(471 GB/s, 17.4% of peak) -- it is structure-bound -- while GEMV was fast partly because the weights were warm. On a
+served model, weights are cold. **GEMV is a clear win at N=4096 and a wash at N=14336.**
+
+Note that all of GEMV's tuning (`auto_split_k`, `GEMV_UNROLL`, the fused reduce) was calibrated cache-resident and has
+not been re-swept against HBM, where the limiter appears to be concurrency rather than the ALU.
 
 ```sh
 make NVCC=<ppu-nvcc> gemv_w4a16
