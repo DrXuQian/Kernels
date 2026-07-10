@@ -37,6 +37,11 @@
 static const int N_PER_BLOCK = 64;   // one int4 spans exactly this many columns
 static const int GEMV_THREADS = 128; // 4 warps; each warp takes a different ktile
 
+// How many independent int4 loads a thread issues before consuming any. Costs GEMV_UNROLL*4 registers.
+#ifndef GEMV_UNROLL
+#define GEMV_UNROLL 4
+#endif
+
 // Marlin's dequant, verbatim. 4 instructions (2 lop3 + hsub2 + hfma2) yield 4 halves; the naive
 // shift/and/int-sub/int-to-float path costs ~5 instructions PER WEIGHT.
 //
@@ -83,34 +88,66 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     #pragma unroll
     for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
 
-    // 4 warps stride the ktile range; each thread reads one int4 per ktile it owns.
-    for (int kt = kt_begin + wid; kt < kt_end; kt += GEMV_THREADS / 32) {
-        const int4 q4 = B[(long long) b_stride * kt + nb_group * 32 + lane];
-        const int kb = kt * 16 + lane_k;               // even, so both half2 loads are 4-byte aligned
-        const half2 a01 = *reinterpret_cast<const half2*>(&A[kb]);      // {A[kb],   A[kb+1]}
-        const half2 a89 = *reinterpret_cast<const half2*>(&A[kb + 8]);  // {A[kb+8], A[kb+9]}
+    // ILP. acu on N=4096 K=4096 says Memory Dependency 5.333 dominates (Not Selected 1.275, achieved occupancy 80%):
+    // warps are plentiful and idle, all waiting on loads. With one int4 load per iteration, consumed immediately by
+    // dequant, the load-to-use distance is zero and a thread never has a second request in flight.
+    //
+    // So issue GEMV_UNROLL independent loads before touching any of them. This is the documented EXCEPTION to "U-unroll
+    // hurts bandwidth kernels": that rule is about grid-stride loops, where unrolling cuts the block count. Here the
+    // block count is pinned by N and SPLIT_K, so ILP is the only lever left for hiding latency.
+    const int step = GEMV_THREADS / 32;
+    const int cnt = (kt_end - kt_begin) / step;        // ktiles this thread owns
+    const int main_cnt = (cnt / GEMV_UNROLL) * GEMV_UNROLL;
 
-        const int q[4] = { q4.x, q4.y, q4.z, q4.w };
 #ifdef GEMV_BW_ONLY
-        // SPEED-ONLY, RESULT IS WRONG. Same addresses, same loop, same reduce -- only the dequant is replaced, by the
-        // cheapest arithmetic that still consumes every loaded byte (so the loads cannot be optimized away). It told us
-        // the kernel was ALU bound, not bandwidth bound: BW_ONLY ran 9.66 us against the naive kernel's 18.97 us on
-        // N=14336 K=4096, and the 9.31 us gap scaled with the WEIGHT COUNT (2.21 us on the 3.5x smaller N=4096 shape).
-        #pragma unroll
-        for (int j = 0; j < 4; j++) hacc[j][0] = __hfma2(__halves2half2(__int2half_rn(q[j] & 1), __int2half_rn(q[j] >> 31)), a01, hacc[j][0]);
-        hacc[0][1] = __hfma2(a89, a01, hacc[0][1]);
+    // SPEED-ONLY, RESULT IS WRONG. Same addresses, same loop, same reduce -- only the dequant is replaced, by the
+    // cheapest arithmetic that still consumes every loaded byte (so the loads cannot be optimized away). It told us the
+    // kernel was ALU bound, not bandwidth bound: BW_ONLY ran 9.66 us against the naive kernel's 18.97 us on N=14336
+    // K=4096, and the 9.31 us gap scaled with the WEIGHT COUNT (2.21 us on the 3.5x smaller N=4096 shape).
+    #define GEMV_BODY(q4_, kt_)                                                                      \
+        do {                                                                                         \
+            const half2 a01 = *reinterpret_cast<const half2*>(&A[(kt_) * 16 + lane_k]);              \
+            const int q[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                 \
+            _Pragma("unroll")                                                                        \
+            for (int j = 0; j < 4; j++)                                                              \
+                hacc[j][0] = __hfma2(__halves2half2(__int2half_rn(q[j] & 1),                         \
+                                                    __int2half_rn(q[j] >> 31)), a01, hacc[j][0]);    \
+        } while (0)
 #else
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const FragB b0 = dequant(q[j]);            // column n
-            const FragB b1 = dequant(q[j] >> 8);       // column n+8
-            hacc[j][0] = __hfma2(b0.v[0], a01, hacc[j][0]);   // k = kb, kb+1
-            hacc[j][0] = __hfma2(b0.v[1], a89, hacc[j][0]);   // k = kb+8, kb+9
-            hacc[j][1] = __hfma2(b1.v[0], a01, hacc[j][1]);
-            hacc[j][1] = __hfma2(b1.v[1], a89, hacc[j][1]);
-        }
+    #define GEMV_BODY(q4_, kt_)                                                                      \
+        do {                                                                                         \
+            const int kb = (kt_) * 16 + lane_k;        /* even -> both half2 loads are 4B aligned */ \
+            const half2 a01 = *reinterpret_cast<const half2*>(&A[kb]);      /* {A[kb],   A[kb+1]} */ \
+            const half2 a89 = *reinterpret_cast<const half2*>(&A[kb + 8]);  /* {A[kb+8], A[kb+9]} */ \
+            const int q[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                 \
+            _Pragma("unroll")                                                                        \
+            for (int j = 0; j < 4; j++) {                                                            \
+                const FragB b0 = dequant(q[j]);        /* column n   */                              \
+                const FragB b1 = dequant(q[j] >> 8);   /* column n+8 */                              \
+                hacc[j][0] = __hfma2(b0.v[0], a01, hacc[j][0]);   /* k = kb, kb+1   */               \
+                hacc[j][0] = __hfma2(b0.v[1], a89, hacc[j][0]);   /* k = kb+8, kb+9 */               \
+                hacc[j][1] = __hfma2(b1.v[0], a01, hacc[j][1]);                                      \
+                hacc[j][1] = __hfma2(b1.v[1], a89, hacc[j][1]);                                      \
+            }                                                                                        \
+        } while (0)
 #endif
+
+    int i = 0;
+    for (; i < main_cnt; i += GEMV_UNROLL) {           // GEMV_UNROLL loads issued back-to-back, none consumed yet
+        int4 q4[GEMV_UNROLL];
+        #pragma unroll
+        for (int u = 0; u < GEMV_UNROLL; u++) {
+            const int kt = kt_begin + wid + (i + u) * step;
+            q4[u] = B[(long long) b_stride * kt + nb_group * 32 + lane];
+        }
+        #pragma unroll
+        for (int u = 0; u < GEMV_UNROLL; u++) GEMV_BODY(q4[u], kt_begin + wid + (i + u) * step);
     }
+    for (; i < cnt; i++) {                             // tail, when cnt is not a multiple of GEMV_UNROLL
+        const int kt = kt_begin + wid + i * step;
+        GEMV_BODY(B[(long long) b_stride * kt + nb_group * 32 + lane], kt);
+    }
+    #undef GEMV_BODY
 
     float acc[4][2];
     #pragma unroll
