@@ -359,7 +359,34 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
     frag_b_quant[k % 2] = *reinterpret_cast<I4*>(&sh_b_stage[b_sh_rd_delta * (k % b_sh_wr_iters) + b_sh_rd]);
   };
 
+  // asys (4096^3, max_par=128) says the kernel is NOT memory bound (Memory Dependency 0.018, Shared Memory Pipe Busy
+  // 0.004) and NOT warp-starved (Not Selected 0.225 -- warps are ready, the scheduler just picks others). The top stall
+  // is Compute Dependency 0.586, and Stall Pipe Busy 0.412 splits as Tensor 0.159 + FALU 0.122 + IALU 0.116: dequant's
+  // ALU work (lop3 / hsub2 / hfma2) loads the ALU pipes 1.5x harder than the MMAs load the tensor pipe. That ratio is
+  // structural -- MARLIN_MAX_MB=2 feeds each B fragment to 2 mmas instead of 4, so dequant:mma is 4:1 -- and raising MB
+  // to pay it back loses to register spills (see MARLIN_MAX_MB).
+  //
+  // What IS addressable is the dependency CHAIN: below, each j's mma waits on that same j's dequant (lop3 -> hsub2 ->
+  // mma). -DMARLIN_DQ_BATCH hoists all four j's dequants first, giving the scheduler 4 independent lop3 chains to
+  // interleave and 8 mutually independent mmas afterwards. It issues the SAME instructions, just reordered; the cost is
+  // 8 live FragB (64 B, far below hggc's ~512 B SROA cliff -- verify with -Xptxas -v that stack frame stays 0).
   auto matmul = [&] (int k) {
+#ifdef MARLIN_DQ_BATCH
+    FragB fb0[4], fb1[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
+      fb0[j] = dequant(b_quant);
+      if (group_blocks != -1) scale(fb0[j], frag_s[k % 2][j], 0);
+      fb1[j] = dequant(b_quant_shift);
+      if (group_blocks != -1) scale(fb1[j], frag_s[k % 2][j], 1);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+      #pragma unroll
+      for (int i = 0; i < thread_m_blocks; i++)
+        mma_n16(frag_a[k % 2][i], fb0[j], fb1[j], frag_c[i][j]);      // PPU: 1 n16 (was 2 n8)
+#else
     #pragma unroll
     for (int j = 0; j < 4; j++) {
       int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
@@ -371,6 +398,7 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       for (int i = 0; i < thread_m_blocks; i++)
         mma_n16(frag_a[k % 2][i], frag_b0, frag_b1, frag_c[i][j]);   // PPU: 1 n16 (was 2 n8)
     }
+#endif
   };
 
   // PPU: UNCHANGED -- register-index-aligned cross-K-warp reduce is correct on PPU.
