@@ -37,6 +37,27 @@
 static const int N_PER_BLOCK = 64;   // one int4 spans exactly this many columns
 static const int GEMV_THREADS = 128; // 4 warps; each warp takes a different ktile
 
+// Marlin's dequant, verbatim. 4 instructions (2 lop3 + hsub2 + hfma2) yield 4 halves; the naive
+// shift/and/int-sub/int-to-float path costs ~5 instructions PER WEIGHT.
+//
+// Its output order is exactly what a GEMV over this packing wants -- because both come from the same packq:
+//   dequant(q)      -> [0] = {B[n][kb],   B[n][kb+1]}    [1] = {B[n][kb+8],   B[n][kb+9]}
+//   dequant(q >> 8) -> [0] = {B[n+8][kb], B[n+8][kb+1]}  [1] = {B[n+8][kb+8], B[n+8][kb+9]}
+// (the >> 8 is arithmetic, but every mask below reads bits at or under position 23, and sign fills only 31:24)
+struct FragB { half2 v[2]; };
+template <int lut> __device__ inline int lop3(int a, int b, int c) {
+  int res; asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n" : "=r"(res) : "r"(a), "r"(b), "r"(c), "n"(lut)); return res;
+}
+__device__ __forceinline__ FragB dequant(int q) {
+  const int LO = 0x000f000f, HI = 0x00f000f0, EX = 0x64006400;
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX), hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  const int SUB = 0x64086408, MUL = 0x2c002c00, ADD = 0xd480d480;
+  FragB b;
+  b.v[0] = __hsub2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<const half2*>(&SUB));
+  b.v[1] = __hfma2(*reinterpret_cast<half2*>(&hi), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD));
+  return b;
+}
+
 // Each thread consumes one int4 per step: 4 nblocks (j) x {lo,hi} n-halves = 8 columns, x 4 k-values.
 // acc[j][hi] accumulates column n = (nb_group*4 + j)*16 + lane/4 + 8*hi.
 template <int SPLIT_K>
@@ -55,46 +76,50 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     const int b_stride = N / 2;                      // int4 per ktile
     const int lane_k = (lane % 4) * 2;               // this lane's k phase within the 16-wide ktile
 
-    float acc[4][2] = {{0.f}};
+    // half2 accumulators: each slot sums (kt_per_slice/4)*2 products. At SPLIT_K=4, K=4096 that is 32 terms, so the
+    // fp16 rounding is ~sqrt(32)*2^-11 = 2.8e-3 relative -- an order worse than an fp32 accumulator, well inside the
+    // 3e-2 check. SPLIT_K bounds the chain, which is a second reason not to run this at SPLIT_K=1 on long K.
+    half2 hacc[4][2];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
 
     // 4 warps stride the ktile range; each thread reads one int4 per ktile it owns.
     for (int kt = kt_begin + wid; kt < kt_end; kt += GEMV_THREADS / 32) {
         const int4 q4 = B[(long long) b_stride * kt + nb_group * 32 + lane];
-        const int kb = kt * 16 + lane_k;
-        // the 4 k values this lane's int4 carries
-        const float a0 = __half2float(A[kb]);
-        const float a1 = __half2float(A[kb + 1]);
-        const float a2 = __half2float(A[kb + 8]);
-        const float a3 = __half2float(A[kb + 9]);
+        const int kb = kt * 16 + lane_k;               // even, so both half2 loads are 4-byte aligned
+        const half2 a01 = *reinterpret_cast<const half2*>(&A[kb]);      // {A[kb],   A[kb+1]}
+        const half2 a89 = *reinterpret_cast<const half2*>(&A[kb + 8]);  // {A[kb+8], A[kb+9]}
 
-        const unsigned q[4] = { (unsigned) q4.x, (unsigned) q4.y, (unsigned) q4.z, (unsigned) q4.w };
+        const int q[4] = { q4.x, q4.y, q4.z, q4.w };
 #ifdef GEMV_BW_ONLY
-        // SPEED-ONLY, RESULT IS WRONG. Same addresses, same loop, same reduce -- but the dequant is replaced by the
-        // cheapest arithmetic that still consumes every loaded byte (so the loads cannot be optimized away). It answers
-        // one question before anyone rewrites dequant: is this kernel bandwidth bound or ALU bound?
-        //
-        // The current dequant costs ~5 instructions per weight (shr, and, integer sub, int->float convert, fma) = ~160
-        // per int4, i.e. 0.1 bytes consumed per instruction. If BW_ONLY lands far above the real kernel, the lop3 +
-        // __hfma2 rewrite (which Marlin already has, and whose output order matches ours exactly) is worth doing.
+        // SPEED-ONLY, RESULT IS WRONG. Same addresses, same loop, same reduce -- only the dequant is replaced, by the
+        // cheapest arithmetic that still consumes every loaded byte (so the loads cannot be optimized away). It told us
+        // the kernel was ALU bound, not bandwidth bound: BW_ONLY ran 9.66 us against the naive kernel's 18.97 us on
+        // N=14336 K=4096, and the 9.31 us gap scaled with the WEIGHT COUNT (2.21 us on the 3.5x smaller N=4096 shape).
         #pragma unroll
-        for (int j = 0; j < 4; j++) acc[j][0] += (float) (q[j] ^ __float_as_uint(a0));
-        acc[0][1] += a1 + a2 + a3;
+        for (int j = 0; j < 4; j++) hacc[j][0] = __hfma2(__halves2half2(__int2half_rn(q[j] & 1), __int2half_rn(q[j] >> 31)), a01, hacc[j][0]);
+        hacc[0][1] = __hfma2(a89, a01, hacc[0][1]);
 #else
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            const unsigned qq = q[j];
-            // shift = 4*hi_k + 8*hi_n + 16*parity
-            acc[j][0] += (int((qq >>  0) & 0xf) - 8) * a0    // hi_n=0 hi_k=0 p=0 -> k=kb
-                       + (int((qq >>  4) & 0xf) - 8) * a2    // hi_n=0 hi_k=1 p=0 -> k=kb+8
-                       + (int((qq >> 16) & 0xf) - 8) * a1    // hi_n=0 hi_k=0 p=1 -> k=kb+1
-                       + (int((qq >> 20) & 0xf) - 8) * a3;   // hi_n=0 hi_k=1 p=1 -> k=kb+9
-            acc[j][1] += (int((qq >>  8) & 0xf) - 8) * a0    // hi_n=1 ...
-                       + (int((qq >> 12) & 0xf) - 8) * a2
-                       + (int((qq >> 24) & 0xf) - 8) * a1
-                       + (int((qq >> 28) & 0xf) - 8) * a3;
+            const FragB b0 = dequant(q[j]);            // column n
+            const FragB b1 = dequant(q[j] >> 8);       // column n+8
+            hacc[j][0] = __hfma2(b0.v[0], a01, hacc[j][0]);   // k = kb, kb+1
+            hacc[j][0] = __hfma2(b0.v[1], a89, hacc[j][0]);   // k = kb+8, kb+9
+            hacc[j][1] = __hfma2(b1.v[0], a01, hacc[j][1]);
+            hacc[j][1] = __hfma2(b1.v[1], a89, hacc[j][1]);
         }
 #endif
     }
+
+    float acc[4][2];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const float2 f = __half22float2(hacc[j][h]);
+            acc[j][h] = f.x + f.y;                     // the two half2 lanes hold different k, so fold them
+        }
 
     // A column n is held by the 4 lanes sharing lane/4 (they differ only in k phase). Fold them.
     #pragma unroll
