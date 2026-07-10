@@ -1,12 +1,17 @@
 // Perf bench for the classic Marlin PPU port. Perf is data-independent -> random buffers (correctness validated
 // separately in test_marlin_classic_num/splitk). Reports us + TFLOP/s.
-// Known perf caveats in this port: write_result/global_reduce use DIRECT global stores (not the NVIDIA smem-staged
-// coalesced writes); A smem->reg is element-wise (not ldmatrix). The main cp.async+mma loop is the NVIDIA structure.
+// Known perf caveats in this port: global_reduce still uses DIRECT global stores (split-K only; the no-split-K
+// heuristic keeps it off the prefill path). write_result is smem-staged/coalesced; A smem->reg is ldmatrix.x4.
+// The main cp.async+mma loop is the NVIDIA structure.
+//
+// Reported time is END-TO-END per marlin_cuda() call, which issues ceil(tot_m_blocks/MB/par) kernels back-to-back --
+// a profiler shows ONE of them (4096^3 with max_par=16: 8 launches, so asys ~67us vs the 517us reported here).
 //
 // build (box):  make bench_marlin   (nvcc -O3, no -arch)
 // run:          ./bench_marlin                 # the default W4A16 shape sweep (decode + prefill)
 //               ./bench_marlin M N K [iters]   # one shape, e.g.  ./bench_marlin 2048 4096 14336
 // env:          MARLIN_NOSPLITK=1 / MARLIN_SPLITK=1   force the split-K choice (default auto: no-split if tiles>=SMs)
+//               MARLIN_MAX_PAR=<n>                    m-tiles per launch (default 16); scales the locks workspace
 //
 // Shape constraints (else ret=1): N % thread_n == 0 and K % thread_k == 0, where the config is picked by M:
 //   M <= 16  -> thread_n=128, thread_k=128      M > 16  -> thread_n=256, thread_k=64
@@ -16,8 +21,15 @@
 #include <cstdlib>
 #include <vector>
 
+// max_par caps how many m-tiles ONE launch covers: a launch does 16*MARLIN_MAX_MB*par rows, so marlin_cuda issues
+// ceil(tot_m_blocks/MB/par) kernels back-to-back. NVIDIA's default of 16 was tuned for a 108-SM A100; on a 72-CU PPU it
+// leaves the grid at cols*16 = 256 CTAs, i.e. 4 waves whose last one fills only 40/72 CUs -- and that tail is paid once
+// per launch. Raising it merges the launches and amortizes the tail (4096^3: 8 launches @ 88.9% -> 1 @ 98.1%).
+// NOT monotonic (32 is no better than 16), so sweep it. The locks workspace scales with max_par -- keep them in sync.
+static int get_max_par() { const char* e = getenv("MARLIN_MAX_PAR"); int v = e ? atoi(e) : 16; return v > 0 ? v : 16; }
+
 static double bench_one(int M, int N, int K, int iters) {
-    const int max_par = 16;
+    const int max_par = get_max_par();
     const size_t A_i4 = (size_t) M * K / 8, B_i4 = (size_t) (K / 16) * (N * 16 / 32), C_i4 = (size_t) M * N / 8, S_h = (size_t) N;
     // locks: one per (n-tile, par). Worst case is thread_n=128 (the M<=16 configs) -> N/128 n-tiles, NOT N/256.
     const size_t WS = (size_t) (N / 128 + 1) * max_par;
@@ -27,7 +39,9 @@ static double bench_one(int M, int N, int K, int iters) {
     cudaMemset(dA, 1, A_i4 * 16); cudaMemset(dB, 1, B_i4 * 16); cudaMemset(dS, 0x3c, (S_h / 8) * 16);   // s~=1.0 (0x3c00)
     cudaMemset(dWS, 0, WS * 4);
 
-    auto run = [&] { return marlin_classic_ppu::marlin_cuda(dA, dB, dC, dS, M, N, K, dWS, -1); };
+    auto run = [&] { return marlin_classic_ppu::marlin_cuda(dA, dB, dC, dS, M, N, K, dWS, -1,
+                                                            /*dev=*/0, /*stream=*/0, /*thread_k=*/-1, /*thread_n=*/-1,
+                                                            /*sms=*/-1, max_par); };
     auto cleanup = [&] { cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS); };
 
     int ret = run(); cudaError_t e = cudaDeviceSynchronize();
