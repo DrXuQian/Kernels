@@ -12,7 +12,7 @@ NVCCFLAGS ?= -O3 -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda
 .flags: force
 	@echo '$(NVCCFLAGS)' | cmp -s - $@ || echo '$(NVCCFLAGS)' > $@
 
-all: dequant_smoke marlin_ppu_test marlin_classic_num marlin_classic_splitk
+all: dequant_smoke marlin_ppu_test marlin_classic_num marlin_classic_splitk marlin_classic_group
 
 # INT4 dequant (lop3) in isolation vs CPU.
 dequant_smoke: dequant_smoke.cu .flags
@@ -28,6 +28,10 @@ marlin_classic_test: test_marlin_classic_ppu.cu marlin_classic_ppu.cuh .flags
 
 # ported classic Marlin NUMERICAL test (self-consistent B packing) vs CPU.
 marlin_classic_num: test_marlin_classic_num.cu marlin_classic_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+# classic Marlin GROUPED-scale test (groupsize=128 -> 4 groups; the group_blocks != -1 path).
+marlin_classic_group: test_marlin_classic_group.cu marlin_classic_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 # classic Marlin split-K test (exercises global_reduce, cross-CTA K reduce).
@@ -53,4 +57,4 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f dequant_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk bench_marlin gemv_w4a16 bw_probe *.o .flags
+	rm -f dequant_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 bw_probe *.o .flags

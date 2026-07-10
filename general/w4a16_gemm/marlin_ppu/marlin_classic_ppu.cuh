@@ -251,9 +251,8 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       ? s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x
       : s_sh_stride * slice_col + threadIdx.x;
   int s_sh_wr = threadIdx.x;
-  int s_sh_rd;
-  if (group_blocks != -1) s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-  else                    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
+  // NVIDIA's s_sh_rd is gone: both scale paths now index sh_s by COLUMN (see fetch_to_registers and write_result).
+  // Its lane mapping encodes NVIDIA's C/B fragment layouts, which PPU does not share.
 
   bool a_sh_wr_pred[a_sh_wr_iters];
   #pragma unroll
@@ -326,9 +325,34 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
   auto wait_for_stage = [&] () { cp_async_wait<stages - 2>(); __syncthreads(); };
 
   auto fetch_to_registers = [&] (int k, int pipe) {
+    // GROUPED SCALES (group_blocks != -1, i.e. groupsize=128). matmul() applies these to the B fragments, so they must
+    // be indexed the way PPU's dequant lays those fragments out:
+    //     dequant(q)      -> column n     = (warp_n*4 + j)*16 + lane/4     scaled by frag_s[.][j][0]
+    //     dequant(q >> 8) -> column n + 8                                  scaled by frag_s[.][j][1]
+    //
+    // NVIDIA fills frag_s[k][0..3] with ONE int4 starting at s_sh_rd = 8*warp_n + lane/4, which puts j at a half-stride
+    // of 2 and lane/4 at a stride of 8. PPU needs j at a stride of 16 and lane/4 at a stride of 1. 22 of the 24
+    // (warp_n, lane, j) combinations disagree -- this path was wrong since the port, and no test ever ran groupsize!=-1.
+    //
+    // So read by column out of sh_s, which the host stages in column order (sh_s_h[c] = s[group_row][tile_col + c]).
+    // Eight scalar half loads per k, hoisted here rather than in matmul's inner loop.
     if (group_blocks != -1) {
       int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+#ifdef MARLIN_NVIDIA_SCALE_MAP
+      // The original (wrong on PPU) mapping, kept so test_marlin_classic_group can demonstrate it fails.
+      const int s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
+#else
+      const half* ss = reinterpret_cast<const half*>(sh_s_stage);
+      const int warp_n = (threadIdx.x / 32) % (thread_n_blocks / 4), lane = threadIdx.x % 32;
+      #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int c = (warp_n * 4 + j) * 16 + lane / 4;   // column within the tile
+        half* fs = reinterpret_cast<half*>(&frag_s[k % 2][j]);
+        fs[0] = ss[c];                                    // scales frag_b0 (column n)
+        fs[1] = ss[c + 8];                                // scales frag_b1 (column n + 8)
+      }
+#endif
     }
 #ifndef MARLIN_A_ELEMENTWISE
     // A smem->reg via ldmatrix.x4 (the classic path): one instruction per m-block, reading the XOR-swizzled stage.
