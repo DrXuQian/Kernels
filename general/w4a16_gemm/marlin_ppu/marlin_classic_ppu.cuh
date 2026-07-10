@@ -676,11 +676,26 @@ static int marlin_cuda(const void* A, const void* B, void* C, void* s, int prob_
   // already fill the machine. MARLIN_NOSPLITK / MARLIN_SPLITK force either way.
   static const bool force_nosplit = getenv("MARLIN_NOSPLITK") != nullptr;
   static const bool force_split   = getenv("MARLIN_SPLITK")   != nullptr;
-  // MARLIN_BLOCKS overrides the grid outright. Safe at any size: the kernel derives
-  // iters = ceildiv(k_tiles*n_tiles*par, gridDim.x), and init_slice() retires any CTA whose slice_col_par lands past
-  // n_tiles*par, so an oversized grid just idles the extras. `locks` is indexed by slice_col < n_tiles, so the
-  // workspace does NOT scale with this (unlike max_par). Useful for decode, where the grid is the whole problem:
-  // M<=16 uses thread_n=128, so there are only N/128 output tiles -- 32 for N=4096 against 72 CUs (0.44x).
+  // MARLIN_BLOCKS overrides the grid outright (diagnostic only -- see below, a bigger grid never wins). Safe at any
+  // size: iters = ceildiv(k_tiles*n_tiles*par, gridDim.x), and init_slice() retires any CTA whose slice_col_par lands
+  // past n_tiles*par, so extras idle. `locks` is indexed by slice_col < n_tiles, so unlike max_par the workspace does
+  // NOT scale with it.
+  //
+  // MEASURED (decode, M=1, N=4096): raising blocks past the heuristic's choice is CATASTROPHIC, monotonically.
+  //   blocks    72     144     288     576    1024    3584
+  //   slice_cnt  3       4       8      16      32     112     <- barrier_acquire chain length per output tile
+  //   K=4096   17.8    18.4    47.5   176.2   588.1     --  us
+  //   K=14336  27.1    28.7    87.7   182.2   474.8  7960.6 us
+  // t ~ slice_count^1.5. The linear part is global_reduce: the slices hand partials down one at a time, fully
+  // serialized. The superlinear part is barrier_acquire spinning on locks[slice_col] -- only n_tiles locks exist, so
+  // more CTAs means more contention. Split-K's parallelism is exhausted at slice_count 3-4, and blocks=sms lands
+  // exactly there. NOT a traffic problem (M=1 writes 128 halves per slice); serialization + lock contention.
+  //
+  // Decode's real limit is upstream of all this: M<=16 selects thread_n=128, so only N/128 output tiles exist -- 32
+  // for N=4096 against 72 CUs (0.44x). N=14336 has 112 tiles and reaches 65.7% HBM; N=4096 gets 17.5%. Fixing that
+  // needs more tiles (thread_n=64 requires thread_k=256, since b_sh_wr_iters = b_sh_stride*KB/threads must be >= 2 or
+  // the `k == b_sh_wr_iters - 2` pipeline trigger never fires) -- or a purpose-built W4A16 GEMV, which is the honest
+  // answer: Marlin's tile is 16x128 and decode uses one of those 16 rows.
   static const char* blocks_env = getenv("MARLIN_BLOCKS");
   int cols = prob_n / thread_n;
   if (prob_n % thread_n != 0 || prob_k % thread_k != 0 || (group_blocks != -1 && prob_k % group_blocks != 0)) return 1;
