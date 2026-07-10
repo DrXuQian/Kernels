@@ -237,9 +237,9 @@ static double bench_one(int N, int K, int iters, bool check) {
     CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
 
-    launch(dB, dA, dS, dP, dC, N, K);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, dP, dC, N, K); CUDA_CHECK(cudaDeviceSynchronize()); }
 
+    if (getenv("GEMV_NCU")) check = false;
 #ifdef GEMV_BW_ONLY
     if (check) printf("  (GEMV_BW_ONLY: dequant replaced by a stub -- results are WRONG on purpose, timing only)\n");
     check = false;
@@ -257,6 +257,17 @@ static double bench_one(int N, int K, int iters, bool check) {
         printf("  correctness N=%d K=%d: max_abs=%.4e rel=%.2e (|ref|max=%.2f) -> %s\n",
                N, K, max_abs, rel, ref_max, rel < 3e-2 ? "MATCH" : "MISMATCH");
         if (rel >= 3e-2) { printf("  MISMATCH -- aborting bench\n"); return -1; }
+    }
+
+    // GEMV_NCU=1: exactly one launch of each kernel, no warmup, no timing loop -- a clean profiler capture.
+    // (Same convention as GEMV_NCU / FA_NCU / CONVERT_NCU in ppu_tests.) The printed us is then meaningless.
+    if (getenv("GEMV_NCU")) {
+        launch(dB, dA, dS, dP, dC, N, K);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("  GEMV_NCU: single launch done (N=%d K=%d sk=%d, %d blocks) -- timing skipped\n",
+               N, K, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K);
+        cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP);
+        return 0;
     }
 
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
