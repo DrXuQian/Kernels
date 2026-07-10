@@ -37,9 +37,19 @@
 static const int N_PER_BLOCK = 64;   // one int4 spans exactly this many columns
 static const int GEMV_THREADS = 128; // 4 warps; each warp takes a different ktile
 
-// How many independent int4 loads a thread issues before consuming any. Costs GEMV_UNROLL*4 registers.
+// How many independent int4 loads a thread issues before consuming any.
+//
+// MEASURED on the box, and it barely matters -- 2 is a small win, 4 and 8 are losses:
+//   N=4096  sk=8   U=1 7.20   U=2 6.94   U=4 7.59   U=8 8.85 us
+//   N=14336 sk=4   U=1 11.90  U=2 11.72  U=4 12.93  U=8 14.95 us
+//
+// So Memory Dependency (5.333, the top stall) is NOT a shortage of in-flight loads. The likely cause is the stride:
+// B is ktile-major (Marlin packed it for the mma), so walking K jumps a whole N-row each step. A thread's consecutive
+// ktiles are step*8N bytes apart -- 128 KB at N=4096, 448 KB at N=14336 -- and U concurrent loads scatter across
+// U times that, thrashing TLB and LLC. That predicts exactly what we see: U hurts, and it hurts more as N grows.
+// This is the price of sharing one packed weight tensor with prefill.
 #ifndef GEMV_UNROLL
-#define GEMV_UNROLL 4
+#define GEMV_UNROLL 2
 #endif
 
 // Marlin's dequant, verbatim. 4 instructions (2 lop3 + hsub2 + hfma2) yield 4 halves; the naive
@@ -132,6 +142,14 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         } while (0)
 #endif
 
+#if GEMV_UNROLL == 1
+    // Keep the original shape exactly. Rewriting this as the U-loop below with U=1 (an int4[1] array plus a recomputed
+    // kt = kt_begin + wid + i*step instead of a kt += step induction) cost 4-7% on the box -- 6.96 -> 7.42 us on
+    // N=4096 sk=16, 11.40 -> 11.90 on N=14336 sk=4. Far outside the 0.6% noise floor.
+    (void) main_cnt;
+    for (int kt = kt_begin + wid; kt < kt_end; kt += step)
+        GEMV_BODY(B[(long long) b_stride * kt + nb_group * 32 + lane], kt);
+#else
     int i = 0;
     for (; i < main_cnt; i += GEMV_UNROLL) {           // GEMV_UNROLL loads issued back-to-back, none consumed yet
         int4 q4[GEMV_UNROLL];
@@ -147,6 +165,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         const int kt = kt_begin + wid + i * step;
         GEMV_BODY(B[(long long) b_stride * kt + nb_group * 32 + lane], kt);
     }
+#endif
     #undef GEMV_BODY
 
     float acc[4][2];
