@@ -8,7 +8,9 @@ Standalone Marlin W4A16 GEMM experiments for the T-Head PPU (ppu001 / ACOMPUTE 1
   - Fuses two NVIDIA `m16n8k16` MMAs into one PPU `m16n16k16` MMA.
   - Uses the verified PPU C fragment layout for result stores and global reduce.
   - `write_result` stages the output tile through shared memory in row-major order and streams it out as `int4`
-    (8 halves per store). The PPU C layout (`col = lane%4 + 4*(l%4)`) makes a lane's columns stride-4, so the direct
+    (8 halves per store). Worth ~1% end-to-end, not more: the epilogue runs once per CTA while the mainloop runs
+    `k_tiles` iterations, so the 8x drop in store *instructions* only ever bought the ~2.8% of runtime that the
+    scattered writes actually cost in DRAM traffic. Kept for the cleaner epilogue, not for speed. The PPU C layout (`col = lane%4 + 4*(l%4)`) makes a lane's columns stride-4, so the direct
     store issued one 2-byte global store per accumulator float. `-DMARLIN_WRITE_DIRECT` restores that old path for
     A/B bisection. The row stride carries a `+1 int4` pad, which drops the staging bank conflicts from 16-way to 2-way.
   - Keeps the classic cp.async pipeline, dispatcher, dequant path, and K-warp reduction structure.
