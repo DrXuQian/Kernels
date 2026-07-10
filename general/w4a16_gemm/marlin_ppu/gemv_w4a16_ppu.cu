@@ -256,18 +256,33 @@ __global__ void gemv_reduce(const float* __restrict__ partial, const half* __res
 // SPLIT_K trades block count against per-thread loop length -- the same tension that caps Marlin, except here the two
 // are NOT tied to a tile decomposition, so we can sit anywhere on the curve. grid = (N/64) x SPLIT_K.
 //
-// Measured optima on the box land at the SAME block count, not the same SPLIT_K:
-//     N=4096  best sk=16 ->  64 * 16 = 1024 blocks   (6.96 us, == the BW_ONLY bound of 6.93)
-//     N=14336 best sk=4  -> 224 *  4 =  896 blocks   (11.40 us)
-// i.e. ~1000 blocks, ~13 per CU. So pick sk to hit that, rather than tuning per shape. Longer K also needs a shorter
-// fp16 accumulator chain, and a larger sk shortens it -- the two wants agree.
+// SPLIT_K also sets the fused reduce's contention: SPLIT_K CTAs race on counter[nb_group], and every block pays a
+// device-scope __threadfence(). Measured A/B on the box (same code, U=2, only the reduce path switched):
 //
-// Clamped to a power of two in [1,32]; K/16/sk must stay divisible by the 4 warps.
-static const int GEMV_TARGET_BLOCKS = 1024;
+//   N=4096  K=4096   sk=2 fused 7.97 / sep 9.05 | sk=4 5.88 / 7.03 | sk=8 5.83 / 6.85 | sk=16 8.80 / 7.44
+//   N=14336 K=4096   sk=2 fused 11.87 / sep 12.69 | sk=4 11.41 / 11.78 | sk=8 14.88 / 13.87
+//
+// The second launch is worth ~1.1 us -- NOT the 2.1 us measured for marlin's big kernels, which is a different
+// quantity that I wrongly carried over. Fusion pays that back while sk <= 8, then loses to contention: the curves cross.
+//
+// So the optimum is not a fixed block count, it is the largest sk whose contention stays cheap:
+//     N=4096  best sk=8 ->  64 * 8 = 512 blocks   (5.83 us)
+//     N=14336 best sk=4 -> 224 * 4 = 896 blocks   (11.41 us)
+// Targeting 896 blocks reproduces both. Longer K also wants a shorter fp16 accumulator chain, which a larger sk gives,
+// so those two constraints agree rather than fight.
+//
+// Clamped to a power of two; K/16/sk must stay divisible by the 4 warps. The fused path caps sk at 8 (sk=16 measured
+// 1.4-2.4 us worse than separate); the separate path has no contention, so it keeps the full range.
+static const int GEMV_TARGET_BLOCKS = 896;
+#ifdef GEMV_SEPARATE_REDUCE
+static const int GEMV_MAX_SPLIT_K = 32;
+#else
+static const int GEMV_MAX_SPLIT_K = 8;
+#endif
 static int auto_split_k(int N, int K) {
     int want = GEMV_TARGET_BLOCKS / (N / N_PER_BLOCK);
     int sk = 1;
-    while (sk * 2 <= want && sk < 32) sk *= 2;
+    while (sk * 2 <= want && sk < GEMV_MAX_SPLIT_K) sk *= 2;
     while (sk > 1 && (K / 16) % (sk * (GEMV_THREADS / 32))) sk /= 2;   // keep ktiles/slice a multiple of 4
     return sk;
 }
