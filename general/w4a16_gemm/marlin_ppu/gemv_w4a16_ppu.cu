@@ -78,7 +78,7 @@ __device__ __forceinline__ FragB dequant(int q) {
 template <int SPLIT_K>
 __global__ void __launch_bounds__(GEMV_THREADS)
 gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
-           float* __restrict__ partial, int N, int K) {
+           float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter, int N, int K) {
     const int nb_group = blockIdx.x;                 // 4 nblocks = 64 columns
     const int slice    = blockIdx.y;
     const int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
@@ -197,13 +197,48 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     __syncthreads();
 
     // 64 columns, 128 threads -> first 64 threads each reduce one column across the 4 warps.
+    float mine = 0.f;
+    const int n = nb_group * N_PER_BLOCK + threadIdx.x;
     if (threadIdx.x < N_PER_BLOCK) {
-        float v = 0.f;
         #pragma unroll
-        for (int w = 0; w < GEMV_THREADS / 32; w++) v += sm[w][threadIdx.x];
-        const int n = nb_group * N_PER_BLOCK + threadIdx.x;
-        partial[(long long) slice * N + n] = v;
+        for (int w = 0; w < GEMV_THREADS / 32; w++) mine += sm[w][threadIdx.x];
     }
+
+    if (SPLIT_K == 1) {                                // nothing to reduce across
+        if (threadIdx.x < N_PER_BLOCK) C[n] = __float2half(mine * __half2float(s[n]));
+        return;
+    }
+
+#ifdef GEMV_SEPARATE_REDUCE
+    if (threadIdx.x < N_PER_BLOCK) partial[(long long) slice * N + n] = mine;
+#else
+    // Last-CTA reduce: the final slice to finish this nb_group folds the partials in place, so the second kernel (and
+    // its ~2.1 us launch, 30% of a 7 us GEMV) disappears. Ordering is the whole game here, and follows CUDA's
+    // threadFenceReduction: __syncthreads() retires this block's partial stores, then thread 0 issues __threadfence()
+    // to push them device-visible, and only then takes a ticket. The block that draws the last ticket is guaranteed to
+    // observe every other block's partials.
+    //
+    // `partial` is read through volatile so the winner cannot serve the other slices' values out of its own L1, which
+    // is not coherent across CTAs.
+    if (threadIdx.x < N_PER_BLOCK) partial[(long long) slice * N + n] = mine;
+    __syncthreads();
+
+    __shared__ bool s_last;
+    if (threadIdx.x == 0) {
+        __threadfence();
+        s_last = (atomicAdd(&counter[nb_group], 1) == SPLIT_K - 1);
+    }
+    __syncthreads();
+    if (!s_last) return;
+
+    if (threadIdx.x < N_PER_BLOCK) {
+        volatile const float* p = partial + n;
+        float v = 0.f;
+        for (int i = 0; i < SPLIT_K; i++) v += p[(long long) i * N];
+        C[n] = __float2half(v * __half2float(s[n]));
+    }
+    if (threadIdx.x == 0) counter[nb_group] = 0;       // rearm for the next launch; the stream orders it
+#endif
 }
 
 // out[n] = half(scale[n] * sum_slice partial[slice][n])
@@ -239,19 +274,18 @@ static int auto_split_k(int N, int K) {
 static int get_split_k(int N, int K) { const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 0; return v > 0 ? v : auto_split_k(N, K); }
 static int SPLIT_K = 8;
 
-static void launch(const int4* B, const half* A, const half* s, float* partial, half* C, int N, int K) {
+static void launch(const int4* B, const half* A, const half* s, float* partial, half* C, int* counter, int N, int K) {
     dim3 grid(N / N_PER_BLOCK, SPLIT_K);
+    #define GEMV_CASE(SK) case SK: gemv_w4a16<SK><<<grid, GEMV_THREADS>>>(B, A, s, partial, C, counter, N, K); break;
     switch (SPLIT_K) {
-        case  1: gemv_w4a16< 1><<<grid, GEMV_THREADS>>>(B, A, s, partial, N, K); break;
-        case  2: gemv_w4a16< 2><<<grid, GEMV_THREADS>>>(B, A, s, partial, N, K); break;
-        case  4: gemv_w4a16< 4><<<grid, GEMV_THREADS>>>(B, A, s, partial, N, K); break;
-        case  8: gemv_w4a16< 8><<<grid, GEMV_THREADS>>>(B, A, s, partial, N, K); break;
-        case 16: gemv_w4a16<16><<<grid, GEMV_THREADS>>>(B, A, s, partial, N, K); break;
-        case 32: gemv_w4a16<32><<<grid, GEMV_THREADS>>>(B, A, s, partial, N, K); break;
+        GEMV_CASE(1) GEMV_CASE(2) GEMV_CASE(4) GEMV_CASE(8) GEMV_CASE(16) GEMV_CASE(32)
         default: printf("  GEMV_SPLIT_K=%d unsupported (1/2/4/8/16/32)\n", SPLIT_K); exit(1);
     }
+    #undef GEMV_CASE
+#ifdef GEMV_SEPARATE_REDUCE
+    // The original two-kernel path, kept so the fused reduce can be A/B'd against it.
     if (SPLIT_K > 1) gemv_reduce<<<(N + 255) / 256, 256>>>(partial, s, C, N, SPLIT_K);
-    else             gemv_reduce<<<(N + 255) / 256, 256>>>(partial, s, C, N, 1);
+#endif
 }
 
 // Marlin's packing, verbatim from test_marlin_classic_num.cu's packq, generalized to any N.
@@ -283,56 +317,66 @@ static double bench_one(int N, int K, int iters, bool check) {
     for (auto& x : Bdeq) x = (rand() & 0xf) - 8;
     pack_B(Bdeq, hB, N, K);
 
-    int4 *dB; half *dA, *dS, *dC; float* dP;
+    int4 *dB; half *dA, *dS, *dC; float* dP; int* dCnt;
     CUDA_CHECK(cudaMalloc(&dB, hB.size() * 4));
     CUDA_CHECK(cudaMalloc(&dA, hA.size() * 2));
     CUDA_CHECK(cudaMalloc(&dS, hS.size() * 2));
     CUDA_CHECK(cudaMalloc(&dC, hC.size() * 2));
     CUDA_CHECK(cudaMalloc(&dP, (size_t) 32 * N * 4));   // max SPLIT_K
+    CUDA_CHECK(cudaMalloc(&dCnt, (size_t) (N / N_PER_BLOCK) * 4));
+    CUDA_CHECK(cudaMemset(dCnt, 0, (size_t) (N / N_PER_BLOCK) * 4));   // the winning CTA rearms it each launch
     CUDA_CHECK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
 
-    if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, dP, dC, N, K); CUDA_CHECK(cudaDeviceSynchronize()); }
+    if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, dP, dC, dCnt, N, K); CUDA_CHECK(cudaDeviceSynchronize()); }
 
     if (getenv("GEMV_NCU")) check = false;
 #ifdef GEMV_BW_ONLY
     if (check) printf("  (GEMV_BW_ONLY: dequant replaced by a stub -- results are WRONG on purpose, timing only)\n");
     check = false;
 #endif
-    if (check) {
+    // Verified BEFORE and AFTER the timing loop. The fused reduce rearms `counter` from inside the winning CTA, so a
+    // leaked count would corrupt every launch after the first -- which a pre-bench check alone cannot see.
+    std::vector<double> ref(N);
+    for (int n = 0; n < N; n++) {
+        double acc = 0;
+        for (int k = 0; k < K; k++) acc += (double) __half2float(hA[k]) * Bdeq[(size_t) n * K + k];
+        ref[n] = acc;
+    }
+    auto verify = [&](const char* when) -> bool {
         CUDA_CHECK(cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost));
         double max_abs = 0, ref_max = 0;
         for (int n = 0; n < N; n++) {
-            double acc = 0;
-            for (int k = 0; k < K; k++) acc += (double) __half2float(hA[k]) * Bdeq[(size_t) n * K + k];
-            max_abs = fmax(max_abs, fabs(__half2float(hC[n]) - acc));
-            ref_max = fmax(ref_max, fabs(acc));
+            max_abs = fmax(max_abs, fabs(__half2float(hC[n]) - ref[n]));
+            ref_max = fmax(ref_max, fabs(ref[n]));
         }
         double rel = max_abs / (ref_max + 1e-9);
-        printf("  correctness N=%d K=%d: max_abs=%.4e rel=%.2e (|ref|max=%.2f) -> %s\n",
-               N, K, max_abs, rel, ref_max, rel < 3e-2 ? "MATCH" : "MISMATCH");
-        if (rel >= 3e-2) { printf("  MISMATCH -- aborting bench\n"); return -1; }
-    }
+        printf("  correctness N=%d K=%d %s: max_abs=%.4e rel=%.2e (|ref|max=%.2f) -> %s\n",
+               N, K, when, max_abs, rel, ref_max, rel < 3e-2 ? "MATCH" : "MISMATCH");
+        return rel < 3e-2;
+    };
+    if (check && !verify("pre-bench")) { printf("  aborting bench\n"); return -1; }
 
     // GEMV_NCU=1: exactly one launch of each kernel, no warmup, no timing loop -- a clean profiler capture.
     // (Same convention as GEMV_NCU / FA_NCU / CONVERT_NCU in ppu_tests.) The printed us is then meaningless.
     if (getenv("GEMV_NCU")) {
-        launch(dB, dA, dS, dP, dC, N, K);
+        launch(dB, dA, dS, dP, dC, dCnt, N, K);
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("  GEMV_NCU: single launch done (N=%d K=%d sk=%d, %d blocks) -- timing skipped\n",
                N, K, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K);
-        cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP);
+        cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
         return 0;
     }
 
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    for (int i = 0; i < 10; i++) launch(dB, dA, dS, dP, dC, N, K);
+    for (int i = 0; i < 10; i++) launch(dB, dA, dS, dP, dC, dCnt, N, K);
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaEventRecord(a);
-    for (int i = 0; i < iters; i++) launch(dB, dA, dS, dP, dC, N, K);
+    for (int i = 0; i < iters; i++) launch(dB, dA, dS, dP, dC, dCnt, N, K);
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
+    if (check && !verify("post-bench")) { printf("  counter leaked across launches\n"); return -1; }
 
     const char* e = getenv("MARLIN_HBM_GBS");
     double peak = e ? atof(e) : 2700.0;
@@ -341,7 +385,7 @@ static double bench_one(int N, int K, int iters, bool check) {
     printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (sk=%d, %d blocks)\n",
            N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K);
 
-    cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP);
+    cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
     cudaEventDestroy(a); cudaEventDestroy(b);
     return ms * 1e3;
 }
