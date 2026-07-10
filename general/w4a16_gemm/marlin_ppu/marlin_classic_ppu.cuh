@@ -592,12 +592,24 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
           reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
         }
       }
+#ifdef MARLIN_BENCH_NOREDUCE
+      // SPEED-ONLY, RESULT IS WRONG ON PURPOSE. Skips the entire serial reduce (barrier_acquire -> global_reduce ->
+      // barrier_release) and lets every slice race to write C. It answers exactly one question, cheaply, before anyone
+      // builds a split-K-parallel path: with the barrier gone, how fast is the mainloop at a large grid?
+      //
+      // t ~ slice_count^1.5 (measured) says the barrier is what kills a big decode grid. But decode also shows
+      // Instruction Fetch 0.981, and if THAT is the real ceiling then a partial-buffer + reduce-kernel rewrite buys
+      // nothing. This flag separates the two. The timing here is a faithful upper bound for a splitk_parallel mainloop
+      // (writing per-slice partials is slightly MORE traffic than this racy single write).
+      write_result();
+#else
       if (slice_count > 1) {
         barrier_acquire(&locks[slice_col], slice_idx);
         global_reduce(slice_idx == 0, last);
         barrier_release(&locks[slice_col], last);
       }
       if (last) write_result();
+#endif
       slice_row = 0; slice_col_par++; slice_col++; init_slice();
       if (slice_iters) {
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
