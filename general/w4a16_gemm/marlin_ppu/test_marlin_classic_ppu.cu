@@ -12,9 +12,9 @@
 
 int main() {
     using namespace marlin_classic_ppu;
-    const int M = 16, N = 128, K = 128, groupsize = -1, max_par = 16;
+    const int M = 16, N = 128, K = 128, groupsize = -1, max_par = 128;   // must match marlin_cuda's default (workspace contract)
     const size_t A_i4 = (size_t) M * K / 8, B_i4 = (size_t) (K / 16) * (N * 16 / 32), C_i4 = (size_t) M * N / 8, S_h = (size_t) N;
-    const size_t WS = (size_t) (N / 128) * max_par;
+    const size_t WS = (size_t) (N / 128 + 1) * max_par;
 
     std::vector<half> hA(M * K), hS(S_h, __float2half(1.0f)), hC(M * N, __float2half(0.f));
     std::vector<int>  hB(B_i4 * 4);

@@ -11,7 +11,7 @@
 // run:          ./bench_marlin                 # the default W4A16 shape sweep (decode + prefill)
 //               ./bench_marlin M N K [iters]   # one shape, e.g.  ./bench_marlin 2048 4096 14336
 // env:          MARLIN_NOSPLITK=1 / MARLIN_SPLITK=1   force the split-K choice (default auto: no-split if tiles>=SMs)
-//               MARLIN_MAX_PAR=<n>                    m-tiles per launch (default 16); scales the locks workspace
+//               MARLIN_MAX_PAR=<n>                    m-tiles per launch (default 128); scales the locks workspace
 //
 // Shape constraints (else ret=1): N % thread_n == 0 and K % thread_k == 0, where the config is picked by M:
 //   M <= 16  -> thread_n=128, thread_k=128      M > 16  -> thread_n=256, thread_k=64
@@ -23,10 +23,17 @@
 
 // max_par caps how many m-tiles ONE launch covers: a launch does 16*MARLIN_MAX_MB*par rows, so marlin_cuda issues
 // ceil(tot_m_blocks/MB/par) kernels back-to-back. NVIDIA's default of 16 was tuned for a 108-SM A100; on a 72-CU PPU it
-// leaves the grid at cols*16 = 256 CTAs, i.e. 4 waves whose last one fills only 40/72 CUs -- and that tail is paid once
-// per launch. Raising it merges the launches and amortizes the tail (4096^3: 8 launches @ 88.9% -> 1 @ 98.1%).
-// NOT monotonic (32 is no better than 16), so sweep it. The locks workspace scales with max_par -- keep them in sync.
-static int get_max_par() { const char* e = getenv("MARLIN_MAX_PAR"); int v = e ? atoi(e) : 16; return v > 0 ? v : 16; }
+// pinned the grid at cols*16 = 256 CTA -> 4 waves whose last fills 40/72 CUs, a tail paid once per launch.
+//
+// Raising it wins TWICE, and the two effects are separable (measured, 4096^3):
+//   tail amortization : 8 launches @ 88.9% tail eff -> 1 @ 98.1%   ~= 48.5 us
+//   launch latency    : ~2.1 us x 7 launches saved                  ~= 15   us
+//   16 -> 266.3   32 -> 272.4   64 -> 293.9   128 -> 303.6 TFLOP/s (total -63 us, predicted -63.5)
+// The 32 case isolates the second effect: identical tail eff (88.9%), 4 fewer launches, +2.3%.
+// 2048x4096x14336 saturates at par = tot_m_blocks/MB = 64 (294.9 -> 312.5); 128 is then a no-op (noise floor ~0.6%).
+//
+// The locks workspace scales with max_par -- see marlin_cuda's WORKSPACE CONTRACT. Keep them in sync or it writes OOB.
+static int get_max_par() { const char* e = getenv("MARLIN_MAX_PAR"); int v = e ? atoi(e) : 128; return v > 0 ? v : 128; }
 
 static double bench_one(int M, int N, int K, int iters) {
     const int max_par = get_max_par();

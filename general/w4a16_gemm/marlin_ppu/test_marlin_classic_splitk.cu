@@ -14,7 +14,7 @@
 
 int main() {
     using namespace marlin_classic_ppu;
-    const int M = 16, N = 128, K = 512, groupsize = -1, max_par = 16;
+    const int M = 16, N = 128, K = 512, groupsize = -1, max_par = 128;   // must match marlin_cuda's default (workspace contract)
     const int NWN = 2, NWK = 4, k_tiles = K / 16 / 8;   // = 4 CTA K-slices
 
     std::vector<half> hA(M * K), hS(N, __float2half(1.0f)), hC(M * N, __float2half(0.f));
@@ -46,11 +46,11 @@ int main() {
 
     half * dA, * dC, * dS; int * dB, * dWS;
     cudaMalloc(&dA, hA.size() * 2); cudaMalloc(&dB, hB.size() * 4); cudaMalloc(&dC, hC.size() * 2);
-    cudaMalloc(&dS, hS.size() * 2); cudaMalloc(&dWS, (N / 128) * max_par * 4);
+    cudaMalloc(&dS, hS.size() * 2); cudaMalloc(&dWS, (N / 128 + 1) * max_par * 4);
     cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice);
     cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice);
-    cudaMemset(dWS, 0, (N / 128) * max_par * 4);
+    cudaMemset(dWS, 0, (N / 128 + 1) * max_par * 4);
 
     int ret = marlin_cuda(dA, dB, dC, dS, M, N, K, dWS, groupsize);
     cudaError_t e = cudaDeviceSynchronize();

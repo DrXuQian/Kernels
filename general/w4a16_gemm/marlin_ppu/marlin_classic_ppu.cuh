@@ -592,9 +592,21 @@ static const int THREADS = 256, STAGES = 4;
     cudaFuncSetAttribute(Marlin<THREADS, MB, NB, KB, STAGES, GB>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem); \
     Marlin<THREADS, MB, NB, KB, STAGES, GB><<<blocks, THREADS, shmem, stream>>>(A_ptr, B_ptr, C_ptr, s_ptr, prob_m, prob_n, prob_k, locks); }
 
+// max_par = how many m-tiles ONE launch covers. This function issues ceil(tot_m_blocks / MARLIN_MAX_MB / par) kernels
+// back-to-back on `stream`, so a profiler only ever shows you ONE of them.
+//
+// WORKSPACE CONTRACT: `workspace` (the locks array) must hold at least (prob_n/128 + 1) * max_par ints, zeroed. It
+// scales with max_par -- raise one without the other and the kernel writes out of bounds. (prob_n/128, not /256:
+// the prob_m<=16 configs use thread_n=128, so they have twice the n-tiles.)
+//
+// PPU (72 CU): NVIDIA's max_par=16 was tuned for a 108-SM A100. Here it pinned the grid at cols*16 = 256 CTA -> 4
+// waves whose last fills 40/72 CUs, and that tail was paid once per launch, plus ~2.1us of launch latency each.
+// Measured on 4096^3: max_par 16 -> 266.3 TFLOP/s, 32 -> 272.4, 64 -> 293.9, 128 -> 303.6 (+14%). On
+// 2048x4096x14336 it saturates at par = tot_m_blocks/MB = 64: 294.9 -> 312.5. Hence the default below.
+// Decode (prob_m <= 16) has tot_m_blocks == 1, never enters the par branch, and is unaffected.
 static int marlin_cuda(const void* A, const void* B, void* C, void* s, int prob_m, int prob_n, int prob_k,
         void* workspace, int groupsize = -1, int dev = 0, cudaStream_t stream = 0,
-        int thread_k = -1, int thread_n = -1, int sms = -1, int max_par = 16) {
+        int thread_k = -1, int thread_n = -1, int sms = -1, int max_par = 128) {
   int tot_m = prob_m, tot_m_blocks = ceildiv(tot_m, 16), pad = 16 * tot_m_blocks - tot_m;
   if (sms == -1) cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   if (thread_k == -1 || thread_n == -1) {
