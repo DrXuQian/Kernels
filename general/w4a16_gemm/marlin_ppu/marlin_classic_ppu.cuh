@@ -368,8 +368,21 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
   //
   // What IS addressable is the dependency CHAIN: below, each j's mma waits on that same j's dequant (lop3 -> hsub2 ->
   // mma). -DMARLIN_DQ_BATCH hoists all four j's dequants first, giving the scheduler 4 independent lop3 chains to
-  // interleave and 8 mutually independent mmas afterwards. It issues the SAME instructions, just reordered; the cost is
-  // 8 live FragB (64 B, far below hggc's ~512 B SROA cliff -- verify with -Xptxas -v that stack frame stays 0).
+  // interleave and 8 mutually independent mmas afterwards. SAME instructions, just reordered (verified in PTX: 256 mma,
+  // 768 lop3, 1536 dequant ALU ops either way); 8 live FragB = 64 B, well under the ~512 B SROA cliff; 0 spill.
+  //
+  // MEASURED, and it is shape-dependent -- which is why it stays opt-in:
+  //   4096^3              302.9 -> 302.0  (-0.3%, inside the 0.6% noise floor)
+  //   2048x4096x14336     313.5 -> 319.7  (+2.0%, real)
+  // The win tracks K, not M: the long-K shape runs 3.5x more matmul(k) iterations, so the mainloop's dependency chain
+  // dominates a larger share of its runtime. On 4096^3 the same reorder buys nothing measurable.
+  //
+  // The residual Compute Dependency (0.586) is structural, and hoisting cannot touch it:
+  //   (a) dequant's own lop3 -> hsub2/hfma2, two levels deep, nothing left to spread;
+  //   (b) the mma -> frag_c[i][j] accumulator chain: matmul(k)'s 8 mmas (4 j x 2 i) are mutually independent, but each
+  //       matmul(k+1) mma waits on matmul(k)'s same (i,j). MB=2 yields only 8 independent mmas to hide mma latency --
+  //       the SECOND cost of MARLIN_MAX_MB=2, on top of the dequant amortization. Deepening it needs MB>2 (real spills)
+  //       and an f16 accumulator to pay for the registers, but fp16 accumulation over K=4096 is ~3e-2 relative error.
   auto matmul = [&] (int k) {
 #ifdef MARLIN_DQ_BATCH
     FragB fb0[4], fb1[4];
