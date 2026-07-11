@@ -97,6 +97,12 @@ __device__ __forceinline__ int acc_j(int t, int l) { return 2 * (t % 4) + (l % 2
 // B: lane t serves column t/4; its two regs hold k-words (t%4) and (t%4)+4.
 __device__ __forceinline__ int b_n(int t, int l) { return t / 4; }
 __device__ __forceinline__ int b_k(int t, int l) { return 4 * l + (t % 4); }
+// A operand by (row, k-word), for building the fragment straight out of RAW shared memory instead of
+// via ldmatrix. Same (row, k) set ldmatrix would have handed back -- established ON HARDWARE in
+// mma_int8_smoke.cu. (ggml's tile<16,8,int>::get_i/get_j describe the ACCUMULATOR, not A; using them
+// here silently zeroes C rows 8-15.)
+__device__ __forceinline__ int a_row(int t, int l) { return t / 4 + 8 * (l % 2); }
+__device__ __forceinline__ int a_kw (int t, int l) { return (t % 4) + 4 * (l / 2); }
 #else
 #define MMQ_TILE_N  16
 #define MMQ_C_NE     8
@@ -110,6 +116,10 @@ __device__ __forceinline__ int acc_j(int t, int l) { return t % 4 + ((l % 4) << 
 // B (16 cols): same fragment formula as the PPU A operand -- row.col makes A and B symmetric.
 __device__ __forceinline__ int b_n(int t, int l) { return t / 4 + 8 * (l / 2); }
 __device__ __forceinline__ int b_k(int t, int l) { return (t % 4) + 4 * (l % 2); }
+// PPU: the A operand has the SAME formula as B (row.col makes them symmetric). Note the bits are
+// swapped relative to NVIDIA -- this is the v1<->v2 swap that ppu_ldmatrix_x4 does for free.
+__device__ __forceinline__ int a_row(int t, int l) { return t / 4 + 8 * (l / 2); }
+__device__ __forceinline__ int a_kw (int t, int l) { return (t % 4) + 4 * (l % 2); }
 #endif
 
 __device__ __forceinline__ void mmq_ldmatrix_A(uint32_t* a, const int* smem) {
@@ -427,6 +437,229 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
 }
 
 // ============================================================================================
+// PIPELINED Q4_K MAINLOOP (-DMMQ_PIPE).  This is Marlin's structure grafted onto MMQ.
+//
+// WHY THE REWRITE.  Upstream MMQ cannot use cp.async AT ALL, and the reason is structural: it
+// dequantizes on the global->shared path (global -> registers -> nibble extract -> shared), and
+// cp.async is a pure DMA that cannot transform anything in flight. So MMQ is stuck with a
+// synchronous load and 4 __syncthreads per 256-k iteration, and it shows -- upstream itself only
+// reaches 12-15% of the int8 tensor core.
+//
+// Marlin does the opposite: cp.async the RAW packed weights into shared, and dequantize on the
+// shared->register path. That is what this does.
+//
+//   shared holds RAW block_q4_K super-blocks. An A fragment register is then just
+//       word = sh[row*36 + 4 + (b/2)*8 + kw];   A = (word >> 4*(b%2)) & 0x0F0F0F0F
+//   -- one LDS + one shift + one and. No ldmatrix, no normalized tile_x, no shared write pass.
+//
+// Two facts make Q4_K fit this like a glove, and both are worth stating because they are why the
+// design works rather than merely compiles:
+//
+//   (1) sizeof(block_q4_K) == 144 == 9*16, so cp.async's 16 B granularity divides a super-block
+//       EXACTLY, and every block start is 16 B aligned. (block_q4_0 is 18 B and is not even 4 B
+//       aligned -- it cannot be cp.async'd at all without repacking. Q4_K keeps the old path.)
+//
+//   (2) The 36-int row stride is bank-conflict-free FOR FREE, no padding. For an A-fragment read
+//       lane t wants row (t/4 + const) and k-word (t%4 + const), so
+//           bank = (36*(t/4) + (t%4) + C) % 32 = (4*(t/4) + (t%4) + C) % 32 = (t + C) % 32
+//       because 36 == 32 + 4. All 32 lanes land on 32 distinct banks. The B read out of the y tile
+//       has the same 36-int stride and so gets the same property.
+//
+// Registers also drop: the old vec_dot hoisted A for 4 k-tiles at once (16 regs) plus dA/mA (16).
+// Here A is rebuilt per sub-block (4 regs) and still reused across every j0 -- identical reuse, ~24
+// fewer live registers. That matters: this kernel was proven register-bound (MIN_BLOCKS=2 was +40%).
+// ============================================================================================
+#ifdef MMQ_PIPE
+
+// STAGES=2 MEASURED BEST -- and 3/4 are not just neutral, they LOSE (137.9 / 136.1 / 116.3 at
+// STAGES=2/3/4, MMQ_X=64). Each extra stage costs 36 KB of shared, and shared is now what caps
+// blocks per CU (72 KB -> 3 blocks, 108 KB -> 2). Two stages already hide the latency; a third buys
+// buffer we don't need at the price of the occupancy that was hiding it. Real trade-off, not noise.
+#ifndef MMQ_STAGES
+#define MMQ_STAGES 2
+#endif
+
+#define SH_X_INTS (MMQ_Y * 36)          // 128 raw q4_K super-blocks, 36 ints each
+#define SH_Y_INTS (MMQ_X * 2 * 36)      // MMQ_X columns x two 128-k slabs
+
+__device__ __forceinline__ void cp_async16(int* smem, const void* g) {
+  uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" :: "r"(s), "l"(g), "n"(16));
+}
+__device__ __forceinline__ void cp_async_fence() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int n> __device__ __forceinline__ void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+}
+
+// Stage the raw weights + the raw quantized activations for ONE 256-k iteration. Both are bulk 16 B
+// copies with no transform, which is exactly what cp.async can do and what upstream's design forbids.
+__device__ __forceinline__ void fetch_stage(int* sh_x, int* sh_y, const char* __restrict__ x,
+                                            const int* __restrict__ y, const int kb0, const int i_max,
+                                            const int stride_row, const int M) {
+  const int tid = threadIdx.y * MMQ_WARP + threadIdx.x;
+
+  // weights: 128 rows x 9 chunks of 16 B
+  for (int c = tid; c < MMQ_Y * 9; c += MMQ_NWARPS * MMQ_WARP) {
+    const int row = min(c / 9, i_max);
+    const int ch = c % 9;
+    const char* g = x + ((size_t)row * stride_row + kb0) * sizeof(block_q4_K) + ch * 16;
+    cp_async16(sh_x + (c / 9) * 36 + ch * 4, g);
+  }
+  // activations: two 128-k slabs, each MMQ_X contiguous block_q8_1_mmq (144 B) -> MMQ_X*9 chunks
+  for (int c = tid; c < MMQ_X * 2 * 9; c += MMQ_NWARPS * MMQ_WARP) {
+    const int slab = c / (MMQ_X * 9);
+    const int r = c % (MMQ_X * 9);
+    const int* g = y + (size_t)(2 * kb0 + slab) * M * MMQ_TILE_Y_K + r * 4;
+    cp_async16(sh_y + slab * (MMQ_X * 36) + r * 4, g);
+  }
+}
+
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe(
+    const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
+    const int N, const int K, const int M, const int stride_row) {
+  extern __shared__ int smem[];
+  int* sh_x = smem;                                   // [MMQ_STAGES][SH_X_INTS]
+  int* sh_y = smem + MMQ_STAGES * SH_X_INTS;          // [MMQ_STAGES][SH_Y_INTS]
+
+  const int t = threadIdx.x;
+  const int i0 = threadIdx.y * 16;
+  const int i_tile = blockIdx.x, j_tile = blockIdx.y;
+  const int i_max = N - i_tile * MMQ_Y - 1;
+  const int nkb = K / QK_K;
+
+  const char* xb = x + (size_t)i_tile * MMQ_Y * stride_row * sizeof(block_q4_K);
+  const int* yb = (const int*)(y + (size_t)j_tile * MMQ_X);
+
+  float sum[MMQ_SUM_NE] = {0.0f};
+
+  // The scale/min unpack is per (row, super-block) and is loop-invariant across j0, so it is done
+  // once per stage per lane -- not once per mma, which is where upstream pays for it.
+  const int wid_a[MMQ_NA] = {0, 8};
+
+#pragma unroll
+  for (int s = 0; s < MMQ_STAGES - 1; s++) {
+    if (s < nkb) fetch_stage(sh_x + s * SH_X_INTS, sh_y + s * SH_Y_INTS, xb, yb, s, i_max, stride_row, M);
+    cp_async_fence();
+  }
+
+  int cur = 0;
+  for (int kb = 0; kb < nkb; kb++) {
+    cp_async_wait<MMQ_STAGES - 2>();
+    __syncthreads();                       // ONE barrier per 256-k iteration (upstream needs four)
+
+    // Issue the next stage BEFORE computing, so the DMA overlaps the mmas. The slot being written is
+    // (cur + STAGES-1) % STAGES, which was last read STAGES-1 iterations ago and is therefore already
+    // past the barrier above -- that is what makes one barrier enough.
+    const int nxt = kb + MMQ_STAGES - 1;
+    if (nxt < nkb) {
+      const int ns = (cur + MMQ_STAGES - 1) % MMQ_STAGES;
+      fetch_stage(sh_x + ns * SH_X_INTS, sh_y + ns * SH_Y_INTS, xb, yb, nxt, i_max, stride_row, M);
+    }
+    cp_async_fence();
+
+    const int* X = sh_x + cur * SH_X_INTS;
+    const int* Y = sh_y + cur * SH_Y_INTS;
+
+    // per-row scales for this super-block: 8 (d*sc_b, -dmin*m_b) pairs, for each of the lane's 2 rows
+    half2 dm[MMQ_NA][8];
+#pragma unroll
+    for (int a = 0; a < MMQ_NA; a++) {
+      const int r = i0 + t / 4 + wid_a[a];
+      const int* h = X + r * 36;
+      const half2 d_nd = __hmul2(*(const half2*)h, make_half2(1.0f, -1.0f));   // (d, -dmin)
+      const int sc03 = unpack_scales_q4_K(h + 1, 0), sc47 = unpack_scales_q4_K(h + 1, 1);
+      const int m03  = unpack_scales_q4_K(h + 1, 2), m47  = unpack_scales_q4_K(h + 1, 3);
+      const uint8_t* s03 = (const uint8_t*)&sc03; const uint8_t* s47 = (const uint8_t*)&sc47;
+      const uint8_t* q03 = (const uint8_t*)&m03;  const uint8_t* q47 = (const uint8_t*)&m47;
+#pragma unroll
+      for (int l = 0; l < 4; l++) {
+        dm[a][l]     = __hmul2(d_nd, make_half2((float)s03[l], (float)q03[l]));
+        dm[a][l + 4] = __hmul2(d_nd, make_half2((float)s47[l], (float)q47[l]));
+      }
+    }
+
+#pragma unroll
+    for (int b = 0; b < 8; b++) {          // 8 sub-blocks of 32 values == 256 k
+      // --- A straight out of the raw nibbles. One LDS + shift + and per register. ---
+      uint32_t A[4];
+#pragma unroll
+      for (int l = 0; l < 4; l++) {
+        const int w = X[(i0 + a_row(t, l)) * 36 + 4 + (b / 2) * 8 + a_kw(t, l)];
+        A[l] = (uint32_t)(w >> (4 * (b % 2))) & 0x0F0F0F0Fu;
+      }
+      float dA[MMQ_NA], mA[MMQ_NA];
+#pragma unroll
+      for (int a = 0; a < MMQ_NA; a++) {
+        const float2 v = __half22float2(dm[a][b]);
+        dA[a] = v.x; mA[a] = v.y;
+      }
+
+      const int* Ys = Y + (b / 4) * (MMQ_X * 36);   // which 128-k slab
+      const int kb32 = b % 4;                        // which 32-value block inside it
+
+#pragma unroll
+      for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_TILE_N) {
+        uint32_t B[MMQ_B_NE];
+#pragma unroll
+        for (int l = 0; l < MMQ_B_NE; l++)
+          B[l] = Ys[(j0 + b_n(t, l)) * 36 + 4 + 8 * kb32 + b_k(t, l)];
+
+        float dB[MMQ_NB], sB[MMQ_NB];
+#pragma unroll
+        for (int l = 0; l < MMQ_NB; l++) {
+          // half2 is 4 B == the width of an int, so a column's half2 index is its int index: 36, not 18.
+          const float2 ds = __half22float2(((const half2*)Ys)[(j0 + acc_j(t, l)) * 36 + kb32]);
+          dB[l] = ds.x; sB[l] = ds.y;
+        }
+
+        int C[MMQ_C_NE] = {0};
+        mmq_mma(C, A, B);
+#pragma unroll
+        for (int l = 0; l < MMQ_C_NE; l++) {
+          float* s = &sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+          *s += dA[ACC_A_IDX(l)] * dB[ACC_B_IDX(l)] * (float)C[l];
+          *s += mA[ACC_A_IDX(l)] * sB[ACC_B_IDX(l)];
+        }
+      }
+    }
+    cur = (cur + 1) % MMQ_STAGES;
+  }
+
+#pragma unroll
+  for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_TILE_N)
+#pragma unroll
+    for (int l = 0; l < MMQ_C_NE; l++) {
+      const int j = j_tile * MMQ_X + j0 + acc_j(t, l);
+      const int i = i_tile * MMQ_Y + i0 + acc_i(t, l);
+      if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+    }
+}
+#endif  // MMQ_PIPE
+
+
+// ============================================================================================
+// One launcher, so the self-check and the bench cannot drift apart in how they configure the kernel
+// -- which is exactly how a "the test passes but the bench is wrong" bug gets in.
+// ============================================================================================
+struct MMQLaunch { size_t shmem; void (*kern)(const char*, const block_q8_1_mmq*, float*, int, int, int, int); };
+
+static MMQLaunch mmq_launch(bool is_q4_K) {
+  MMQLaunch L;
+#ifdef MMQ_PIPE
+  if (is_q4_K) {
+    L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS + SH_Y_INTS) * sizeof(int);
+    L.kern = mul_mat_q_pipe;
+    CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
+    return L;
+  }
+#endif
+  L.shmem = (size_t)(MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * sizeof(int);
+  L.kern = is_q4_K ? mul_mat_q<true> : mul_mat_q<false>;
+  CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
+  return L;
+}
+
+// ============================================================================================
 // Host: quantizers + the two references.
 // ============================================================================================
 static void quantize_q4_0_host(const float* w, block_q4_0* out, int n) {
@@ -585,12 +818,9 @@ static bool run_case(bool is_q4_K, int N, int K, int M) {
   quantize_q8_1_mmq<<<dim3(M, K_pad / 512), 128>>>(dYf, dY, K, K_pad, M);
   CUDA_CHECK(cudaGetLastError());
 
-  const size_t shmem = (size_t)(MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * sizeof(int);
-  auto kern = is_q4_K ? mul_mat_q<true> : mul_mat_q<false>;
-  CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
-
+  const MMQLaunch L = mmq_launch(is_q4_K);
   dim3 grid((N + MMQ_Y - 1) / MMQ_Y, (M + MMQ_X - 1) / MMQ_X);
-  kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), shmem>>>(dX, dY, dC, N, K, M, blocks_per_row);
+  L.kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), L.shmem>>>(dX, dY, dC, N, K, M, blocks_per_row);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -679,21 +909,19 @@ static void bench(bool is_q4_K, int N, int K, int M, double peak_top) {
   CUDA_CHECK(cudaMemset(dY, 0, ny * sizeof(block_q8_1_mmq)));
   quantize_q8_1_mmq<<<dim3(M, K_pad / 512), 128>>>(dYf, dY, K, K_pad, M);
 
-  const size_t shmem = (size_t)(MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * sizeof(int);
-  auto kern = is_q4_K ? mul_mat_q<true> : mul_mat_q<false>;
-  CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
+  const MMQLaunch L = mmq_launch(is_q4_K);
   dim3 grid((N + MMQ_Y - 1) / MMQ_Y, (M + MMQ_X - 1) / MMQ_X);
 
   const int iters = 50;
   for (int c = 0; c < ncopy; c++)  // warm the instruction cache, not the data
-    kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), shmem>>>(dX[c], dY, dC, N, K, M, bpr);
+    L.kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), L.shmem>>>(dX[c], dY, dC, N, K, M, bpr);
   CUDA_CHECK(cudaDeviceSynchronize());
 
   cudaEvent_t e0, e1;
   CUDA_CHECK(cudaEventCreate(&e0)); CUDA_CHECK(cudaEventCreate(&e1));
   CUDA_CHECK(cudaEventRecord(e0));
   for (int it = 0; it < iters; it++)
-    kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), shmem>>>(dX[it % ncopy], dY, dC, N, K, M, bpr);
+    L.kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), L.shmem>>>(dX[it % ncopy], dY, dC, N, K, M, bpr);
   CUDA_CHECK(cudaEventRecord(e1));
   CUDA_CHECK(cudaEventSynchronize(e1));
   float ms; CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
