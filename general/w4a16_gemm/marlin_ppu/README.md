@@ -86,10 +86,22 @@ The PPU's LLC is between 64 and 128 MB, and every decode shape's weights (8.4-29
 loop over one weight buffer therefore measures cache, not HBM. `GEMV_WORKSET_MB` / `MARLIN_WORKSET_MB` rotate through
 enough copies of B to miss it. **Both columns matter, and they say different things:**
 
+**Both kernels now apply grouped scales (groupsize=128) correctly**, which is what real quantized models use, and both
+pay for it. The honest comparison is cold weights, groupsize=128, both correct:
+
+| shape (M=1)     | Marlin | `gemv_w4a16` | speedup |
+|-----------------|--------|--------------|---------|
+| N=4096  K=4096  | 19.48 us | **10.48 us** | **1.86x** |
+| N=14336 K=4096  | 22.19 us | 21.98 us | 1.01x (tie) |
+| N=4096  K=14336 | 34.22 us | **21.75 us** | **1.57x** |
+
+Grouped scales cost Marlin +4.1% to +18.0% and the GEMV +6.5% to +14.5% over per-column scales. For reference, the
+per-column (groupsize=-1) numbers, which no real model uses:
+
 | shape (M=1)     | | cache-resident | HBM-resident (wset 256 MB) |
 |-----------------|---|----------------|----------------------------|
-| N=4096  K=4096  | Marlin / GEMV | 17.86 / **5.82 us** = 3.07x | 18.72 / **9.29 us** = 2.02x |
-| N=14336 K=4096  | Marlin / GEMV | 16.56 / **11.40 us** = 1.45x | 18.81 / **18.40 us** = 1.02x |
+| N=4096  K=4096  | Marlin / GEMV | 17.86 / **5.82 us** = 3.07x | 18.72 / **9.84 us** = 1.90x |
+| N=14336 K=4096  | Marlin / GEMV | 16.56 / **11.40 us** = 1.45x | 18.81 / **19.19 us** = 0.98x |
 
 Losing the cache costs GEMV ~70% and Marlin only 5-14%: Marlin decode never saturated bandwidth in the first place
 (471 GB/s, 17.4% of peak) -- it is structure-bound -- while GEMV was fast partly because the weights were warm. On a
