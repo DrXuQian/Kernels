@@ -50,6 +50,11 @@ dump_ldmatrix: dump_ldmatrix.cu .flags
 bw_probe: bw_probe.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# W4A16 GEMV on an N-MAJOR INT4 layout (a SECOND weight tensor). The v8 structure from the bf16 sweep: lean register
+# LDG, no shared / cp.async / split-K. Self-checking. Sweep with -DNM_COLS / -DNM_THREADS / -DNM_UNROLL.
+gemv_nmajor: gemv_w4a16_nmajor.cu .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 # W4A16 GEMV for decode: reads Marlin's B format in place, no ppu.* asm (so it also builds on stock CUDA).
 # Self-checking (packs B on the host, compares against a CPU dot product) and reports GB/s + %HBM.
 gemv_w4a16: gemv_w4a16_ppu.cu .flags
@@ -57,4 +62,4 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f dequant_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 bw_probe *.o .flags
+	rm -f dequant_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
