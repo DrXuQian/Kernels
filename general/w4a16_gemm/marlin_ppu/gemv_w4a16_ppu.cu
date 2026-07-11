@@ -78,7 +78,8 @@ __device__ __forceinline__ FragB dequant(int q) {
 template <int SPLIT_K>
 __global__ void __launch_bounds__(GEMV_THREADS)
 gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
-           float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter, int N, int K) {
+           float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
+           int N, int K, int kt_per_group) {
     const int nb_group = blockIdx.x;                 // 4 nblocks = 64 columns
     const int slice    = blockIdx.y;
     const int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
@@ -91,91 +92,101 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     const int b_stride = N / 2;                      // int4 per ktile
     const int lane_k = (lane % 4) * 2;               // this lane's k phase within the 16-wide ktile
 
-    // half2 accumulators: each slot sums (kt_per_slice/4)*2 products. At SPLIT_K=4, K=4096 that is 32 terms, so the
-    // fp16 rounding is ~sqrt(32)*2^-11 = 2.8e-3 relative -- an order worse than an fp32 accumulator, well inside the
-    // 3e-2 check. SPLIT_K bounds the chain, which is a second reason not to run this at SPLIT_K=1 on long K.
-    half2 hacc[4][2];
-    #pragma unroll
-    for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
-
-    // ILP. acu on N=4096 K=4096 says Memory Dependency 5.333 dominates (Not Selected 1.275, achieved occupancy 80%):
-    // warps are plentiful and idle, all waiting on loads. With one int4 load per iteration, consumed immediately by
-    // dequant, the load-to-use distance is zero and a thread never has a second request in flight.
+    // GROUPED SCALES. Real quantized models use groupsize=128, so s varies along K and CANNOT be applied once at the
+    // end -- which is exactly what this kernel used to do (and its test set every scale to 1.0, the multiplicative
+    // identity, so neither bug was visible). Same pair of bugs we just fixed in marlin_classic_ppu.cuh.
     //
-    // So issue GEMV_UNROLL independent loads before touching any of them. This is the documented EXCEPTION to "U-unroll
-    // hurts bandwidth kernels": that rule is about grid-stride loops, where unrolling cuts the block count. Here the
-    // block count is pinned by N and SPLIT_K, so ILP is the only lever left for hiding latency.
-    const int step = GEMV_THREADS / 32;
-    const int cnt = (kt_end - kt_begin) / step;        // ktiles this thread owns
-    const int main_cnt = (cnt / GEMV_UNROLL) * GEMV_UNROLL;
+    // C[n] = sum_g s[g][n] * (sum_{k in group g} A[k] * q[n][k])
+    //
+    // So walk K one group at a time: accumulate the group's partial in half2, then FLUSH it into an fp32 accumulator
+    // scaled by that group's s. kt_per_group = groupsize/16; the caller passes k_tiles for per-column scales (gs == -1),
+    // which collapses to a single group and reproduces the old behaviour exactly.
+    //
+    // This also IMPROVES precision: the fp16 chain is now bounded by one group (8 ktiles / 4 warps = 2 per thread at
+    // groupsize=128) instead of the whole slice, and everything across groups is fp32.
+    float facc[4][2] = {{0.f}};
+
+    for (int g0 = kt_begin; g0 < kt_end; g0 += kt_per_group) {
+        const int g  = g0 / kt_per_group;                     // scale row
+        const int g1 = min(g0 + kt_per_group, kt_end);
+
+        half2 hacc[4][2];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
+
+        // ILP. acu (cache-resident) put Memory Dependency at 5.333 with warps idle, so issue GEMV_UNROLL independent
+        // int4 loads before consuming any. Measured: U=2 is the optimum and it is worth MORE on cold weights (+10.5%)
+        // than warm (+3.6%); U>=4 loses, and loses harder as N grows -- B is ktile-major, so consecutive ktiles are
+        // 8N bytes apart and U concurrent loads scatter across U times that.
+        const int step = GEMV_THREADS / 32;
+        const int n_kt = (g1 - g0 > wid) ? ((g1 - g0 - wid + step - 1) / step) : 0;   // ktiles THIS thread owns here
+        const int main_n = (n_kt / GEMV_UNROLL) * GEMV_UNROLL;
+        int kt = g0 + wid;
 
 #ifdef GEMV_BW_ONLY
-    // SPEED-ONLY, RESULT IS WRONG. Same addresses, same loop, same reduce -- only the dequant is replaced, by the
-    // cheapest arithmetic that still consumes every loaded byte (so the loads cannot be optimized away). It told us the
-    // kernel was ALU bound, not bandwidth bound: BW_ONLY ran 9.66 us against the naive kernel's 18.97 us on N=14336
-    // K=4096, and the 9.31 us gap scaled with the WEIGHT COUNT (2.21 us on the 3.5x smaller N=4096 shape).
-    #define GEMV_BODY(q4_, kt_)                                                                      \
-        do {                                                                                         \
-            const half2 a01 = *reinterpret_cast<const half2*>(&A[(kt_) * 16 + lane_k]);              \
-            const int q[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                 \
-            _Pragma("unroll")                                                                        \
-            for (int j = 0; j < 4; j++)                                                              \
-                hacc[j][0] = __hfma2(__halves2half2(__int2half_rn(q[j] & 1),                         \
-                                                    __int2half_rn(q[j] >> 31)), a01, hacc[j][0]);    \
-        } while (0)
+        // SPEED-ONLY, RESULT IS WRONG. Same addresses, same loop, same reduce -- only the dequant is replaced, by the
+        // cheapest arithmetic that still consumes every loaded byte. It told us the kernel was ALU bound, not bandwidth
+        // bound: 9.66 us vs the naive kernel's 18.97 us on N=14336 K=4096, and the gap scaled with the WEIGHT COUNT.
+        #define GEMV_BODY(q4_, kt_)                                                                      \
+            do {                                                                                         \
+                const half2 a01 = *reinterpret_cast<const half2*>(&A[(kt_) * 16 + lane_k]);              \
+                const int q[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                 \
+                _Pragma("unroll")                                                                        \
+                for (int j = 0; j < 4; j++)                                                              \
+                    hacc[j][0] = __hfma2(__halves2half2(__int2half_rn(q[j] & 1),                         \
+                                                        __int2half_rn(q[j] >> 31)), a01, hacc[j][0]);    \
+            } while (0)
 #else
-    #define GEMV_BODY(q4_, kt_)                                                                      \
-        do {                                                                                         \
-            const int kb = (kt_) * 16 + lane_k;        /* even -> both half2 loads are 4B aligned */ \
-            const half2 a01 = *reinterpret_cast<const half2*>(&A[kb]);      /* {A[kb],   A[kb+1]} */ \
-            const half2 a89 = *reinterpret_cast<const half2*>(&A[kb + 8]);  /* {A[kb+8], A[kb+9]} */ \
-            const int q[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                 \
-            _Pragma("unroll")                                                                        \
-            for (int j = 0; j < 4; j++) {                                                            \
-                const FragB b0 = dequant(q[j]);        /* column n   */                              \
-                const FragB b1 = dequant(q[j] >> 8);   /* column n+8 */                              \
-                hacc[j][0] = __hfma2(b0.v[0], a01, hacc[j][0]);   /* k = kb, kb+1   */               \
-                hacc[j][0] = __hfma2(b0.v[1], a89, hacc[j][0]);   /* k = kb+8, kb+9 */               \
-                hacc[j][1] = __hfma2(b1.v[0], a01, hacc[j][1]);                                      \
-                hacc[j][1] = __hfma2(b1.v[1], a89, hacc[j][1]);                                      \
-            }                                                                                        \
-        } while (0)
+        #define GEMV_BODY(q4_, kt_)                                                                      \
+            do {                                                                                         \
+                const int kb = (kt_) * 16 + lane_k;        /* even -> both half2 loads are 4B aligned */ \
+                const half2 a01 = *reinterpret_cast<const half2*>(&A[kb]);      /* {A[kb],   A[kb+1]} */ \
+                const half2 a89 = *reinterpret_cast<const half2*>(&A[kb + 8]);  /* {A[kb+8], A[kb+9]} */ \
+                const int q[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                 \
+                _Pragma("unroll")                                                                        \
+                for (int j = 0; j < 4; j++) {                                                            \
+                    const FragB b0 = dequant(q[j]);        /* column n   */                              \
+                    const FragB b1 = dequant(q[j] >> 8);   /* column n+8 */                              \
+                    hacc[j][0] = __hfma2(b0.v[0], a01, hacc[j][0]);   /* k = kb, kb+1   */               \
+                    hacc[j][0] = __hfma2(b0.v[1], a89, hacc[j][0]);   /* k = kb+8, kb+9 */               \
+                    hacc[j][1] = __hfma2(b1.v[0], a01, hacc[j][1]);                                      \
+                    hacc[j][1] = __hfma2(b1.v[1], a89, hacc[j][1]);                                      \
+                }                                                                                        \
+            } while (0)
 #endif
-
-#if GEMV_UNROLL == 1
-    // Keep the original shape exactly. Rewriting this as the U-loop below with U=1 (an int4[1] array plus a recomputed
-    // kt = kt_begin + wid + i*step instead of a kt += step induction) cost 4-7% on the box -- 6.96 -> 7.42 us on
-    // N=4096 sk=16, 11.40 -> 11.90 on N=14336 sk=4. Far outside the 0.6% noise floor.
-    (void) main_cnt;
-    for (int kt = kt_begin + wid; kt < kt_end; kt += step)
-        GEMV_BODY(B[(long long) b_stride * kt + nb_group * 32 + lane], kt);
-#else
-    int i = 0;
-    for (; i < main_cnt; i += GEMV_UNROLL) {           // GEMV_UNROLL loads issued back-to-back, none consumed yet
-        int4 q4[GEMV_UNROLL];
-        #pragma unroll
-        for (int u = 0; u < GEMV_UNROLL; u++) {
-            const int kt = kt_begin + wid + (i + u) * step;
-            q4[u] = B[(long long) b_stride * kt + nb_group * 32 + lane];
+        int i = 0;
+        for (; i < main_n; i += GEMV_UNROLL) {          // GEMV_UNROLL loads issued back-to-back, none consumed yet
+            int4 q4[GEMV_UNROLL];
+            #pragma unroll
+            for (int u = 0; u < GEMV_UNROLL; u++)
+                q4[u] = B[(long long) b_stride * (kt + u * step) + nb_group * 32 + lane];
+            #pragma unroll
+            for (int u = 0; u < GEMV_UNROLL; u++) GEMV_BODY(q4[u], kt + u * step);
+            kt += GEMV_UNROLL * step;
         }
+        for (; i < n_kt; i++) {                        // tail, when n_kt is not a multiple of GEMV_UNROLL
+            GEMV_BODY(B[(long long) b_stride * kt + nb_group * 32 + lane], kt);
+            kt += step;
+        }
+        #undef GEMV_BODY
+
+        // FLUSH: fold this group's half2 partial into fp32, scaled by this group's s. The two half2 lanes hold
+        // different k, so they add. Column of slot (j,h) is (nb_group*4 + j)*16 + lane/4 + 8*h.
         #pragma unroll
-        for (int u = 0; u < GEMV_UNROLL; u++) GEMV_BODY(q4[u], kt_begin + wid + (i + u) * step);
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const float2 f = __half22float2(hacc[j][h]);
+                const int col = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h;
+                facc[j][h] += (f.x + f.y) * __half2float(s[(long long) g * N + col]);
+            }
     }
-    for (; i < cnt; i++) {                             // tail, when cnt is not a multiple of GEMV_UNROLL
-        const int kt = kt_begin + wid + i * step;
-        GEMV_BODY(B[(long long) b_stride * kt + nb_group * 32 + lane], kt);
-    }
-#endif
-    #undef GEMV_BODY
 
     float acc[4][2];
     #pragma unroll
     for (int j = 0; j < 4; j++)
         #pragma unroll
-        for (int h = 0; h < 2; h++) {
-            const float2 f = __half22float2(hacc[j][h]);
-            acc[j][h] = f.x + f.y;                     // the two half2 lanes hold different k, so fold them
-        }
+        for (int h = 0; h < 2; h++) acc[j][h] = facc[j][h];
 
     // A column n is held by the 4 lanes sharing lane/4 (they differ only in k phase). Fold them.
     #pragma unroll
@@ -205,7 +216,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     }
 
     if (SPLIT_K == 1) {                                // nothing to reduce across
-        if (threadIdx.x < N_PER_BLOCK) C[n] = __float2half(mine * __half2float(s[n]));
+        if (threadIdx.x < N_PER_BLOCK) C[n] = __float2half(mine);   // scales already applied per group
         return;
     }
 
@@ -235,20 +246,20 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         volatile const float* p = partial + n;
         float v = 0.f;
         for (int i = 0; i < SPLIT_K; i++) v += p[(long long) i * N];
-        C[n] = __float2half(v * __half2float(s[n]));
+        C[n] = __float2half(v);   // scales already applied per group in the mainloop
     }
     if (threadIdx.x == 0) counter[nb_group] = 0;       // rearm for the next launch; the stream orders it
 #endif
 }
 
-// out[n] = half(scale[n] * sum_slice partial[slice][n])
-__global__ void gemv_reduce(const float* __restrict__ partial, const half* __restrict__ s,
-                            half* __restrict__ C, int N, int split_k) {
+// out[n] = half(sum_slice partial[slice][n]). The scales are applied per group inside the mainloop, so they must NOT
+// be applied again here -- with groupsize=128 there is no single s[n] to apply.
+__global__ void gemv_reduce(const float* __restrict__ partial, half* __restrict__ C, int N, int split_k) {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
     float v = 0.f;
     for (int i = 0; i < split_k; i++) v += partial[(long long) i * N + n];
-    C[n] = __float2half(v * __half2float(s[n]));
+    C[n] = __float2half(v);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -303,18 +314,24 @@ static int get_rot(size_t b_bytes) {
 }
 
 static int get_split_k(int N, int K) { const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 0; return v > 0 ? v : auto_split_k(N, K); }
+
+// -1 = per-column scales; 128 = grouped, WHAT REAL QUANTIZED MODELS USE. Grouped scales vary along K, so they cannot be
+// applied once at the end -- the kernel folds each group's partial into an fp32 accumulator, scaled by that group's s.
+static int get_groupsize() { const char* e = getenv("GEMV_GROUPSIZE"); return e ? atoi(e) : -1; }
 static int SPLIT_K = 8;
 
-static void launch(const int4* B, const half* A, const half* s, float* partial, half* C, int* counter, int N, int K) {
+// kt_per_group = groupsize/16, or k_tiles when groupsize == -1 (one group spanning all of K -> per-column scales).
+static void launch(const int4* B, const half* A, const half* s, float* partial, half* C, int* counter,
+                   int N, int K, int kt_per_group) {
     dim3 grid(N / N_PER_BLOCK, SPLIT_K);
-    #define GEMV_CASE(SK) case SK: gemv_w4a16<SK><<<grid, GEMV_THREADS>>>(B, A, s, partial, C, counter, N, K); break;
+    #define GEMV_CASE(SK) case SK: gemv_w4a16<SK><<<grid, GEMV_THREADS>>>(B, A, s, partial, C, counter, N, K, kt_per_group); break;
     switch (SPLIT_K) {
         GEMV_CASE(1) GEMV_CASE(2) GEMV_CASE(4) GEMV_CASE(8) GEMV_CASE(16) GEMV_CASE(32)
         default: printf("  GEMV_SPLIT_K=%d unsupported (1/2/4/8/16/32)\n", SPLIT_K); exit(1);
     }
     #undef GEMV_CASE
 #ifndef GEMV_FUSED_REDUCE
-    if (SPLIT_K > 1) gemv_reduce<<<(N + 255) / 256, 256>>>(partial, s, C, N, SPLIT_K);
+    if (SPLIT_K > 1) gemv_reduce<<<(N + 255) / 256, 256>>>(partial, C, N, SPLIT_K);
 #endif
 }
 
@@ -340,11 +357,23 @@ static double bench_one(int N, int K, int iters, bool check) {
     if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
         printf("  N=%d K=%d SPLIT_K=%d unsupported (N%%64, K%%%d, ktiles/slice %% 4)\n", N, K, SPLIT_K, 16 * SPLIT_K); return -1; }
 
-    std::vector<half> hA(K), hS(N, __float2half(1.0f)), hC(N);
+    const int gs = get_groupsize();
+    if (gs != -1 && (gs % 16 || K % gs)) { printf("  GEMV_GROUPSIZE=%d unsupported (need %%16==0, K%%gs==0)\n", gs); return -1; }
+    // GEMV_SCALE_BUG=1 reproduces the ORIGINAL bug: pass kt_per_group = k_tiles even when gs=128, so the kernel sees a
+    // single group and applies only s[0][n] -- a per-column scale on a grouped problem. It must MISMATCH, which is how
+    // we know the test is not blind. (The kernel really did this, and its test set every scale to 1.0 so nothing showed.)
+    const int kt_per_group = (gs == -1 || getenv("GEMV_SCALE_BUG")) ? (K / 16) : (gs / 16);
+    const int GROUPS = (gs == -1) ? 1 : (K / gs);
+
+    std::vector<half> hA(K), hS((size_t) GROUPS * N), hC(N);
     std::vector<int> Bdeq((size_t) N * K), hB((size_t) (K / 16) * (N / 2) * 4);
     srand(1234);
     for (auto& x : hA) x = __float2half(0.05f * (rand() % 40 - 20));
     for (auto& x : Bdeq) x = (rand() & 0xf) - 8;
+    // NON-TRIVIAL scales, distinct per (group, column). They used to be all 1.0 -- the multiplicative identity -- so a
+    // kernel that dropped the scale entirely passed anyway, and a kernel that applied a per-COLUMN scale to a GROUPED
+    // problem also passed. Both bugs were live in this file.
+    for (auto& x : hS) x = __float2half(0.5f + (rand() % 100) / 100.0f);
     pack_B(Bdeq, hB, N, K);
 
     const size_t b_bytes = hB.size() * 4;
@@ -363,7 +392,7 @@ static double bench_one(int N, int K, int iters, bool check) {
     CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
 
-    if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, dP, dC, dCnt, N, K); CUDA_CHECK(cudaDeviceSynchronize()); }
+    if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, dP, dC, dCnt, N, K, kt_per_group); CUDA_CHECK(cudaDeviceSynchronize()); }
 
     if (getenv("GEMV_NCU")) check = false;
 #ifdef GEMV_BW_ONLY
@@ -372,11 +401,17 @@ static double bench_one(int N, int K, int iters, bool check) {
 #endif
     // Verified BEFORE and AFTER the timing loop. The fused reduce rearms `counter` from inside the winning CTA, so a
     // leaked count would corrupt every launch after the first -- which a pre-bench check alone cannot see.
+    // C[n] = sum_g s[g][n] * sum_{k in group g} A[k] * q[n][k]
+    const int gsz = (gs == -1) ? K : gs;
     std::vector<double> ref(N);
     for (int n = 0; n < N; n++) {
-        double acc = 0;
-        for (int k = 0; k < K; k++) acc += (double) __half2float(hA[k]) * Bdeq[(size_t) n * K + k];
-        ref[n] = acc;
+        double total = 0;
+        for (int g = 0; g < GROUPS; g++) {
+            double acc = 0;
+            for (int k = g * gsz; k < (g + 1) * gsz; k++) acc += (double) __half2float(hA[k]) * Bdeq[(size_t) n * K + k];
+            total += acc * __half2float(hS[(size_t) g * N + n]);
+        }
+        ref[n] = total;
     }
     auto verify = [&](const char* when) -> bool {
         CUDA_CHECK(cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost));
@@ -395,7 +430,7 @@ static double bench_one(int N, int K, int iters, bool check) {
     // GEMV_NCU=1: exactly one launch of each kernel, no warmup, no timing loop -- a clean profiler capture.
     // (Same convention as GEMV_NCU / FA_NCU / CONVERT_NCU in ppu_tests.) The printed us is then meaningless.
     if (getenv("GEMV_NCU")) {
-        launch(dB, dA, dS, dP, dC, dCnt, N, K);
+        launch(dB, dA, dS, dP, dC, dCnt, N, K, kt_per_group);
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("  GEMV_NCU: single launch done (N=%d K=%d sk=%d, %d blocks) -- timing skipped\n",
                N, K, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K);
@@ -405,21 +440,21 @@ static double bench_one(int N, int K, int iters, bool check) {
 
     auto Brot = [&](int i) { return (const int4*) ((char*) dB + (size_t) (i % rot) * b_bytes); };
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    for (int i = 0; i < 10; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K);
+    for (int i = 0; i < 10; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K, kt_per_group);
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaEventRecord(a);
-    for (int i = 0; i < iters; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K);
+    for (int i = 0; i < iters; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K, kt_per_group);
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
     if (check && !verify("post-bench")) { printf("  counter leaked across launches\n"); return -1; }
 
     const char* e = getenv("MARLIN_HBM_GBS");
     double peak = e ? atof(e) : 2700.0;
-    double bytes = (double) N * K / 2 + (double) K * 2 + (double) N * 2 + (double) N * 2;  // B + A + C + scales
+    double bytes = (double) N * K / 2 + (double) K * 2 + (double) N * 2 + (double) GROUPS * N * 2;  // B + A + C + scales
     double gbs = bytes / (ms * 1e6);
-    printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (sk=%d, %d blocks, wset=%zu MB)\n",
-           N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak, SPLIT_K,
-           (N / N_PER_BLOCK) * SPLIT_K, (b_bytes * rot) >> 20);
+    printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (gs=%d, sk=%d, %d blocks, wset=%zu MB)\n",
+           N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak,
+           gs, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K, (b_bytes * rot) >> 20);
 
     cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
     cudaEventDestroy(a); cudaEventDestroy(b);
