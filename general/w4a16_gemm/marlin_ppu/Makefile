@@ -12,7 +12,7 @@ NVCCFLAGS ?= -O3 -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda
 .flags: force
 	@echo '$(NVCCFLAGS)' | cmp -s - $@ || echo '$(NVCCFLAGS)' > $@
 
-all: dequant_smoke marlin_ppu_test marlin_classic_num marlin_classic_splitk marlin_classic_group
+all: dequant_smoke marlin_ppu_test marlin_classic_num marlin_classic_splitk marlin_classic_group mma_int8_smoke
 
 # INT4 dequant (lop3) in isolation vs CPU.
 dequant_smoke: dequant_smoke.cu .flags
@@ -42,6 +42,12 @@ marlin_classic_splitk: test_marlin_classic_splitk.cu marlin_classic_ppu.cuh .fla
 bench_marlin: bench_marlin.cu marlin_classic_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# INT8 tensor-core gate for the llama.cpp MMQ port: does the PPU have m16n16k32 s32.s8.s8.s32?
+# NVIDIA reference path (validates the probe harness):  make NVCCFLAGS="-O3 -std=c++17 -arch=sm_90" mma_int8_smoke
+# PPU path (box, ppu001, NO -arch):                     make NVCCFLAGS="-O3 -std=c++17 -DUSE_PPU" mma_int8_smoke
+mma_int8_smoke: mma_int8_smoke.cu .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 # ground truth for ppu.ldmatrix.x4 register distribution (which 8x8 matrix lands in which reg).
 dump_ldmatrix: dump_ldmatrix.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
@@ -62,4 +68,4 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f dequant_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f dequant_smoke mma_int8_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
