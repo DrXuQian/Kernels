@@ -43,8 +43,19 @@
 #ifndef NM_THREADS
 #define NM_THREADS 128   // v8's width
 #endif
+// Chunks issued before any is consumed. DEFAULT 1, and read this before raising it:
+//
+// The staging arrays are q4[COLS][U] + av[4][U] int4, i.e. 4*(COLS+4)*U registers JUST to hold loads in flight.
+// COLS=8 U=2 measured 167 registers (COLS=16 U=2: 254, at the cap). On the PPU that caps occupancy at
+// 131072/(167*32) = 24.5 warps/CU -- BELOW the 28.4 the grid would otherwise give. The unroll pays for itself only
+// if it is actually used.
+//
+// And it often is NOT: a thread walks nchunk = K/32 chunks with stride T, so it gets ceil(nchunk/T) of them.
+// At K=4096, T=128 that is exactly ONE -- every u > 0 is skipped and the registers are pure waste. That is the
+// configuration this kernel was first benchmarked in, and it lost to the ktile-major kernel because of it.
+// Raise U only when K/32 > NM_THREADS.
 #ifndef NM_UNROLL
-#define NM_UNROLL 2      // int4 chunks issued before any is consumed
+#define NM_UNROLL 1
 #endif
 
 struct FragB { half2 v[2]; };
