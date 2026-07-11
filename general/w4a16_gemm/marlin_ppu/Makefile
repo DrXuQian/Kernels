@@ -54,6 +54,12 @@ mma_int8_smoke: mma_int8_smoke.cu .flags
 mmq_ppu: mmq_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# Tensor-core PEAK: the DENOMINATOR for every compute-utilization number. Reports int8 and fp16
+# back-to-back mma throughput and their ratio. Sweep NACC (argv[1]) to prove it isn't latency-bound.
+#   PPU:  make NVCCFLAGS="-O3 -std=c++17" mma_peak && ./mma_peak 4
+mma_peak: mma_peak.cu .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 # ground truth for ppu.ldmatrix.x4 register distribution (which 8x8 matrix lands in which reg).
 dump_ldmatrix: dump_ldmatrix.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
@@ -74,4 +80,4 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f dequant_smoke mma_int8_smoke mmq_ppu dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f dequant_smoke mma_int8_smoke mmq_ppu mma_peak dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags

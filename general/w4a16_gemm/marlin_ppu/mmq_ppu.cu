@@ -618,12 +618,107 @@ static bool run_case(bool is_q4_K, int N, int K, int M) {
   return bad;
 }
 
-int main() {
+// ============================================================================================
+// Benchmark. COLD WEIGHTS, and that is not optional: the LLC is 64-128 MB and a single layer's
+// weights (a 4096x14336 Q4_K tensor is 33 MB) fit inside it. Timing a loop that re-reads the same
+// tensor measures the LLC, not HBM, and flatters the result -- this exact mistake made the decode
+// GEMV numbers look good for a day. So we allocate a WORKSET of several weight copies and rotate
+// through them, evicting each before it comes back around.
+//
+// The reported %peak needs a denominator: run mma_peak to get the PPU's achievable back-to-back
+// int8 mma throughput. That is the ceiling for a kernel built out of those mmas.
+// ============================================================================================
+static void bench(bool is_q4_K, int N, int K, int M, double peak_top) {
+  const int qk = is_q4_K ? QK_K : QK4_0;
+  const int bpr = K / qk;
+  const size_t bsz = is_q4_K ? sizeof(block_q4_K) : sizeof(block_q4_0);
+  const size_t wbytes = (size_t)N * bpr * bsz;
+
+  const int workset_mb = getenv("MMQ_WORKSET_MB") ? atoi(getenv("MMQ_WORKSET_MB")) : 512;
+  int ncopy = (int)(((size_t)workset_mb << 20) / wbytes);
+  if (ncopy < 1) ncopy = 1;
+
+  std::mt19937 rng(7);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<float> W((size_t)N * K), Y((size_t)M * K);
+  for (auto& v : W) v = nd(rng);
+  for (auto& v : Y) v = nd(rng);
+  std::vector<char> Xq(wbytes);
+  for (int i = 0; i < N; i++) {
+    if (is_q4_K) quantize_q4_K_host(W.data() + (size_t)i * K, (block_q4_K*)Xq.data() + (size_t)i * bpr, K, rng);
+    else         quantize_q4_0_host(W.data() + (size_t)i * K, (block_q4_0*)Xq.data() + (size_t)i * bpr, K);
+  }
+
+  std::vector<char*> dX(ncopy);
+  for (int c = 0; c < ncopy; c++) {
+    CUDA_CHECK(cudaMalloc(&dX[c], wbytes));
+    CUDA_CHECK(cudaMemcpy(dX[c], Xq.data(), wbytes, cudaMemcpyHostToDevice));
+  }
+
+  const int K_pad = ((K + 511) / 512) * 512;
+  const size_t ny = (size_t)(K_pad / 128) * M + MMQ_X;
+  float* dYf; block_q8_1_mmq* dY; float* dC;
+  CUDA_CHECK(cudaMalloc(&dYf, Y.size() * 4));
+  CUDA_CHECK(cudaMalloc(&dY, ny * sizeof(block_q8_1_mmq)));
+  CUDA_CHECK(cudaMalloc(&dC, (size_t)N * M * 4));
+  CUDA_CHECK(cudaMemcpy(dYf, Y.data(), Y.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dY, 0, ny * sizeof(block_q8_1_mmq)));
+  quantize_q8_1_mmq<<<dim3(M, K_pad / 512), 128>>>(dYf, dY, K, K_pad, M);
+
+  const size_t shmem = (size_t)(MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * sizeof(int);
+  auto kern = is_q4_K ? mul_mat_q<true> : mul_mat_q<false>;
+  CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
+  dim3 grid((N + MMQ_Y - 1) / MMQ_Y, (M + MMQ_X - 1) / MMQ_X);
+
+  const int iters = 50;
+  for (int c = 0; c < ncopy; c++)  // warm the instruction cache, not the data
+    kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), shmem>>>(dX[c], dY, dC, N, K, M, bpr);
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  cudaEvent_t e0, e1;
+  CUDA_CHECK(cudaEventCreate(&e0)); CUDA_CHECK(cudaEventCreate(&e1));
+  CUDA_CHECK(cudaEventRecord(e0));
+  for (int it = 0; it < iters; it++)
+    kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), shmem>>>(dX[it % ncopy], dY, dC, N, K, M, bpr);
+  CUDA_CHECK(cudaEventRecord(e1));
+  CUDA_CHECK(cudaEventSynchronize(e1));
+  float ms; CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+  CUDA_CHECK(cudaGetLastError());
+
+  const double us = ms * 1e3 / iters;
+  const double tops = 2.0 * N * K * M / (us * 1e-6) / 1e12;
+  const double gbs = (double)wbytes / (us * 1e-6) / 1e9;
+
+  printf("  %-4s N=%-6d K=%-6d M=%-5d  %8.1f us  %7.1f TOP/s%s  %7.0f GB/s  (workset %d x %.0f MB)\n",
+         is_q4_K ? "Q4_K" : "Q4_0", N, K, M, us, tops,
+         peak_top > 0 ? "" : "", gbs, ncopy, wbytes / 1048576.0);
+  if (peak_top > 0) printf("        -> %.1f%% of the %.0f TOP/s int8 mma peak\n", 100.0 * tops / peak_top, peak_top);
+
+  for (int c = 0; c < ncopy; c++) cudaFree(dX[c]);
+  cudaFree(dYf); cudaFree(dY); cudaFree(dC);
+}
+
+int main(int argc, char** argv) {
 #ifdef MMQ_NV
   printf("=== MMQ standalone: NVIDIA mma.m16n8k32.s32.s8.s8.s32, MMQ_X=%d ===\n", MMQ_X);
 #else
   printf("=== MMQ standalone: PPU ppu.mma.m16n16k32.s32.s8.s8.s32, MMQ_X=%d ===\n", MMQ_X);
 #endif
+
+  if (argc > 1 && strcmp(argv[1], "bench") == 0) {
+    // MMQ_PEAK_TOPS: the int8 mma ceiling from mma_peak, so the %util line means something.
+    const double peak = getenv("MMQ_PEAK_TOPS") ? atof(getenv("MMQ_PEAK_TOPS")) : 0.0;
+    if (peak <= 0) printf("    (set MMQ_PEAK_TOPS=<int8 TOP/s from ./mma_peak> to get a %% of peak)\n");
+    printf("    COLD weights: rotating a %s MB workset so the LLC cannot serve the reads.\n\n",
+           getenv("MMQ_WORKSET_MB") ? getenv("MMQ_WORKSET_MB") : "512");
+    // llama-ish prefill shapes, same ones the Marlin bench uses so the two are directly comparable.
+    bench(true, 4096,  4096, 2048, peak);
+    bench(true, 14336, 4096, 2048, peak);
+    bench(true, 4096, 14336, 2048, peak);
+    bench(false, 4096, 4096, 2048, peak);
+    return 0;
+  }
+
   bool bad = false;
   bad |= run_case(false, 128,  256,  64);   // one tile, one k-iteration
   bad |= run_case(false, 256,  512, 128);
