@@ -324,7 +324,19 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
 
 #ifdef GEMV_AIU
 // ============================================================================================================
-// PROBE: replace the strided B loads with ONE AIU bulk DMA per (cube_w=64) strip.
+// PROBE -- RESULT: AIU LOSES. MEASURED, CORRECT, AND THE DOOR IS NOW CLOSED FOR GOOD.
+//
+//                          LDG (default)      AIU
+//   N=4096  K=4096         9.38 us / 34.2%   10.23 us / 31.4%   -9.1%
+//   N=14336 K=4096        20.69    / 54.3%   21.79    / 51.5%   -5.3%
+//
+// Both MATCH at rel 5.0e-04, identical to LDG -- so this is a correct kernel losing, not a broken one.
+//
+// WHAT MAKES THIS CONCLUSIVE: it tests exactly the case the bf16 GEMV sweep never did. That sweep ran AIU against a
+// ROW-MAJOR weight, where reads were already contiguous and the AIU had nothing to offer. Ours is ktile-major, so
+// walking K jumps 8N = 32 KB, and the AIU's 2D descriptor gathers those strided rows IN HARDWARE -- one instruction
+// pulls 8 ktiles across the stride. That advantage is real and it still is not enough. The four mechanical reasons
+// below are simply larger than it:
 //
 // Everything we know says this should LOSE, and the bf16 GEMV sweep measured it losing (v2 swzl, v2b double-buffered,
 // v7 bulk-linear -- all beaten by the dumbest register-LDG kernel; AIU ran 38% of HBM vs 70-76%). The reasons:
