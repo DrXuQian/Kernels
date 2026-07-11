@@ -35,7 +35,25 @@
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_) { printf("CUDA %s @%d\n", cudaGetErrorString(e_), __LINE__); exit(1);} } while(0)
 
 static const int N_PER_BLOCK = 64;   // one int4 spans exactly this many columns
-static const int GEMV_THREADS = 128; // 4 warps; each warp takes a different ktile
+
+// Warps per block. THIS IS THE BANDWIDTH KNOB, and it is the only one that raises per-thread work WITHOUT cutting the
+// block count. Loads per thread = K / (16 * SPLIT_K * warps), and the measured cold-weight utilisation tracks it:
+//
+//   shape              sk  blocks  loads/thread   %HBM
+//   N=4096  K=4096     16    1024        4        30.6
+//   N=4096  K=14336    16    1024       14        51.6
+//   N=14336 K=4096      4     896       16        51.1
+//
+// Four loads per thread is nearly all fixed cost -- block launch, 8 shfls, the shared reduce, the partial write. But
+// lowering SPLIT_K to get more loads per thread just trades away blocks and cancels out (cold, N=4096 K=4096:
+// sk=16 -> 4 loads / 1024 blocks / 9.28 us, sk=4 -> 16 loads / 256 blocks / 9.44 us). Fewer WARPS per block gives both:
+// at GEMV_THREADS=32, N=4096 K=4096 gets 16 loads/thread AND keeps 1024 blocks.
+//
+// The cost is warp count: 1024 blocks x (T/32) warps / 72 CU = 14.2 warps/CU at T=32 vs 56.9 at T=128. Whether that
+// starves latency-hiding is exactly what the sweep answers.
+#ifndef GEMV_THREADS
+#define GEMV_THREADS 128
+#endif
 
 // How many independent int4 loads a thread issues before consuming any.
 //
@@ -207,21 +225,27 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     }
     __syncthreads();
 
-    // 64 columns, 128 threads -> first 64 threads each reduce one column across the 4 warps.
-    float mine = 0.f;
-    const int n = nb_group * N_PER_BLOCK + threadIdx.x;
-    if (threadIdx.x < N_PER_BLOCK) {
-        #pragma unroll
-        for (int w = 0; w < GEMV_THREADS / 32; w++) mine += sm[w][threadIdx.x];
-    }
+    // Reduce the 64 columns across the warps. GEMV_THREADS may be fewer than 64, so each thread may own >1 column.
+    #define GEMV_COL_LOOP(body) \
+        for (int c = threadIdx.x; c < N_PER_BLOCK; c += GEMV_THREADS) { body }
 
     if (SPLIT_K == 1) {                                // nothing to reduce across
-        if (threadIdx.x < N_PER_BLOCK) C[n] = __float2half(mine);   // scales already applied per group
+        GEMV_COL_LOOP({
+            float v = 0.f;
+            #pragma unroll
+            for (int w = 0; w < GEMV_THREADS / 32; w++) v += sm[w][c];
+            C[nb_group * N_PER_BLOCK + c] = __float2half(v);   // scales already applied per group
+        })
         return;
     }
 
 #ifndef GEMV_FUSED_REDUCE
-    if (threadIdx.x < N_PER_BLOCK) partial[(long long) slice * N + n] = mine;
+    GEMV_COL_LOOP({
+        float v = 0.f;
+        #pragma unroll
+        for (int w = 0; w < GEMV_THREADS / 32; w++) v += sm[w][c];
+        partial[(long long) slice * N + nb_group * N_PER_BLOCK + c] = v;
+    })
 #else
     // Last-CTA reduce: the final slice to finish this nb_group folds the partials in place, so the second kernel (and
     // its ~2.1 us launch, 30% of a 7 us GEMV) disappears. Ordering is the whole game here, and follows CUDA's
@@ -231,7 +255,12 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     //
     // `partial` is read through volatile so the winner cannot serve the other slices' values out of its own L1, which
     // is not coherent across CTAs.
-    if (threadIdx.x < N_PER_BLOCK) partial[(long long) slice * N + n] = mine;
+    GEMV_COL_LOOP({
+        float v = 0.f;
+        #pragma unroll
+        for (int w = 0; w < GEMV_THREADS / 32; w++) v += sm[w][c];
+        partial[(long long) slice * N + nb_group * N_PER_BLOCK + c] = v;
+    })
     __syncthreads();
 
     __shared__ bool s_last;
@@ -242,14 +271,15 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     __syncthreads();
     if (!s_last) return;
 
-    if (threadIdx.x < N_PER_BLOCK) {
-        volatile const float* p = partial + n;
+    GEMV_COL_LOOP({
+        volatile const float* p = partial + nb_group * N_PER_BLOCK + c;
         float v = 0.f;
         for (int i = 0; i < SPLIT_K; i++) v += p[(long long) i * N];
-        C[n] = __float2half(v);   // scales already applied per group in the mainloop
-    }
+        C[nb_group * N_PER_BLOCK + c] = __float2half(v);   // scales already applied per group
+    })
     if (threadIdx.x == 0) counter[nb_group] = 0;       // rearm for the next launch; the stream orders it
 #endif
+    #undef GEMV_COL_LOOP
 }
 
 // out[n] = half(sum_slice partial[slice][n]). The scales are applied per group inside the mainloop, so they must NOT
