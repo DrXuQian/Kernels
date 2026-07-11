@@ -57,19 +57,29 @@ static const int N_PER_BLOCK = 64;   // one int4 spans exactly this many columns
 #define GEMV_THREADS 64
 #endif
 
-// How many independent int4 loads a thread issues before consuming any.
+// How many ktiles' worth of loads (B int4 + both A half2) a thread issues before consuming any.
 //
-// MEASURED on the box, and it barely matters -- 2 is a small win, 4 and 8 are losses:
-//   N=4096  sk=8   U=1 7.20   U=2 6.94   U=4 7.59   U=8 8.85 us
-//   N=14336 sk=4   U=1 11.90  U=2 11.72  U=4 12.93  U=8 14.95 us
+// This only became meaningful once the A loads were hoisted alongside B (see the Memory Dependency note in the group
+// loop). Before that, U hoisted 8 of the 40 loads per warp and the other 32 were fetched-and-used one instruction
+// later, which is why raising U used to make things WORSE.
 //
-// So Memory Dependency (5.333, the top stall) is NOT a shortage of in-flight loads. The likely cause is the stride:
-// B is ktile-major (Marlin packed it for the mma), so walking K jumps a whole N-row each step. A thread's consecutive
-// ktiles are step*8N bytes apart -- 128 KB at N=4096, 448 KB at N=14336 -- and U concurrent loads scatter across
-// U times that, thrashing TLB and LLC. That predicts exactly what we see: U hurts, and it hurts more as N grows.
-// This is the price of sharing one packed weight tensor with prefill.
+// MEASURED cold, gs=128, T=64 (hoisted):
+//                    N=4096 K=4096      N=14336 K=4096
+//   U=1                 10.33 us            26.02 us
+//   U=2                  9.51               21.36
+//   U=4                  9.42               20.68     <- default
+//   U=8                 10.18               24.94
+//
+// SHAPE-DEPENDENT, and worth being honest about: on N=14336 the hoist + U=4 is a real 4.3% (21.58 -> 20.68), but on
+// N=4096 it is a ~2% REGRESSION against the old no-hoist U=2 (9.14 -> 9.42). That shape gives each warp only 8 ktiles,
+// so U=4 is two iterations and the extra registers and setup never amortize; N=14336 gives 32 and they do.
+//
+// So the "80% of loads have zero load-to-use distance" diagnosis was accurate as a DESCRIPTION and not load-bearing as
+// a CAUSE. Memory Dependency (2.630, dominant) is mostly the 8 cold B loads from DRAM; A and the scales hit L1/L2 and
+// are cheap. Hoisting them only buys room for a deeper B pipeline, which needs a long loop to pay off.
+// -DGEMV_NO_HOIST restores the old placement.
 #ifndef GEMV_UNROLL
-#define GEMV_UNROLL 2
+#define GEMV_UNROLL 4
 #endif
 
 // Marlin's dequant, verbatim. 4 instructions (2 lop3 + hsub2 + hfma2) yield 4 halves; the naive
