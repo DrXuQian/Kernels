@@ -1,0 +1,636 @@
+/*
+ * Standalone llama.cpp MMQ (quantized matmul) -- Q4_0 and Q4_K -- extracted from
+ * ggml/src/ggml-cuda/{mmq.cuh, quantize.cu, mma.cuh} and rebuilt with no ggml dependency.
+ *
+ * WHAT MMQ IS, AND WHY IT IS NOT MARLIN.  Marlin dequantizes INT4 weights to FP16 and runs a FP16
+ * tensor core. MMQ instead dequantizes the INT4 weights to INT8, quantizes the ACTIVATIONS to INT8
+ * (Q8_1: an int8 quant + a per-32-value scale d + a per-32-value sum s), and runs the entire K-loop
+ * on an INTEGER tensor core, rescaling the int32 accumulator once per 32-value block. On NVIDIA the
+ * payoff is that int8 tensor cores run at 2x the fp16 rate. Whether that holds on the PPU is exactly
+ * what mma_int8_smoke.cu is for -- if the PPU has no int8 MMA, this file has no reason to exist and
+ * the right move is to dequantize GGUF's Q4_K to fp16 and reuse the proven ppu.mma.m16n16k16.
+ *
+ * Build:
+ *   NVIDIA reference (H800):   nvcc -O3 -std=c++17 -arch=sm_90 -DMMQ_NV  -o mmq mmq_ppu.cu
+ *   PPU (box, ppu001, NO -arch): nvcc -O3 -std=c++17 -DMMQ_PPU -o mmq mmq_ppu.cu
+ * Run:  ./mmq            (self-check, both quant types)
+ *       MMQ_BENCH=1 ./mmq
+ *
+ * SELF-CHECK DISCIPLINE (learned the hard way on the Marlin port, where every test set scale = 1.0
+ * and so hid TWO separate scale bugs for days): the reference here uses NON-TRIVIAL, PER-BLOCK,
+ * VARYING d / dmin / sub-block scales and mins. A test with flat scales would pass on a kernel that
+ * ignores them entirely.
+ *
+ * Two references are computed, and they answer different questions:
+ *   ref_exact  -- the kernel's OWN formula (from the quantized X and the quantized Y), in double.
+ *                 The kernel must match this to ~1e-5. This isolates KERNEL bugs.
+ *   ref_true   -- the honest fp32 A*B. The gap to ref_exact is the QUANTIZATION error (~1e-2 for
+ *                 4-bit) and is not a bug. Reporting only this number would let a real kernel bug
+ *                 hide inside the quantization noise.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <vector>
+#include <random>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#define CUDA_CHECK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
+  printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); exit(1); } } while (0)
+
+#if !defined(MMQ_NV) && !defined(MMQ_PPU)
+#define MMQ_NV
+#endif
+
+// ============================================================================================
+// Block formats (verbatim from ggml-common.h)
+// ============================================================================================
+#define QK4_0 32
+#define QI4_0 4          // 32-bit words of quants per q4_0 block (16 bytes / 4)
+struct block_q4_0 { half d; uint8_t qs[QK4_0 / 2]; };
+static_assert(sizeof(block_q4_0) == 18, "q4_0");
+
+#define QK_K 256
+struct block_q4_K { half d; half dmin; uint8_t scales[12]; uint8_t qs[QK_K / 2]; };
+static_assert(sizeof(block_q4_K) == 144, "q4_K");
+
+#define QK8_1 32
+#define QI8_1 8
+// 128 activation values of ONE column, with the four 32-value (d, s) pairs hoisted to the front.
+// 144 B == 36 ints == MMQ_TILE_Y_K, so the shared tile is a bit-identical copy of global memory.
+struct block_q8_1_mmq { half2 ds4[4]; int8_t qs[4 * QK8_1]; };
+static_assert(sizeof(block_q8_1_mmq) == 144, "q8_1_mmq");
+
+#define MMQ_TILE_Y_K      36   // ints per column per 128-k slab
+#define MMQ_TILE_X_K      76   // ints per weight row per 256-k tile: 64 quants + 8 scales + 4 pad
+#define MMQ_TILE_NE_K     32   // ints of quants per half-tile (128 k)
+#define MMQ_ITER_K       256   // k advanced per mainloop iteration
+
+// The +4 padding is what keeps the ldmatrix accesses bank-conflict-free; it is not slack.
+static_assert(MMQ_TILE_X_K % 8 == 4, "tile-x stride must be 4 mod 8 for conflict-free ldmatrix");
+
+// ============================================================================================
+// Backend: fragment layouts and the MMA.
+//
+// NVIDIA  mma.m16n8k32.row.col.s32.s8.s8.s32   -- C is 16x8, 4 s32 regs
+// PPU     ppu.mma.m16n16k32.row.col.s32.s8.s8.s32 -- C is 16x16, 8 s32 regs (two n8 fused)
+//
+// A (both): filled by ldmatrix.x4.b16, which hands back the four 8x8 b16 tiles in the order its 32
+// lane addresses named them: v0=(rows 0-7, k lo) v1=(rows 8-15, k lo) v2=(rows 0-7, k hi)
+// v3=(rows 8-15, k hi), i.e. row bit = l%2, k bit = l/2. NVIDIA's mma consumes that order directly.
+// The PPU's mma wants row bit = l/2, k bit = l%2 -- so v1 and v2 swap, which is FREE (bind the asm's
+// 2nd and 3rd outputs to a[2] and a[1]). Same trick as marlin_classic_ppu.cuh's ppu_ldmatrix_x4.
+// ============================================================================================
+#ifdef MMQ_NV
+#define MMQ_TILE_N   8    // columns of Y per C tile
+#define MMQ_C_NE     4    // s32 accumulator regs
+#define MMQ_B_NE     2    // B operand regs
+#define MMQ_NA       2    // distinct weight rows a lane touches -> index with (l / 2)
+#define MMQ_NB       2    // distinct Y columns a lane touches  -> index with (l % 2)
+#define ACC_A_IDX(l) ((l) / 2)
+#define ACC_B_IDX(l) ((l) % 2)
+__device__ __forceinline__ int acc_i(int t, int l) { return 8 * (l / 2) + t / 4; }
+__device__ __forceinline__ int acc_j(int t, int l) { return 2 * (t % 4) + (l % 2); }
+// B: lane t serves column t/4; its two regs hold k-words (t%4) and (t%4)+4.
+__device__ __forceinline__ int b_n(int t, int l) { return t / 4; }
+__device__ __forceinline__ int b_k(int t, int l) { return 4 * l + (t % 4); }
+#else
+#define MMQ_TILE_N  16
+#define MMQ_C_NE     8
+#define MMQ_B_NE     4
+#define MMQ_NA       2    // -> index with (l >> 2)
+#define MMQ_NB       4    // -> index with (l % 4)
+#define ACC_A_IDX(l) ((l) >> 2)
+#define ACC_B_IDX(l) ((l) % 4)
+__device__ __forceinline__ int acc_i(int t, int l) { return t / 4 + (((l >> 2) & 1) << 3); }
+__device__ __forceinline__ int acc_j(int t, int l) { return t % 4 + ((l % 4) << 2); }
+// B (16 cols): same fragment formula as the PPU A operand -- row.col makes A and B symmetric.
+__device__ __forceinline__ int b_n(int t, int l) { return t / 4 + 8 * (l / 2); }
+__device__ __forceinline__ int b_k(int t, int l) { return (t % 4) + 4 * (l % 2); }
+#endif
+
+__device__ __forceinline__ void mmq_ldmatrix_A(uint32_t* a, const int* smem) {
+#ifdef MMQ_NV
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+               : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "l"(smem));
+#else
+  // v1 <-> v2: ldmatrix's natural order is NVIDIA's; the PPU mma wants the row bit in l/2.
+  asm volatile("ppu.ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+               : "=r"(a[0]), "=r"(a[2]), "=r"(a[1]), "=r"(a[3]) : "l"(smem));
+#endif
+}
+
+__device__ __forceinline__ void mmq_mma(int* c, const uint32_t* a, const uint32_t* b) {
+#ifdef MMQ_NV
+  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+  asm("ppu.mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9,%10,%11}, {%12,%13,%14,%15}, {%0,%1,%2,%3,%4,%5,%6,%7};"
+      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]), "+r"(c[4]), "+r"(c[5]), "+r"(c[6]), "+r"(c[7])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]));
+#endif
+}
+
+// ============================================================================================
+// Tiling. mmq_y = 128 weight rows per block, 8 warps of 32 -> each warp owns 16 rows (one C tile
+// in the m direction), and walks all MMQ_X columns. This is llama.cpp's ntx == 1 case; it keeps the
+// port honest before any of ntx==2 / stream-k / cp.async gets layered on.
+// ============================================================================================
+#ifndef MMQ_X
+#define MMQ_X 64
+#endif
+#define MMQ_Y      128
+#define MMQ_NWARPS   8
+#define MMQ_WARP    32
+static_assert(MMQ_NWARPS * 16 == MMQ_Y, "one 16-row C tile per warp must cover mmq_y");
+static_assert(MMQ_X % MMQ_TILE_N == 0, "MMQ_X must be a whole number of C tiles");
+#define MMQ_SUM_NE (MMQ_X / MMQ_TILE_N * MMQ_C_NE)   // == MMQ_X/2 for both backends
+
+// ============================================================================================
+// Y quantization (quantize_mmq_q8_1). One thread per 4 floats.
+//
+// NOTE on `s`: it is the sum of the RAW fp32 activations over the 32-value group, NOT d*sum(q).
+// Q4_K's affine correction term is -dmin*m_b * s, so s must be the un-quantized sum or the min
+// correction is biased. Recomputing s as d*sum(q) "looks equivalent" and is not.
+//
+// NOTE on amax == 0: upstream's quantize_mmq_q8_1 does NOT guard this (its non-MMQ sibling does),
+// so d_inv = 127/0 = inf and roundf(0*inf) = NaN. In the zero-padded tail of a row that is exactly
+// the case. Guarded here.
+// ============================================================================================
+__global__ void quantize_q8_1_mmq(const float* __restrict__ x, block_q8_1_mmq* __restrict__ y,
+                                  const int K, const int K_padded, const int M) {
+  const int64_t i0 = ((int64_t)blockDim.x * blockIdx.y + threadIdx.x) * 4;  // k offset, 4 per thread
+  if (i0 >= K_padded) return;
+  const int j = blockIdx.x;  // column of Y
+
+  float4 xi = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (i0 + 3 < K) xi = *(const float4*)(x + (int64_t)j * K + i0);
+
+  float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+  float sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+  for (int off = 4; off > 0; off >>= 1) {  // 32 vals / 4 per thread = 8 lanes
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off, 32));
+    sum += __shfl_xor_sync(0xFFFFFFFF, sum, off, 32);
+  }
+
+  const float d = amax / 127.0f;
+  const float d_inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+  char4 q;
+  q.x = (int8_t)roundf(xi.x * d_inv);
+  q.y = (int8_t)roundf(xi.y * d_inv);
+  q.z = (int8_t)roundf(xi.z * d_inv);
+  q.w = (int8_t)roundf(xi.w * d_inv);
+
+  const int64_t ib = (i0 / (4 * QK8_1)) * M + j;  // k-slab major, column minor
+  const int iqs = i0 % (4 * QK8_1);
+  ((char4*)y[ib].qs)[iqs / 4] = q;
+  if (iqs % 32 == 0) y[ib].ds4[iqs / 32] = make_half2(d, sum);
+}
+
+// ============================================================================================
+// Weight tile loads.  Both normalize a 256-k slice of 128 weight rows into the SAME shared layout:
+//    ints [i*76 +  0 .. +63]  quants, 64 ints = 256 int8, grouped so that ints [8b, 8b+8) are the
+//                             32 values of 32-value block b -- which is what the dot product's
+//                             k0/QI8_1 indexing assumes.
+//    ints [i*76 + 64 .. +71]  8 scales: float d (Q4_0) or half2(d*sc_b, -dmin*m_b) (Q4_K)
+//    ints [i*76 + 72 .. +75]  padding
+// After this the dot product is IDENTICAL for the two types except for the scale arithmetic. That
+// normalization is the whole trick of MMQ and it is why upstream has no vec_dot_q4_0/q4_K at all.
+// ============================================================================================
+
+// sizeof(block_q4_0) == 18, so in an array of them qs lands at byte 18*b + 2 -- only 2-byte aligned.
+// A plain 32-bit load there is a misaligned access (it faults). ggml calls this get_int_b2.
+// block_q4_K is 144 B with qs at offset 16, so it can be read with a plain int load (get_int_b4).
+__device__ __forceinline__ int get_int_b2(const void* p, const int i32) {
+  const uint16_t* h = (const uint16_t*)p;
+  return (int)h[2 * i32 + 0] | ((int)h[2 * i32 + 1] << 16);
+}
+
+// Q4_0: quants are shifted to SIGNED [-8,7] here, so the dot product needs no correction term.
+__device__ __forceinline__ void load_tiles_q4_0(const char* __restrict__ x, int* __restrict__ tile,
+                                                const int kb0, const int i_max, const int stride) {
+  int* x_qs = tile;
+  float* x_df = (float*)(x_qs + 2 * MMQ_TILE_NE_K);
+  const int t = threadIdx.x;
+
+  const int kbx = t / QI4_0;   // 0..7  which q4_0 block inside the 256-k tile
+  const int kqsx = t % QI4_0;  // 0..3  which int inside that block's 16 qs bytes
+#pragma unroll
+  for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS) {
+    const int i = min(i0 + (int)threadIdx.y, i_max);
+    const block_q4_0* b = (const block_q4_0*)x + kb0 + i * stride + kbx;
+    const int qs0 = get_int_b2(b->qs, kqsx);
+    x_qs[i * MMQ_TILE_X_K + kbx * (2 * QI4_0) + kqsx + 0]     = __vsubss4((qs0 >> 0) & 0x0F0F0F0F, 0x08080808);
+    x_qs[i * MMQ_TILE_X_K + kbx * (2 * QI4_0) + kqsx + QI4_0] = __vsubss4((qs0 >> 4) & 0x0F0F0F0F, 0x08080808);
+  }
+
+  const int kbxd = t % 8;
+#pragma unroll
+  for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS * 4) {
+    const int i = min(i0 + (int)threadIdx.y * 4 + t / 8, i_max);
+    const block_q4_0* b = (const block_q4_0*)x + kb0 + i * stride + kbxd;
+    x_df[i * MMQ_TILE_X_K + kbxd] = __half2float(b->d);
+  }
+}
+
+// The 12 packed bytes of a Q4_K super-block hold 8 six-bit scales and 8 six-bit mins.
+// ksc: 0 -> sc0..sc3, 1 -> sc4..sc7, 2 -> m0..m3, 3 -> m4..m7. Returns 4 six-bit values, one per byte.
+__device__ __forceinline__ int unpack_scales_q4_K(const int* scales, const int ksc) {
+  return ((scales[(ksc % 2) + (ksc != 0)] >> (4 * (ksc & (ksc / 2)))) & 0x0F0F0F0F) |  // low 4 bits
+         ((scales[ksc / 2] >> (2 * (ksc % 2))) & 0x30303030);                          // high 2 bits
+}
+
+// Q4_K: quants stay UNSIGNED [0,15]. The affine "-min" term never touches the tensor core -- it is a
+// rank-1 correction -dmin*m_b * s_y[j][b] applied straight to the fp accumulator.
+__device__ __forceinline__ void load_tiles_q4_K(const char* __restrict__ x, int* __restrict__ tile,
+                                                const int kb0, const int i_max, const int stride) {
+  int* x_qs = tile;
+  half2* x_dm = (half2*)(x_qs + 2 * MMQ_TILE_NE_K);
+  const int t = threadIdx.x;
+
+#pragma unroll
+  for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS) {
+    const int i = min(i0 + (int)threadIdx.y, i_max);
+    const block_q4_K* b = (const block_q4_K*)x + kb0 + i * stride;
+    const int qs0 = *(const int*)(b->qs + 4 * t);
+    // src int t -> dst 16*(t/8) + t%8 (low nibbles) and +8 (high nibbles), which lands sub-block b
+    // exactly on dst ints [8b, 8b+8).
+    x_qs[i * MMQ_TILE_X_K + 16 * (t / 8) + t % 8 + 0] = (qs0 >> 0) & 0x0F0F0F0F;
+    x_qs[i * MMQ_TILE_X_K + 16 * (t / 8) + t % 8 + 8] = (qs0 >> 4) & 0x0F0F0F0F;
+  }
+
+  // 2 threads cooperate per row, 16 rows per warp.
+#pragma unroll
+  for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS * 16) {
+    const int i = min(i0 + (int)threadIdx.y * 16 + t / 2, i_max);
+    const block_q4_K* b = (const block_q4_K*)x + kb0 + i * stride;
+    const int* scales = (const int*)b->scales;
+    const int ksc = t % 2;
+
+    const int sc32 = unpack_scales_q4_K(scales, ksc + 0);
+    const int m32  = unpack_scales_q4_K(scales, ksc + 2);
+    const uint8_t* sc8 = (const uint8_t*)&sc32;
+    const uint8_t* m8  = (const uint8_t*)&m32;
+
+    const half2 dm = __hmul2(make_half2(b->d, b->dmin), make_half2(1.0f, -1.0f));  // (d, -dmin)
+#pragma unroll
+    for (int l = 0; l < 4; l++)
+      x_dm[i * MMQ_TILE_X_K + 4 * ksc + l] = __hmul2(dm, make_half2((float)sc8[l], (float)m8[l]));
+  }
+}
+
+// ============================================================================================
+// The dot product. One warp owns rows [i0, i0+16) and walks all MMQ_X columns.
+// k00 selects the first or second 128-k half of the 256-k tile (in ints: 0 or 32).
+//
+// The int32 accumulator is REZEROED every 32 k-values and folded into the fp sum, because the scale
+// changes every 32 values. That is not a missed optimization -- it is the arithmetic.
+// ============================================================================================
+template <bool IS_Q4_K>
+__device__ __forceinline__ void vec_dot(const int* __restrict__ tile_x, const int* __restrict__ tile_y,
+                                        float* __restrict__ sum, const int k00) {
+  const int t = threadIdx.x;
+  const int i0 = threadIdx.y * 16;
+
+  const int* x_qs = tile_x;
+  const float* x_df = (const float*)(x_qs + 2 * MMQ_TILE_NE_K);
+  const half2* x_dm = (const half2*)(x_qs + 2 * MMQ_TILE_NE_K);
+  const int* y_qs = tile_y + 4;      // the 4 leading ints are the ds4 scales
+  const half2* y_ds = (const half2*)tile_y;
+
+  uint32_t A[MMQ_TILE_NE_K / QI8_1][4];
+  float dA[MMQ_TILE_NE_K / QI8_1][MMQ_NA];    // Q4_0: d ; Q4_K: d*sc
+  float mA[MMQ_TILE_NE_K / QI8_1][MMQ_NA];    // Q4_K: -dmin*m
+#pragma unroll
+  for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+    const int k0 = k00 + k01;
+    mmq_ldmatrix_A(A[k01 / QI8_1],
+                   x_qs + (i0 + t % 16) * MMQ_TILE_X_K + k0 + (t / 16) * 4);
+#pragma unroll
+    for (int a = 0; a < MMQ_NA; a++) {
+      const int i = i0 + (t / 4) + 8 * a;      // the two weight rows this lane accumulates
+      if (IS_Q4_K) {
+        const float2 dm = __half22float2(x_dm[i * MMQ_TILE_X_K + k0 / QI8_1]);
+        dA[k01 / QI8_1][a] = dm.x;
+        mA[k01 / QI8_1][a] = dm.y;
+      } else {
+        dA[k01 / QI8_1][a] = x_df[i * MMQ_TILE_X_K + k0 / QI8_1];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_TILE_N) {
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+      uint32_t B[MMQ_B_NE];
+#pragma unroll
+      for (int l = 0; l < MMQ_B_NE; l++)
+        B[l] = y_qs[(j0 + b_n(t, l)) * MMQ_TILE_Y_K + k01 + b_k(t, l)];
+
+      float dB[MMQ_NB], sB[MMQ_NB];
+#pragma unroll
+      for (int l = 0; l < MMQ_NB; l++) {
+        const int j = j0 + acc_j(t, l);        // acc_j(t, l) for l < MMQ_NB enumerates this lane's columns
+        const float2 ds = __half22float2(y_ds[j * MMQ_TILE_Y_K + k01 / QI8_1]);
+        dB[l] = ds.x;
+        sB[l] = ds.y;
+      }
+
+      int C[MMQ_C_NE] = {0};
+      mmq_mma(C, A[k01 / QI8_1], B);
+
+#pragma unroll
+      for (int l = 0; l < MMQ_C_NE; l++) {
+        const int a = ACC_A_IDX(l), b = ACC_B_IDX(l);
+        float* s = &sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+        *s += dA[k01 / QI8_1][a] * dB[b] * (float)C[l];
+        if (IS_Q4_K) *s += mA[k01 / QI8_1][a] * sB[b];  // rank-1 min correction, no tensor core
+      }
+    }
+  }
+}
+
+// ============================================================================================
+// Mainloop. Plain 2D tiling, single-buffered, no cp.async -- deliberately. Get the arithmetic and
+// the layouts right first; the pipeline is a perf question and it comes after the PPU tells us
+// whether the int8 tensor core is even there.
+// ============================================================================================
+template <bool IS_Q4_K>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS) void mul_mat_q(
+    const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
+    const int N, const int K, const int M, const int stride_row_x) {
+  extern __shared__ int smem[];
+  int* tile_y = smem;
+  int* tile_x = tile_y + MMQ_X * MMQ_TILE_Y_K;
+
+  const int qk = IS_Q4_K ? QK_K : QK4_0;
+  const int blocks_per_iter = MMQ_ITER_K / qk;   // Q4_0: 8, Q4_K: 1
+
+  const int i_tile = blockIdx.x;   // 128 weight rows
+  const int j_tile = blockIdx.y;   // MMQ_X columns
+  const int i_max = N - i_tile * MMQ_Y - 1;
+
+  float sum[MMQ_SUM_NE] = {0.0f};
+
+  const char* xb = x + (size_t)i_tile * MMQ_Y * stride_row_x * (IS_Q4_K ? sizeof(block_q4_K) : sizeof(block_q4_0));
+  const int* yb = (const int*)(y + (size_t)j_tile * MMQ_X);
+
+  for (int kb0 = 0; kb0 < K / qk; kb0 += blocks_per_iter) {
+    if (IS_Q4_K) load_tiles_q4_K(xb, tile_x, kb0, i_max, stride_row_x);
+    else         load_tiles_q4_0(xb, tile_x, kb0, i_max, stride_row_x);
+
+    const int kslab = kb0 * qk / 128;   // which 128-k slab of Y
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+      const int* y0 = yb + (size_t)(kslab + half) * M * MMQ_TILE_Y_K;
+      for (int l = threadIdx.y * MMQ_WARP + threadIdx.x; l < MMQ_X * MMQ_TILE_Y_K;
+           l += MMQ_NWARPS * MMQ_WARP)
+        tile_y[l] = y0[l];
+      __syncthreads();
+      vec_dot<IS_Q4_K>(tile_x, tile_y, sum, half * MMQ_TILE_NE_K);
+      __syncthreads();
+    }
+  }
+
+  // Write back. dst is column-major (ggml's convention): dst[j*N + i].
+  const int t = threadIdx.x;
+  const int i0 = threadIdx.y * 16;
+#pragma unroll
+  for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_TILE_N)
+#pragma unroll
+    for (int l = 0; l < MMQ_C_NE; l++) {
+      const int j = j_tile * MMQ_X + j0 + acc_j(t, l);
+      const int i = i_tile * MMQ_Y + i0 + acc_i(t, l);
+      if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+    }
+}
+
+// ============================================================================================
+// Host: quantizers + the two references.
+// ============================================================================================
+static void quantize_q4_0_host(const float* w, block_q4_0* out, int n) {
+  for (int b = 0; b < n / QK4_0; b++) {
+    const float* s = w + b * QK4_0;
+    float amax = 0, vmax = 0;
+    for (int i = 0; i < QK4_0; i++)
+      if (fabsf(s[i]) > amax) { amax = fabsf(s[i]); vmax = s[i]; }
+    const float d = vmax / -8.0f;
+    const float id = d ? 1.0f / d : 0.0f;
+    out[b].d = __float2half(d);
+    for (int i = 0; i < QK4_0 / 2; i++) {
+      const int x0 = fminf(15, (int)(s[i] * id + 8.5f));
+      const int x1 = fminf(15, (int)(s[i + 16] * id + 8.5f));
+      out[b].qs[i] = (uint8_t)(x0 | (x1 << 4));
+    }
+  }
+}
+
+// Q4_K packing. We do NOT need llama.cpp's exact k-means quantizer -- we need a VALID Q4_K block
+// with NON-TRIVIAL, VARYING d / dmin / sc_b / m_b, because the kernel's job is to reproduce the
+// dequantization, not to be a good quantizer. Flat scales would pass a kernel that ignores them.
+static void quantize_q4_K_host(const float* w, block_q4_K* out, int n, std::mt19937& rng) {
+  std::uniform_int_distribution<int> d6(1, 63);
+  for (int b = 0; b < n / QK_K; b++) {
+    const float* s = w + b * QK_K;
+    uint8_t sc[8], mn[8];
+    for (int g = 0; g < 8; g++) { sc[g] = (uint8_t)d6(rng); mn[g] = (uint8_t)d6(rng); }
+
+    float gmax = 0;
+    for (int i = 0; i < QK_K; i++) gmax = fmaxf(gmax, fabsf(s[i]));
+    const float d = gmax / (63.0f * 15.0f) + 1e-6f;   // so that d*sc*q spans the data
+    const float dmin = d * 0.5f;
+    out[b].d = __float2half(d);
+    out[b].dmin = __float2half(dmin);
+
+    // pack the 8 six-bit scales and 8 six-bit mins into 12 bytes (llama.cpp's layout)
+    uint8_t* q = out[b].scales;
+    memset(q, 0, 12);
+    for (int g = 0; g < 4; g++) { q[g] = sc[g] & 63; q[g + 4] = mn[g] & 63; }
+    for (int g = 4; g < 8; g++) {
+      q[g + 4] = (uint8_t)((sc[g] & 0xF) | ((mn[g] & 0xF) << 4));
+      q[g - 4] |= (uint8_t)((sc[g] >> 4) << 6);
+      q[g - 0] |= (uint8_t)((mn[g] >> 4) << 6);
+    }
+
+    // quantize: w ~= d*sc_g*q - dmin*m_g
+    for (int g = 0; g < 8; g++) {
+      const float ds = d * sc[g], dm = dmin * mn[g];
+      for (int i = 0; i < 32; i++) {
+        const int k = g * 32 + i;
+        int qv = (int)lroundf((s[k] + dm) / (ds > 0 ? ds : 1.0f));
+        qv = qv < 0 ? 0 : (qv > 15 ? 15 : qv);
+        const int byte = (g / 2) * 32 + i;
+        if (g % 2 == 0) out[b].qs[byte] = (uint8_t)qv;
+        else            out[b].qs[byte] |= (uint8_t)(qv << 4);
+      }
+    }
+  }
+}
+
+// Read back the 8 scales/mins exactly the way unpack_scales_q4_K does, to prove host and device agree.
+static void get_scale_min_k4(const uint8_t* q, uint8_t* sc, uint8_t* mn) {
+  for (int g = 0; g < 4; g++) { sc[g] = q[g] & 63; mn[g] = q[g + 4] & 63; }
+  for (int g = 4; g < 8; g++) {
+    sc[g] = (uint8_t)((q[g + 4] & 0xF) | ((q[g - 4] >> 6) << 4));
+    mn[g] = (uint8_t)((q[g + 4] >> 4)  | ((q[g - 0] >> 6) << 4));
+  }
+}
+
+// ref_exact: the kernel's own formula, from the quantized X and quantized Y, in double.
+static void ref_exact(bool is_q4_K, const void* xq, const std::vector<block_q8_1_mmq>& yq,
+                      std::vector<double>& dst, int N, int K, int M) {
+  const int nslab = K / 128;
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < M; j++) {
+      double acc = 0;
+      for (int kb = 0; kb < K / 32; kb++) {          // 32-value blocks
+        const block_q8_1_mmq& yb = yq[(kb / 4) * M + j];
+        const float dy = __half2float(__low2half(yb.ds4[kb % 4]));
+        const float sy = __half2float(__high2half(yb.ds4[kb % 4]));
+        const int8_t* qy = yb.qs + (kb % 4) * 32;
+
+        if (is_q4_K) {
+          const block_q4_K* b = (const block_q4_K*)xq + (size_t)i * (K / QK_K) + kb / 8;
+          uint8_t sc[8], mn[8];
+          get_scale_min_k4(b->scales, sc, mn);
+          const int g = kb % 8;
+          // ggml forms the per-sub-block scales with a HALF2 multiply (load_tiles_q4_K:
+          // x_dm[..] = dm * make_half2(sc8[l], m8[l])), so d*sc and dmin*m are each ROUNDED TO HALF
+          // before they ever reach the accumulator. The reference has to round the same way or it
+          // is not modelling the kernel: computing these in float leaves a ~2.6e-4 residual, which
+          // is half's epsilon, and a tolerance loose enough to swallow that would also swallow a
+          // real bug. (Doing the product in float would be strictly more accurate -- but we want
+          // bit-compatibility with llama.cpp, so this is faithful, not a defect to fix.)
+          const float dx = __half2float(__float2half(__half2float(b->d) * sc[g]));
+          const float mx = -__half2float(__float2half(__half2float(b->dmin) * mn[g]));
+          int isum = 0;
+          for (int t = 0; t < 32; t++) {
+            const int byte = (g / 2) * 32 + t;
+            const int qv = (g % 2 == 0) ? (b->qs[byte] & 0xF) : (b->qs[byte] >> 4);
+            isum += qv * (int)qy[t];
+          }
+          acc += (double)dx * dy * isum + (double)mx * sy;
+        } else {
+          const block_q4_0* b = (const block_q4_0*)xq + (size_t)i * (K / QK4_0) + kb;
+          const float dx = __half2float(b->d);
+          int isum = 0;
+          for (int t = 0; t < 32; t++) {
+            const int qv = (t < 16) ? (b->qs[t] & 0xF) : (b->qs[t - 16] >> 4);
+            isum += (qv - 8) * (int)qy[t];
+          }
+          acc += (double)dx * dy * isum;
+        }
+      }
+      dst[(size_t)j * N + i] = acc;
+    }
+  }
+  (void)nslab;
+}
+
+// ============================================================================================
+
+static bool run_case(bool is_q4_K, int N, int K, int M) {
+  const char* name = is_q4_K ? "Q4_K" : "Q4_0";
+  const int qk = is_q4_K ? QK_K : QK4_0;
+  const int blocks_per_row = K / qk;
+  const size_t bsz = is_q4_K ? sizeof(block_q4_K) : sizeof(block_q4_0);
+
+  std::mt19937 rng(12345 + N + K * 7 + M * 13);
+  std::normal_distribution<float> nd(0.f, 1.f);
+
+  std::vector<float> W((size_t)N * K), Y((size_t)M * K);
+  for (auto& v : W) v = nd(rng);
+  for (auto& v : Y) v = nd(rng);
+
+  std::vector<char> Xq((size_t)N * blocks_per_row * bsz);
+  for (int i = 0; i < N; i++) {
+    if (is_q4_K) quantize_q4_K_host(W.data() + (size_t)i * K, (block_q4_K*)Xq.data() + (size_t)i * blocks_per_row, K, rng);
+    else         quantize_q4_0_host(W.data() + (size_t)i * K, (block_q4_0*)Xq.data() + (size_t)i * blocks_per_row, K);
+  }
+
+  // Y on device, quantized by the device kernel (so the reference reads back exactly what the GEMM sees).
+  const int K_pad = ((K + 511) / 512) * 512;
+  const size_t ny = (size_t)(K_pad / 128) * M + MMQ_X;   // + slop: the mainloop copies a full MMQ_X tile
+  float* dYf; block_q8_1_mmq* dY; char* dX; float* dC;
+  CUDA_CHECK(cudaMalloc(&dYf, Y.size() * 4));
+  CUDA_CHECK(cudaMalloc(&dY, ny * sizeof(block_q8_1_mmq)));
+  CUDA_CHECK(cudaMalloc(&dX, Xq.size()));
+  CUDA_CHECK(cudaMalloc(&dC, (size_t)N * M * 4));
+  CUDA_CHECK(cudaMemcpy(dYf, Y.data(), Y.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dX, Xq.data(), Xq.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dY, 0, ny * sizeof(block_q8_1_mmq)));
+  CUDA_CHECK(cudaMemset(dC, 0, (size_t)N * M * 4));
+
+  quantize_q8_1_mmq<<<dim3(M, K_pad / 512), 128>>>(dYf, dY, K, K_pad, M);
+  CUDA_CHECK(cudaGetLastError());
+
+  const size_t shmem = (size_t)(MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * sizeof(int);
+  auto kern = is_q4_K ? mul_mat_q<true> : mul_mat_q<false>;
+  CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
+
+  dim3 grid((N + MMQ_Y - 1) / MMQ_Y, (M + MMQ_X - 1) / MMQ_X);
+  kern<<<grid, dim3(MMQ_WARP, MMQ_NWARPS), shmem>>>(dX, dY, dC, N, K, M, blocks_per_row);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<float> C((size_t)N * M);
+  std::vector<block_q8_1_mmq> Yq(ny);
+  CUDA_CHECK(cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(Yq.data(), dY, ny * sizeof(block_q8_1_mmq), cudaMemcpyDeviceToHost));
+  cudaFree(dYf); cudaFree(dY); cudaFree(dX); cudaFree(dC);
+
+  std::vector<double> Rex((size_t)N * M);
+  ref_exact(is_q4_K, Xq.data(), Yq, Rex, N, K, M);
+
+  // vs the kernel's own formula -- any gap here is a KERNEL bug.
+  double maxrel = 0; int bi = -1, bj = -1;
+  double scale = 0;
+  for (size_t i = 0; i < Rex.size(); i++) scale = fmax(scale, fabs(Rex[i]));
+  for (int j = 0; j < M; j++)
+    for (int i = 0; i < N; i++) {
+      const double r = fabs(C[(size_t)j * N + i] - Rex[(size_t)j * N + i]) / (scale + 1e-9);
+      if (r > maxrel) { maxrel = r; bi = i; bj = j; }
+    }
+
+  // vs the honest fp32 GEMM -- this is the QUANTIZATION error, not a bug. Reported so that a real
+  // kernel bug can't hide inside it.
+  double qerr = 0, qden = 0;
+  for (int j = 0; j < M; j += (M > 8 ? M / 8 : 1))
+    for (int i = 0; i < N; i += (N > 8 ? N / 8 : 1)) {
+      double t = 0;
+      for (int k = 0; k < K; k++) t += (double)W[(size_t)i * K + k] * Y[(size_t)j * K + k];
+      qerr += fabs(t - Rex[(size_t)j * N + i]);
+      qden += fabs(t);
+    }
+
+  const bool bad = !(maxrel < 1e-4);
+  printf("  %-4s N=%-6d K=%-6d M=%-4d  vs-kernel-formula rel %.2e %s   (quant err vs fp32: %.1f%%)\n",
+         name, N, K, M, maxrel, bad ? "MISMATCH" : "ok", 100.0 * qerr / (qden + 1e-9));
+  if (bad) printf("        worst at i=%d j=%d: got %.6f want %.6f\n", bi, bj,
+                  C[(size_t)bj * N + bi], Rex[(size_t)bj * N + bi]);
+  return bad;
+}
+
+int main() {
+#ifdef MMQ_NV
+  printf("=== MMQ standalone: NVIDIA mma.m16n8k32.s32.s8.s8.s32, MMQ_X=%d ===\n", MMQ_X);
+#else
+  printf("=== MMQ standalone: PPU ppu.mma.m16n16k32.s32.s8.s8.s32, MMQ_X=%d ===\n", MMQ_X);
+#endif
+  bool bad = false;
+  bad |= run_case(false, 128,  256,  64);   // one tile, one k-iteration
+  bad |= run_case(false, 256,  512, 128);
+  bad |= run_case(false, 512, 4096, 256);
+  bad |= run_case(true,  128,  256,  64);
+  bad |= run_case(true,  256,  512, 128);
+  bad |= run_case(true,  512, 4096, 256);
+  printf("\n%s\n", bad ? ">>> FAIL" : ">>> ALL CASES PASS");
+  return bad ? 1 : 0;
+}

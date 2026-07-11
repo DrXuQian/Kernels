@@ -48,6 +48,12 @@ bench_marlin: bench_marlin.cu marlin_classic_ppu.cuh .flags
 mma_int8_smoke: mma_int8_smoke.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# Standalone llama.cpp MMQ (Q4_0 + Q4_K), self-checking.
+# NVIDIA reference:  make NVCCFLAGS="-O3 -std=c++17 -arch=sm_90 -DMMQ_NV" mmq_ppu
+# PPU (ppu001, NO -arch): make NVCCFLAGS="-O3 -std=c++17 -DMMQ_PPU" mmq_ppu
+mmq_ppu: mmq_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 # ground truth for ppu.ldmatrix.x4 register distribution (which 8x8 matrix lands in which reg).
 dump_ldmatrix: dump_ldmatrix.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
@@ -68,4 +74,4 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f dequant_smoke mma_int8_smoke dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f dequant_smoke mma_int8_smoke mmq_ppu dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
