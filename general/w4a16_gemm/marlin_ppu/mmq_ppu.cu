@@ -362,8 +362,22 @@ __device__ __forceinline__ void vec_dot(const int* __restrict__ tile_x, const in
 // the layouts right first; the pipeline is a perf question and it comes after the PPU tells us
 // whether the int8 tensor core is even there.
 // ============================================================================================
+// MMQ_MIN_BLOCKS: cap registers so this many blocks fit per CU. MEASURED, and it is worth 40% on
+// Q4_K. Left to itself the compiler gives Q4_K 254 registers at MMQ_X=64, which is ONE block (8 of
+// 64 warps) per SM -- there are no spare warps to hide the memory latency behind, and the tensor
+// core idles. Forcing 2 blocks caps it at 128 regs:
+//     MIN_BLOCKS   regs   Q4_K TOP/s   Q4_0 TOP/s
+//         1        254      70.1         72.8
+//         2        128      98.2        111.9     <- peak
+//         3         80      59.1        110.2     (Q4_K now SPILLS; Q4_0 has room to spare)
+// The peak is at 2 for exactly the reason it was on Marlin: it is the largest block count you can
+// buy before the register cap starts spilling. Q4_K spills first because its min-correction path
+// carries a second set of per-row scales (mA) that Q4_0 does not have.
+#ifndef MMQ_MIN_BLOCKS
+#define MMQ_MIN_BLOCKS 2
+#endif
 template <bool IS_Q4_K>
-__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS) void mul_mat_q(
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q(
     const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
     const int N, const int K, const int M, const int stride_row_x) {
   extern __shared__ int smem[];
