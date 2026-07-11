@@ -1,10 +1,22 @@
 // W4A16 GEMV (M=1 decode) reading Marlin's INT4 B format in place.
 //
-// WHY THIS EXISTS. Marlin is a GEMM: its tile is 16x128 and decode uses 1 of those 16 rows. Worse, its (tile, k)
-// decomposition obeys blocks * iters ~= n_tiles * k_tiles, so grid size and pipeline depth trade against each other and
-// decode tops out around 37% of HBM no matter how the knobs are set (measured; see marlin_classic_ppu.cuh). A GEMV has
-// no such conservation law: each block owns a slice of N columns and walks all of K, so `iters` is long (pipeline is
-// fine) and `blocks` is large (warps are plentiful), independently.
+// WHY THIS EXISTS. Marlin is a GEMM: its tile is 16x128 and decode uses 1 of those 16 rows, and it wastes most of a
+// dequant on rows nobody reads. A purpose-built GEMV is 1.0-1.9x faster on cold weights (see README).
+//
+// IT DOES NOT ESCAPE MARLIN'S CONSERVATION LAW. This file used to claim it did. It does not:
+//
+//     loads_per_thread x warps_per_CU  =  (K/16) * (N/64) / CUs      -- independent of SPLIT_K and of GEMV_THREADS
+//
+// (= 228 at N=K=4096 on 72 CUs). SPLIT_K and GEMV_THREADS only slide along that hyperbola, which is exactly why every
+// SPLIT_K sweep looked like it "cancelled out" -- it did. Measured on that curve, cold, gs=128, N=4096 K=4096:
+//
+//     T=32   16 loads/thread, 14.2 warps/CU -> 10.64 us    (too few warps to hide DRAM latency)
+//     T=64    8 loads/thread, 28.4 warps/CU ->  9.13 us    <- the optimum
+//     T=128   4 loads/thread, 56.9 warps/CU -> 10.57 us
+//     T=256   2 loads/thread, 113  warps/CU -> 12.51 us    (fixed cost per block no longer amortized)
+//
+// Getting past the hyperbola means changing the CONSTANT: cut the per-block fixed cost (block launch, the shared
+// reduce, the partial write, and the separate reduce kernel's ~1.1 us launch), or make each DRAM access carry more.
 //
 // B LAYOUT (decoded from Marlin's b_gl_rd + the packq in test_marlin_classic_num.cu). Crucially it is INDEPENDENT of
 // thread_n_blocks -- folding slice_col*b_sh_stride + warp_n*32 into (nblock/4)*32 makes the config drop out -- so
@@ -36,23 +48,13 @@
 
 static const int N_PER_BLOCK = 64;   // one int4 spans exactly this many columns
 
-// Warps per block. THIS IS THE BANDWIDTH KNOB, and it is the only one that raises per-thread work WITHOUT cutting the
-// block count. Loads per thread = K / (16 * SPLIT_K * warps), and the measured cold-weight utilisation tracks it:
+// Warps per block. Together with SPLIT_K this picks the point on the conservation hyperbola (see the file header):
+// more loads per thread costs warps per CU, one for one, and the product is fixed by the problem and the CU count.
 //
-//   shape              sk  blocks  loads/thread   %HBM
-//   N=4096  K=4096     16    1024        4        30.6
-//   N=4096  K=14336    16    1024       14        51.6
-//   N=14336 K=4096      4     896       16        51.1
-//
-// Four loads per thread is nearly all fixed cost -- block launch, 8 shfls, the shared reduce, the partial write. But
-// lowering SPLIT_K to get more loads per thread just trades away blocks and cancels out (cold, N=4096 K=4096:
-// sk=16 -> 4 loads / 1024 blocks / 9.28 us, sk=4 -> 16 loads / 256 blocks / 9.44 us). Fewer WARPS per block gives both:
-// at GEMV_THREADS=32, N=4096 K=4096 gets 16 loads/thread AND keeps 1024 blocks.
-//
-// The cost is warp count: 1024 blocks x (T/32) warps / 72 CU = 14.2 warps/CU at T=32 vs 56.9 at T=128. Whether that
-// starves latency-hiding is exactly what the sweep answers.
+// MEASURED: 64 is the optimum on BOTH shapes (cold, gs=128). N=4096 K=4096: 10.57 -> 9.13 us (+13.6%).
+// N=14336 K=4096: 21.62 -> 21.58 us (flat). Both extremes lose -- see the conservation law at the top of the file.
 #ifndef GEMV_THREADS
-#define GEMV_THREADS 128
+#define GEMV_THREADS 64
 #endif
 
 // How many independent int4 loads a thread issues before consuming any.
