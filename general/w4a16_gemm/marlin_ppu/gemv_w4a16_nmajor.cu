@@ -1,3 +1,21 @@
+// ============================================================================================================
+// NOT USED. Kept for the record only -- DO NOT productionize, and do not spend more time tuning it.
+//
+// This needs a SECOND weight tensor: n-major for decode, ktile-major for prefill, both resident. Weight memory
+// DOUBLES (7B -> 7 GB, 70B -> 70 GB), and decode is exactly when memory is tightest. That is a product constraint,
+// not a perf trade -- so the decision is made regardless of how fast this kernel turns out to be.
+//
+// Prefill cannot simply read n-major instead: Marlin's shared tile is 256 columns x 64 k, which is ONE contiguous
+// run in ktile-major and 256 scattered 32-byte fragments in n-major. cp.async instruction count explodes and every
+// fragment becomes its own DRAM access.
+//
+// So gemv_w4a16_ppu.cu (which reads Marlin's B in place) is the decode path, and its 34.1% / 54.3% of HBM is the
+// honest price of one shared weight tensor. Sharing the layout is not free -- it is just cheaper than not sharing.
+//
+// What is still worth knowing from this file: the packing below (a lossless nibble permutation that lands 8
+// consecutive k of one column in the order Marlin's dequant already emits) and the register trap in NM_UNROLL.
+// ============================================================================================================
+//
 // W4A16 decode GEMV on an N-MAJOR INT4 layout -- the v8 structure from the bf16 GEMV sweep (ppu_tests/gemv_ppu.cu),
 // which reached ~82% of HBM by copying cuBLAS: lean register LDG, one output row per block, NO shared / cp.async /
 // split-K. In that sweep AIU (swzl and bulk-linear), cp.async pipelines, split-K, multi-row and prefetch rings ALL LOST
