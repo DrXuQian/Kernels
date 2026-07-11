@@ -13,6 +13,12 @@
 //     int4 idx = (N/2)*ktile + (nblock/4)*32 + lane,  and the (nblock%4)-th uint32 of it
 // which reproduces the classic path's per-config packing exactly (verified: for (1,8,8) it equals tid + 256*k).
 //
+// TWO configs are exercised, because the scale index depends on BOTH of the parameters that differ between them:
+//     M<=16 -> (1,8,8):   thread_n_blocks/4 = 2 n-warps, group_blocks/thread_k_blocks = 8/8 = 1 (new group each stage)
+//     M>16  -> (2,16,4):  4 n-warps,                     8/4 = 2 (group changes every SECOND stage)   <- PREFILL RUNS THIS
+// warp_n = (tid/32) % (thread_n_blocks/4) feeds the column index directly, and the stage->group mapping feeds
+// sh_s_stage. A test that only runs M=16 never executes the config prefill actually uses.
+//
 // build (box):  make marlin_classic_group   (nvcc -O3, no -arch).  Run: ./marlin_classic_group
 
 #include "marlin_classic_ppu.cuh"
@@ -21,10 +27,10 @@
 #include <cmath>
 #include <vector>
 
-int main() {
+static int run_case(int M, int N, int K) {
     using namespace marlin_classic_ppu;
-    const int M = 16, N = 128, K = 512, groupsize = 128, max_par = 128;
-    const int GROUPS = K / groupsize;                 // 4 -- the point of the test
+    const int groupsize = 128, max_par = 128;
+    const int GROUPS = K / groupsize;                 // >= 2, so the kernel must switch groups while walking K
 
     std::vector<half> hA(M * K), hC(M * N, __float2half(0.f));
     std::vector<half> hS((size_t) GROUPS * N);        // s[g][n], row-major, column order (our format)
@@ -72,7 +78,7 @@ int main() {
 
     int ret = marlin_cuda(dA, dB, dC, dS, M, N, K, dWS, groupsize);
     cudaError_t e = cudaDeviceSynchronize();
-    if (ret || e) { printf("ret=%d err=%s\n", ret, cudaGetErrorString(e)); return 2; }
+    if (ret || e) { printf("  M%-4d N%-5d K%-4d: ret=%d err=%s\n", M, N, K, ret, cudaGetErrorString(e)); return 2; }
     cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost);
 
     double max_abs = 0, ref_max = 0;
@@ -81,11 +87,24 @@ int main() {
         ref_max = fmax(ref_max, fabs(ref[i]));
     }
     double rel = max_abs / (ref_max + 1e-9);
-    printf("classic Marlin PPU grouped scales (M%d N%d K%d, groupsize=%d -> %d groups, cfg 1/8/8): "
-           "max_abs=%.4e rel=%.2e (|ref|max=%.2f) -> %s\n",
-           M, N, K, groupsize, GROUPS, max_abs, rel, ref_max, rel < 3e-2 ? "MATCH" : "MISMATCH");
-    printf("  C[0..3]=%.3f %.3f %.3f %.3f  ref=%.3f %.3f %.3f %.3f\n",
-           __half2float(hC[0]), __half2float(hC[1]), __half2float(hC[2]), __half2float(hC[3]),
-           ref[0], ref[1], ref[2], ref[3]);
+    const int mb = (M <= 16) ? 1 : 2, nb = (M <= 16) ? 8 : 16, kb = (M <= 16) ? 8 : 4;
+    printf("  M%-4d N%-5d K%-4d gs=%d (%d groups)  cfg (%d,%d,%d): max_abs=%.4e rel=%.2e (|ref|max=%.1f) -> %s\n",
+           M, N, K, groupsize, GROUPS, mb, nb, kb, max_abs, rel, ref_max, rel < 3e-2 ? "MATCH" : "MISMATCH");
+    if (rel >= 3e-2)
+        printf("       C[0..3]=%.3f %.3f %.3f %.3f  ref=%.3f %.3f %.3f %.3f\n",
+               __half2float(hC[0]), __half2float(hC[1]), __half2float(hC[2]), __half2float(hC[3]),
+               ref[0], ref[1], ref[2], ref[3]);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS);
     return rel < 3e-2 ? 0 : 1;
+}
+
+int main() {
+    printf("classic Marlin PPU grouped scales (groupsize=128):\n");
+    int bad = 0;
+    bad |= run_case(  16,  128,  512);   // (1,8,8)   -- 2 n-warps, group changes every stage
+    bad |= run_case(  32,  256,  512);   // (2,16,4)  -- 4 n-warps, group changes every 2nd stage  <- PREFILL's config
+    bad |= run_case(  64,  256, 1024);   // (2,16,4)  -- 8 groups, par branch, more k-tiles
+    bad |= run_case( 128,  512, 1024);   // (2,16,4)  -- wider N (2 slice_cols), exercises s_gl_rd's slice_col term
+    printf("%s\n", bad ? "SOME CASES FAILED" : "all grouped-scale cases MATCH");
+    return bad;
 }
