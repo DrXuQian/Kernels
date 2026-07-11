@@ -382,10 +382,20 @@ gemv_w4a16_aiu(const int4* __restrict__ B, const half* __restrict__ A, const hal
 
     for (int g0 = kt_begin; g0 < kt_end; g0 += H) {
         const int g = g0 / H;
-        // 4 AIU strips, one per 64-b16 cube. Threads 0..3 each issue one (the DMA is single-thread by design).
-        if (threadIdx.x < 4)
-            aiu_linear_b16(cvta_s(sh + threadIdx.x * H * AW), B, k_tiles, 4 * N, H, AW,
-                           g0, nb_group * 256 + threadIdx.x * AW);
+        // 4 AIU strips, one per 64-b16 cube.
+        //
+        // THREAD 0 ISSUES ALL FOUR, IN A LOOP. The AIU is a SINGLE-THREAD bulk DMA (ThrID = Layout<_1>), so the
+        // descriptor operands must be uniform. My first version used `if (threadIdx.x < 4)`, i.e. four lanes of the
+        // SAME warp issuing with DIFFERENT operands -- lane-divergent issue of a single-thread instruction. It
+        // produced garbage (rel = 1.5). fa_ppu.cu's v2 does `if (tid == 0) for (w...) aiu_load(...)`; v7 does
+        // `if (lane == 0)`, one issuer per warp -- issuers in DIFFERENT warps are fine, divergent lanes are not.
+        // Every thread still commits, to keep the per-thread cp.async group stack consistent.
+        if (threadIdx.x == 0) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                aiu_linear_b16(cvta_s(sh + j * H * AW), B, k_tiles, 4 * N, H, AW,
+                               g0, nb_group * 256 + j * AW);
+        }
         aiu_commit();
         aiu_wait0();
         __syncthreads();
