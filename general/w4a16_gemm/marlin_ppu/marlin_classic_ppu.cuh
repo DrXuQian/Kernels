@@ -337,6 +337,18 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
     // So read by column out of sh_s, which the host stages in column order (sh_s_h[c] = s[group_row][tile_col + c]).
     // Eight scalar half loads per k, hoisted here rather than in matmul's inner loop.
     if (group_blocks != -1) {
+#ifdef MARLIN_SCALE_NONE
+      // SPEED-ONLY, RESULT IS WRONG. Removes ALL grouped-scale work from the MAINLOOP (this load and the scale() calls
+      // in matmul), while keeping everything else about the grouped path: the s staging in fetch_to_shared, the
+      // group_blocks != -1 branches, the address math. It BRACKETS the cost.
+      //
+      // Needed because MARLIN_SCALE_LOAD_PROBE falsified the obvious diagnosis: swapping the 8 scalar half loads for
+      // one int4 (killing ~10M loads, ~10M converts, ~10M bank conflicts) bought only 6.6 us of the 113 us gap. The
+      // ncu deltas were real but not load-bearing. So either scale()'s 24 FALU ops per matmul call are the whole rest,
+      // or something outside the mainloop is. This says which:
+      //     ~470 us  -> it is all in the mainloop scale (loads 6.6 us + math ~107 us) -> fold+hoist the multiply
+      //     ~540 us  -> ~70 us lives elsewhere and the mainloop is only ~43 us of it
+#else
       int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
 #ifdef MARLIN_SCALE_LOAD_PROBE
       // SPEED-ONLY, RESULT IS WRONG (it reads the UNPERMUTED buffer). This is the exact instruction SHAPE a host-side
@@ -367,6 +379,7 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
         fs[0] = ss[c];                                    // scales frag_b0 (column n)
         fs[1] = ss[c + 8];                                // scales frag_b1 (column n + 8)
       }
+#endif
 #endif
     }
 #ifndef MARLIN_A_ELEMENTWISE
@@ -430,9 +443,13 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
     for (int j = 0; j < 4; j++) {
       int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
       fb0[j] = dequant(b_quant);
+#ifndef MARLIN_SCALE_NONE
       if (group_blocks != -1) scale(fb0[j], frag_s[k % 2][j], 0);
+#endif
       fb1[j] = dequant(b_quant_shift);
+#ifndef MARLIN_SCALE_NONE
       if (group_blocks != -1) scale(fb1[j], frag_s[k % 2][j], 1);
+#endif
     }
     #pragma unroll
     for (int j = 0; j < 4; j++)
@@ -444,9 +461,13 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
     for (int j = 0; j < 4; j++) {
       int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
       FragB frag_b0 = dequant(b_quant);
+#ifndef MARLIN_SCALE_NONE
       if (group_blocks != -1) scale(frag_b0, frag_s[k % 2][j], 0);
+#endif
       FragB frag_b1 = dequant(b_quant_shift);
+#ifndef MARLIN_SCALE_NONE
       if (group_blocks != -1) scale(frag_b1, frag_s[k % 2][j], 1);
+#endif
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++)
         mma_n16(frag_a[k % 2][i], frag_b0, frag_b1, frag_c[i][j]);   // PPU: 1 n16 (was 2 n8)
