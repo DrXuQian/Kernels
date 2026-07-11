@@ -321,6 +321,140 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     #undef GEMV_COL_LOOP
 }
 
+
+#ifdef GEMV_AIU
+// ============================================================================================================
+// PROBE: replace the strided B loads with ONE AIU bulk DMA per (cube_w=64) strip.
+//
+// Everything we know says this should LOSE, and the bf16 GEMV sweep measured it losing (v2 swzl, v2b double-buffered,
+// v7 bulk-linear -- all beaten by the dumbest register-LDG kernel; AIU ran 38% of HBM vs 70-76%). The reasons:
+//   - GEMV has ZERO weight reuse. AIU does global->TSM; you still need TSM->register. Plain LDG is one hop. Shared
+//     only pays when data is read more than once, and PPU shared loads are expensive (1 transaction per 4-byte word,
+//     no half-merging -- measured in marlin_classic_ppu.cuh).
+//   - AIU is a SINGLE-THREAD bulk DMA (ThrID = Layout<_1>): one thread issues it, everyone else waits on
+//     commit/wait_group. Saturating HBM needs many outstanding requests; LDG gets them from many warps x many
+//     independent loads, AIU gets far fewer, each behind a barrier.
+//   - Its two selling points are both worth ZERO here: the swzl layout buys conflict-free ldmatrix (there is no mma),
+//     and a big cube amortizes over many mma reads (there is no reuse).
+//
+// BUT that sweep tested AIU on a ROW-MAJOR weight, where the reads were already contiguous and the AIU had nothing to
+// offer. Our B is ktile-major: walking K jumps 8N = 32 KB. The AIU's 2D descriptor gathers strided rows IN HARDWARE --
+// one instruction pulls cube_h ktiles across that stride. That is the one thing it could uniquely do here, and it was
+// never measured. "AIU loses on a contiguous layout" does not automatically transfer to a strided one.
+//
+// Geometry (verified by enumeration): B as b16 is [k_tiles][4N]. A block's 64 columns are 256 b16 = 512 B of each
+// ktile row. cube_w maxes at 64 b16 (128 B), so 4 cubes cover them. cube_h = kt_per_group = 8 -> one AIU batch is
+// exactly one scale group. Shared = 4*8*64*2 = 4 KB per block (57 KB/CU at 14.2 blocks/CU -- no occupancy cost).
+// Lane l's int4 (the l-th of the block's 32) lands in cube l/8 at slot l%8:
+//     shared int4 index = (l/8)*cube_h*8 + h*8 + (l%8)
+// ============================================================================================================
+__device__ __forceinline__ unsigned cvta_s(const void* p) { return (unsigned) __cvta_generic_to_shared((void*) p); }
+__device__ __forceinline__ void aiu_linear_b16(unsigned smem, const void* gmem,
+        int dim_h, int dim_w, int cube_h, int cube_w, int coord_h, int coord_w) {
+    asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.linear.2d.b16 [%0], [%1], "
+        "{%2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11};\n"
+        :: "r"(smem), "l"(gmem), "r"(1), "r"(dim_h), "r"(dim_w),
+           "r"(0), "r"(coord_h), "r"(coord_w), "r"(1), "r"(cube_h), "r"(cube_w), "r"(1));
+}
+__device__ __forceinline__ void aiu_commit() { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void aiu_wait0()  { asm volatile("cp.async.wait_group 0;\n"); }
+
+template <int SPLIT_K>
+__global__ void __launch_bounds__(GEMV_THREADS)
+gemv_w4a16_aiu(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
+               float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
+               int N, int K, int kt_per_group) {
+    constexpr int AW = 64;                       // AIU cube width in b16 (128 B -- the hardware max contiguous)
+    const int nb_group = blockIdx.x, slice = blockIdx.y;
+    const int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+    constexpr int NW = GEMV_THREADS / 32;
+
+    const int k_tiles = K / 16, kt_per_slice = k_tiles / SPLIT_K;
+    const int kt_begin = slice * kt_per_slice, kt_end = kt_begin + kt_per_slice;
+    const int lane_k = (lane % 4) * 2;
+    const int H = kt_per_group;                  // ktiles per AIU batch == one scale group
+
+    extern __shared__ half sh[];                 // 4 cubes x [H][AW] b16
+    const int4* sh4 = reinterpret_cast<const int4*>(sh);
+
+    float facc[4][2] = {{0.f}};
+
+    for (int g0 = kt_begin; g0 < kt_end; g0 += H) {
+        const int g = g0 / H;
+        // 4 AIU strips, one per 64-b16 cube. Threads 0..3 each issue one (the DMA is single-thread by design).
+        if (threadIdx.x < 4)
+            aiu_linear_b16(cvta_s(sh + threadIdx.x * H * AW), B, k_tiles, 4 * N, H, AW,
+                           g0, nb_group * 256 + threadIdx.x * AW);
+        aiu_commit();
+        aiu_wait0();
+        __syncthreads();
+
+        half2 hacc[4][2];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
+        half sg[4][2];
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int h2 = 0; h2 < 2; h2++)
+                sg[j][h2] = s[(long long) g * N + (nb_group * 4 + j) * 16 + lane / 4 + 8 * h2];
+
+        for (int h = wid; h < H; h += NW) {
+            const int4 q4 = sh4[(lane / 8) * H * 8 + h * 8 + (lane % 8)];   // == the LDG kernel's B[...+lane]
+            const int kb = (g0 + h) * 16 + lane_k;
+            const half2 aa = *reinterpret_cast<const half2*>(&A[kb]);
+            const half2 ab = *reinterpret_cast<const half2*>(&A[kb + 8]);
+            const int q[4] = { q4.x, q4.y, q4.z, q4.w };
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const FragB b0 = dequant(q[j]);
+                const FragB b1 = dequant(q[j] >> 8);
+                hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);
+                hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);
+                hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);
+                hacc[j][1] = __hfma2(b1.v[1], ab, hacc[j][1]);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int h2 = 0; h2 < 2; h2++) {
+                const float2 f = __half22float2(hacc[j][h2]);
+                facc[j][h2] += (f.x + f.y) * __half2float(sg[j][h2]);
+            }
+        __syncthreads();                          // single-buffer TSM: done reading before the next AIU overwrites
+    }
+
+    float acc[4][2];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        #pragma unroll
+        for (int h2 = 0; h2 < 2; h2++) {
+            float v = facc[j][h2];
+            v += __shfl_xor_sync(0xffffffff, v, 1);
+            v += __shfl_xor_sync(0xffffffff, v, 2);
+            acc[j][h2] = v;
+        }
+    __shared__ float sm[NW][N_PER_BLOCK];
+    if (lane % 4 == 0) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int h2 = 0; h2 < 2; h2++) sm[wid][j * 16 + lane / 4 + 8 * h2] = acc[j][h2];
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < N_PER_BLOCK; c += GEMV_THREADS) {
+        float v = 0.f;
+        #pragma unroll
+        for (int w = 0; w < NW; w++) v += sm[w][c];
+        const int n = nb_group * N_PER_BLOCK + c;
+        if (SPLIT_K == 1) C[n] = __float2half(v);
+        else              partial[(long long) slice * N + n] = v;
+    }
+}
+#endif  // GEMV_AIU
+
 // out[n] = half(sum_slice partial[slice][n]). The scales are applied per group inside the mainloop, so they must NOT
 // be applied again here -- with groupsize=128 there is no single s[n] to apply.
 __global__ void gemv_reduce(const float* __restrict__ partial, half* __restrict__ C, int N, int split_k) {
@@ -393,7 +527,12 @@ static int SPLIT_K = 8;
 static void launch(const int4* B, const half* A, const half* s, float* partial, half* C, int* counter,
                    int N, int K, int kt_per_group) {
     dim3 grid(N / N_PER_BLOCK, SPLIT_K);
+#ifdef GEMV_AIU
+    const int smem = 4 * kt_per_group * 64 * (int) sizeof(half);   // 4 cubes x [kt_per_group][64] b16
+    #define GEMV_CASE(SK) case SK: gemv_w4a16_aiu<SK><<<grid, GEMV_THREADS, smem>>>(B, A, s, partial, C, counter, N, K, kt_per_group); break;
+#else
     #define GEMV_CASE(SK) case SK: gemv_w4a16<SK><<<grid, GEMV_THREADS>>>(B, A, s, partial, C, counter, N, K, kt_per_group); break;
+#endif
     switch (SPLIT_K) {
         GEMV_CASE(1) GEMV_CASE(2) GEMV_CASE(4) GEMV_CASE(8) GEMV_CASE(16) GEMV_CASE(32)
         default: printf("  GEMV_SPLIT_K=%d unsupported (1/2/4/8/16/32)\n", SPLIT_K); exit(1);
