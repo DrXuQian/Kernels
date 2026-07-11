@@ -130,6 +130,32 @@ __device__ __forceinline__ FragB dequant(int q) {
   frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD));
   return frag_b;
 }
+// DO NOT fold this multiply into dequant's constants. It is the obvious optimization and it is NUMERICALLY WRONG.
+//
+// Grouped scales (groupsize=128) cost 130 us of the 581 us at 4096^3 -- 24 FALU ops per matmul call (8 __half2half2 +
+// 16 __hmul2), 50.3M warp-instructions, and they flip the kernel from tensor-bound to issue-bound. The tempting fix is
+// to fold s into dequant's magic constants, since s is constant within a group:
+//     (lo - SUB) * s      -> __hfma2(lo, s2, -SUB*s2)
+//     (hi*MUL + ADD) * s  -> __hfma2(hi, MUL*s2, ADD*s2)
+// That would delete all 24 ops. It also destroys the lop3 trick.
+//
+// The trick works because lo = 1024 + q and SUB = 1032 are BOTH exactly representable in fp16 (spacing is exactly 1.0
+// at that magnitude), so `lo - SUB` gives q-8 with ZERO error. Fold s in and you instead round 1024*s and 1032*s
+// separately (each off by up to half an ULP = 0.5) and then subtract them to get a result of magnitude ~10. Textbook
+// catastrophic cancellation. Measured over 20k random (q, s in [0.5,1.5)):
+//
+//   current (exact hsub2, then hmul2)         median 0        p99 4.6e-04   max 4.9e-04
+//   fold v[0]: fma(lo, s, -SUB*s)             median 4.3e-02  p99 3.7e-01   max 5.0e-01
+//   fold v[1]: fma(hi, MUL*s, ADD*s)          median 2.9e-03  p99 2.5e-02   max 3.5e-02
+//
+// Note the trap in that last row: folding only v[1] gives a MEDIAN error of 2.9e-03, which sails through the 3e-2
+// threshold in test_marlin_classic_group -- while the p99 and the max are already over it. It would report MATCH and
+// quietly degrade the model.
+//
+// So the 16 __hmul2 are the floor: the scale must be applied AFTER the exact subtraction. The 8 __half2half2 are
+// removable (have the host emit each scale pre-broadcast as a half2), worth ~41 us / +8.7%, at the cost of a scale
+// format change. The 8 shared loads are worth only 6.6 us (measured with MARLIN_SCALE_LOAD_PROBE) -- a scale
+// permutation is not worth building.
 __device__ __forceinline__ void scale(FragB& frag_b, FragS& frag_s, int i) {
   half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
   frag_b[0] = __hmul2(frag_b[0], s); frag_b[1] = __hmul2(frag_b[1], s);
