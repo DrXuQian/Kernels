@@ -338,7 +338,22 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
     // Eight scalar half loads per k, hoisted here rather than in matmul's inner loop.
     if (group_blocks != -1) {
       int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
-#ifdef MARLIN_NVIDIA_SCALE_MAP
+#ifdef MARLIN_SCALE_LOAD_PROBE
+      // SPEED-ONLY, RESULT IS WRONG (it reads the UNPERMUTED buffer). This is the exact instruction SHAPE a host-side
+      // scale permutation would produce -- ONE int4 load per lane, at the address the permuted layout would use -- so
+      // it measures the ceiling of that fix before anyone builds it.
+      //
+      // ncu says the 8 scalar half loads are the whole problem, and three deltas lock it down (gs=128 vs gs=-1):
+      //     shared load instructions  +10,092,544
+      //     v.cnvt                    + 9,961,472   (hggc converts to pack each half into the half2 register)
+      //     bank conflicts            +10,092,544   (EXACTLY one per load: PPU does not merge the two halves of a
+      //                                              4-byte word -- the same thing we measured on the STORE side)
+      // ~20M extra instructions flipped the SOL's top contributor: WE Pipe Tensor Cycles 66.67% -> WS Issue Active
+      // 70.83%. The kernel went from TENSOR-bound to ISSUE-bound, and the tensor pipe went idle (Stall Tensor Pipe
+      // Busy 0.137 -> 0.025). Shared BANDWIDTH is not the issue at all -- TSM %Peak barely moved, 35.05 -> 35.36.
+      const int probe_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
+      reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[probe_rd];   // in range: max 8*(NB/4-1)+7 < s_sh_stride
+#elif defined(MARLIN_NVIDIA_SCALE_MAP)
       // The original (wrong on PPU) mapping, kept so test_marlin_classic_group can demonstrate it fails.
       const int s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
