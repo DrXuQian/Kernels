@@ -39,8 +39,13 @@ static int run_case(int M, int N, int K) {
     for (auto & x : hA) x = __float2half(0.05f * (rand() % 40 - 20));
     for (auto & x : Bdeq) x = (rand() & 0xf) - 8;
     // Distinct scale per (group, column): a bug that reads the wrong group, or the wrong column, cannot hide.
+    // DISTINCT scales, on purpose: the old 0.5+(rand()%100)/100 drew from only 100 values across 128+
+    // columns, so columns collided -- which broke the SCALE_DECODE readout (it reported "wrong" columns
+    // on the KNOWN-GOOD path, because two columns had the same value). Step by n so that within one group
+    // every column is distinct even after rounding to half (0.9/N >= 0.0035 >> half ulp near 1.0).
     for (int g = 0; g < GROUPS; g++)
-        for (int n = 0; n < N; n++) hS[(size_t) g * N + n] = __float2half(0.5f + (rand() % 100) / 100.0f);
+        for (int n = 0; n < N; n++)
+            hS[(size_t) g * N + n] = __float2half(0.5f + 0.9f * (float) n / (float) N + 0.03f * (float) g);
 
     // hS above is the PLAIN [G][N] layout our kernel reads by column. hSdev is what actually gets uploaded.
     std::vector<half> hSdev = hS;
@@ -161,9 +166,11 @@ int main() {
     printf("classic Marlin PPU grouped scales (groupsize=128):\n");
     int bad = 0;
 #ifdef SCALE_DECODE
-    bad |= run_case(  16,  128,  128);   // K == groupsize -> exactly 1 group, so the scale decodes uniquely
-    bad |= run_case(  32,  256,  128);   // same, in the (2,16,4) prefill config
-    return bad;
+    // single-group (K == groupsize): each column has ONE scale, so the decode readout is unambiguous.
+    bad |= run_case(  16,  128,  128);
+    bad |= run_case(  32,  256,  128);
+    // fall through to the multi-group cases too -- they skip the decode and just report the numeric
+    // verdict, which is the real judge and the one still-open question (perm + NVIDIA_MAP, >1 group).
 #endif
     bad |= run_case(  16,  128,  512);   // (1,8,8)   -- 2 n-warps, group changes every stage
     bad |= run_case(  32,  256,  512);   // (2,16,4)  -- 4 n-warps, group changes every 2nd stage  <- PREFILL's config
