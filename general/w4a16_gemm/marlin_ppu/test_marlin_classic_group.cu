@@ -97,6 +97,49 @@ static int run_case(int M, int N, int K) {
     if (ret || e) { printf("  M%-4d N%-5d K%-4d: ret=%d err=%s\n", M, N, K, ret, cudaGetErrorString(e)); return 2; }
     cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost);
 
+#ifdef SCALE_DECODE
+    // MAKE THE FAILURE TELL US THE ANSWER, instead of deriving the permutation a fourth time.
+    //
+    // With exactly ONE group (K == groupsize) every column has a single scale, so
+    //     C[m][n] = (A . Bdeq)[m][n] * s_actual[n]
+    // Dividing the kernel's output by the UNSCALED product recovers s_actual[n] -- the scale the kernel
+    // REALLY applied to column n. Looking that value up in s[] says which index it actually read. That
+    // reads the true permutation straight off the hardware: no algebra, no assumptions about the branch.
+    //
+    // I derived the required permutation three times and enumerated it exhaustively on the host; all four
+    // said -DTEST_SCALE_PERM + -DMARLIN_NVIDIA_SCALE_MAP must PASS. The PPU says it does not. So the model
+    // is wrong somewhere I cannot see by reading, and the only honest move left is to ask the hardware.
+    if (GROUPS == 1) {
+        printf("  --- SCALE_DECODE  M%d N%d K%d ---\n", M, N, K);
+        int wrong = 0;
+        for (int n = 0; n < N; n++) {
+            // pick the row with the largest |unscaled| so the division is well conditioned
+            int best_m = 0; double best = 0;
+            std::vector<double> uns(M);
+            for (int m = 0; m < M; m++) {
+                double acc = 0;
+                for (int k = 0; k < K; k++) acc += __half2float(hA[(size_t) m * K + k]) * (double) Bdeq[(size_t) n * K + k];
+                uns[m] = acc;
+                if (fabs(acc) > best) { best = fabs(acc); best_m = m; }
+            }
+            if (best < 1e-3) continue;
+            const double s_act = __half2float(hC[(size_t) best_m * N + n]) / uns[best_m];
+            // which column's scale is this? (scales are distinct by construction)
+            int hit = -1; double bestd = 1e9;
+            for (int q = 0; q < N; q++) {
+                double d = fabs(s_act - __half2float(hS[q]));
+                if (d < bestd) { bestd = d; hit = q; }
+            }
+            if (hit != n) {
+                if (wrong < 16) printf("      col %3d  got s[%3d]  (s_act=%.4f, s[%d]=%.4f)\n",
+                                       n, hit, s_act, n, __half2float(hS[n]));
+                wrong++;
+            }
+        }
+        printf("      %d / %d columns read the WRONG scale index\n", wrong, N);
+    }
+#endif
+
     double max_abs = 0, ref_max = 0;
     for (size_t i = 0; i < (size_t) M * N; ++i) {
         max_abs = fmax(max_abs, fabs(__half2float(hC[i]) - ref[i]));
@@ -117,6 +160,11 @@ static int run_case(int M, int N, int K) {
 int main() {
     printf("classic Marlin PPU grouped scales (groupsize=128):\n");
     int bad = 0;
+#ifdef SCALE_DECODE
+    bad |= run_case(  16,  128,  128);   // K == groupsize -> exactly 1 group, so the scale decodes uniquely
+    bad |= run_case(  32,  256,  128);   // same, in the (2,16,4) prefill config
+    return bad;
+#endif
     bad |= run_case(  16,  128,  512);   // (1,8,8)   -- 2 n-warps, group changes every stage
     bad |= run_case(  32,  256,  512);   // (2,16,4)  -- 4 n-warps, group changes every 2nd stage  <- PREFILL's config
     bad |= run_case(  64,  256, 1024);   // (2,16,4)  -- 8 groups, par branch, more k-tiles
