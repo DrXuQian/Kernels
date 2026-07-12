@@ -42,6 +42,22 @@ static int run_case(int M, int N, int K) {
     for (int g = 0; g < GROUPS; g++)
         for (int n = 0; n < N; n++) hS[(size_t) g * N + n] = __float2half(0.5f + (rand() % 100) / 100.0f);
 
+    // hS above is the PLAIN [G][N] layout our kernel reads by column. hSdev is what actually gets uploaded.
+    std::vector<half> hSdev = hS;
+#ifdef TEST_SCALE_PERM
+    // Upstream Marlin/vLLM does NOT ship plain scales -- its repack applies _scale_perm:
+    //     for i in range(8): scale_perm += [i + 8*j for j in range(8)]
+    //     s = s.reshape((-1, 64))[:, scale_perm]
+    // i.e. an 8x8 transpose inside every 64-column chunk. Pair this with -DMARLIN_NVIDIA_SCALE_MAP
+    // (the kernel's one-int4-per-lane read) and the question "can we eat a vLLM checkpoint as-is?"
+    // becomes a PASS/FAIL, instead of something I derive on a whiteboard and get wrong.
+    for (int g = 0; g < GROUPS; g++)
+        for (int c0 = 0; c0 < N; c0 += 64)
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 8; j++)
+                    hSdev[(size_t) g * N + c0 + 8 * i + j] = hS[(size_t) g * N + c0 + i + 8 * j];
+#endif
+
     auto Bu = [&](int n, int k) { return (Bdeq[(size_t) n * K + k] + 8) & 0xf; };
     for (int ktile = 0; ktile < K / 16; ktile++)
         for (int nblock = 0; nblock < N / 16; nblock++)
@@ -73,7 +89,7 @@ static int run_case(int M, int N, int K) {
     cudaMalloc(&dS, hS.size() * 2); cudaMalloc(&dWS, (N / 128 + 1) * max_par * 4);
     cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice);
     cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(dS, hSdev.data(), hS.size() * 2, cudaMemcpyHostToDevice);
     cudaMemset(dWS, 0, (N / 128 + 1) * max_par * 4);
 
     int ret = marlin_cuda(dA, dB, dC, dS, M, N, K, dWS, groupsize);

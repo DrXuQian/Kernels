@@ -31,6 +31,11 @@ marlin_classic_num: test_marlin_classic_num.cu marlin_classic_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 # classic Marlin GROUPED-scale test (groupsize=128 -> 4 groups; the group_blocks != -1 path).
+# CAN WE EAT A vLLM/MARLIN CHECKPOINT AS-IS?  Build it two ways and let the answer be a PASS/FAIL:
+#   plain (default)                                 -> our column-indexed read + unpermuted [G][N] scales
+#   -DTEST_SCALE_PERM -DMARLIN_NVIDIA_SCALE_MAP     -> upstream's _scale_perm + upstream's one-int4 lane read
+# The second is the one that matters: _scale_perm is derived from the B-FRAGMENT column layout, and B's
+# layout is identical on PPU, so it SHOULD pass. If it does, vLLM's grouped scales need no un-permuting.
 marlin_classic_group: test_marlin_classic_group.cu marlin_classic_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
