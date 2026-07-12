@@ -30,12 +30,14 @@ marlin_classic_test: test_marlin_classic_ppu.cu marlin_classic_ppu.cuh .flags
 marlin_classic_num: test_marlin_classic_num.cu marlin_classic_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
-# classic Marlin GROUPED-scale test (groupsize=128 -> 4 groups; the group_blocks != -1 path).
-# CAN WE EAT A vLLM/MARLIN CHECKPOINT AS-IS?  Build it two ways and let the answer be a PASS/FAIL:
-#   plain (default)                                 -> our column-indexed read + unpermuted [G][N] scales
-#   -DTEST_SCALE_PERM -DMARLIN_NVIDIA_SCALE_MAP     -> upstream's _scale_perm + upstream's one-int4 lane read
-# The second is the one that matters: _scale_perm is derived from the B-FRAGMENT column layout, and B's
-# layout is identical on PPU, so it SHOULD pass. If it does, vLLM's grouped scales need no un-permuting.
+# classic Marlin GROUPED-scale test (groupsize=128; the group_blocks != -1 path).
+# ANSWERED, on ppu001, all four configs, 1 group AND 4/8 groups: a vLLM / GPTQ-Marlin checkpoint's B AND
+# grouped scales are BOTH directly edible -- no conversion at load. _scale_perm is derived from the
+# B-FRAGMENT column layout, and B's fragment layout is identical on PPU, so upstream's layout is the
+# kernel's DEFAULT contract now (one int4 per lane -- correct AND ~6.6 us faster than the by-column read).
+#   default              -> upstream's _scale_perm layout (marlin_permute_scales in the header)
+#   -DMARLIN_SCALE_PLAIN -> raw [num_groups][prob_n] scales, e.g. straight off a GPTQ checkpoint
+#   -DSCALE_DECODE       -> also print, per column, WHICH scale index the kernel actually read
 marlin_classic_group: test_marlin_classic_group.cu marlin_classic_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 

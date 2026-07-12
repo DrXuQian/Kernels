@@ -154,12 +154,32 @@ __device__ __forceinline__ FragB dequant(int q) {
 //
 // So the 16 __hmul2 are the floor: the scale must be applied AFTER the exact subtraction. The 8 __half2half2 are
 // removable (have the host emit each scale pre-broadcast as a half2), worth ~41 us / +8.7%, at the cost of a scale
-// format change. The 8 shared loads are worth only 6.6 us (measured with MARLIN_SCALE_LOAD_PROBE) -- a scale
-// permutation is not worth building.
+// format change. The 8 scalar shared loads were worth 6.6 us, and THAT one is now taken: the permuted layout turned
+// out to be upstream's own _scale_perm, so it cost nothing to adopt -- see fetch_to_registers.
 __device__ __forceinline__ void scale(FragB& frag_b, FragS& frag_s, int i) {
   half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
   frag_b[0] = __hmul2(frag_b[0], s); frag_b[1] = __hmul2(frag_b[1], s);
 }
+// HOST: the grouped-scale layout the kernel expects by default. This is upstream Marlin's _scale_perm,
+// bit for bit -- an 8x8 transpose inside every 64-column chunk of each group row:
+//     out[64c + 8i + j] = plain[64c + i + 8j]
+// It falls out of the B-fragment column layout (see fetch_to_registers), which PPU shares with NVIDIA,
+// which is why a vLLM / GPTQ-Marlin checkpoint's scales need NO conversion -- they are already like this.
+// You only need this function when you hold RAW [num_groups][prob_n] scales (e.g. straight off a GPTQ
+// checkpoint). The alternative is -DMARLIN_SCALE_PLAIN, which reads that layout directly but costs 8
+// scalar half loads per k instead of one int4.
+//
+// ONE definition, shared by the kernel's tests and by any integration -- so the two cannot drift apart.
+// Requires prob_n % 64 == 0. Only for groupsize != -1 (gs == -1 scales are applied in write_result and
+// are indexed by column there; they are NOT permuted).
+inline void marlin_permute_scales(const half* plain, half* out, int num_groups, int prob_n) {
+  for (int g = 0; g < num_groups; g++)
+    for (int c0 = 0; c0 < prob_n; c0 += 64)
+      for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+          out[(size_t) g * prob_n + c0 + 8 * i + j] = plain[(size_t) g * prob_n + c0 + i + 8 * j];
+}
+
 __device__ inline void barrier_acquire(int* lock, int count) {
   if (threadIdx.x == 0) { int state = -1;
     do asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock)); while (state != count); }
@@ -351,51 +371,48 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
   auto wait_for_stage = [&] () { cp_async_wait<stages - 2>(); __syncthreads(); };
 
   auto fetch_to_registers = [&] (int k, int pipe) {
-    // GROUPED SCALES (group_blocks != -1, i.e. groupsize=128). matmul() applies these to the B fragments, so they must
-    // be indexed the way PPU's dequant lays those fragments out:
+    // GROUPED SCALES (group_blocks != -1, i.e. groupsize=128 -- what every real model uses).
+    //
+    // matmul() applies these to the B FRAGMENTS, before the mma -- not to C. So the layout they need is
+    // dictated by where dequant puts those fragments:
     //     dequant(q)      -> column n     = (warp_n*4 + j)*16 + lane/4     scaled by frag_s[.][j][0]
     //     dequant(q >> 8) -> column n + 8                                  scaled by frag_s[.][j][1]
+    // and PPU's B fragment layout is IDENTICAL to NVIDIA's (same (n,k) set AND same register order --
+    // which is exactly why the whole B path is verbatim upstream). Therefore upstream's scale layout is
+    // PPU-correct, and this reads it with upstream's single int4 per lane.
     //
-    // NVIDIA fills frag_s[k][0..3] with ONE int4 starting at s_sh_rd = 8*warp_n + lane/4, which puts j at a half-stride
-    // of 2 and lane/4 at a stride of 8. PPU needs j at a stride of 16 and lane/4 at a stride of 1. 22 of the 24
-    // (warp_n, lane, j) combinations disagree -- this path was wrong since the port, and no test ever ran groupsize!=-1.
+    // Working it through: lane (warp_n=w, c=lane/4) needs the 8 halves s[64w + 8t + c], t=0..7. One int4
+    // at s_sh_rd = 8w + c covers shared halves [64w + 8c .. +7]. So the buffer must hold
+    //     buf[64w + 8c + t] == s_plain[64w + 8t + c]
+    // i.e. an 8x8 transpose inside every 64-column chunk -- which is precisely upstream's _scale_perm
+    // ("for i in range(8): perm += [i + 8*j for j in range(8)]"). marlin_permute_scales() below is that
+    // transpose; use it, do not re-derive it.
     //
-    // So read by column out of sh_s, which the host stages in column order (sh_s_h[c] = s[group_row][tile_col + c]).
-    // Eight scalar half loads per k, hoisted here rather than in matmul's inner loop.
+    // VERIFIED ON ppu001 (test_marlin_classic_group, all four configs, 1 group AND 4/8 groups): MATCH.
+    // A long-standing comment here claimed this mapping was "wrong on PPU". It was not. It had only ever
+    // been run against an UNPERMUTED buffer, where of course it fails -- and that failure was misread as
+    // the mapping being incompatible. The permutation is a HOST-side format, not a kernel property.
+    //
+    // Consequence for integration: a vLLM / GPTQ-Marlin checkpoint's B AND grouped scales are both
+    // directly edible, with no transform at load. (gs == -1 is different: that scale is applied in
+    // write_result, so it IS tied to the C layout, which PPU genuinely does not share -- upstream's
+    // _scale_perm_single does NOT carry over. Real models use gs=128.)
+    //
+    // -DMARLIN_SCALE_PLAIN takes raw [num_groups][prob_n] scales instead (e.g. straight off a GPTQ
+    // checkpoint, whose scales are already in that layout). Correct, but 8 scalar half loads per k
+    // instead of one int4: ncu measured +10.1M shared loads, +10.0M converts and +10.1M bank conflicts
+    // against the int4 form (the PPU issues one conflict per half load -- it does not merge the two
+    // halves of a 4-byte word). Worth ~6.6 us on the 4096-cube, so the default is both correct AND the
+    // faster of the two.
     if (group_blocks != -1) {
 #ifdef MARLIN_SCALE_NONE
-      // SPEED-ONLY, RESULT IS WRONG. Removes ALL grouped-scale work from the MAINLOOP (this load and the scale() calls
-      // in matmul), while keeping everything else about the grouped path: the s staging in fetch_to_shared, the
-      // group_blocks != -1 branches, the address math. It BRACKETS the cost.
-      //
-      // Needed because MARLIN_SCALE_LOAD_PROBE falsified the obvious diagnosis: swapping the 8 scalar half loads for
-      // one int4 (killing ~10M loads, ~10M converts, ~10M bank conflicts) bought only 6.6 us of the 113 us gap. The
-      // ncu deltas were real but not load-bearing. So either scale()'s 24 FALU ops per matmul call are the whole rest,
-      // or something outside the mainloop is. This says which:
-      //     ~470 us  -> it is all in the mainloop scale (loads 6.6 us + math ~107 us) -> fold+hoist the multiply
-      //     ~540 us  -> ~70 us lives elsewhere and the mainloop is only ~43 us of it
+      // SPEED-ONLY, RESULT IS WRONG. Removes ALL grouped-scale work from the mainloop (this load and the
+      // scale() calls in matmul) while keeping the s staging, the group_blocks branches and the address
+      // math -- it BRACKETS what the grouped-scale path costs.
 #else
       int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
-#ifdef MARLIN_SCALE_LOAD_PROBE
-      // SPEED-ONLY, RESULT IS WRONG (it reads the UNPERMUTED buffer). This is the exact instruction SHAPE a host-side
-      // scale permutation would produce -- ONE int4 load per lane, at the address the permuted layout would use -- so
-      // it measures the ceiling of that fix before anyone builds it.
-      //
-      // ncu says the 8 scalar half loads are the whole problem, and three deltas lock it down (gs=128 vs gs=-1):
-      //     shared load instructions  +10,092,544
-      //     v.cnvt                    + 9,961,472   (hggc converts to pack each half into the half2 register)
-      //     bank conflicts            +10,092,544   (EXACTLY one per load: PPU does not merge the two halves of a
-      //                                              4-byte word -- the same thing we measured on the STORE side)
-      // ~20M extra instructions flipped the SOL's top contributor: WE Pipe Tensor Cycles 66.67% -> WS Issue Active
-      // 70.83%. The kernel went from TENSOR-bound to ISSUE-bound, and the tensor pipe went idle (Stall Tensor Pipe
-      // Busy 0.137 -> 0.025). Shared BANDWIDTH is not the issue at all -- TSM %Peak barely moved, 35.05 -> 35.36.
-      const int probe_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-      reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[probe_rd];   // in range: max 8*(NB/4-1)+7 < s_sh_stride
-#elif defined(MARLIN_NVIDIA_SCALE_MAP)
-      // The original (wrong on PPU) mapping, kept so test_marlin_classic_group can demonstrate it fails.
-      const int s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-      reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
-#else
+#ifdef MARLIN_SCALE_PLAIN
+      // Raw [num_groups][prob_n] scales, read by column. No host permutation needed; 8 scalar half loads.
       const half* ss = reinterpret_cast<const half*>(sh_s_stage);
       const int warp_n = (threadIdx.x / 32) % (thread_n_blocks / 4), lane = threadIdx.x % 32;
       #pragma unroll
@@ -405,6 +422,10 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
         fs[0] = ss[c];                                    // scales frag_b0 (column n)
         fs[1] = ss[c + 8];                                // scales frag_b1 (column n + 8)
       }
+#else
+      // DEFAULT: upstream's _scale_perm layout (see marlin_permute_scales). One int4 per lane.
+      const int s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
+      reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];   // max 8*(NB/4-1)+7 < s_sh_stride
 #endif
 #endif
     }

@@ -47,20 +47,16 @@ static int run_case(int M, int N, int K) {
         for (int n = 0; n < N; n++)
             hS[(size_t) g * N + n] = __float2half(0.5f + 0.9f * (float) n / (float) N + 0.03f * (float) g);
 
-    // hS above is the PLAIN [G][N] layout our kernel reads by column. hSdev is what actually gets uploaded.
-    std::vector<half> hSdev = hS;
-#ifdef TEST_SCALE_PERM
-    // Upstream Marlin/vLLM does NOT ship plain scales -- its repack applies _scale_perm:
-    //     for i in range(8): scale_perm += [i + 8*j for j in range(8)]
-    //     s = s.reshape((-1, 64))[:, scale_perm]
-    // i.e. an 8x8 transpose inside every 64-column chunk. Pair this with -DMARLIN_NVIDIA_SCALE_MAP
-    // (the kernel's one-int4-per-lane read) and the question "can we eat a vLLM checkpoint as-is?"
-    // becomes a PASS/FAIL, instead of something I derive on a whiteboard and get wrong.
-    for (int g = 0; g < GROUPS; g++)
-        for (int c0 = 0; c0 < N; c0 += 64)
-            for (int i = 0; i < 8; i++)
-                for (int j = 0; j < 8; j++)
-                    hSdev[(size_t) g * N + c0 + 8 * i + j] = hS[(size_t) g * N + c0 + i + 8 * j];
+    // hS is the PLAIN [G][N] layout. The kernel's DEFAULT contract is upstream's _scale_perm layout
+    // (one int4 per lane), so convert with the header's own helper -- the same function any integration
+    // would call, so the test and the shipping path cannot drift apart. -DMARLIN_SCALE_PLAIN keeps the
+    // raw layout and exercises the by-column read instead. Either way the CPU reference uses hS, so the
+    // two builds must agree; if they ever stop agreeing, one of the two read paths is broken.
+    std::vector<half> hSdev(hS.size());
+#ifdef MARLIN_SCALE_PLAIN
+    hSdev = hS;
+#else
+    marlin_classic_ppu::marlin_permute_scales(hS.data(), hSdev.data(), GROUPS, N);
 #endif
 
     auto Bu = [&](int n, int k) { return (Bdeq[(size_t) n * K + k] + 8) & 0xf; };
@@ -111,9 +107,15 @@ static int run_case(int M, int N, int K) {
     // REALLY applied to column n. Looking that value up in s[] says which index it actually read. That
     // reads the true permutation straight off the hardware: no algebra, no assumptions about the branch.
     //
-    // I derived the required permutation three times and enumerated it exhaustively on the host; all four
-    // said -DTEST_SCALE_PERM + -DMARLIN_NVIDIA_SCALE_MAP must PASS. The PPU says it does not. So the model
-    // is wrong somewhere I cannot see by reading, and the only honest move left is to ask the hardware.
+    // Kept because it is the check that would catch a scale layout going quietly wrong: the numeric rel
+    // can stay small while columns read each other's scales, if the scales happen to be close in value.
+    // This names the index, so it cannot be fudged.
+    //
+    // It also has to be its own warning label. The first version of this probe drew scales as
+    // 0.5 + (rand()%100)/100 -- 100 distinct values across 128+ columns, so columns COLLIDED and the
+    // "which index has this value" lookup was ambiguous. It reported 55/128 columns wrong on the
+    // KNOWN-GOOD path, and I nearly read that as the kernel being broken. A probe that identifies things
+    // by VALUE needs values that are distinct BY CONSTRUCTION -- hence the stepped scales above.
     if (GROUPS == 1) {
         printf("  --- SCALE_DECODE  M%d N%d K%d ---\n", M, N, K);
         int wrong = 0;
