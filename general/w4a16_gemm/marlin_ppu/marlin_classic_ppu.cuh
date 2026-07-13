@@ -180,6 +180,33 @@ inline void marlin_permute_scales(const half* plain, half* out, int num_groups, 
           out[(size_t) g * prob_n + c0 + 8 * i + j] = plain[(size_t) g * prob_n + c0 + i + 8 * j];
 }
 
+// HOST: gs == -1 (per-column scales). THIS ONE IS THE OPPOSITE CASE from the grouped scales above, and
+// the difference is worth stating because it is the whole reason the two behave differently.
+//
+// A per-column scale is CONSTANT along K, so it is applied ONCE after the K reduction -- in write_result,
+// against frag_c. That means its layout is dictated by the C (accumulator) fragment, and PPU's C layout is
+// genuinely NOT NVIDIA's (NVIDIA gives a lane two ADJACENT columns {0,1}; PPU gives four stride-4 columns
+// {0,4,8,12}). So upstream's _scale_perm_single does NOT carry over, and our write_result instead reads
+// sh_s BY COLUMN -- i.e. this kernel wants PLAIN [1][prob_n] scales for gs == -1.
+//
+// (The grouped scale is the opposite: it VARIES along K, so it must be applied inside the K-loop, before
+// the accumulation -- onto the B fragment. Its layout is therefore dictated by B, which PPU shares with
+// NVIDIA bit for bit, which is why upstream's _scale_perm DOES carry over. Upstream needing two separate
+// tables at all is the proof that the two scales hang off two different fragments.)
+//
+// So: raw GPTQ per-column scales are already plain and need nothing. Only a checkpoint that upstream
+// already packed with _scale_perm_single needs undoing -- and that permutation is an INVOLUTION, so
+// undoing it is applying it again. Writing p = 8i + 2a + b, it maps to 2i + 8a + b: a 4x4 transpose of
+// the (i, a) digits, hence self-inverse. Chunk width is 32 columns here, NOT the 64 of _scale_perm.
+// Verified by round-trip against upstream's table.
+inline void marlin_unpermute_scales_single(const half* packed, half* out, int prob_n) {
+  for (int c0 = 0; c0 < prob_n; c0 += 32)
+    for (int p = 0; p < 32; p++) {
+      const int q = 2 * (p / 8) + 8 * ((p % 8) / 2) + (p % 2);   // == _scale_perm_single[p], self-inverse
+      out[c0 + q] = packed[c0 + p];
+    }
+}
+
 __device__ inline void barrier_acquire(int* lock, int count) {
   if (threadIdx.x == 0) { int state = -1;
     do asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock)); while (state != count); }
