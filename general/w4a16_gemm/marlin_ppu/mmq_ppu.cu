@@ -113,9 +113,18 @@ constexpr __host__ __device__ const char* fmt_name(int f) {
 constexpr __host__ __device__ int fmt_x(int) { return MMQ_X; }
 #else
 constexpr __host__ __device__ int fmt_x(int f) {
-  return (f == F_Q4_0 || f == F_IQ4_NL || f == F_IQ4_XS) ? 80 : 48;   // symmetric-pipe formats take X=80; affine 48
+  return (f == F_Q4_0 || f == F_IQ4_NL || f == F_IQ4_XS) ? 80 : (f == F_Q4_K) ? 88 : 48;
 }
 #endif
+// Per-format min-blocks/CU (launch_bounds 2nd arg). MEASURED: Q4_1 wants 2 (spills at 1); every other
+// format wants 1 (more registers -> better ILP, and the wide Q4_K tile needs the room). -DMMQ_MIN_BLOCKS
+// overrides uniformly for sweeps.
+#ifdef MMQ_MIN_BLOCKS
+constexpr __host__ __device__ int fmt_mb(int) { return MMQ_MIN_BLOCKS; }
+#else
+constexpr __host__ __device__ int fmt_mb(int f) { return f == F_Q4_1 ? 2 : 1; }
+#endif
+template <int F> static constexpr int MBF = fmt_mb(F);
 
 // The IQ4 codebook (kvalues_iq4nl, verbatim from ggml-common.h). Shared by IQ4_NL and IQ4_XS.
 __device__ __constant__ int8_t kvalues_iq4nl_dev[16] =
@@ -554,8 +563,8 @@ __device__ __forceinline__ void vec_dot(const int* __restrict__ tile_x, const in
 #ifndef MMQ_MIN_BLOCKS
 #define MMQ_MIN_BLOCKS 2
 #endif
-template <int FMT, int XT>
-__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q(
+template <int FMT, int XT, int MB>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q(
     const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
     const int N, const int K, const int M, const int stride_row_x) {
   extern __shared__ int smem[];
@@ -688,8 +697,8 @@ __device__ __forceinline__ void fetch_stage(int* sh_x, int* sh_y, const char* __
   }
 }
 
-template <int XT>
-__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe(
+template <int XT, int MB>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q_pipe(
     const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
     const int N, const int K, const int M, const int stride_row) {
   constexpr int SHY = SH_Y_INTS(XT);
@@ -826,8 +835,8 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
 // lane t register l holds row (t/4 + 8*(l%2)), k-word kw = t%4 + 4*(l/2) of the 32-value block. The
 // q4_0 block stores quant q in the low nibble of qs[q] (q<16) or high nibble of qs[q-16] (q>=16), so
 // k-word kw<4 is 4 LOW nibbles of qs int (t%4), kw>=4 is 4 HIGH nibbles of the same int. l>=2 <=> kw>=4.
-template <bool IS_IQ4, int XT>
-__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe_sym32(
+template <bool IS_IQ4, int XT, int MB>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q_pipe_sym32(
     const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
     const int N, const int K, const int M, const int stride_row_unused) {
   constexpr int SHY = SH_Y_INTS(XT);
@@ -944,8 +953,8 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
 // PIPELINED AFFINE 32-BLOCK MAINLOOP (Q4_1).  Like sym32 but affine (min term) and CLEANER: the
 // q4_1 block is 20 B = 5 ints, all 4-aligned -- dm=(d,m) half2 at int[5b], qs ints at [5b+1..5b+4].
 // No misaligned reads at all. Row = 8 blocks x 5 = 40 ints = 160 B = 10 x 16 B chunks (aligned).
-template <int XT>
-__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe_q41(
+template <int XT, int MB>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q_pipe_q41(
     const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
     const int N, const int K, const int M, const int stride_row_unused) {
   constexpr int RI = 40;                        // ints per row (8 q4_1 blocks x 5)
@@ -1051,8 +1060,8 @@ __device__ __forceinline__ void cp_async8(int* smem, const void* g) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" :: "r"(s), "l"(g), "n"(8));
 }
 
-template <int XT>
-__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe_xs(
+template <int XT, int MB>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q_pipe_xs(
     const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
     const int N, const int K, const int M, const int stride_row_unused) {
   constexpr int RI = 34;                        // ints per iq4_xs super-block row
@@ -1183,32 +1192,32 @@ static MMQLaunch mmq_launch(int fmt) {
   // reuse the same 144 B/row staging. Q4_1 (160 B/row) and IQ4_XS stay on the naive path for now.
   if (fmt == F_Q4_K || fmt == F_Q4_0 || fmt == F_IQ4_NL) {
     L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS(36) + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
-    L.kern = fmt == F_Q4_K   ? mul_mat_q_pipe<XF<F_Q4_K>>
-           : fmt == F_IQ4_NL ? mul_mat_q_pipe_sym32<true,  XF<F_IQ4_NL>>
-                             : mul_mat_q_pipe_sym32<false, XF<F_Q4_0>>;
+    L.kern = fmt == F_Q4_K   ? mul_mat_q_pipe<XF<F_Q4_K>, MBF<F_Q4_K>>
+           : fmt == F_IQ4_NL ? mul_mat_q_pipe_sym32<true,  XF<F_IQ4_NL>, MBF<F_IQ4_NL>>
+                             : mul_mat_q_pipe_sym32<false, XF<F_Q4_0>, MBF<F_Q4_0>>;
     CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
     return L;
   }
   if (fmt == F_Q4_1) {   // affine 32-block pipe, 40-int rows
     L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS(40) + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
-    L.kern = mul_mat_q_pipe_q41<XF<F_Q4_1>>;
+    L.kern = mul_mat_q_pipe_q41<XF<F_Q4_1>, MBF<F_Q4_1>>;
     CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
     return L;
   }
   if (fmt == F_IQ4_XS) {   // symmetric super-block pipe, 34-int rows (8 B cp.async)
     L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS(34) + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
-    L.kern = mul_mat_q_pipe_xs<XF<F_IQ4_XS>>;
+    L.kern = mul_mat_q_pipe_xs<XF<F_IQ4_XS>, MBF<F_IQ4_XS>>;
     CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
     return L;
   }
 #endif
   L.shmem = (size_t)(L.x_tile * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * sizeof(int);
   switch (fmt) {
-    case F_Q4_0:   L.kern = mul_mat_q<F_Q4_0,   XF<F_Q4_0>>;   break;
-    case F_Q4_1:   L.kern = mul_mat_q<F_Q4_1,   XF<F_Q4_1>>;   break;
-    case F_Q4_K:   L.kern = mul_mat_q<F_Q4_K,   XF<F_Q4_K>>;   break;
-    case F_IQ4_NL: L.kern = mul_mat_q<F_IQ4_NL, XF<F_IQ4_NL>>; break;
-    default:       L.kern = mul_mat_q<F_IQ4_XS, XF<F_IQ4_XS>>; break;
+    case F_Q4_0:   L.kern = mul_mat_q<F_Q4_0,   XF<F_Q4_0>,   MBF<F_Q4_0>>;   break;
+    case F_Q4_1:   L.kern = mul_mat_q<F_Q4_1,   XF<F_Q4_1>,   MBF<F_Q4_1>>;   break;
+    case F_Q4_K:   L.kern = mul_mat_q<F_Q4_K,   XF<F_Q4_K>,   MBF<F_Q4_K>>;   break;
+    case F_IQ4_NL: L.kern = mul_mat_q<F_IQ4_NL, XF<F_IQ4_NL>, MBF<F_IQ4_NL>>; break;
+    default:       L.kern = mul_mat_q<F_IQ4_XS, XF<F_IQ4_XS>, MBF<F_IQ4_XS>>; break;
   }
   CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
   return L;
