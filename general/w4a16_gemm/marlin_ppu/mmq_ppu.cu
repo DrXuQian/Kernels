@@ -113,7 +113,7 @@ constexpr __host__ __device__ const char* fmt_name(int f) {
 constexpr __host__ __device__ int fmt_x(int) { return MMQ_X; }
 #else
 constexpr __host__ __device__ int fmt_x(int f) {
-  return (f == F_Q4_0 || f == F_IQ4_NL) ? 80 : (f == F_Q4_K) ? 48 : 64;
+  return (f == F_Q4_0 || f == F_IQ4_NL) ? 80 : (f == F_Q4_K || f == F_Q4_1) ? 48 : 64;
 }
 #endif
 
@@ -650,7 +650,7 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
 #define MMQ_STAGES 2
 #endif
 
-#define SH_X_INTS (MMQ_Y * 36)          // 128 raw q4_K super-blocks, 36 ints each
+#define SH_X_INTS(RI) (MMQ_Y * (RI))     // 128 raw rows, RI ints each (36 for Q4_0/Q4_K, 40 for Q4_1)
 #define SH_Y_INTS(XT) ((XT) * 2 * 36)    // XT columns x two 128-k slabs
 
 __device__ __forceinline__ void cp_async16(int* smem, const void* g) {
@@ -664,18 +664,20 @@ template <int n> __device__ __forceinline__ void cp_async_wait() {
 
 // Stage the raw weights + the raw quantized activations for ONE 256-k iteration. Both are bulk 16 B
 // copies with no transform, which is exactly what cp.async can do and what upstream's design forbids.
-template <int XT>
+template <int XT, int NCHUNK>
 __device__ __forceinline__ void fetch_stage(int* sh_x, int* sh_y, const char* __restrict__ x,
                                             const int* __restrict__ y, const int kb0, const int i_max,
                                             const int stride_row, const int M) {
+  constexpr int ROWINTS = NCHUNK * 4;                 // 9 chunks -> 36 ints (Q4_0/Q4_K), 10 -> 40 (Q4_1)
+  constexpr int ROWBYTES = NCHUNK * 16;
   const int tid = threadIdx.y * MMQ_WARP + threadIdx.x;
 
-  // weights: 128 rows x 9 chunks of 16 B
-  for (int c = tid; c < MMQ_Y * 9; c += MMQ_NWARPS * MMQ_WARP) {
-    const int row = min(c / 9, i_max);
-    const int ch = c % 9;
-    const char* g = x + ((size_t)row * stride_row + kb0) * sizeof(block_q4_K) + ch * 16;
-    cp_async16(sh_x + (c / 9) * 36 + ch * 4, g);
+  // weights: 128 rows x NCHUNK chunks of 16 B
+  for (int c = tid; c < MMQ_Y * NCHUNK; c += MMQ_NWARPS * MMQ_WARP) {
+    const int row = min(c / NCHUNK, i_max);
+    const int ch = c % NCHUNK;
+    const char* g = x + ((size_t)row * stride_row + kb0) * ROWBYTES + ch * 16;
+    cp_async16(sh_x + (c / NCHUNK) * ROWINTS + ch * 4, g);
   }
   // activations: two 128-k slabs, each XT contiguous block_q8_1_mmq (144 B) -> XT*9 chunks
   for (int c = tid; c < XT * 2 * 9; c += MMQ_NWARPS * MMQ_WARP) {
@@ -694,7 +696,7 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
   constexpr int SUM_NE = XT / MMQ_TILE_N * MMQ_C_NE;
   extern __shared__ int smem[];
   int* sh_x = smem;                                   // [MMQ_STAGES][SH_X_INTS]
-  int* sh_y = smem + MMQ_STAGES * SH_X_INTS;          // [MMQ_STAGES][SHY]
+  int* sh_y = smem + MMQ_STAGES * SH_X_INTS(36);          // [MMQ_STAGES][SHY]
 
   const int t = threadIdx.x;
   const int i0 = threadIdx.y * 16;
@@ -713,7 +715,7 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
 
 #pragma unroll
   for (int s = 0; s < MMQ_STAGES - 1; s++) {
-    if (s < nkb) fetch_stage<XT>(sh_x + s * SH_X_INTS, sh_y + s * SHY, xb, yb, s, i_max, stride_row, M);
+    if (s < nkb) fetch_stage<XT, 9>(sh_x + s * SH_X_INTS(36), sh_y + s * SHY, xb, yb, s, i_max, stride_row, M);
     cp_async_fence();
   }
 
@@ -728,11 +730,11 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
     const int nxt = kb + MMQ_STAGES - 1;
     if (nxt < nkb) {
       const int ns = (cur + MMQ_STAGES - 1) % MMQ_STAGES;
-      fetch_stage<XT>(sh_x + ns * SH_X_INTS, sh_y + ns * SHY, xb, yb, nxt, i_max, stride_row, M);
+      fetch_stage<XT, 9>(sh_x + ns * SH_X_INTS(36), sh_y + ns * SHY, xb, yb, nxt, i_max, stride_row, M);
     }
     cp_async_fence();
 
-    const int* X = sh_x + cur * SH_X_INTS;
+    const int* X = sh_x + cur * SH_X_INTS(36);
     const int* Y = sh_y + cur * SHY;
 
     // per-row scales for this super-block: 8 (d*sc_b, -dmin*m_b) pairs, for each of the lane's 2 rows
@@ -832,7 +834,7 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
   constexpr int SUM_NE = XT / MMQ_TILE_N * MMQ_C_NE;
   extern __shared__ int smem[];
   int* sh_x = smem;
-  int* sh_y = smem + MMQ_STAGES * SH_X_INTS;
+  int* sh_y = smem + MMQ_STAGES * SH_X_INTS(36);
 
   const int t = threadIdx.x;
   const int i0 = threadIdx.y * 16;
@@ -848,7 +850,7 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
 
 #pragma unroll
   for (int s = 0; s < MMQ_STAGES - 1; s++) {
-    if (s < nkb) fetch_stage<XT>(sh_x + s * SH_X_INTS, sh_y + s * SHY, xb, yb, s, i_max, nkb, M);
+    if (s < nkb) fetch_stage<XT, 9>(sh_x + s * SH_X_INTS(36), sh_y + s * SHY, xb, yb, s, i_max, nkb, M);
     cp_async_fence();
   }
 
@@ -859,11 +861,11 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
     const int nxt = kb + MMQ_STAGES - 1;
     if (nxt < nkb) {
       const int ns = (cur + MMQ_STAGES - 1) % MMQ_STAGES;
-      fetch_stage<XT>(sh_x + ns * SH_X_INTS, sh_y + ns * SHY, xb, yb, nxt, i_max, nkb, M);
+      fetch_stage<XT, 9>(sh_x + ns * SH_X_INTS(36), sh_y + ns * SHY, xb, yb, nxt, i_max, nkb, M);
     }
     cp_async_fence();
 
-    const int* X = sh_x + cur * SH_X_INTS;
+    const int* X = sh_x + cur * SH_X_INTS(36);
     const int* Y = sh_y + cur * SHY;
 
 #pragma unroll
@@ -938,6 +940,107 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
       if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
     }
 }
+// ============================================================================================
+// PIPELINED AFFINE 32-BLOCK MAINLOOP (Q4_1).  Like sym32 but affine (min term) and CLEANER: the
+// q4_1 block is 20 B = 5 ints, all 4-aligned -- dm=(d,m) half2 at int[5b], qs ints at [5b+1..5b+4].
+// No misaligned reads at all. Row = 8 blocks x 5 = 40 ints = 160 B = 10 x 16 B chunks (aligned).
+template <int XT>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe_q41(
+    const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
+    const int N, const int K, const int M, const int stride_row_unused) {
+  constexpr int RI = 40;                        // ints per row (8 q4_1 blocks x 5)
+  constexpr int SHX = SH_X_INTS(RI);
+  constexpr int SHY = SH_Y_INTS(XT);
+  constexpr int SUM_NE = XT / MMQ_TILE_N * MMQ_C_NE;
+  extern __shared__ int smem[];
+  int* sh_x = smem;
+  int* sh_y = smem + MMQ_STAGES * SHX;
+
+  const int t = threadIdx.x;
+  const int i0 = threadIdx.y * 16;
+  const int i_tile = blockIdx.x, j_tile = blockIdx.y;
+  const int i_max = N - i_tile * MMQ_Y - 1;
+  const int nkb = K / 256;
+  (void)stride_row_unused;
+
+  const char* xb = x + (size_t)i_tile * MMQ_Y * nkb * 160;
+  const int* yb = (const int*)(y + (size_t)j_tile * XT);
+  float sum[SUM_NE] = {0.0f};
+
+#pragma unroll
+  for (int s = 0; s < MMQ_STAGES - 1; s++) {
+    if (s < nkb) fetch_stage<XT, 10>(sh_x + s * SHX, sh_y + s * SHY, xb, yb, s, i_max, nkb, M);
+    cp_async_fence();
+  }
+
+  int cur = 0;
+  for (int kb = 0; kb < nkb; kb++) {
+    cp_async_wait<MMQ_STAGES - 2>();
+    __syncthreads();
+    const int nxt = kb + MMQ_STAGES - 1;
+    if (nxt < nkb) {
+      const int ns = (cur + MMQ_STAGES - 1) % MMQ_STAGES;
+      fetch_stage<XT, 10>(sh_x + ns * SHX, sh_y + ns * SHY, xb, yb, nxt, i_max, nkb, M);
+    }
+    cp_async_fence();
+
+    const int* X = sh_x + cur * SHX;
+    const int* Y = sh_y + cur * SHY;
+
+#pragma unroll
+    for (int b = 0; b < 8; b++) {                 // 8 q4_1 blocks == 256 k
+      uint32_t A[4];
+#pragma unroll
+      for (int half = 0; half < 2; half++) {      // half == l%2 -> which of the lane's two rows
+        const int row = i0 + t / 4 + 8 * half;
+        const uint32_t raw = (uint32_t)X[row * RI + 5 * b + 1 + (t % 4)];   // qs int, aligned
+        A[half + 0] = (raw >> 0) & 0x0F0F0F0Fu;    // low nibbles  (kw < 4), unsigned (affine)
+        A[half + 2] = (raw >> 4) & 0x0F0F0F0Fu;    // high nibbles (kw >= 4)
+      }
+      // scale: affine (d, m) per (row, block); m is added via the rank-1 term.
+      float dA[MMQ_NA], mA[MMQ_NA];
+#pragma unroll
+      for (int a = 0; a < MMQ_NA; a++) {
+        const float2 dm = __half22float2(*(const half2*)&X[(i0 + t / 4 + 8 * a) * RI + 5 * b]);
+        dA[a] = dm.x; mA[a] = dm.y;
+      }
+
+      const int* Ys = Y + (b / 4) * (XT * 36);
+      const int kb32 = b % 4;
+#pragma unroll
+      for (int j0 = 0; j0 < XT; j0 += MMQ_TILE_N) {
+        uint32_t B[MMQ_B_NE];
+#pragma unroll
+        for (int l = 0; l < MMQ_B_NE; l++)
+          B[l] = Ys[(j0 + b_n(t, l)) * 36 + 4 + 8 * kb32 + b_k(t, l)];
+        float dB[MMQ_NB], sB[MMQ_NB];
+#pragma unroll
+        for (int l = 0; l < MMQ_NB; l++) {
+          const float2 ds = __half22float2(((const half2*)Ys)[(j0 + acc_j(t, l)) * 36 + kb32]);
+          dB[l] = ds.x; sB[l] = ds.y;
+        }
+        int C[MMQ_C_NE] = {0};
+        mmq_mma(C, A, B);
+#pragma unroll
+        for (int l = 0; l < MMQ_C_NE; l++) {
+          float* sp = &sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+          *sp += dA[ACC_A_IDX(l)] * dB[ACC_B_IDX(l)] * (float)C[l];
+          *sp += mA[ACC_A_IDX(l)] * sB[ACC_B_IDX(l)];
+        }
+      }
+    }
+    cur = (cur + 1) % MMQ_STAGES;
+  }
+
+#pragma unroll
+  for (int j0 = 0; j0 < XT; j0 += MMQ_TILE_N)
+#pragma unroll
+    for (int l = 0; l < MMQ_C_NE; l++) {
+      const int j = j_tile * XT + j0 + acc_j(t, l);
+      const int i = i_tile * MMQ_Y + i0 + acc_i(t, l);
+      if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+    }
+}
 #endif  // MMQ_PIPE
 
 
@@ -959,10 +1062,16 @@ static MMQLaunch mmq_launch(int fmt) {
   // cp.async pipeline: Q4_K (super-block) and the symmetric 32-block formats (Q4_0/IQ4_NL), which
   // reuse the same 144 B/row staging. Q4_1 (160 B/row) and IQ4_XS stay on the naive path for now.
   if (fmt == F_Q4_K || fmt == F_Q4_0 || fmt == F_IQ4_NL) {
-    L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
+    L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS(36) + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
     L.kern = fmt == F_Q4_K   ? mul_mat_q_pipe<XF<F_Q4_K>>
            : fmt == F_IQ4_NL ? mul_mat_q_pipe_sym32<true,  XF<F_IQ4_NL>>
                              : mul_mat_q_pipe_sym32<false, XF<F_Q4_0>>;
+    CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
+    return L;
+  }
+  if (fmt == F_Q4_1) {   // affine 32-block pipe, 40-int rows
+    L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS(40) + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
+    L.kern = mul_mat_q_pipe_q41<XF<F_Q4_1>>;
     CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
     return L;
   }
