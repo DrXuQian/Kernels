@@ -365,15 +365,34 @@ __device__ __forceinline__ void load_tiles_q4_1(const char* __restrict__ x, int*
 }
 
 // LUT: 8 nibbles of q4 -> 8 signed int8 codebook values, packed as int2 (.x = low nibbles, .y = high).
-// The generic (portable) form -- scalar table indexing, no __byte_perm, so it moves to the PPU as-is.
-// __byte_perm would be faster on NVIDIA; left as a later optimization once correctness holds.
+//
+// __byte_perm (== the PTX `prmt`) form, ported verbatim from ggml's get_int_from_table_16. This is the
+// difference between IQ4 running at 57 TOP/s (scalar table indexing) and matching the other formats:
+// upstream reaches ~300 on IQ4 precisely because it does the LUT this way. __byte_perm selects bytes by
+// a 3-bit index; the 4th bit of each nibble is handled by a second __byte_perm that picks between the
+// low and high halves of the 16-byte table. `prmt` is standard SM80 PTX, so this carries to the PPU
+// (the scalar form is kept under -DMMQ_LUT_SCALAR as a portable fallback in case a target lacks prmt).
 __device__ __forceinline__ int2 lut16(const int q4, const int8_t* tbl) {
+#ifdef MMQ_LUT_SCALAR
   const int q0 = (q4 >> 0) & 0x0F0F0F0F, q1 = (q4 >> 4) & 0x0F0F0F0F;
   const int8_t* a = (const int8_t*)&q0;
   const int8_t* b = (const int8_t*)&q1;
   const char4 v0 = make_char4(tbl[a[0]], tbl[a[1]], tbl[a[2]], tbl[a[3]]);
   const char4 v1 = make_char4(tbl[b[0]], tbl[b[1]], tbl[b[2]], tbl[b[3]]);
   int2 r; r.x = *(const int*)&v0; r.y = *(const int*)&v1; return r;
+#else
+  const uint32_t* t32 = (const uint32_t*)tbl;
+  uint32_t tmp[2];
+  const uint32_t sel = 0x32103210 | ((q4 & 0x88888888) >> 1);
+#pragma unroll
+  for (uint32_t i = 0; i < 2; i++) {
+    const uint32_t sh = 16 * i;
+    const uint32_t low  = __byte_perm(t32[0], t32[1], q4 >> sh);
+    const uint32_t high = __byte_perm(t32[2], t32[3], q4 >> sh);
+    tmp[i] = __byte_perm(low, high, sel >> sh);
+  }
+  return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+#endif
 }
 
 // IQ4_NL: symmetric (codebook values are signed int8), so it feeds the SAME dot product as Q4_0.
