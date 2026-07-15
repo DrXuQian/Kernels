@@ -795,6 +795,133 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
       if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
     }
 }
+// ============================================================================================
+// PIPELINED SYMMETRIC 32-BLOCK MAINLOOP (Q4_0, IQ4_NL).  Same cp.async structure as the Q4_K pipe --
+// and it reuses fetch_stage UNCHANGED, because a Q4_0 row and a Q4_K row are the SAME byte length
+// (both 0.5625*K bytes), so 8 raw q4_0 blocks per 256-k land in shared exactly where one q4_K
+// super-block would. Only the mma-loop dequant differs.
+//
+// The raw q4_0 block is [d:2][qs:16] = 18 B, so within the 36-int (144 B) shared row, block b occupies
+// bytes [18b, 18b+18): d at 18b, qs at 18b+2. qs is BYTE-MISALIGNED (18b+2 is 2 mod 4 for even b, 0 for
+// odd b), but b is a compile-time unroll index, so every shift below is a compile-time constant -- a
+// misaligned int read is 2 aligned loads + a const shift/or, no dynamic addressing.
+//
+// A-fragment derivation (matches the naive tile, verified): for the mma A operand (tile<16,8,int>),
+// lane t register l holds row (t/4 + 8*(l%2)), k-word kw = t%4 + 4*(l/2) of the 32-value block. The
+// q4_0 block stores quant q in the low nibble of qs[q] (q<16) or high nibble of qs[q-16] (q>=16), so
+// k-word kw<4 is 4 LOW nibbles of qs int (t%4), kw>=4 is 4 HIGH nibbles of the same int. l>=2 <=> kw>=4.
+template <bool IS_IQ4>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe_sym32(
+    const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
+    const int N, const int K, const int M, const int stride_row_unused) {
+  extern __shared__ int smem[];
+  int* sh_x = smem;
+  int* sh_y = smem + MMQ_STAGES * SH_X_INTS;
+
+  const int t = threadIdx.x;
+  const int i0 = threadIdx.y * 16;
+  const int i_tile = blockIdx.x, j_tile = blockIdx.y;
+  const int i_max = N - i_tile * MMQ_Y - 1;
+  const int nkb = K / 256;                     // 256-k iterations; also == the 144 B/row stride
+  (void)stride_row_unused;
+
+  const char* xb = x + (size_t)i_tile * MMQ_Y * nkb * 144;
+  const int* yb = (const int*)(y + (size_t)j_tile * MMQ_X);
+
+  float sum[MMQ_SUM_NE] = {0.0f};
+
+#pragma unroll
+  for (int s = 0; s < MMQ_STAGES - 1; s++) {
+    if (s < nkb) fetch_stage(sh_x + s * SH_X_INTS, sh_y + s * SH_Y_INTS, xb, yb, s, i_max, nkb, M);
+    cp_async_fence();
+  }
+
+  int cur = 0;
+  for (int kb = 0; kb < nkb; kb++) {
+    cp_async_wait<MMQ_STAGES - 2>();
+    __syncthreads();
+    const int nxt = kb + MMQ_STAGES - 1;
+    if (nxt < nkb) {
+      const int ns = (cur + MMQ_STAGES - 1) % MMQ_STAGES;
+      fetch_stage(sh_x + ns * SH_X_INTS, sh_y + ns * SH_Y_INTS, xb, yb, nxt, i_max, nkb, M);
+    }
+    cp_async_fence();
+
+    const int* X = sh_x + cur * SH_X_INTS;
+    const int* Y = sh_y + cur * SH_Y_INTS;
+
+#pragma unroll
+    for (int b = 0; b < 8; b++) {                 // 8 q4_0 blocks == 256 k
+      constexpr int qbyte = 0;                    // set per-b below via b*18
+      const int base = b * 18;                    // byte offset of this block in the 144 B row
+      const int iwb  = (base + 2) >> 2;           // aligned int index of qs (const per b)
+      const int shq  = ((base + 2) & 3) * 8;      // 0 (b odd) or 16 (b even), const per b
+      const int iwd  = base >> 2;                 // aligned int index holding d
+      const int shd  = (base & 3) * 8;            // 0 (b even) or 16 (b odd), const per b
+      (void)qbyte;
+
+      // A: two distinct rows per lane (l%2), each giving a low(l<2)/high(l>=2) nibble word.
+      uint32_t A[4];
+#pragma unroll
+      for (int half = 0; half < 2; half++) {      // half == l%2 -> which of the lane's two rows
+        const int row = i0 + t / 4 + 8 * half;
+        const int* r = X + row * 36;
+        const int iw = iwb + (t % 4);
+        const uint32_t raw = shq ? ((uint32_t)r[iw] >> shq) | ((uint32_t)r[iw + 1] << (32 - shq))
+                                 : (uint32_t)r[iw];
+        if (IS_IQ4) {
+          const int2 v = lut16((int)raw, kvalues_iq4nl_dev);
+          A[half + 0] = v.x;    // l=half   (low nibbles, kw<4)
+          A[half + 2] = v.y;    // l=half+2 (high nibbles, kw>=4)
+        } else {
+          A[half + 0] = __vsubss4((int)( raw        & 0x0F0F0F0F), 0x08080808);
+          A[half + 2] = __vsubss4((int)((raw >> 4)  & 0x0F0F0F0F), 0x08080808);
+        }
+      }
+
+      // scale: symmetric, d per (row, block). The two rows the lane accumulates are i0+t/4 and +8.
+      float dA[MMQ_NA];
+#pragma unroll
+      for (int a = 0; a < MMQ_NA; a++) {
+        const int* r = X + (i0 + t / 4 + 8 * a) * 36;
+        const uint32_t dw = (uint32_t)r[iwd] >> shd;     // d half in the low 16 bits after the shift
+        dA[a] = __half2float(*(const half*)&dw);
+      }
+
+      const int* Ys = Y + (b / 4) * (MMQ_X * 36);
+      const int kb32 = b % 4;
+
+#pragma unroll
+      for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_TILE_N) {
+        uint32_t B[MMQ_B_NE];
+#pragma unroll
+        for (int l = 0; l < MMQ_B_NE; l++)
+          B[l] = Ys[(j0 + b_n(t, l)) * 36 + 4 + 8 * kb32 + b_k(t, l)];
+
+        float dB[MMQ_NB];
+#pragma unroll
+        for (int l = 0; l < MMQ_NB; l++)
+          dB[l] = __low2float(((const half2*)Ys)[(j0 + acc_j(t, l)) * 36 + kb32]);
+
+        int C[MMQ_C_NE] = {0};
+        mmq_mma(C, A, B);
+#pragma unroll
+        for (int l = 0; l < MMQ_C_NE; l++)
+          sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l] += dA[ACC_A_IDX(l)] * dB[ACC_B_IDX(l)] * (float)C[l];
+      }
+    }
+    cur = (cur + 1) % MMQ_STAGES;
+  }
+
+#pragma unroll
+  for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_TILE_N)
+#pragma unroll
+    for (int l = 0; l < MMQ_C_NE; l++) {
+      const int j = j_tile * MMQ_X + j0 + acc_j(t, l);
+      const int i = i_tile * MMQ_Y + i0 + acc_i(t, l);
+      if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+    }
+}
 #endif  // MMQ_PIPE
 
 
@@ -807,9 +934,13 @@ struct MMQLaunch { size_t shmem; void (*kern)(const char*, const block_q8_1_mmq*
 static MMQLaunch mmq_launch(int fmt) {
   MMQLaunch L;
 #ifdef MMQ_PIPE
-  if (fmt == F_Q4_K) {   // the cp.async pipeline is Q4_K-only for now (144 B blocks divide 16 B)
+  // cp.async pipeline: Q4_K (super-block) and the symmetric 32-block formats (Q4_0/IQ4_NL), which
+  // reuse the same 144 B/row staging. Q4_1 (160 B/row) and IQ4_XS stay on the naive path for now.
+  if (fmt == F_Q4_K || fmt == F_Q4_0 || fmt == F_IQ4_NL) {
     L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS + SH_Y_INTS) * sizeof(int);
-    L.kern = mul_mat_q_pipe;
+    L.kern = fmt == F_Q4_K   ? mul_mat_q_pipe
+           : fmt == F_IQ4_NL ? mul_mat_q_pipe_sym32<true>
+                             : mul_mat_q_pipe_sym32<false>;
     CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
     return L;
   }
