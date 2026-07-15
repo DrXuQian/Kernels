@@ -113,7 +113,7 @@ constexpr __host__ __device__ const char* fmt_name(int f) {
 constexpr __host__ __device__ int fmt_x(int) { return MMQ_X; }
 #else
 constexpr __host__ __device__ int fmt_x(int f) {
-  return (f == F_Q4_0 || f == F_IQ4_NL) ? 80 : (f == F_Q4_K || f == F_Q4_1) ? 48 : 64;
+  return (f == F_Q4_0 || f == F_IQ4_NL || f == F_IQ4_XS) ? 80 : 48;   // symmetric-pipe formats take X=80; affine 48
 }
 #endif
 
@@ -1041,6 +1041,126 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_
       if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
     }
 }
+// ============================================================================================
+// PIPELINED IQ4_XS MAINLOOP (symmetric super-block).  The 136 B super-block is 8-mod-16, so cp.async
+// uses 8 B chunks (17 per row, all 8-aligned since 136 and kb0*136 are multiples of 8). Row = 34 ints:
+//   int[0] = (d_half, scales_h)   int[1] = scales_l[4]   ints[2..33] = qs (32 ints, ALIGNED at int 2).
+// Symmetric (LUT codebook is signed int8), so no min term -- should reach the sym32 formats' speed.
+__device__ __forceinline__ void cp_async8(int* smem, const void* g) {
+  uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" :: "r"(s), "l"(g), "n"(8));
+}
+
+template <int XT>
+__global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MMQ_MIN_BLOCKS) void mul_mat_q_pipe_xs(
+    const char* __restrict__ x, const block_q8_1_mmq* __restrict__ y, float* __restrict__ dst,
+    const int N, const int K, const int M, const int stride_row_unused) {
+  constexpr int RI = 34;                        // ints per iq4_xs super-block row
+  constexpr int SHX = SH_X_INTS(RI);
+  constexpr int SHY = SH_Y_INTS(XT);
+  constexpr int SUM_NE = XT / MMQ_TILE_N * MMQ_C_NE;
+  extern __shared__ int smem[];
+  int* sh_x = smem;
+  int* sh_y = smem + MMQ_STAGES * SHX;
+
+  const int t = threadIdx.x;
+  const int i0 = threadIdx.y * 16;
+  const int i_tile = blockIdx.x, j_tile = blockIdx.y;
+  const int i_max = N - i_tile * MMQ_Y - 1;
+  const int nkb = K / 256;
+  (void)stride_row_unused;
+
+  const char* xb = x + (size_t)i_tile * MMQ_Y * nkb * 136;
+  const int* yb = (const int*)(y + (size_t)j_tile * XT);
+  float sum[SUM_NE] = {0.0f};
+
+  // fetch one 256-k tile (weights 136 B/row via 8 B chunks + the y tile) into stage `st`.
+  auto fetch = [&](int* sx, int* sy, int kb0) {
+    const int tid = threadIdx.y * MMQ_WARP + threadIdx.x;
+    for (int c = tid; c < MMQ_Y * 17; c += MMQ_NWARPS * MMQ_WARP) {
+      const int row = min(c / 17, i_max);
+      const int ch = c % 17;
+      const char* g = xb + ((size_t)row * nkb + kb0) * 136 + ch * 8;
+      cp_async8(sx + (c / 17) * RI + ch * 2, g);
+    }
+    for (int c = tid; c < XT * 2 * 9; c += MMQ_NWARPS * MMQ_WARP) {
+      const int slab = c / (XT * 9), r = c % (XT * 9);
+      const int* g = yb + (size_t)(2 * kb0 + slab) * M * MMQ_TILE_Y_K + r * 4;
+      cp_async16(sy + slab * (XT * 36) + r * 4, g);
+    }
+  };
+
+#pragma unroll
+  for (int s = 0; s < MMQ_STAGES - 1; s++) {
+    if (s < nkb) fetch(sh_x + s * SHX, sh_y + s * SHY, s);
+    cp_async_fence();
+  }
+
+  int cur = 0;
+  for (int kb = 0; kb < nkb; kb++) {
+    cp_async_wait<MMQ_STAGES - 2>();
+    __syncthreads();
+    const int nxt = kb + MMQ_STAGES - 1;
+    if (nxt < nkb) fetch(sh_x + ((cur + MMQ_STAGES - 1) % MMQ_STAGES) * SHX,
+                         sh_y + ((cur + MMQ_STAGES - 1) % MMQ_STAGES) * SHY, nxt);
+    cp_async_fence();
+
+    const int* X = sh_x + cur * SHX;
+    const int* Y = sh_y + cur * SHY;
+
+#pragma unroll
+    for (int b = 0; b < 8; b++) {                 // 8 sub-blocks of 32 == 256 k
+      uint32_t A[4];
+#pragma unroll
+      for (int half = 0; half < 2; half++) {
+        const int row = i0 + t / 4 + 8 * half;
+        const int2 v = lut16(X[row * RI + 2 + 4 * b + (t % 4)], kvalues_iq4nl_dev);  // qs aligned
+        A[half + 0] = v.x;    // low nibbles  (kw < 4)
+        A[half + 2] = v.y;    // high nibbles (kw >= 4)
+      }
+      // scale: symmetric d*(ls-32) per (row, sub-block). ls is the 6-bit sub-block scale.
+      float dA[MMQ_NA];
+#pragma unroll
+      for (int a = 0; a < MMQ_NA; a++) {
+        const int* r = X + (i0 + t / 4 + 8 * a) * RI;
+        const int i0w = r[0], i1w = r[1];
+        const int d_h = i0w & 0xFFFF, sh = (i0w >> 16) & 0xFFFF;
+        const int scl = (i1w >> (8 * (b / 2))) & 0xFF;
+        const int ls = ((scl >> (4 * (b % 2))) & 0x0F) | (((sh >> (2 * b)) & 0x03) << 4);
+        dA[a] = __half2float(*(const half*)&d_h) * (ls - 32);
+      }
+
+      const int* Ys = Y + (b / 4) * (XT * 36);
+      const int kb32 = b % 4;
+#pragma unroll
+      for (int j0 = 0; j0 < XT; j0 += MMQ_TILE_N) {
+        uint32_t B[MMQ_B_NE];
+#pragma unroll
+        for (int l = 0; l < MMQ_B_NE; l++)
+          B[l] = Ys[(j0 + b_n(t, l)) * 36 + 4 + 8 * kb32 + b_k(t, l)];
+        float dB[MMQ_NB];
+#pragma unroll
+        for (int l = 0; l < MMQ_NB; l++)
+          dB[l] = __low2float(((const half2*)Ys)[(j0 + acc_j(t, l)) * 36 + kb32]);
+        int C[MMQ_C_NE] = {0};
+        mmq_mma(C, A, B);
+#pragma unroll
+        for (int l = 0; l < MMQ_C_NE; l++)
+          sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l] += dA[ACC_A_IDX(l)] * dB[ACC_B_IDX(l)] * (float)C[l];
+      }
+    }
+    cur = (cur + 1) % MMQ_STAGES;
+  }
+
+#pragma unroll
+  for (int j0 = 0; j0 < XT; j0 += MMQ_TILE_N)
+#pragma unroll
+    for (int l = 0; l < MMQ_C_NE; l++) {
+      const int j = j_tile * XT + j0 + acc_j(t, l);
+      const int i = i_tile * MMQ_Y + i0 + acc_i(t, l);
+      if (i < N && j < M) dst[(size_t)j * N + i] = sum[(j0 / MMQ_TILE_N) * MMQ_C_NE + l];
+    }
+}
 #endif  // MMQ_PIPE
 
 
@@ -1072,6 +1192,12 @@ static MMQLaunch mmq_launch(int fmt) {
   if (fmt == F_Q4_1) {   // affine 32-block pipe, 40-int rows
     L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS(40) + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
     L.kern = mul_mat_q_pipe_q41<XF<F_Q4_1>>;
+    CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
+    return L;
+  }
+  if (fmt == F_IQ4_XS) {   // symmetric super-block pipe, 34-int rows (8 B cp.async)
+    L.shmem = (size_t)MMQ_STAGES * (SH_X_INTS(34) + SH_Y_INTS(1) * L.x_tile) * sizeof(int);
+    L.kern = mul_mat_q_pipe_xs<XF<F_IQ4_XS>>;
     CUDA_CHECK(cudaFuncSetAttribute(L.kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)L.shmem));
     return L;
   }
