@@ -30,6 +30,11 @@ marlin_classic_test: test_marlin_classic_ppu.cu marlin_classic_ppu.cuh .flags
 marlin_classic_num: test_marlin_classic_num.cu marlin_classic_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# GGUF int4 on the PPU Marlin (marlin_gguf_ppu.cuh): gs=32 per-32 in-tile scale (what Q4_0 needs).
+# Box only (ppu.mma). PTX check: nvcc -std=c++17 --expt-relaxed-constexpr -arch=sm_90 -ptx -c test_marlin_gguf.cu
+marlin_gguf: test_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 # classic Marlin GROUPED-scale test (groupsize=128; the group_blocks != -1 path).
 # ANSWERED, on ppu001, all four configs, 1 group AND 4/8 groups: a vLLM / GPTQ-Marlin checkpoint's B AND
 # grouped scales are BOTH directly edible -- no conversion at load. _scale_perm is derived from the
@@ -87,4 +92,4 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f dequant_smoke mma_int8_smoke mmq_ppu mma_peak dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
