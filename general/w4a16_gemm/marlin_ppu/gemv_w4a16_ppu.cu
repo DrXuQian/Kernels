@@ -120,8 +120,29 @@ __device__ __forceinline__ FragB dequant(int q) {
 //
 // The per-thread A-sum must cover exactly the k this thread consumed, so that the existing lane/warp
 // reduction totals the whole group -- it does, since every (j,h) slot of a thread shares the same k.
+// OCCUPANCY. acu: theoretical 62.5%, achieved 41.3%, "limited by the number of required registers" -- 88
+// per thread gives 10 warps per scheduler against a hardware max of 16. On the PPU that is 131072 regs and
+// 64 warps per CU, so saturating needs <= 131072/(64*32) = 64 regs/thread.
+//
+// This matters for the same reason the loop structure does. gs=32 leaves only ONE B load in flight per warp
+// (main_n = 0 for every gs <= 64), and the GEMV_KTPG probe showed the whole +67% is structural, not the
+// scale data -- 19.89us for gs=32's data through gs=128's structure against 19.87 for gs=128 itself. More
+// resident warps attacks that from the other side: instead of raising per-warp memory-level parallelism by
+// restructuring the loop, raise the number of warps with a load outstanding.
+//
+// GEMV_MIN_BLOCKS is the blocks-per-CU ptxas must fit, which caps registers accordingly. At 64 threads a
+// block is 2 warps, so 32 blocks = 64 warps = full occupancy and a 64-register budget. 0 leaves it alone.
+#ifndef GEMV_MIN_BLOCKS
+#define GEMV_MIN_BLOCKS 0
+#endif
+#if GEMV_MIN_BLOCKS > 0
+#define GEMV_LB __launch_bounds__(GEMV_THREADS, GEMV_MIN_BLOCKS)
+#else
+#define GEMV_LB __launch_bounds__(GEMV_THREADS)
+#endif
+
 template <int SPLIT_K, bool AFFINE>
-__global__ void __launch_bounds__(GEMV_THREADS)
+__global__ void GEMV_LB
 gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
            const half* __restrict__ mn,
            float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
@@ -595,18 +616,46 @@ __global__ void gemv_reduce(const float* __restrict__ partial, half* __restrict_
 // path, which is the better choice only when the weights genuinely stay resident.
 //
 // Clamped to a power of two; K/16/sk must stay divisible by the 4 warps.
-static const int GEMV_TARGET_BLOCKS = 1024;
+// Blocks to aim for. Was a flat 1024, which on a 72-CU PPU is 14.2 blocks = 28 of 64 warps per CU, and acu
+// measured achieved occupancy at exactly that (41.3%). Made CU-aware: at 64 threads a block is 2 warps, so
+// 32 blocks per CU is full occupancy. GEMV_TARGET_BLOCKS=<n> overrides.
+static int gemv_target_blocks() {
+    if (const char* e = getenv("GEMV_TARGET_BLOCKS")) { int v = atoi(e); if (v > 0) return v; }
+    int cus = 0; cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0);
+    return (cus > 0 ? cus : 32) * 32;
+}
 #ifdef GEMV_FUSED_REDUCE
 static const int GEMV_MAX_SPLIT_K = 8;    // fused contention grows with sk
 #else
 static const int GEMV_MAX_SPLIT_K = 32;   // separate reduce has no contention
 #endif
-static int auto_split_k(int N, int K) {
-    int want = GEMV_TARGET_BLOCKS / (N / N_PER_BLOCK);
-    int sk = 1;
-    while (sk * 2 <= want && sk < GEMV_MAX_SPLIT_K) sk *= 2;
-    while (sk > 1 && (K / 16) % (sk * (GEMV_THREADS / 32))) sk /= 2;   // keep ktiles/slice a multiple of 4
-    return sk;
+// SPLIT_K sets the grid: blocks = (N/64) * SPLIT_K. That is what ACHIEVED occupancy is made of, and it was
+// the real limit -- acu reported theoretical 62.5% (88 registers) but achieved 41.3%, and 1024 blocks over
+// 72 CUs is 14.2 blocks = 28.4 of 64 warps per CU = 44%, which is the achieved figure. So the registers set
+// a ceiling the kernel never reached; too few blocks set the floor it sat on.
+//
+// kt_per_group belongs in this decision and was missing. A slice that does not hold a whole number of groups
+// makes kt_begin land mid-group, and the kernel's g = g0/kt_per_group is then simply the wrong scale row --
+// silently wrong results, not a rejected shape. GEMV_SPLIT_K=32 at gs=128 hits exactly that (28 ktiles per
+// slice against a group of 8); the auto heuristic only ever avoided it by accident.
+//
+// It also cuts the other way: gs=32 has the SMALLEST group and so the loosest divisibility, meaning it can
+// take the most slices -- which is what it needs, since it was the case starved for blocks.
+static int auto_split_k(int N, int K, int kt_per_group) {
+    const int cols = N / N_PER_BLOCK, k_tiles = K / 16, tgt = gemv_target_blocks();
+    // gs == -1 sets kt_per_group = k_tiles, i.e. ONE group spanning all of K. Splitting is still fine there:
+    // g = g0/kt_per_group is 0 in every slice, so nothing straddles. Only a real per-group scale constrains.
+    const int kpg = (kt_per_group >= k_tiles) ? 1 : kt_per_group;
+    int best = 1;
+    for (int sk = 1; sk <= GEMV_MAX_SPLIT_K; sk *= 2) {
+        if (k_tiles % sk) continue;
+        const int kts = k_tiles / sk;                    // ktiles per slice
+        if (kts % (GEMV_THREADS / 32)) continue;         // warps must divide the slice
+        if (kts % kpg) continue;                         // groups must not straddle a slice boundary
+        if ((long long) cols * sk > tgt) break;
+        best = sk;
+    }
+    return best;
 }
 // The weight stream fits in LLC (BW_ONLY reported 112.9% of HBM peak on N=14336's 29.4 MB), so a 200-iteration loop
 // over ONE B buffer measures cache, not HBM: only iteration 0 touches DRAM. Every %HBM number in this file is therefore
@@ -622,7 +671,10 @@ static int get_rot(size_t b_bytes) {
     return r < 1 ? 1 : r;
 }
 
-static int get_split_k(int N, int K) { const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 0; return v > 0 ? v : auto_split_k(N, K); }
+static int get_split_k(int N, int K, int kt_per_group) {
+    const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 0;
+    return v > 0 ? v : auto_split_k(N, K, kt_per_group);
+}
 
 // -1 = per-column scales; 128 = grouped, WHAT REAL QUANTIZED MODELS USE. Grouped scales vary along K, so they cannot be
 // applied once at the end -- the kernel folds each group's partial into an fp32 accumulator, scaled by that group's s.
@@ -670,11 +722,6 @@ static void pack_B(const std::vector<int>& Bdeq, std::vector<int>& hB, int N, in
 }
 
 static double bench_one(int N, int K, int iters, bool check) {
-    SPLIT_K = get_split_k(N, K);
-    // each slice needs a whole number of ktiles, and the 4 warps must divide them evenly
-    if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
-        printf("  N=%d K=%d SPLIT_K=%d unsupported (N%%64, K%%%d, ktiles/slice %% 4)\n", N, K, SPLIT_K, 16 * SPLIT_K); return -1; }
-
     const int gs = get_groupsize();
     if (gs != -1 && (gs % 16 || K % gs)) { printf("  GEMV_GROUPSIZE=%d unsupported (need %%16==0, K%%gs==0)\n", gs); return -1; }
     // GEMV_SCALE_BUG=1 reproduces the ORIGINAL bug: pass kt_per_group = k_tiles even when gs=128, so the kernel sees a
@@ -698,6 +745,19 @@ static double bench_one(int N, int K, int iters, bool check) {
     // itself is what costs -- and all three refuted hypotheses were looking at the wrong half of it.
     bool ktpg_probe = false;
     if (const char* e = getenv("GEMV_KTPG")) { kt_per_group = atoi(e); ktpg_probe = true; }
+
+    // SPLIT_K is chosen AFTER kt_per_group, because it depends on it -- see auto_split_k.
+    SPLIT_K = get_split_k(N, K, kt_per_group);
+    if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
+        printf("  N=%d K=%d SPLIT_K=%d unsupported (N%%64, K%%%d, ktiles/slice %% 4)\n", N, K, SPLIT_K, 16 * SPLIT_K); return -1; }
+    // A slice must hold a whole number of GROUPS. Otherwise kt_begin lands mid-group and the kernel's
+    // g = g0/kt_per_group reads the wrong scale row -- wrong numbers, not a rejected shape. Previously
+    // unchecked, so an explicit GEMV_SPLIT_K=32 at gs=128 computed garbage that only the correctness test
+    // caught. Reject it here instead.
+    if (kt_per_group < K / 16 && (K / 16 / SPLIT_K) % kt_per_group) {
+        printf("  SPLIT_K=%d incompatible with gs=%d: %d ktiles/slice is not a multiple of the group's %d "
+               "-- groups would straddle slice boundaries\n", SPLIT_K, gs, K / 16 / SPLIT_K, kt_per_group);
+        return -1; }
     const int GROUPS = (gs == -1) ? 1 : (K / gs);
 
     // AFFINE: GGUF Q4_1/Q4_K carry a per-group min. The host folds m' = m + 8s so the symmetric (q-8) dequant is
