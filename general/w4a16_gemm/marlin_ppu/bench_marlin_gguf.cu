@@ -98,8 +98,10 @@ int main(int argc, char** argv) {
         return 0;
     }
     int shapes[][3] = {
-        {1,    4096, 4096}, {1,    4096, 14336},                        // decode -- weight-BW bound, read %HBM
-        {2048, 4096, 4096}, {2048, 14336, 4096}, {2048, 4096, 14336},   // prefill -- compute bound, read %MFU
+        // PREFILL ONLY. The M=1 rows that used to be here measured Marlin at batch 1, which is not the decode
+        // path -- decode goes through gemv_w4a16_ppu.cu (GGUF Q4_K: build gemv_w4a16_t32). Reading Marlin's
+        // 16.8% HBM at M=1 against the GEMV's ~52% compares two different kernels, so the rows are gone.
+        {2048, 4096, 4096}, {2048, 14336, 4096}, {2048, 4096, 14336},   // compute bound -- read %MFU
     };
     // Paired so the gs=32 cost is a difference between adjacent lines on one shape, not a comparison against a
     // number from another binary on another day.
