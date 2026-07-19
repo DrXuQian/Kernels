@@ -53,6 +53,11 @@ bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 # cannot tell the arithmetic from the load. WRONG RESULTS, timing only.
 # Is the affine min cheaper as its OWN kernel? It never touches B, so it factors into
 # Asum[M x G] @ m'[G x N] with G = K/32 -- ~3% of the main GEMM's FLOPs. Needs cublas for the skinny gemm.
+# Which path wins at which M: fused affine vs split affine vs dequant-to-fp16 + dense hgemm.
+# All three verified against one CPU reference before any timing.
+bench_prefill_paths: bench_prefill_paths.cu marlin_gguf_ppu.cuh affine_split_ppu.cuh dequant_w4_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $< -lcublas
+
 bench_affine_split: bench_affine_split.cu marlin_gguf_ppu.cuh affine_split_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $< -lcublas
 
@@ -145,4 +150,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
