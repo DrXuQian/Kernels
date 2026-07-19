@@ -79,7 +79,13 @@ static const int N_PER_BLOCK = 64;   // one int4 spans exactly this many columns
 // are cheap. Hoisting them only buys room for a deeper B pipeline, which needs a long loop to pay off.
 // -DGEMV_NO_HOIST restores the old placement.
 #ifndef GEMV_UNROLL
+// Overridable so the main_n cliff can be swept. n_kt = kt_per_group/step ktiles per warp per group, and
+// main_n = (n_kt/GEMV_UNROLL)*GEMV_UNROLL -- so once kt_per_group/step < GEMV_UNROLL the hoisted path is
+// SILENTLY skipped entirely and every B load is consumed at load-to-use distance zero. At step=2, U=4 that
+// is every gs <= 64. Suspected cause of gs=32 costing +67% on PPU; sweep -DGEMV_UNROLL to test.
+#ifndef GEMV_UNROLL
 #define GEMV_UNROLL 4
+#endif
 #endif
 
 // Marlin's dequant, verbatim. 4 instructions (2 lop3 + hsub2 + hfma2) yield 4 halves; the naive
