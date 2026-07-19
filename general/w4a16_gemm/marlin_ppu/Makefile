@@ -107,10 +107,15 @@ gemv_w4a16_perm: gemv_w4a16_ppu.cu .flags
 gemv_w4a16_h16: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_FLUSH_H16 -o $@ $<
 
-# ONE warp per block. At gs=32 a group is 2 ktiles, so with 2 warps each group is flushed TWICE (once per
-# warp) and each warp gets n_kt=1; with 1 warp it owns the whole group -- half the flushes, n_kt=2.
-# The per-group cost is invariant to SPLIT_K (total group x warp flushes do not change when K is resliced,
-# only the reduce grows, which is why SPLIT_K=32 LOST on PPU). Warps-per-group is the factor that moves.
+# ONE warp per block. Two quantities move in opposite directions here and both have to be held:
+#   flushes   ~ groups x WARPS PER GROUP        (T=32 halves it: one warp owns the group's 2 ktiles)
+#   occupancy ~ blocks x WARPS PER BLOCK        (T=32 halves it too: 1024 blocks x 1 warp = 14/CU = 22%)
+# So T=32 alone trades one for the other. Pair it with SPLIT_K=32 and both are held: 2048 blocks x 1 warp
+# is 28 warps/CU, identical to today's 1024 x 2, while each group is flushed once instead of twice. The
+# only new cost is 2x reduce -- and that is exactly what (T=64, sk=32) paid WITHOUT buying fewer flushes,
+# which is why it lost on the box (33.26 -> 36.76).
+#   ./gemv_w4a16_t32                      -> sk auto (16): half the flushes, half the occupancy  [control]
+#   GEMV_SPLIT_K=32 ./gemv_w4a16_t32      -> half the flushes, occupancy unchanged               [the test]
 gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=32 -DGEMV_UNROLL=2 -o $@ $<
 
