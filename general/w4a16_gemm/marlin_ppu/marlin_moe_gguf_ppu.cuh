@@ -27,9 +27,11 @@
 // is computed once for all tokens and only the second GEMM is grouped. Deliberately not done here: the
 // fused path is the one with a correctness test behind it, and the split needs its own reference.
 #include "marlin_gguf_ppu.cuh"
+#include "marlin_moe_kernel_ppu.cuh"
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#include <cstdio>
 
 namespace marlin_moe_gguf_ppu {
 
@@ -105,6 +107,43 @@ inline int moe_cuda(const half* Ag, const int* B, half* Cg, const half* s, const
     if (ret) return ret;
   }
   return 0;
+}
+
+// SINGLE-LAUNCH grouped GEMM: every expert's tiles in one grid. v1 above issues one marlin_cuda per
+// expert, which pays a launch (~2us) and a wave tail PER EXPERT -- and an A3B layer has many experts each
+// holding few rows, so that is the worst case for it. Here the expert is looked up per m-tile from
+// mtile_expert and only the B / s / mins bases move; Marlin's own scheduler already flattens
+// (k_tile, n_tile, parallel) across a grid of #CU and stripes it, so one launch over the padded rows IS
+// the persistent grouped kernel.
+//
+// mtile_expert must be built at moe_m_tile()'s granularity -- the same one moe_plan padded to.
+inline int moe_cuda_fused(const half* Ag, const int* B, half* Cg, const half* s, const half* mins,
+                          const MoePlan& plan, int N, int K, void* workspace, int gs,
+                          int num_experts, const int* d_mtile_expert, int max_par = 128) {
+  const long long b_stride_i4 = (long long) (K / 16) * (N * 16 / 32) / 4;   // int4 per expert
+  const long long s_stride_i4 = (long long) (K / gs) * N / 8;               // int4 per expert
+  return marlin_moe_kernel_ppu::marlin_cuda(
+      Ag, B, Cg, (void*) s, mins ? (void*) mins : nullptr,
+      plan.padded_rows, N, K, workspace, gs, 0, 0, -1, -1, -1, max_par,
+      d_mtile_expert, b_stride_i4, s_stride_i4);
+}
+
+// Expert of each m-tile, at the KERNEL's tile granularity -- which is NOT necessarily the plan's.
+// MARLIN_MAX_MB is 2, so the kernel tiles at 32 rows while a plan may pad to 64. Padding to a larger
+// multiple is safe (every 32-row tile still sits inside one expert), but building this array at the
+// PLAN's granularity while the kernel indexes at its own silently shifts every expert. The plan's m_tile
+// must therefore be a multiple of the kernel's, and the array is built at the kernel's.
+inline std::vector<int> moe_mtile_expert(const MoePlan& plan, int num_experts, int kernel_m_tile) {
+  if (plan.m_tile % kernel_m_tile) {
+    printf("moe_mtile_expert: plan m_tile=%d is not a multiple of the kernel's %d -- an m-tile would "
+           "straddle two experts\n", plan.m_tile, kernel_m_tile);
+    return {};
+  }
+  std::vector<int> v(plan.padded_rows / kernel_m_tile);
+  for (int e = 0; e < num_experts; e++)
+    for (int r = plan.expert_off[e]; r < plan.expert_off[e + 1]; r += kernel_m_tile)
+      v[r / kernel_m_tile] = e;
+  return v;
 }
 
 }  // namespace marlin_moe_gguf_ppu
