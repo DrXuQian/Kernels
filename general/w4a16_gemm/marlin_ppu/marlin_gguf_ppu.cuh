@@ -27,6 +27,20 @@
 #define MARLIN_APPLY_MIN 1
 #endif
 
+// -DMARLIN_MINS_CONST: the THIRD point, and the reason it is needed. MARLIN_MINS_NOAPPLY does not keep the
+// mins path alive as its comment claimed: with frag_m unread, ptxas dead-code-eliminates the per-k shared
+// int4 load, so that probe drops the LOAD and the hfma2 together and cannot separate them. This one keeps
+// the hfma2 and feeds it a compile-time constant instead, dropping only the load. Three points then read:
+//   real (load + hfma2)            29.9% MFU at gs=32
+//   NOAPPLY (neither, via DCE)     40.2%
+//   CONST (hfma2, no load)         -> near 29.9 means the ARITHMETIC costs; near 40.2 means the LOAD does
+// Wrong results by design, timing only.
+#ifdef MARLIN_MINS_CONST
+#define MARLIN_MIN_VAL(fm) __float2half2_rn(0.25f)
+#else
+#define MARLIN_MIN_VAL(fm) __half2half2(reinterpret_cast<__half*>(&(fm))[i])
+#endif
+
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -186,7 +200,7 @@ __device__ __forceinline__ void scale(FragB& frag_b, FragS& frag_s, int i) {
 // a separate rank-1 correction AND an int32-accumulator flush at every scale boundary. Here it is free.
 __device__ __forceinline__ void scale_affine(FragB& frag_b, FragS& frag_s, FragS& frag_m, int i) {
   half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
-  half2 m = __half2half2(reinterpret_cast<__half*>(&frag_m)[i]);
+  half2 m = MARLIN_MIN_VAL(frag_m);
   frag_b[0] = __hfma2(frag_b[0], s, m); frag_b[1] = __hfma2(frag_b[1], s, m);
 }
 // HOST: the grouped-scale layout the kernel expects by default. This is upstream Marlin's _scale_perm,

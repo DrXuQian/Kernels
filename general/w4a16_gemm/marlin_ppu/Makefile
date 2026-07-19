@@ -48,6 +48,12 @@ bench_marlin_gguf: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -DMARLIN_MINS_NOAPPLY -o $@ $<
 
+# hfma2 KEPT, min value replaced by a constant -- drops the per-k shared load only. Needed because
+# _nomin's unread frag_m gets dead-code-eliminated along with its load, so that build drops both and
+# cannot tell the arithmetic from the load. WRONG RESULTS, timing only.
+bench_marlin_gguf_cmin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -DMARLIN_MINS_CONST -o $@ $<
+
 # classic Marlin GROUPED-scale test (groupsize=128; the group_blocks != -1 path).
 # ANSWERED, on ppu001, all four configs, 1 group AND 4/8 groups: a vLLM / GPTQ-Marlin checkpoint's B AND
 # grouped scales are BOTH directly edible -- no conversion at load. _scale_perm is derived from the
@@ -134,4 +140,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
