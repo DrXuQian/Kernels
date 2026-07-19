@@ -34,8 +34,8 @@ marlin_classic_num: test_marlin_classic_num.cu marlin_classic_ppu.cuh .flags
 # Box only (ppu.mma). PTX check: nvcc -std=c++17 --expt-relaxed-constexpr -arch=sm_90 -ptx -c test_marlin_gguf.cu
 # The sha is compiled IN and printed at startup: a stale checkout / wrong branch shows up in the output
 # instead of masquerading as "the fix did not work" (that misread cost a full debug cycle once already).
-marlin_gguf: test_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
-	$(NVCC) $(NVCCFLAGS) -DGGUF_BUILD_SHA='"$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet 2>/dev/null || echo -dirty)"' -o $@ $<
+marlin_gguf: test_marlin_gguf.cu marlin_gguf_ppu.cuh affine_split_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -lcublas -DGGUF_BUILD_SHA='"$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet 2>/dev/null || echo -dirty)"' -o $@ $<
 
 # perf bench for the GGUF W4A16 port. Pairs gs=128 vs gs=32 (and sym vs affine) on each shape, because the
 # question is the gs=32 DELTA against marlin_classic's 47% MFU, not an absolute number.
@@ -53,7 +53,7 @@ bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 # cannot tell the arithmetic from the load. WRONG RESULTS, timing only.
 # Is the affine min cheaper as its OWN kernel? It never touches B, so it factors into
 # Asum[M x G] @ m'[G x N] with G = K/32 -- ~3% of the main GEMM's FLOPs. Needs cublas for the skinny gemm.
-bench_affine_split: bench_affine_split.cu marlin_gguf_ppu.cuh .flags
+bench_affine_split: bench_affine_split.cu marlin_gguf_ppu.cuh affine_split_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $< -lcublas
 
 bench_marlin_gguf_cmin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags

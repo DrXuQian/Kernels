@@ -20,6 +20,7 @@
 #include <random>
 #include <cuda_fp16.h>
 #include "marlin_gguf_ppu.cuh"
+#include "affine_split_ppu.cuh"
 #ifndef GGUF_BUILD_SHA
 #define GGUF_BUILD_SHA "unknown-sha (pass -DGGUF_BUILD_SHA=...)"
 #endif
@@ -41,7 +42,13 @@ static const char* sm_name(int m) { return m==SM_ONE?"s=1.0":m==SM_COL?"s=f(n)":
 // values), which is exactly how gs>=64 + affine shipped reading an uninitialized frag_m -- the mins were
 // never staged on the group_blocks!=2 branch, and the bench does not check results, so it timed a gs=128
 // affine that did no work. Synthetic data here can take any gs, so it closes that hole.
-static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32, bool affine = false) {
+// split: run the affine min as a SEPARATE pass (symmetric Marlin + Asum @ m') instead of folded into the
+// mainloop, checked against the SAME independent CPU reference. This is the path bench_affine_split
+// measures at 20% faster, and until now its numerical correctness had never been checked anywhere -- the
+// bench is timing-only on memset inputs. That is exactly how gs>=64 affine shipped multiplying by an
+// uninitialized frag_m: a fast number from a build nothing verified.
+static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32, bool affine = false,
+                    bool split = false) {
   using namespace marlin_gguf_ppu;
   const int max_par = 128;
   const int NG = K / gs;                             // groups per column
@@ -142,7 +149,20 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32, bool a
   cudaMemcpy(dS, sDev.data(), sDev.size() * 2, cudaMemcpyHostToDevice);
   cudaMemset(dWS, 0, (N / 128 + 1) * max_par * 4);
 
-  int ret = marlin_cuda(dA, dB, dC, dS, affine ? (void*) dM : nullptr, M, N, K, dWS, gs);
+  int ret;
+  if (split) {
+    // NOTE the layout: the fused path reads mins in _scale_perm order (dM), the correction reads them as
+    // a plain [G][N] matrix. Feeding it the permuted buffer is silently wrong, so it gets mPlain.
+    const int G = K / gs;
+    half *dMp, *dAsum;
+    cudaMalloc(&dMp, (size_t) G * N * 2); cudaMalloc(&dAsum, (size_t) M * G * 2);
+    cudaMemcpy(dMp, mPlain.data(), (size_t) G * N * 2, cudaMemcpyHostToDevice);
+    cublasHandle_t cub; cublasCreate(&cub);
+    ret = affine_split_ppu::affine_split_cuda(dA, dB, dC, dS, dMp, M, N, K, dWS, gs, dAsum, cub);
+    cublasDestroy(cub); cudaFree(dMp); cudaFree(dAsum);
+  } else {
+    ret = marlin_cuda(dA, dB, dC, dS, affine ? (void*) dM : nullptr, M, N, K, dWS, gs);
+  }
   cudaError_t e = cudaDeviceSynchronize();
   if (ret || e) { printf("  M%-4d N%-5d K%-4d gs=32: ret=%d err=%s\n", M, N, K, ret, cudaGetErrorString(e)); return 2; }
   cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost);
@@ -154,8 +174,9 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32, bool a
   }
   double rel = maxabs / (refmax + 1e-9);
   const bool bad = rel >= 3e-2;
-  printf("  Q4_0/%-8s gs=%-3d %-3s M%-4d N%-5d K%-5d  rel %.2e (|ref|max=%.1f) -> %s\n",
-         sm_name(mode), gs, affine ? "aff" : "sym", M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
+  printf("  Q4_0/%-8s gs=%-3d %-9s M%-4d N%-5d K%-5d  rel %.2e (|ref|max=%.1f) -> %s\n",
+         sm_name(mode), gs, split ? "aff-SPLIT" : (affine ? "aff" : "sym"),
+         M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
   // The group axis is the one that is broken (s=f(n) sits on the s=1.0 baseline, s=f(g) does not). Rather
   // than keep reading the kernel and guessing, ask which group it ACTUALLY read: rebuild the reference
   // under a list of candidate wrong mappings and see which one reproduces the GPU output. The one that
@@ -328,6 +349,14 @@ int main() {
   probe |= run_case(64, 256, 1024, SM_FULL, 128, true);
   probe |= run_case(64, 256, 1024, SM_FULL, 32,  true);
   probe |= run_case(128, 512, 1024, SM_FULL, 128, true);
+  // The SPLIT affine path, against the same reference as the fused one. Both gs, and a shape where the
+  // symmetric Marlin needs split-K, since the correction accumulates onto whatever Marlin wrote and a
+  // reduce that runs afterwards would double-count.
+  printf("--- affine as a SEPARATE pass (symmetric Marlin + Asum @ m') ---\n");
+  probe |= run_case(64,  256, 1024, SM_FULL, 32,  true, true);
+  probe |= run_case(64,  256, 1024, SM_FULL, 128, true, true);
+  probe |= run_case(128, 512, 1024, SM_FULL, 32,  true, true);
+  probe |= run_case(16,  128, 512,  SM_FULL, 32,  true, true);
   printf("GGUF int4 on PPU Marlin, gs=32 (per-32 in-tile scale):\n");
   int bad = 0;
   int bad2 = probe;

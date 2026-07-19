@@ -17,6 +17,7 @@
 //
 // build (box): make bench_affine_split && ./bench_affine_split
 #include "marlin_gguf_ppu.cuh"
+#include "affine_split_ppu.cuh"   // asum_kernel + affine_split_cuda: ONE copy, shared with test_marlin_gguf
 #include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
@@ -24,39 +25,6 @@
 #include <random>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_) { printf("cuda %s @%d\n", cudaGetErrorString(e_), __LINE__); exit(1); } } while (0)
-
-// Asum[m][g] = sum of A[m][k] over the group's gs activations.
-//
-// v1 gave one thread the whole group and had it read gs halves in a scalar loop. Consecutive threads then
-// sat 64 B apart, so every single 2-byte load was a 32-way scatter over 2 KB -- one cache line per lane.
-// It measured 35.3us against a 6.1us bandwidth floor at K=4096 (58.7 MB / 2766 GB/s = 21.2 vs 107 at
-// K=14336), i.e. 5x off, and it was 62-66% of the whole correction.
-//
-// v2: one thread per int4 (8 halves), so lanes address contiguously and the warp reads a solid 512 B per
-// instruction. gs=32 is exactly 4 int4, so the four lanes covering a group reduce among themselves with
-// shuffles and lane%4==0 writes. Eight times fewer load instructions and fully coalesced.
-__global__ void asum_kernel(const half* __restrict__ A, half* __restrict__ Asum, int M, int K, int gs) {
-    const int G = K / gs, per_group = gs / 8;              // int4 per group (4 at gs=32)
-    const long long nvec = (long long) M * (K / 8);
-    const long long idx = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nvec) return;
-
-    const int4 v = reinterpret_cast<const int4*>(A)[idx];
-    const half2* h = reinterpret_cast<const half2*>(&v);
-    float acc = 0.f;
-    #pragma unroll
-    for (int i = 0; i < 4; i++) { const float2 f = __half22float2(h[i]); acc += f.x + f.y; }
-
-    // Reduce the per_group lanes that share a group. They are adjacent in idx, hence adjacent lanes.
-    #pragma unroll
-    for (int off = 1; off < 8; off <<= 1)
-        if (off < per_group) acc += __shfl_down_sync(0xffffffff, acc, off);
-
-    if (idx % per_group == 0) {
-        const long long vg = idx / per_group;              // global group index
-        Asum[(vg / G) * (long long) G + (vg % G)] = __float2half(acc);
-    }
-}
 
 int main(int argc, char** argv) {
     const int M = argc > 1 ? atoi(argv[1]) : 2048;
@@ -86,7 +54,7 @@ int main(int argc, char** argv) {
     };
     // C += Asum[M x G] * m'[G x N]. cublas is column-major, so compute C^T = m'^T * Asum^T by swapping.
     auto correction = [&] {
-        asum_kernel<<<(int) (((long long) M * (K / 8) + 255) / 256), 256>>>(dA, dAsum, M, K, gs);
+        affine_split_ppu::asum_kernel<<<(int) (((long long) M * (K / 8) + 255) / 256), 256>>>(dA, dAsum, M, K, gs);
         cublasHgemm(cub, CUBLAS_OP_N, CUBLAS_OP_N, N, M, G, &alpha,
                     dM, N, dAsum, G, &beta_acc, dC, N);
     };
@@ -96,7 +64,7 @@ int main(int argc, char** argv) {
         std::normal_distribution<float> nd(0.f, 1.f);
         for (auto& x : hA) x = __float2half(0.1f * nd(rng));
         CK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
-        asum_kernel<<<(int) (((long long) M * (K / 8) + 255) / 256), 256>>>(dA, dAsum, M, K, gs);
+        affine_split_ppu::asum_kernel<<<(int) (((long long) M * (K / 8) + 255) / 256), 256>>>(dA, dAsum, M, K, gs);
         CK(cudaDeviceSynchronize());
         std::vector<half> got((size_t) M * G);
         CK(cudaMemcpy(got.data(), dAsum, got.size() * 2, cudaMemcpyDeviceToHost));
@@ -135,7 +103,7 @@ int main(int argc, char** argv) {
     // A); the hgemm is a skinny GEMM plus a read-modify-write of all of C, which is a floor the separate
     // -kernel shape cannot avoid -- only fusing into Marlin's epilogue could.
     const double t_asum = time_it("  asum only (read A, reduce by gs)", F_corr,
-        [&] { asum_kernel<<<(int) (((long long) M * (K / 8) + 255) / 256), 256>>>(dA, dAsum, M, K, gs); });
+        [&] { affine_split_ppu::asum_kernel<<<(int) (((long long) M * (K / 8) + 255) / 256), 256>>>(dA, dAsum, M, K, gs); });
     const double t_hg   = time_it("  hgemm only (skinny, + C rmw)", F_corr,
         [&] { cublasHgemm(cub, CUBLAS_OP_N, CUBLAS_OP_N, N, M, G, &alpha, dM, N, dAsum, G, &beta_acc, dC, N); });
     const double t_corr = time_it("correction alone (asum + hgemm)", F_corr, [&] { correction(); });
