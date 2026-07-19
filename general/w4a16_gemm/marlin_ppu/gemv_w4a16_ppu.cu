@@ -628,9 +628,27 @@ __global__ void gemv_reduce(const float* __restrict__ partial, half* __restrict_
 // The occupancy number was real and the arithmetic was right -- filling the CUs simply is not what this
 // kernel is short of. Fourth explanation for the gs=32 cost to die, and the third to look right on a 5090
 // and wrong on the PPU.
+// Expressed as a target number of WARPS, because that is the quantity that has to be held. Box, gs=32
+// affine, cold, the 2x2 of threads-per-block x SPLIT_K:
+//
+//   shape             (64,16) base   (32,16)   (32,32)
+//   N4096  K4096         13.43        12.78     11.15   -17%
+//   N14336 K4096         38.70        37.43     26.29   -32%   (base auto-picked sk=4, only 896 blocks)
+//   N4096  K14336        35.73        34.63     26.54   -26%
+//
+// Two quantities move opposite ways and both have to be held:
+//   flushes   ~ groups x WARPS PER GROUP    T=32 halves it (one warp owns the group's 2 ktiles at gs=32)
+//   occupancy ~ blocks x WARPS PER BLOCK    T=32 halves that too
+// The (32,16) column is the control and shows why it must be both: alone, T=32 buys 2-3%, because halving
+// the flushes and halving residency nearly cancel. Restoring the warp count with sk=32 is what cashes it in.
+// Symmetrically (64,32) LOST on the box, 33.26 -> 36.76: it paid the extra reduce for occupancy it did not
+// need and bought no reduction in flushes.
+//
+// So: target warps. 2048 is the configuration already verified at T=64/sk=16 (1024 blocks x 2 warps), and
+// it now yields sk=32 at T=32 on its own. GEMV_TARGET_BLOCKS overrides, in blocks, for sweeping.
 static int gemv_target_blocks() {
     if (const char* e = getenv("GEMV_TARGET_BLOCKS")) { int v = atoi(e); if (v > 0) return v; }
-    return 1024;
+    return 2048 / (GEMV_THREADS / 32);
 }
 #ifdef GEMV_FUSED_REDUCE
 static const int GEMV_MAX_SPLIT_K = 8;    // fused contention grows with sk
