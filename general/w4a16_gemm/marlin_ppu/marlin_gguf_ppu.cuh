@@ -543,15 +543,23 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       // frag_s[k%2] is loaded (via the k-pipeline) with THAT group's scales, so matmul(k) -- which is
       // unchanged and applies frag_s[k%2] to the B fragments -- gets per-32 scaling. _scale_perm layout,
       // one int4 per lane, same as the default coarse-group read.
-      // k is a ROLLING counter across stages -- fetch_to_registers(k+1) prefetches into the next stage,
-      // so k reaches b_sh_wr_iters. Everything else here indexes with (k % b_sh_wr_iters) (see the A and B
-      // reads); the group within the stage must too, or k==b_sh_wr_iters reads past the staged groups.
-      const int k_in_stage = k % b_sh_wr_iters;
-      int4* sh_s_stage = sh_s + s_sh_stage * pipe + (k_in_stage / 2) * s_sh_stride;
+      // WARPS SPLIT THE K DIMENSION -- that is what thread_block_reduce() exists to undo, and it is the
+      // thing I originally got wrong here. b_sh_wr_iters is NOT thread_k_blocks: it is 8*NB*KB/threads,
+      // which is 2 for every config in the CALL_IF list while thread_k_blocks is 4 or 8. The k-block a
+      // thread actually works on is therefore split between the loop counter and its warp id, exactly as
+      // a_sh_rd encodes it (a_sh_rd += 2 * ((threadIdx.x/32) / (thread_n_blocks/4)) at init, stepped by
+      // a_sh_rd_delta_o = 2*NWK per iteration):
+      //     ktile_in_stage = (k % b_sh_wr_iters) * NWK + warp_k
+      // Using (k % b_sh_wr_iters) / 2 made the group index identically 0, so every warp read the stage's
+      // FIRST group -- which is precisely what the readout probe showed (blocks 0-3 -> 0, 4-7 -> 4, ...).
+      constexpr int NWK = (threads / 32) / (thread_n_blocks / 4);
+      const int warp_k = (threadIdx.x / 32) / (thread_n_blocks / 4);
+      const int grp = ((k % b_sh_wr_iters) * NWK + warp_k) / 2;   // gs=32 = 2 k-blocks of 16
+      int4* sh_s_stage = sh_s + s_sh_stage * pipe + grp * s_sh_stride;
       const int s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
       if (AFFINE) reinterpret_cast<int4*>(&frag_m[k % 2])[0] =
-          (sh_m + s_sh_stage * pipe + (k_in_stage / 2) * s_sh_stride)[s_sh_rd];
+          (sh_m + s_sh_stage * pipe + grp * s_sh_stride)[s_sh_rd];
     } else if (group_blocks != -1) {
 #ifdef MARLIN_SCALE_NONE
       // SPEED-ONLY, RESULT IS WRONG. Removes ALL grouped-scale work from the mainloop (this load and the
