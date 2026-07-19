@@ -30,7 +30,10 @@ int main(int argc, char** argv) {
     const int M = argc > 1 ? atoi(argv[1]) : 2048;
     const int N = argc > 2 ? atoi(argv[2]) : 4096;
     const int K = argc > 3 ? atoi(argv[3]) : 4096;
-    const int gs = 32, G = K / gs, max_par = 128, iters = 20;
+    // gs from argv so the bench is not permanently pinned to the one groupsize that hid an asum bug:
+    // the shuffle reduction was short by half at gs=128 and only gs=32 was ever benched here.
+    const int gs = argc > 4 ? atoi(argv[4]) : 32;
+    const int G = K / gs, max_par = 128, iters = 20;
     printf("affine split: M=%d N=%d K=%d gs=%d (G=%d, correction is %.1f%% of the main GEMM's FLOPs)\n",
            M, N, K, gs, G, 100.0 / gs);
 

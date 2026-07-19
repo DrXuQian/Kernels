@@ -18,6 +18,7 @@
 // NOT for decode. At M=1 the GEMM is weight-bandwidth bound and this adds a full read of A plus a
 // read-modify-write of C for a correction that gemv_w4a16_ppu.cu already gets rank-1 and nearly free.
 #include <cuda_fp16.h>
+#include <cstdio>
 #include <cublas_v2.h>
 #include "marlin_gguf_ppu.cuh"
 
@@ -30,7 +31,9 @@ namespace affine_split_ppu {
 // threads gs*2 bytes apart and makes every 2-byte load a 32-way scatter; it measured 5x off the bandwidth
 // floor (35.3us against 6.1) and was two thirds of the whole correction.
 __global__ void asum_kernel(const half* __restrict__ A, half* __restrict__ Asum, int M, int K, int gs) {
-    const int G = K / gs, per_group = gs / 8;              // int4 per group (4 at gs=32)
+    // per_group lanes cooperate on one group, so a group must fit inside a warp: gs <= 256. Larger would
+    // need a cross-warp reduction; assert rather than silently truncate the way v1 did.
+    const int G = K / gs, per_group = gs / 8;              // int4 per group (4 at gs=32, 16 at gs=128)
     const long long nvec = (long long) M * (K / 8);
     const long long idx = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nvec) return;
@@ -42,8 +45,14 @@ __global__ void asum_kernel(const half* __restrict__ A, half* __restrict__ Asum,
     for (int i = 0; i < 4; i++) { const float2 f = __half22float2(h[i]); acc += f.x + f.y; }
 
     // The per_group lanes sharing a group are adjacent in idx, hence adjacent lanes.
+    //
+    // The bound is per_group, NOT a constant. v1 wrote `off < 8`, which reduces at most 8 lanes: right for
+    // gs=32 (per_group=4, off 1..2) and short by half for gs=128 (per_group=16, needs off up to 8), so it
+    // summed half of every group and the split path came out at rel 3.2e-1 there. gs=32 could never show
+    // it, and gs=32 was the only groupsize bench_affine_split ran -- the 20% speedup was measured in the
+    // one configuration that hides the bug.
     #pragma unroll
-    for (int off = 1; off < 8; off <<= 1)
+    for (int off = 1; off < 32; off <<= 1)
         if (off < per_group) acc += __shfl_down_sync(0xffffffff, acc, off);
 
     if (idx % per_group == 0) {
@@ -53,6 +62,7 @@ __global__ void asum_kernel(const half* __restrict__ A, half* __restrict__ Asum,
 }
 
 inline void asum_launch(const half* A, half* Asum, int M, int K, int gs, cudaStream_t stream = 0) {
+    if (gs > 256 || gs % 8) { printf("asum: gs=%d unsupported (need gs%%8==0 and gs<=256)\n", gs); return; }
     const int blocks = (int) (((long long) M * (K / 8) + 255) / 256);
     asum_kernel<<<blocks, 256, 0, stream>>>(A, Asum, M, K, gs);
 }
