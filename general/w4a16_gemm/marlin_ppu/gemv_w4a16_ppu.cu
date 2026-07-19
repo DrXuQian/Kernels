@@ -283,11 +283,33 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         // FLUSH: fold this group's half2 partial into fp32, scaled by this group's s. The two half2 lanes hold
         // different k, so they add. Column of slot (j,h) is (nb_group*4 + j)*16 + lane/4 + 8*h.
         float asum = 0.f;
-        if (AFFINE) { const float2 fa = __half22float2(asum2); asum = fa.x + fa.y; }
+        half asum_h = __float2half(0.f);
+        if (AFFINE) {
+#ifdef GEMV_FLUSH_H16
+            asum_h = __hadd(__low2half(asum2), __high2half(asum2));
+#else
+            const float2 fa = __half22float2(asum2); asum = fa.x + fa.y;
+#endif
+        }
+        (void) asum; (void) asum_h;
         #pragma unroll
         for (int j = 0; j < 4; j++)
             #pragma unroll
             for (int h = 0; h < 2; h++) {
+#if defined(GEMV_FLUSH_H16) && !defined(GEMV_NO_HOIST)
+                // acu (gs=32 vs gs=128) put v.cnvt at 1,382,400 against 350,208 -- +295%, and the single
+                // most-executed opcode in the kernel, ahead of v.fma.f16 (1,376,256, UNCHANGED). The real
+                // math does not grow with gs at all; the per-group FLUSH does, 4x with 4x the groups. Each
+                // (j,h) used to cost 3 conversions (2 for hacc, 1 for the scale) plus an fp32 add and fma,
+                // and 4 conversions when affine.
+                //
+                // Reducing and scaling in half instead costs ONE conversion: the group partial is already a
+                // half2 accumulator, so folding its two lanes and applying the scale there loses nothing
+                // structural, and the cross-group accumulator stays fp32 where the range actually matters.
+                half v = __hmul(__hadd(__low2half(hacc[j][h]), __high2half(hacc[j][h])), sg[j][h]);
+                if (AFFINE) v = __hfma(asum_h, mg[j][h], v);
+                facc[j][h] += __half2float(v);
+#else
                 const float2 f = __half22float2(hacc[j][h]);
 #ifdef GEMV_NO_HOIST
                 const int col = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h;
@@ -296,6 +318,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
                 facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);   // prefetched at the top of the group
 #endif
                 if (AFFINE) facc[j][h] += asum * __half2float(mg[j][h]);
+#endif
             }
     }
 

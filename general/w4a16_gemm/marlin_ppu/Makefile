@@ -102,6 +102,11 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 gemv_w4a16_perm: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_SCALE_PERM -o $@ $<
 
+# Per-group flush done in half (one v.cnvt instead of three/four). acu says gs=32 is ALU-bound on the PPU:
+# v.fma.f16 and v.lop3.i are IDENTICAL to gs=128 while v.cnvt is +295% and the fp32 flush ops are +300%.
+gemv_w4a16_h16: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_FLUSH_H16 -o $@ $<
+
 
 clean:
-	rm -f gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
