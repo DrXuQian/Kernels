@@ -267,10 +267,10 @@ int main() {
   // already verified on this box. It shares the B packing, the scale layout and _scale_perm with gs=32 and
   // differs ONLY in the group machinery, so it is the control: if it passes, the fault is confined to the
   // group_blocks==2 branch I added, and nothing under it is suspect.
+  int probe = p_one | p_col | p_grp;
   printf("--- control: gs=128 (group_blocks=8, the path marlin_classic already verified) ---\n");
   probe |= run_case(64, 256, 1024, SM_FULL, 128);
   probe |= run_case(128, 512, 1024, SM_FULL, 128);
-  int probe = p_one | p_col | p_grp;
   printf("GGUF int4 on PPU Marlin, gs=32 (per-32 in-tile scale):\n");
   int bad = 0;
   int bad2 = probe;
