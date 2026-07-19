@@ -182,6 +182,17 @@ __device__ __forceinline__ int a_row(int t, int l) { return t / 4 + 8 * (l / 2);
 __device__ __forceinline__ int a_kw (int t, int l) { return (t % 4) + 4 * (l % 2); }
 #endif
 
+// A-fragment register index for (row-half rh, k-half kh). The two backends order these DIFFERENTLY --
+// NVIDIA puts the row bit in l%2 and the k bit in l/2; the PPU swaps them (this is the same v1<->v2
+// swap ppu_ldmatrix_x4 does for free in the fp16 Marlin). Hardcoding NVIDIA's order in a pipe compiles
+// and passes on the 5090 but produces garbage on ppu001 -- that is exactly how Q4_0/Q4_1/IQ4_NL/IQ4_XS
+// failed on the PPU while Q4_K (which goes through a_row/a_kw) passed. Always use this, never A[half+2].
+#ifdef MMQ_NV
+#define A_IDX(rh, kh) ((rh) + 2 * (kh))     // row bit = l%2, k bit = l/2
+#else
+#define A_IDX(rh, kh) (2 * (rh) + (kh))     // row bit = l/2, k bit = l%2  (PPU)
+#endif
+
 __device__ __forceinline__ void mmq_ldmatrix_A(uint32_t* a, const int* smem) {
 #ifdef MMQ_NV
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
@@ -898,11 +909,11 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q_pipe_sym32
                                  : (uint32_t)r[iw];
         if (IS_IQ4) {
           const int2 v = lut16((int)raw, kvalues_iq4nl_dev);
-          A[half + 0] = v.x;    // l=half   (low nibbles, kw<4)
-          A[half + 2] = v.y;    // l=half+2 (high nibbles, kw>=4)
+          A[A_IDX(half, 0)] = v.x;    // low nibbles  (k-half 0)
+          A[A_IDX(half, 1)] = v.y;    // high nibbles (k-half 1)
         } else {
-          A[half + 0] = __vsubss4((int)( raw        & 0x0F0F0F0F), 0x08080808);
-          A[half + 2] = __vsubss4((int)((raw >> 4)  & 0x0F0F0F0F), 0x08080808);
+          A[A_IDX(half, 0)] = __vsubss4((int)( raw        & 0x0F0F0F0F), 0x08080808);
+          A[A_IDX(half, 1)] = __vsubss4((int)((raw >> 4)  & 0x0F0F0F0F), 0x08080808);
         }
       }
 
@@ -1003,8 +1014,8 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q_pipe_q41(
       for (int half = 0; half < 2; half++) {      // half == l%2 -> which of the lane's two rows
         const int row = i0 + t / 4 + 8 * half;
         const uint32_t raw = (uint32_t)X[row * RI + 5 * b + 1 + (t % 4)];   // qs int, aligned
-        A[half + 0] = (raw >> 0) & 0x0F0F0F0Fu;    // low nibbles  (kw < 4), unsigned (affine)
-        A[half + 2] = (raw >> 4) & 0x0F0F0F0Fu;    // high nibbles (kw >= 4)
+        A[A_IDX(half, 0)] = (raw >> 0) & 0x0F0F0F0Fu;    // low nibbles  (unsigned, affine)
+        A[A_IDX(half, 1)] = (raw >> 4) & 0x0F0F0F0Fu;    // high nibbles
       }
       // scale: affine (d, m) per (row, block); m is added via the rank-1 term.
       float dA[MMQ_NA], mA[MMQ_NA];
@@ -1124,8 +1135,8 @@ __global__ __launch_bounds__(MMQ_WARP* MMQ_NWARPS, MB) void mul_mat_q_pipe_xs(
       for (int half = 0; half < 2; half++) {
         const int row = i0 + t / 4 + 8 * half;
         const int2 v = lut16(X[row * RI + 2 + 4 * b + (t % 4)], kvalues_iq4nl_dev);  // qs aligned
-        A[half + 0] = v.x;    // low nibbles  (kw < 4)
-        A[half + 2] = v.y;    // high nibbles (kw >= 4)
+        A[A_IDX(half, 0)] = v.x;    // low nibbles
+        A[A_IDX(half, 1)] = v.y;    // high nibbles
       }
       // scale: symmetric d*(ls-32) per (row, sub-block). ls is the 6-bit sub-block scale.
       float dA[MMQ_NA];
