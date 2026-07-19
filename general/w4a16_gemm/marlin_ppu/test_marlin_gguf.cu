@@ -28,7 +28,16 @@
 // group-rows, still cp.async'd into shared, still read per k-block) -- only the VALUES are all equal, so a
 // wrong group INDEX becomes invisible. Bisection: uniform MATCH + distinct MISMATCH => the bug is purely
 // in which group we read. Both MISMATCH => the bug is in the B pack / dequant / mma, not the scales.
-static int run_case(int M, int N, int K, bool uniform = false) {
+// SM_*: which axis the per-32 scale actually varies along. All four run the identical staging path;
+// they differ only in which class of index error can show up in the result:
+//   SM_ONE  s=1.0        both group- and column-index errors invisible -> tests everything BUT the scales
+//   SM_COL  s = f(n)     group errors invisible, COLUMN errors visible
+//   SM_GRP  s = f(g)     column errors invisible, GROUP errors visible
+//   SM_FULL s = f(n,g)   everything visible (the real case)
+enum ScaleMode { SM_ONE, SM_COL, SM_GRP, SM_FULL };
+static const char* sm_name(int m) { return m==SM_ONE?"s=1.0":m==SM_COL?"s=f(n)":m==SM_GRP?"s=f(g)":"gs=32"; }
+
+static int run_case(int M, int N, int K, int mode = SM_FULL) {
   using namespace marlin_gguf_ppu;
   const int gs = 32, max_par = 128;
   const int NG = K / gs;                             // groups per column
@@ -47,7 +56,13 @@ static int run_case(int M, int N, int K, bool uniform = false) {
     for (int k = 0; k < K; k++) Bq[(size_t)n * K + k] = qd(rng);
     for (int g = 0; g < NG; g++) {
       float dv = 0.4f + 0.6f * ((rng() % 100) / 100.0f);      // draw regardless, so rng state matches
-      d[(size_t)n * NG + g] = __float2half(uniform ? 1.0f : dv);
+      // f(n) and f(g) are spread over the same [0.4,1.0) range as the full case, so a mismatch is
+      // comparable in magnitude and cannot be dismissed as "a weaker test".
+      float v = mode == SM_ONE  ? 1.0f
+              : mode == SM_COL  ? 0.4f + 0.6f * ((n % 97) / 97.0f)
+              : mode == SM_GRP  ? 0.4f + 0.6f * ((g % 97) / 97.0f)
+                                : dv;
+      d[(size_t)n * NG + g] = __float2half(v);
     }
   }
 
@@ -103,7 +118,7 @@ static int run_case(int M, int N, int K, bool uniform = false) {
   double rel = maxabs / (refmax + 1e-9);
   const bool bad = rel >= 3e-2;
   printf("  Q4_0/%-8s M%-4d N%-5d K%-5d  rel %.2e (|ref|max=%.1f) -> %s\n",
-         uniform ? "s=1.0" : "gs=32", M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
+         sm_name(mode), M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
   cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS);
   return bad ? 1 : 0;
 }
@@ -192,12 +207,20 @@ static int run_q4k(int M, int N, int K) {
 
 int main() {
   printf("BUILD %s  (%s %s)\n", GGUF_BUILD_SHA, __DATE__, __TIME__);
-  printf("--- probe: ALL scales == 1.0 (same staging path, index errors invisible) ---\n");
-  int probe = 0;
-  probe |= run_case(16,  128, 512,  true);
-  probe |= run_case(64,  256, 1024, true);
-  printf("  => %s\n", probe ? "BASE PATH IS BROKEN (B pack/dequant/mma) -- scales are NOT the bug"
-                             : "base path OK -- the bug is the scale GROUP INDEX");
+  // s=1.0 already came back MATCH on ppu001 (rel 5e-4), so the B pack / dequant / mma / A path is sound
+  // and the fault is somewhere in the scales. These two split WHICH scale index is wrong -- s=1.0 could
+  // not, because it hid the group and the column error alike.
+  printf("--- probe: isolate the scale axis (identical staging path in all cases) ---\n");
+  int p_one = run_case(64, 256, 1024, SM_ONE);
+  int p_col = run_case(64, 256, 1024, SM_COL);
+  int p_grp = run_case(64, 256, 1024, SM_GRP);
+  printf("  => %s\n",
+      p_one ? "s=1.0 FAILED: base path broken, scales are not the bug"
+    : (p_col && p_grp) ? "BOTH axes wrong"
+    : p_col ? "COLUMN index wrong (s_sh_rd / _scale_perm), group index OK"
+    : p_grp ? "GROUP index wrong ((k%b_sh_wr_iters)/2 / staging), column index OK"
+            : "both axes OK alone -- the fault only appears when BOTH vary (aliasing in the int4 read)");
+  int probe = p_one | p_col | p_grp;
   printf("GGUF int4 on PPU Marlin, gs=32 (per-32 in-tile scale):\n");
   int bad = 0;
   int bad2 = probe;
