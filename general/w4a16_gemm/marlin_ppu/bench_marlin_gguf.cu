@@ -16,6 +16,14 @@
 //               ./bench_marlin_gguf M N K [iters]
 // env:          MARLIN_MAX_PAR / MARLIN_HBM_GBS / MARLIN_WORKSET_MB -- as in bench_marlin
 //               MARLIN_PEAK_TFLOPS=<n>   fp16 tensor-core peak for the %MFU column (PPU: 500, measured by mma_peak)
+//               MARLIN_NOSPLITK=1 / MARLIN_SPLITK=1 / MARLIN_BLOCKS=<n>  -- read by marlin_cuda itself, and via
+//                 getenv into a `static`, so they are latched ONCE per process: sweeping them needs separate runs.
+//
+// DECODE (M=1) IS AN OCCUPANCY PROBLEM BEFORE IT IS A BANDWIDTH ONE. marlin_cuda picks thread_n=128 for M<=16, so
+// there are only N/128 output tiles -- 32 at N=4096 on a 72-CU part. That is printed per line. Marlin is a prefill
+// kernel; the decode answer on this part is the dedicated GEMV (82% HBM, reads Marlin's B format in place), not a
+// tuned Marlin. Compare against marlin_classic at the same gs before reading any decode number as a regression:
+//   MARLIN_GROUPSIZE=128 ./bench_marlin 1 4096 4096
 #include "marlin_gguf_ppu.cuh"
 #include <cstdio>
 #include <cstdlib>
@@ -68,9 +76,16 @@ static double bench_one(int M, int N, int K, int gs, bool affine, int iters) {
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
     double tflops = 2.0 * M * N * K / (ms * 1e9);
     double gbs = compulsory_bytes(M, N, K, gs, affine) / (ms * 1e6);
-    printf("  gs=%-3d %-4s M=%-5d N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %5.1f%% MFU  %6.0f GB/s %5.1f%% HBM\n",
+    // n_tiles vs CUs is the number to read at M=1. marlin_cuda picks thread_n=128 for M<=16, so decode has only
+    // N/128 output tiles -- 32 at N=4096, against 72 CUs. More than half the machine is idle before a single byte
+    // moves, which caps %HBM no matter how good the inner loop is. Printed so a decode line cannot be misread as
+    // a bandwidth result when it is really an occupancy one.
+    int cus = 0; cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0);
+    const int n_tiles = N / (M <= 16 ? 128 : 256);
+    printf("  gs=%-3d %-4s M=%-5d N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %5.1f%% MFU  %6.0f GB/s %5.1f%% HBM"
+           "   [%d tiles / %d CU]\n",
            gs, affine ? "aff" : "sym", M, N, K, ms * 1e3, tflops, 100.0 * tflops / get_peak(),
-           gbs, 100.0 * gbs / get_hbm_gbs());
+           gbs, 100.0 * gbs / get_hbm_gbs(), n_tiles, cus);
     cudaEventDestroy(a); cudaEventDestroy(b); cleanup();
     return tflops;
 }
