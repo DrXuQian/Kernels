@@ -680,7 +680,24 @@ static double bench_one(int N, int K, int iters, bool check) {
     // GEMV_SCALE_BUG=1 reproduces the ORIGINAL bug: pass kt_per_group = k_tiles even when gs=128, so the kernel sees a
     // single group and applies only s[0][n] -- a per-column scale on a grouped problem. It must MISMATCH, which is how
     // we know the test is not blind. (The kernel really did this, and its test set every scale to 1.0 so nothing showed.)
-    const int kt_per_group = (gs == -1 || getenv("GEMV_SCALE_BUG")) ? (K / 16) : (gs / 16);
+    int kt_per_group = (gs == -1 || getenv("GEMV_SCALE_BUG")) ? (K / 16) : (gs / 16);
+    // GEMV_KTPG=<n> overrides the GROUP STRUCTURE while leaving the scale DATA at whatever gs says. The
+    // result is then numerically WRONG (the kernel applies one group's scale across n ktiles of data), so
+    // this is a timing probe only, in the same spirit as GEMV_BW_ONLY -- correctness checking is disabled.
+    //
+    // It exists because three explanations for the +67% gs=32 costs on PPU have now been refuted: the
+    // scale-load ratio (_scale_perm made it WORSE), the main_n unroll bypass (the gs=64 control did not
+    // show the predicted cliff), and the flush's arithmetic (cutting 2/3 of v.cnvt moved nothing, even
+    // though acu had it as the most-executed opcode at +295%). What all three share is that they assume
+    // the cost is in the WORK. This isolates the other possibility: the group STRUCTURE itself -- one
+    // serialization point per group, and only main_n>0 keeps more than one B load in flight.
+    //
+    //   GEMV_GROUPSIZE=32 GEMV_KTPG=8  -> gs=32's scale traffic and layout, gs=128's loop structure
+    // If that lands near gs=128's 19.9 us, the cost is entirely structural and no amount of trimming the
+    // per-group work will touch it. If it stays near 33 us, the structure is innocent and the scale data
+    // itself is what costs -- and all three refuted hypotheses were looking at the wrong half of it.
+    bool ktpg_probe = false;
+    if (const char* e = getenv("GEMV_KTPG")) { kt_per_group = atoi(e); ktpg_probe = true; }
     const int GROUPS = (gs == -1) ? 1 : (K / gs);
 
     // AFFINE: GGUF Q4_1/Q4_K carry a per-group min. The host folds m' = m + 8s so the symmetric (q-8) dequant is
@@ -743,6 +760,7 @@ static double bench_one(int N, int K, int iters, bool check) {
     if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, (affine && !affine_drop) ? dM : nullptr, dP, dC, dCnt, N, K, kt_per_group); CUDA_CHECK(cudaDeviceSynchronize()); }
 
     if (getenv("GEMV_NCU")) check = false;
+    if (ktpg_probe) { printf("  (GEMV_KTPG=%d: group STRUCTURE decoupled from the scale data -- results are WRONG on purpose, timing only)\n", kt_per_group); check = false; }
 #ifdef GEMV_BW_ONLY
     if (check) printf("  (GEMV_BW_ONLY: dequant replaced by a stub -- results are WRONG on purpose, timing only)\n");
     check = false;
