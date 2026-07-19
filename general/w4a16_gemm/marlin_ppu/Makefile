@@ -42,6 +42,12 @@ marlin_gguf: test_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 bench_marlin_gguf: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# Brackets the affine min cost: stages and loads the mins exactly as the real path does, applies hmul2
+# instead of hfma2. WRONG RESULTS BY DESIGN, timing only. If the aff lines fall back to the sym lines the
+# cost is arithmetic; if they stay put it is moving the mins.
+bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -DMARLIN_MINS_NOAPPLY -o $@ $<
+
 # classic Marlin GROUPED-scale test (groupsize=128; the group_blocks != -1 path).
 # ANSWERED, on ppu001, all four configs, 1 group AND 4/8 groups: a vLLM / GPTQ-Marlin checkpoint's B AND
 # grouped scales are BOTH directly edible -- no conversion at load. _scale_perm is derived from the
@@ -128,4 +134,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags

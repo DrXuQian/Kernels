@@ -12,6 +12,21 @@
 #ifndef MARLIN_GGUF_PPU_CUH
 #define MARLIN_GGUF_PPU_CUH
 
+// -DMARLIN_MINS_NOAPPLY: RESULT IS WRONG ON PURPOSE. Keeps every byte of the mins path -- the extra
+// cp.async per stage, the extra shared int4 per k, the registers -- and drops ONLY the hfma2, falling back
+// to the symmetric hmul2. It brackets what the affine min actually costs:
+//   time returns to the sym line -> the cost is the ARITHMETIC (and the header's "free, hmul2 -> hfma2 is
+//                                   the same instruction count" claim is wrong about more than count)
+//   time stays at the aff line   -> the cost is MOVING the mins, and trimming the math cannot touch it
+// Measured affine cost to explain: -3.8 to -4.5 MFU points at gs=128, -10.6 to -11.3 at gs=32. Same shared
+// read per k in both; what differs is cp.async per stage, 1 against thread_k_blocks/2.
+// Same convention as MARLIN_SCALE_NONE / GEMV_KTPG -- isolate one half, do not guess which half.
+#ifdef MARLIN_MINS_NOAPPLY
+#define MARLIN_APPLY_MIN 0
+#else
+#define MARLIN_APPLY_MIN 1
+#endif
+
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -661,12 +676,12 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
       fb0[j] = dequant(b_quant);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) { if (AFFINE) scale_affine(fb0[j], frag_s[k % 2][j], frag_m[k % 2][j], 0);
+      if (group_blocks != -1) { if (AFFINE && MARLIN_APPLY_MIN) scale_affine(fb0[j], frag_s[k % 2][j], frag_m[k % 2][j], 0);
                                 else            scale(fb0[j], frag_s[k % 2][j], 0); }
 #endif
       fb1[j] = dequant(b_quant_shift);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) { if (AFFINE) scale_affine(fb1[j], frag_s[k % 2][j], frag_m[k % 2][j], 1);
+      if (group_blocks != -1) { if (AFFINE && MARLIN_APPLY_MIN) scale_affine(fb1[j], frag_s[k % 2][j], frag_m[k % 2][j], 1);
                                 else            scale(fb1[j], frag_s[k % 2][j], 1); }
 #endif
     }
@@ -681,12 +696,12 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
       FragB frag_b0 = dequant(b_quant);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) { if (AFFINE) scale_affine(frag_b0, frag_s[k % 2][j], frag_m[k % 2][j], 0);
+      if (group_blocks != -1) { if (AFFINE && MARLIN_APPLY_MIN) scale_affine(frag_b0, frag_s[k % 2][j], frag_m[k % 2][j], 0);
                                 else            scale(frag_b0, frag_s[k % 2][j], 0); }
 #endif
       FragB frag_b1 = dequant(b_quant_shift);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) { if (AFFINE) scale_affine(frag_b1, frag_s[k % 2][j], frag_m[k % 2][j], 1);
+      if (group_blocks != -1) { if (AFFINE && MARLIN_APPLY_MIN) scale_affine(frag_b1, frag_s[k % 2][j], frag_m[k % 2][j], 1);
                                 else            scale(frag_b1, frag_s[k % 2][j], 1); }
 #endif
       #pragma unroll
