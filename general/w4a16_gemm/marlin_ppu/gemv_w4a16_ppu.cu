@@ -163,19 +163,51 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         // -DGEMV_NO_HOIST restores the old placement.
 #ifndef GEMV_NO_HOIST
         half sg[4][2];
+#ifdef GEMV_SCALE_PERM
+        // ONE int4 instead of EIGHT scalar half loads (and 2 instead of 16 with mins). A lane's 8 columns
+        // are j*16 + lane/4 + 8h, i.e. {lane/4 + 8m : m=0..7} -- scattered over 128 B in the plain layout.
+        // Marlin's _scale_perm (out[8i+j] = plain[i+8j]) makes exactly that set contiguous, so a lane's
+        // whole group of scales is a single 16 B load and slot (j,h) is element 2j+h. This is what
+        // _scale_perm is FOR, and the GEMV's per-lane column set is the same formula as Marlin's B
+        // fragment, so it carries over untouched.
+        //
+        // Aimed at gs=32. Per thread per group the kernel issues 1 B load against 8 scale loads (16 with
+        // mins); gs=128 issues 4 B loads against the same 8. That 4x worse ratio is why gs=32 costs +67%
+        // on PPU against +9.8% on a 5090 -- this file's own notes already had Memory Dependency as the
+        // dominant stall with the scale loads outnumbering B 4 to 1.
+        {
+            const int4 sv = reinterpret_cast<const int4*>(s)[(long long) g * (N / 8) + nb_group * 8 + lane / 4];
+            const half* sp = reinterpret_cast<const half*>(&sv);
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) sg[j][h] = sp[2 * j + h];
+        }
+#else
         #pragma unroll
         for (int j = 0; j < 4; j++)
             #pragma unroll
             for (int h = 0; h < 2; h++)
                 sg[j][h] = s[(long long) g * N + (nb_group * 4 + j) * 16 + lane / 4 + 8 * h];
 #endif
+#endif
         half mg[4][2];
-        if (AFFINE)
+        if (AFFINE) {
+#ifdef GEMV_SCALE_PERM
+            const int4 mv = reinterpret_cast<const int4*>(mn)[(long long) g * (N / 8) + nb_group * 8 + lane / 4];
+            const half* mp = reinterpret_cast<const half*>(&mv);
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) mg[j][h] = mp[2 * j + h];
+#else
             #pragma unroll
             for (int j = 0; j < 4; j++)
                 #pragma unroll
                 for (int h = 0; h < 2; h++)
                     mg[j][h] = mn[(long long) g * N + (nb_group * 4 + j) * 16 + lane / 4 + 8 * h];
+#endif
+        }
 
         // ILP. acu (cache-resident) put Memory Dependency at 5.333 with warps idle, so issue GEMV_UNROLL independent
         // int4 loads before consuming any. Measured: U=2 is the optimum and it is worth MORE on cold weights (+10.5%)
@@ -659,6 +691,25 @@ static double bench_one(int N, int K, int iters, bool check) {
     CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dM, hM.data(), hM.size() * 2, cudaMemcpyHostToDevice));
+#ifdef GEMV_SCALE_PERM
+    // Marlin's _scale_perm, host side, under the SAME #ifdef as the kernel's int4 read so the two cannot
+    // drift apart. The CPU reference below keeps using the UNPERMUTED hS/hM, so a wrong permutation shows
+    // up as a mismatch instead of cancelling against itself.
+    {
+        auto perm = [&](const std::vector<half>& v) {
+            std::vector<half> t(v.size());
+            for (int g = 0; g < GROUPS; g++)
+                for (int c0 = 0; c0 < N; c0 += 64)
+                    for (int i = 0; i < 8; i++)
+                        for (int j = 0; j < 8; j++)
+                            t[(size_t) g * N + c0 + 8 * i + j] = v[(size_t) g * N + c0 + i + 8 * j];
+            return t;
+        };
+        const std::vector<half> sp = perm(hS), mp = perm(hM);
+        CUDA_CHECK(cudaMemcpy(dS, sp.data(), sp.size() * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dM, mp.data(), mp.size() * 2, cudaMemcpyHostToDevice));
+    }
+#endif
 
     if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, (affine && !affine_drop) ? dM : nullptr, dP, dC, dCnt, N, K, kt_per_group); CUDA_CHECK(cudaDeviceSynchronize()); }
 

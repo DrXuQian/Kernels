@@ -97,6 +97,11 @@ gemv_nmajor: gemv_w4a16_nmajor.cu .flags
 gemv_w4a16: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# Same GEMV with Marlin's _scale_perm applied to the scale/min tensors, so a lane's 8 scales are ONE int4
+# load instead of 8 scattered halves. Aimed at gs=32, where the scale:B load ratio is 4x worse than gs=128.
+gemv_w4a16_perm: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_SCALE_PERM -o $@ $<
+
 
 clean:
-	rm -f bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
