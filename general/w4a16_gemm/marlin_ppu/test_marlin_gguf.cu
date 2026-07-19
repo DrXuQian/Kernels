@@ -37,7 +37,11 @@
 enum ScaleMode { SM_ONE, SM_COL, SM_GRP, SM_FULL, SM_READOUT };
 static const char* sm_name(int m) { return m==SM_ONE?"s=1.0":m==SM_COL?"s=f(n)":m==SM_GRP?"s=f(g)":m==SM_READOUT?"readout":"gs=32"; }
 
-static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
+// affine: also exercise the MIN path. run_q4k covers affine only at gs=32 (real Q4_K sub-blocks are 32
+// values), which is exactly how gs>=64 + affine shipped reading an uninitialized frag_m -- the mins were
+// never staged on the group_blocks!=2 branch, and the bench does not check results, so it timed a gs=128
+// affine that did no work. Synthetic data here can take any gs, so it closes that hole.
+static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32, bool affine = false) {
   using namespace marlin_gguf_ppu;
   const int max_par = 128;
   const int NG = K / gs;                             // groups per column
@@ -113,15 +117,32 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
     for (int n = 0; n < N; n++) sPlain[(size_t)g * N + n] = d[(size_t)n * NG + g];
   marlin_permute_scales(sPlain.data(), sDev.data(), NG, N);
 
+  // mins, drawn with BOTH signs and a magnitude comparable to |Bq|*d, so dropping the term cannot pass.
+  std::vector<half> mPlain((size_t) NG * N), mDev((size_t) NG * N);
+  for (int g = 0; g < NG; g++)
+    for (int n = 0; n < N; n++)
+      mPlain[(size_t) g * N + n] = __float2half(affine ? ((int) (rng() % 100) - 50) / 20.0f : 0.0f);
+  marlin_permute_scales(mPlain.data(), mDev.data(), NG, N);
+  if (affine)
+    for (int m = 0; m < M; m++)
+      for (int n = 0; n < N; n++) {
+        double acc = 0;
+        for (int k = 0; k < K; k++)
+          acc += (double) __half2float(hA[(size_t) m * K + k]) * __half2float(mPlain[(size_t)(k / gs) * N + n]);
+        ref[(size_t) m * N + n] += acc;
+      }
+
   half *dA, *dC, *dS; int *dB, *dWS;
   cudaMalloc(&dA, hA.size() * 2); cudaMalloc(&dB, hB.size() * 4); cudaMalloc(&dC, hC.size() * 2);
   cudaMalloc(&dS, sDev.size() * 2); cudaMalloc(&dWS, (N / 128 + 1) * max_par * 4);
+  half* dM; cudaMalloc(&dM, mDev.size() * 2);
+  cudaMemcpy(dM, mDev.data(), mDev.size() * 2, cudaMemcpyHostToDevice);
   cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice);
   cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice);
   cudaMemcpy(dS, sDev.data(), sDev.size() * 2, cudaMemcpyHostToDevice);
   cudaMemset(dWS, 0, (N / 128 + 1) * max_par * 4);
 
-  int ret = marlin_cuda(dA, dB, dC, dS, nullptr /*mins: symmetric*/, M, N, K, dWS, gs);
+  int ret = marlin_cuda(dA, dB, dC, dS, affine ? (void*) dM : nullptr, M, N, K, dWS, gs);
   cudaError_t e = cudaDeviceSynchronize();
   if (ret || e) { printf("  M%-4d N%-5d K%-4d gs=32: ret=%d err=%s\n", M, N, K, ret, cudaGetErrorString(e)); return 2; }
   cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost);
@@ -133,8 +154,8 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
   }
   double rel = maxabs / (refmax + 1e-9);
   const bool bad = rel >= 3e-2;
-  printf("  Q4_0/%-8s gs=%-3d M%-4d N%-5d K%-5d  rel %.2e (|ref|max=%.1f) -> %s\n",
-         sm_name(mode), gs, M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
+  printf("  Q4_0/%-8s gs=%-3d %-3s M%-4d N%-5d K%-5d  rel %.2e (|ref|max=%.1f) -> %s\n",
+         sm_name(mode), gs, affine ? "aff" : "sym", M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
   // The group axis is the one that is broken (s=f(n) sits on the s=1.0 baseline, s=f(g) does not). Rather
   // than keep reading the kernel and guessing, ask which group it ACTUALLY read: rebuild the reference
   // under a list of candidate wrong mappings and see which one reproduces the GPU output. The one that
@@ -157,7 +178,7 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
     }
     printf("    (a column of constant wrong values = a group remap; values varying along n = the group\n"
            "     read depends on the column, i.e. the two axes are not separable after all)\n");
-    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dM); cudaFree(dWS);
     return 0;
   }
   if (bad && mode == SM_GRP) {
@@ -190,7 +211,7 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
       printf("      %-44s rel %.2e%s\n", c.name, r, r < 3e-2 ? "   <== THIS IS WHAT THE KERNEL DOES" : "");
     }
   }
-  cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS);
+  cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dM); cudaFree(dWS);
   return bad ? 1 : 0;
 }
 
@@ -302,6 +323,11 @@ int main() {
   printf("--- control: gs=128 (group_blocks=8, the path marlin_classic already verified) ---\n");
   probe |= run_case(64, 256, 1024, SM_FULL, 128);
   probe |= run_case(128, 512, 1024, SM_FULL, 128);
+  // AFFINE at gs=128 AND gs=32. The first is the case that was silently wrong; the second guards the
+  // group_blocks==2 branch that already had mins, so a fix to one cannot quietly break the other.
+  probe |= run_case(64, 256, 1024, SM_FULL, 128, true);
+  probe |= run_case(64, 256, 1024, SM_FULL, 32,  true);
+  probe |= run_case(128, 512, 1024, SM_FULL, 128, true);
   printf("GGUF int4 on PPU Marlin, gs=32 (per-32 in-tile scale):\n");
   int bad = 0;
   int bad2 = probe;

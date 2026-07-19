@@ -495,8 +495,16 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
           }
         s_gl_rd += groups_per_stage * s_gl_rd_delta;
       } else if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
+        // The mins were MISSING from this branch. group_blocks==2 staged them, this one did not, while
+        // matmul applies scale_affine() whenever AFFINE regardless of group_blocks -- so gs>=64 + affine
+        // read an UNINITIALIZED frag_m and produced wrong numbers. Not caught because the only affine test
+        // case (run_q4k) is gs=32, and the bench does not check correctness at all: it timed a gs=128
+        // affine that was never doing the work, which is what made affine look free there.
         int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-        if (s_sh_wr_pred) cp_async4_stream(&sh_s_stage[s_sh_wr], &s[s_gl_rd]);
+        if (s_sh_wr_pred) {
+          cp_async4_stream(&sh_s_stage[s_sh_wr], &s[s_gl_rd]);
+          if (AFFINE) cp_async4_stream(&(sh_m + s_sh_stage * pipe)[s_sh_wr], &mn[s_gl_rd]);
+        }
         s_gl_rd += s_gl_rd_delta;
       }
     }
@@ -568,6 +576,9 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
 #else
       int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
 #ifdef MARLIN_SCALE_PLAIN
+      // Diagnostic path only, and it does NOT read the mins -- fail the build rather than repeat the bug
+      // this branch already had once (affine applied against an uninitialized frag_m).
+      static_assert(!AFFINE, "MARLIN_SCALE_PLAIN does not implement the affine mins");
       // Raw [num_groups][prob_n] scales, read by column. No host permutation needed; 8 scalar half loads.
       const half* ss = reinterpret_cast<const half*>(sh_s_stage);
       const int warp_n = (threadIdx.x / 32) % (thread_n_blocks / 4), lane = threadIdx.x % 32;
@@ -582,6 +593,9 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       // DEFAULT: upstream's _scale_perm layout (see marlin_permute_scales). One int4 per lane.
       const int s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];   // max 8*(NB/4-1)+7 < s_sh_stride
+      // mins, staged at the same stage offset as the scales (see fetch_to_shared above).
+      if (AFFINE) reinterpret_cast<int4*>(&frag_m[k % 2])[0] =
+          (sh_m + (sh_s_stage - sh_s))[s_sh_rd];
 #endif
 #endif
     }
