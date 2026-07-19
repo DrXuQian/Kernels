@@ -105,9 +105,19 @@ __device__ __forceinline__ FragB dequant(int q) {
 
 // Each thread consumes one int4 per step: 4 nblocks (j) x {lo,hi} n-halves = 8 columns, x 4 k-values.
 // acc[j][hi] accumulates column n = (nb_group*4 + j)*16 + lane/4 + 8*hi.
-template <int SPLIT_K>
+// AFFINE (GGUF Q4_1/Q4_K): the weight is w = (q-8)*s + m', with m' = m + 8s folded on the host, so the
+// symmetric dequant above is reused untouched. Distributing over the dot product,
+//     C[n] = sum_g [ s[g][n] * sum_{k in g} A[k]*(q-8)  +  m'[g][n] * sum_{k in g} A[k] ]
+// the min term is RANK-1: the A-sum is a scalar shared by all 64 columns of the block, and A is already in
+// registers, so it costs one half2 add per body and one fma per column at the flush. It touches no B load,
+// which is what the %HBM number is actually made of.
+//
+// The per-thread A-sum must cover exactly the k this thread consumed, so that the existing lane/warp
+// reduction totals the whole group -- it does, since every (j,h) slot of a thread shares the same k.
+template <int SPLIT_K, bool AFFINE>
 __global__ void __launch_bounds__(GEMV_THREADS)
 gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
+           const half* __restrict__ mn,
            float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
            int N, int K, int kt_per_group) {
     const int nb_group = blockIdx.x;                 // 4 nblocks = 64 columns
@@ -143,6 +153,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         half2 hacc[4][2];
         #pragma unroll
         for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
+        half2 asum2 = __float2half2_rn(0.f);    // AFFINE: this thread's sum of A over the group
 
         // Prefetch this group's 8 scales HERE, not in the flush. acu (cold, T=64, 4096^2) says Memory Dependency 2.630
         // dominates everything -- 4.3x the next stall, and 30x the ALU stalls. But GEMV_UNROLL only hoists the B loads:
@@ -158,6 +169,13 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
             for (int h = 0; h < 2; h++)
                 sg[j][h] = s[(long long) g * N + (nb_group * 4 + j) * 16 + lane / 4 + 8 * h];
 #endif
+        half mg[4][2];
+        if (AFFINE)
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++)
+                    mg[j][h] = mn[(long long) g * N + (nb_group * 4 + j) * 16 + lane / 4 + 8 * h];
 
         // ILP. acu (cache-resident) put Memory Dependency at 5.333 with warps idle, so issue GEMV_UNROLL independent
         // int4 loads before consuming any. Measured: U=2 is the optimum and it is worth MORE on cold weights (+10.5%)
@@ -187,6 +205,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
         #define GEMV_BODY(q4_, a01_, a89_)                                                               \
             do {                                                                                         \
                 const half2 aa = (a01_), ab = (a89_);                                                    \
+                if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));   /* rank-1 min term */             \
                 const int q[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                 \
                 _Pragma("unroll")                                                                        \
                 for (int j = 0; j < 4; j++) {                                                            \
@@ -225,6 +244,8 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
 
         // FLUSH: fold this group's half2 partial into fp32, scaled by this group's s. The two half2 lanes hold
         // different k, so they add. Column of slot (j,h) is (nb_group*4 + j)*16 + lane/4 + 8*h.
+        float asum = 0.f;
+        if (AFFINE) { const float2 fa = __half22float2(asum2); asum = fa.x + fa.y; }
         #pragma unroll
         for (int j = 0; j < 4; j++)
             #pragma unroll
@@ -236,6 +257,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
 #else
                 facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);   // prefetched at the top of the group
 #endif
+                if (AFFINE) facc[j][h] += asum * __half2float(mg[j][h]);
             }
     }
 
@@ -415,6 +437,7 @@ gemv_w4a16_aiu(const int4* __restrict__ B, const half* __restrict__ A, const hal
         half2 hacc[4][2];
         #pragma unroll
         for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
+        half2 asum2 = __float2half2_rn(0.f);    // AFFINE: this thread's sum of A over the group
         half sg[4][2];
         #pragma unroll
         for (int j = 0; j < 4; j++)
@@ -546,14 +569,18 @@ static int get_groupsize() { const char* e = getenv("GEMV_GROUPSIZE"); return e 
 static int SPLIT_K = 8;
 
 // kt_per_group = groupsize/16, or k_tiles when groupsize == -1 (one group spanning all of K -> per-column scales).
-static void launch(const int4* B, const half* A, const half* s, float* partial, half* C, int* counter,
-                   int N, int K, int kt_per_group) {
+static void launch(const int4* B, const half* A, const half* s, const half* mn, float* partial, half* C,
+                   int* counter, int N, int K, int kt_per_group) {
     dim3 grid(N / N_PER_BLOCK, SPLIT_K);
 #ifdef GEMV_AIU
     const int smem = 4 * kt_per_group * 64 * (int) sizeof(half);   // 4 cubes x [kt_per_group][64] b16
+    // The AIU variant stays symmetric-only: it stages B through a different path and the min term would need
+    // its own staging. Fail loudly rather than silently dropping the term.
+    if (mn) { printf("  GEMV_AIU does not support affine (Q4_K min) yet\n"); exit(1); }
     #define GEMV_CASE(SK) case SK: gemv_w4a16_aiu<SK><<<grid, GEMV_THREADS, smem>>>(B, A, s, partial, C, counter, N, K, kt_per_group); break;
 #else
-    #define GEMV_CASE(SK) case SK: gemv_w4a16<SK><<<grid, GEMV_THREADS>>>(B, A, s, partial, C, counter, N, K, kt_per_group); break;
+    #define GEMV_CASE(SK) case SK: if (mn) gemv_w4a16<SK, true ><<<grid, GEMV_THREADS>>>(B, A, s, mn, partial, C, counter, N, K, kt_per_group); \
+                                   else    gemv_w4a16<SK, false><<<grid, GEMV_THREADS>>>(B, A, s, nullptr, partial, C, counter, N, K, kt_per_group); break;
 #endif
     switch (SPLIT_K) {
         GEMV_CASE(1) GEMV_CASE(2) GEMV_CASE(4) GEMV_CASE(8) GEMV_CASE(16) GEMV_CASE(32)
@@ -595,7 +622,15 @@ static double bench_one(int N, int K, int iters, bool check) {
     const int kt_per_group = (gs == -1 || getenv("GEMV_SCALE_BUG")) ? (K / 16) : (gs / 16);
     const int GROUPS = (gs == -1) ? 1 : (K / gs);
 
-    std::vector<half> hA(K), hS((size_t) GROUPS * N), hC(N);
+    // AFFINE: GGUF Q4_1/Q4_K carry a per-group min. The host folds m' = m + 8s so the symmetric (q-8) dequant is
+    // reused, exactly as marlin_repack_q4k does -- see marlin_gguf_ppu.cuh. Mins are drawn with BOTH signs and a
+    // magnitude comparable to s*|q|, so a kernel that dropped the term cannot pass by the term being small.
+    const bool affine = getenv("GEMV_AFFINE") != nullptr;
+    // GEMV_AFFINE_DROP=1 keeps the affine REFERENCE but runs the SYMMETRIC kernel, i.e. drops the min term. It must
+    // MISMATCH. Same guard as GEMV_SCALE_BUG, and for the same reason: this file's scales were once all 1.0, so a
+    // kernel that ignored them passed. A test that has never been shown to fail proves nothing.
+    const bool affine_drop = getenv("GEMV_AFFINE_DROP") != nullptr;
+    std::vector<half> hA(K), hS((size_t) GROUPS * N), hM((size_t) GROUPS * N), hC(N);
     std::vector<int> Bdeq((size_t) N * K), hB((size_t) (K / 16) * (N / 2) * 4);
     srand(1234);
     for (auto& x : hA) x = __float2half(0.05f * (rand() % 40 - 20));
@@ -604,6 +639,7 @@ static double bench_one(int N, int K, int iters, bool check) {
     // kernel that dropped the scale entirely passed anyway, and a kernel that applied a per-COLUMN scale to a GROUPED
     // problem also passed. Both bugs were live in this file.
     for (auto& x : hS) x = __float2half(0.5f + (rand() % 100) / 100.0f);
+    for (auto& x : hM) x = __float2half(affine ? (rand() % 100 - 50) / 25.0f : 0.0f);
     pack_B(Bdeq, hB, N, K);
 
     const size_t b_bytes = hB.size() * 4;
@@ -612,6 +648,7 @@ static double bench_one(int N, int K, int iters, bool check) {
     CUDA_CHECK(cudaMalloc(&dB, b_bytes * rot));
     CUDA_CHECK(cudaMalloc(&dA, hA.size() * 2));
     CUDA_CHECK(cudaMalloc(&dS, hS.size() * 2));
+    half* dM; CUDA_CHECK(cudaMalloc(&dM, hM.size() * 2));
     CUDA_CHECK(cudaMalloc(&dC, hC.size() * 2));
     CUDA_CHECK(cudaMalloc(&dP, (size_t) 32 * N * 4));   // max SPLIT_K
     CUDA_CHECK(cudaMalloc(&dCnt, (size_t) (N / N_PER_BLOCK) * 4));
@@ -621,8 +658,9 @@ static double bench_one(int N, int K, int iters, bool check) {
         CUDA_CHECK(cudaMemcpy((char*) dB + (size_t) r * b_bytes, dB, b_bytes, cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dM, hM.data(), hM.size() * 2, cudaMemcpyHostToDevice));
 
-    if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, dP, dC, dCnt, N, K, kt_per_group); CUDA_CHECK(cudaDeviceSynchronize()); }
+    if (!getenv("GEMV_NCU")) { launch(dB, dA, dS, (affine && !affine_drop) ? dM : nullptr, dP, dC, dCnt, N, K, kt_per_group); CUDA_CHECK(cudaDeviceSynchronize()); }
 
     if (getenv("GEMV_NCU")) check = false;
 #ifdef GEMV_BW_ONLY
@@ -631,15 +669,22 @@ static double bench_one(int N, int K, int iters, bool check) {
 #endif
     // Verified BEFORE and AFTER the timing loop. The fused reduce rearms `counter` from inside the winning CTA, so a
     // leaked count would corrupt every launch after the first -- which a pre-bench check alone cannot see.
-    // C[n] = sum_g s[g][n] * sum_{k in group g} A[k] * q[n][k]
+    // C[n] = sum_g [ s[g][n] * sum_{k in g} A[k]*q[n][k]  +  m'[g][n] * sum_{k in g} A[k] ]
+    // The min term is written out as its own A-sum rather than folded into a dequantized weight, so the reference
+    // does not reproduce the kernel's factorization -- a shared misreading of the rank-1 form cannot cancel.
     const int gsz = (gs == -1) ? K : gs;
     std::vector<double> ref(N);
     for (int n = 0; n < N; n++) {
         double total = 0;
         for (int g = 0; g < GROUPS; g++) {
             double acc = 0;
-            for (int k = g * gsz; k < (g + 1) * gsz; k++) acc += (double) __half2float(hA[k]) * Bdeq[(size_t) n * K + k];
+            double asum = 0;
+            for (int k = g * gsz; k < (g + 1) * gsz; k++) {
+                acc  += (double) __half2float(hA[k]) * Bdeq[(size_t) n * K + k];
+                asum += (double) __half2float(hA[k]);
+            }
             total += acc * __half2float(hS[(size_t) g * N + n]);
+            if (affine) total += asum * __half2float(hM[(size_t) g * N + n]);
         }
         ref[n] = total;
     }
@@ -660,33 +705,38 @@ static double bench_one(int N, int K, int iters, bool check) {
     // GEMV_NCU=1: exactly one launch of each kernel, no warmup, no timing loop -- a clean profiler capture.
     // (Same convention as GEMV_NCU / FA_NCU / CONVERT_NCU in ppu_tests.) The printed us is then meaningless.
     if (getenv("GEMV_NCU")) {
-        launch(dB, dA, dS, dP, dC, dCnt, N, K, kt_per_group);
+        launch(dB, dA, dS, (affine && !affine_drop) ? dM : nullptr, dP, dC, dCnt, N, K, kt_per_group);
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("  GEMV_NCU: single launch done (N=%d K=%d sk=%d, %d blocks) -- timing skipped\n",
                N, K, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K);
-        cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
+        cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dM); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
         return 0;
     }
 
     auto Brot = [&](int i) { return (const int4*) ((char*) dB + (size_t) (i % rot) * b_bytes); };
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    for (int i = 0; i < 10; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K, kt_per_group);
+    for (int i = 0; i < 10; i++) launch(Brot(i), dA, dS, (affine && !affine_drop) ? dM : nullptr, dP, dC, dCnt, N, K, kt_per_group);
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaEventRecord(a);
-    for (int i = 0; i < iters; i++) launch(Brot(i), dA, dS, dP, dC, dCnt, N, K, kt_per_group);
+    for (int i = 0; i < iters; i++) launch(Brot(i), dA, dS, (affine && !affine_drop) ? dM : nullptr, dP, dC, dCnt, N, K, kt_per_group);
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
     if (check && !verify("post-bench")) { printf("  counter leaked across launches\n"); return -1; }
 
     const char* e = getenv("MARLIN_HBM_GBS");
     double peak = e ? atof(e) : 2700.0;
-    double bytes = (double) N * K / 2 + (double) K * 2 + (double) N * 2 + (double) GROUPS * N * 2;  // B + A + C + scales
+    // scales: one fp16 row per group per column, DOUBLED when affine (s and m'). At gs=32 this is 4x the gs=128
+    // scale traffic, which is the term to watch -- B is unchanged, so any %HBM move has to come from here.
+    double bytes = (double) N * K / 2 + (double) K * 2 + (double) N * 2
+                 + (double) GROUPS * N * 2 * (affine ? 2 : 1);            // B + A + C + scales(+mins)
     double gbs = bytes / (ms * 1e6);
-    printf("  M=1     N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (gs=%d, sk=%d, %d blocks, wset=%zu MB)\n",
+    printf("  M=1 %-3s N=%-5d K=%-5d : %8.2f us  %7.1f TFLOP/s  %7.0f GB/s  %5.1f%% HBM   (gs=%d, sk=%d, %d blocks, wset=%zu MB)\n",
+           affine ? "aff" : "sym",
            N, K, ms * 1e3, 2.0 * N * K / (ms * 1e9), gbs, 100.0 * gbs / peak,
            gs, SPLIT_K, (N / N_PER_BLOCK) * SPLIT_K, (b_bytes * rot) >> 20);
+    (void) 0;
 
-    cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
+    cudaFree(dB); cudaFree(dA); cudaFree(dS); cudaFree(dM); cudaFree(dC); cudaFree(dP); cudaFree(dCnt);
     cudaEventDestroy(a); cudaEventDestroy(b);
     return ms * 1e3;
 }
