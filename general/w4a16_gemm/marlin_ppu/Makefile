@@ -107,6 +107,13 @@ gemv_w4a16_perm: gemv_w4a16_ppu.cu .flags
 gemv_w4a16_h16: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_FLUSH_H16 -o $@ $<
 
+# ONE warp per block. At gs=32 a group is 2 ktiles, so with 2 warps each group is flushed TWICE (once per
+# warp) and each warp gets n_kt=1; with 1 warp it owns the whole group -- half the flushes, n_kt=2.
+# The per-group cost is invariant to SPLIT_K (total group x warp flushes do not change when K is resliced,
+# only the reduce grows, which is why SPLIT_K=32 LOST on PPU). Warps-per-group is the factor that moves.
+gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=32 -DGEMV_UNROLL=2 -o $@ $<
+
 
 clean:
-	rm -f gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
