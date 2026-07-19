@@ -114,8 +114,15 @@ gemv_w4a16_h16: gemv_w4a16_ppu.cu .flags
 # is 28 warps/CU, identical to today's 1024 x 2, while each group is flushed once instead of twice. The
 # only new cost is 2x reduce -- and that is exactly what (T=64, sk=32) paid WITHOUT buying fewer flushes,
 # which is why it lost on the box (33.26 -> 36.76).
-#   ./gemv_w4a16_t32                      -> sk auto (16): half the flushes, half the occupancy  [control]
-#   GEMV_SPLIT_K=32 ./gemv_w4a16_t32      -> half the flushes, occupancy unchanged               [the test]
+# MEASURED, and the two builds are NOT interchangeable -- pick by groupsize (box, cold, N4096 K14336):
+#            T=64/sk16   T=32
+#   gs=32      35.73     26.54   -26%   <- GGUF Q4_K lives here: use gemv_w4a16_t32
+#   gs=-1      19.17     20.02    +4%
+#   gs=128     19.89     25.49   +28%   <- gs=128 cannot reach sk=32 (28 ktiles/slice vs an 8-ktile group),
+#                                          so T=32 only costs it half its warps. Use gemv_w4a16.
+# Small group -> T=32 (it can take sk=32, which is what pays for the halved warps-per-block).
+# gs>=128     -> T=64. There is no single default; this is the same per-format templating the MMQ port
+# needed for its X and MIN_BLOCKS.
 gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=32 -DGEMV_UNROLL=2 -o $@ $<
 
