@@ -71,22 +71,37 @@ int main(int argc, char** argv) {
     };
 
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    auto time_it = [&](const char* name, auto&& fn) {
+    // flops: the correction's inner dimension is G, NOT K. Printing 2*M*N*K over the correction's time
+    // reported 1214 TFLOP/s and 242.9% MFU -- six times a peak that cannot be exceeded. A >100% figure is
+    // a broken denominator every time, and this is the second one this session I read past instead of
+    // stopping at (the first was 114.5% HBM on a 1792 GB/s part).
+    auto time_it = [&](const char* name, double flops, auto&& fn) {
         for (int i = 0; i < 3; i++) fn();
         CK(cudaDeviceSynchronize());
         cudaEventRecord(a);
         for (int i = 0; i < iters; i++) fn();
         cudaEventRecord(b); cudaEventSynchronize(b);
         float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= iters;
-        printf("  %-34s %8.2f us   %7.1f TFLOP/s  %5.1f%% MFU\n", name, ms * 1e3,
-               2.0 * M * N * K / (ms * 1e9), 100.0 * (2.0 * M * N * K / (ms * 1e9)) / 500.0);
+        const double tf = flops / (ms * 1e9);
+        printf("  %-34s %8.2f us   %7.1f TFLOP/s  %5.1f%% MFU\n", name, ms * 1e3, tf, 100.0 * tf / 500.0);
         return ms * 1e3;
     };
 
-    const double t_aff  = time_it("fused affine (mins in mainloop)", [&] { marlin(true); });
-    const double t_sym  = time_it("symmetric only (no min at all)",  [&] { marlin(false); });
-    const double t_corr = time_it("correction alone (asum + hgemm)", [&] { correction(); });
-    const double t_spl  = time_it("SPLIT = symmetric + correction",  [&] { marlin(false); correction(); });
+    const double F_main = 2.0 * M * N * K, F_corr = 2.0 * (double) M * N * G;
+    const double t_aff  = time_it("fused affine (mins in mainloop)", F_main, [&] { marlin(true); });
+    const double t_sym  = time_it("symmetric only (no min at all)",  F_main, [&] { marlin(false); });
+    // Split, because "the correction is slow" does not say WHICH part. asum is bandwidth work (read all of
+    // A); the hgemm is a skinny GEMM plus a read-modify-write of all of C, which is a floor the separate
+    // -kernel shape cannot avoid -- only fusing into Marlin's epilogue could.
+    const double t_asum = time_it("  asum only (read A, reduce by gs)", F_corr,
+        [&] { asum_kernel<<<(M * G + 255) / 256, 256>>>(dA, dAsum, M, K, gs); });
+    const double t_hg   = time_it("  hgemm only (skinny, + C rmw)", F_corr,
+        [&] { cublasHgemm(cub, CUBLAS_OP_N, CUBLAS_OP_N, N, M, G, &alpha, dM, N, dAsum, G, &beta_acc, dC, N); });
+    const double t_corr = time_it("correction alone (asum + hgemm)", F_corr, [&] { correction(); });
+    const double t_spl  = time_it("SPLIT = symmetric + correction",  F_main, [&] { marlin(false); correction(); });
+    const double bytes_floor = (double) M * K * 2 + 2.0 * M * N * 2;   // read A, read+write C
+    printf("  correction traffic floor: %.1f MB -> %.1f us at 2766 GB/s (asum %.1f + hgemm %.1f measured)\n",
+           bytes_floor / 1e6, bytes_floor / 2766e3, t_asum, t_hg);
 
     printf("\n  correction costs %.1f us; folding the min in costs %.1f us -> split %s by %.1f%%\n",
            t_corr, t_aff - t_sym, t_spl < t_aff ? "WINS" : "LOSES", 100.0 * (t_aff - t_spl) / t_aff);
