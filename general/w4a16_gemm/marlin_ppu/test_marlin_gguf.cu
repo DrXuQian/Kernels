@@ -56,11 +56,18 @@ static int run_case(int M, int N, int K, int mode = SM_FULL) {
     for (int k = 0; k < K; k++) Bq[(size_t)n * K + k] = qd(rng);
     for (int g = 0; g < NG; g++) {
       float dv = 0.4f + 0.6f * ((rng() % 100) / 100.0f);      // draw regardless, so rng state matches
-      // f(n) and f(g) are spread over the same [0.4,1.0) range as the full case, so a mismatch is
-      // comparable in magnitude and cannot be dismissed as "a weaker test".
+      // HIGH CONTRAST, and deliberately so. The first version of these was 0.4+0.6*((i%97)/97), which is
+      // CONTINUOUS in the index: neighbours differ by 0.6%, so an off-by-one read produced ~0.6% error and
+      // passed a 3% tolerance. Both axes "MATCHed" while the real case sat at 24% -- the probe was blind
+      // to exactly the bug class it existed to find. hashf decorrelates neighbours, so ANY wrong index
+      // gives a full-magnitude miss.
+      auto hashf = [](uint32_t i) {                       // uncorrelated in [0.4, 1.0)
+        i = (i + 0x9e3779b9u) * 0x85ebca6bu; i ^= i >> 13; i *= 0xc2b2ae35u; i ^= i >> 16;
+        return 0.4f + 0.6f * ((i % 1024) / 1024.0f);
+      };
       float v = mode == SM_ONE  ? 1.0f
-              : mode == SM_COL  ? 0.4f + 0.6f * ((n % 97) / 97.0f)
-              : mode == SM_GRP  ? 0.4f + 0.6f * ((g % 97) / 97.0f)
+              : mode == SM_COL  ? hashf(n)
+              : mode == SM_GRP  ? hashf(g)
                                 : dv;
       d[(size_t)n * NG + g] = __float2half(v);
     }
@@ -219,7 +226,8 @@ int main() {
     : (p_col && p_grp) ? "BOTH axes wrong"
     : p_col ? "COLUMN index wrong (s_sh_rd / _scale_perm), group index OK"
     : p_grp ? "GROUP index wrong ((k%b_sh_wr_iters)/2 / staging), column index OK"
-            : "both axes OK alone -- the fault only appears when BOTH vary (aliasing in the int4 read)");
+            : "both axes OK alone -- fault needs BOTH to vary (aliasing in the packed int4 scale read)");
+  printf("  (compare each rel against the s=1.0 baseline, not just against the threshold)\n");
   int probe = p_one | p_col | p_grp;
   printf("GGUF int4 on PPU Marlin, gs=32 (per-32 in-tile scale):\n");
   int bad = 0;
