@@ -34,8 +34,8 @@
 //   SM_COL  s = f(n)     group errors invisible, COLUMN errors visible
 //   SM_GRP  s = f(g)     column errors invisible, GROUP errors visible
 //   SM_FULL s = f(n,g)   everything visible (the real case)
-enum ScaleMode { SM_ONE, SM_COL, SM_GRP, SM_FULL };
-static const char* sm_name(int m) { return m==SM_ONE?"s=1.0":m==SM_COL?"s=f(n)":m==SM_GRP?"s=f(g)":"gs=32"; }
+enum ScaleMode { SM_ONE, SM_COL, SM_GRP, SM_FULL, SM_READOUT };
+static const char* sm_name(int m) { return m==SM_ONE?"s=1.0":m==SM_COL?"s=f(n)":m==SM_GRP?"s=f(g)":m==SM_READOUT?"readout":"gs=32"; }
 
 static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
   using namespace marlin_gguf_ppu;
@@ -47,6 +47,14 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
 
   std::vector<half> hA((size_t)M * K), hC((size_t)M * N, __float2half(0.f));
   for (auto& x : hA) x = __float2half(0.1f * nd(rng));
+  // READOUT: stop inferring which group the kernel read and just make it print the index. Row m of A is
+  // one-hot on the m-th 32-block, every Bq is 1, and the scale VALUE is the group number itself (g+1). So
+  // C[m][n] = 32 * (whatever group index the kernel used for block m, +1) -- an exact small integer in
+  // half. Dividing by 32 reads the kernel's group index straight out, per (block, column).
+  if (mode == SM_READOUT)
+    for (int m = 0; m < M; m++)
+      for (int k = 0; k < K; k++)
+        hA[(size_t)m * K + k] = __float2half((k / gs) == m ? 1.0f : 0.0f);
 
   // Bq[n][k] in [-8,7] and a DISTINCT per-32 scale d[n][kb] -- distinct so a per-tile (not per-32)
   // scale bug cannot pass: the two 32-blocks of one 64-k tile get different d.
@@ -57,7 +65,7 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
   std::vector<int>  Bq((size_t)N * K);
   std::vector<half> d((size_t)N * NG);
   for (int n = 0; n < N; n++) {
-    for (int k = 0; k < K; k++) Bq[(size_t)n * K + k] = qd(rng);
+    for (int k = 0; k < K; k++) Bq[(size_t)n * K + k] = (mode == SM_READOUT) ? 1 : qd(rng);
     for (int g = 0; g < NG; g++) {
       float dv = 0.4f + 0.6f * ((rng() % 100) / 100.0f);      // draw regardless, so rng state matches
       // HIGH CONTRAST, and deliberately so. The first version of these was 0.4+0.6*((i%97)/97), which is
@@ -68,6 +76,7 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
       float v = mode == SM_ONE  ? 1.0f
               : mode == SM_COL  ? hashf(n)
               : mode == SM_GRP  ? hashf(g)
+              : mode == SM_READOUT ? (float)(g + 1)
                                 : dv;
       d[(size_t)n * NG + g] = __float2half(v);
     }
@@ -131,6 +140,26 @@ static int run_case(int M, int N, int K, int mode = SM_FULL, int gs = 32) {
   // under a list of candidate wrong mappings and see which one reproduces the GPU output. The one that
   // matches names the bug outright; if none matches, the fault is not a uniform remap of the group index
   // and the next probe has to be per-(stage,k) rather than per-g.
+  if (mode == SM_READOUT) {
+    printf("    group index the kernel actually used (row = the 32-block being probed):\n");
+    printf("      block |  n=0    n=1    n=8    n=64   n=65  |  expected\n");
+    const int ns[5] = {0, 1, 8, 64, 65};
+    int wrong = 0;
+    for (int m = 0; m < M && m < NG; m++) {
+      printf("      %5d |", m);
+      for (int t = 0; t < 5; t++) {
+        int n = ns[t] % N;
+        float v = __half2float(hC[(size_t)m * N + n]) / 32.0f - 1.0f;   // == the group index it read
+        printf(" %6.2f", v);
+        if (fabs(v - m) > 0.01) wrong++;
+      }
+      printf("  |  %5d%s\n", m, wrong ? "" : "");
+    }
+    printf("    (a column of constant wrong values = a group remap; values varying along n = the group\n"
+           "     read depends on the column, i.e. the two axes are not separable after all)\n");
+    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS);
+    return 0;
+  }
   if (bad && mode == SM_GRP) {
     struct Cand { const char* name; int (*f)(int, int); };
     static const Cand cands[] = {
@@ -268,6 +297,8 @@ int main() {
   // differs ONLY in the group machinery, so it is the control: if it passes, the fault is confined to the
   // group_blocks==2 branch I added, and nothing under it is suspect.
   int probe = p_one | p_col | p_grp;
+  printf("--- READOUT: make the kernel print the group index it used ---\n");
+  run_case(16, 128, 512, SM_READOUT);
   printf("--- control: gs=128 (group_blocks=8, the path marlin_classic already verified) ---\n");
   probe |= run_case(64, 256, 1024, SM_FULL, 128);
   probe |= run_case(128, 512, 1024, SM_FULL, 128);
