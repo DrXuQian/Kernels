@@ -149,8 +149,11 @@ int main(int argc, char** argv) {
         const double tf = tm(M, run_fused), ts = tm(M, run_split), td = tm(M, run_dequant);
         const double best = fmin(tf, fmin(ts, td));
         const char* w = (best == td) ? "dequant" : (best == ts) ? "split" : "fused";
+        // MFU: time is in MICROseconds, so FLOP/s = flops/(us*1e-6) and MFU = flops/(us*5e8) at a
+        // 500 TFLOP/s peak. The first version divided by (us*1e3) and then by 500e9 and printed 0.0%
+        // for everything -- six orders out, and a column of zeros is as useless as the 242% one.
         printf("  %-6d %11.2f %11.2f %11.2f   %-8s %5.1f%%\n", M, tf, ts, td, w,
-               100.0 * (2.0 * M * N * K / (best * 1e3)) / 500e9);
+               100.0 * (2.0 * M * N * K) / (best * 5e8));
     }
     printf("\n  dequant charges a full weight expansion (%.1f MB write + read back) on every call.\n",
            2.0 * N * K * 2 / 1e6);
