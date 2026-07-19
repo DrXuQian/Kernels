@@ -15,6 +15,18 @@
 // tile, and the tile uses one B for both -- silently wrong rows, no error. The same trap bit the public
 // DeepGEMM .so port (see llamacpp-public-so-decoupling: per-expert row segments must be padded to 128).
 //
+// KNOWN SHAPE PROBLEM, from the fp16 AIU MoE GEMM (see memory ppu-moe-gemm-design). That kernel is
+// weight/memory bound, so the quantity it minimizes is the TOTAL NUMBER OF M-TILES, sum_e ceil(rows_e/BMR)
+// -- weight traffic scales with it, and its ragged default is BMR=128. Marlin's m-tile is 16*MARLIN_MAX_MB
+// = 32 rows, A QUARTER of that, so each expert's weight is re-streamed ~4x as often. MARLIN_MAX_MB is
+// capped at 2 by register spills, so this is structural to the Marlin path, not a tuning knob.
+// => measure B's DRAM traffic here, not just TFLOP/s; expect weight-bound before compute-bound.
+//
+// That kernel also MASKS rather than pads (true per-expert bounds, `if (row < m_end)` on the store, padz
+// for the real OOB, and over-reading into the next expert's rows is harmless since those rows are never
+// written). Padding as done here additionally costs rows in A and a larger gather. Worth revisiting if the
+// m-tile problem forces a rewrite anyway.
+//
 // v1 issues one marlin_cuda per expert over that expert's contiguous rows. Correct, and the baseline the
 // persistent version has to beat. NEXT STEP, from the fp16 MoE work that reached DeepGemm parity
 // (ppu-moe-aiu-persist-matches-deepgemm): a single persistent launch, grid = #CU * blocks-per-CU, with a
