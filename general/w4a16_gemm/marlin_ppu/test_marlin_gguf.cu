@@ -20,8 +20,15 @@
 #include <random>
 #include <cuda_fp16.h>
 #include "marlin_gguf_ppu.cuh"
+#ifndef GGUF_BUILD_SHA
+#define GGUF_BUILD_SHA "unknown-sha (pass -DGGUF_BUILD_SHA=...)"
+#endif
 
-static int run_case(int M, int N, int K) {
+// uniform=true: every per-32 scale is EXACTLY 1.0. The staging path is byte-for-byte the same (still NG
+// group-rows, still cp.async'd into shared, still read per k-block) -- only the VALUES are all equal, so a
+// wrong group INDEX becomes invisible. Bisection: uniform MATCH + distinct MISMATCH => the bug is purely
+// in which group we read. Both MISMATCH => the bug is in the B pack / dequant / mma, not the scales.
+static int run_case(int M, int N, int K, bool uniform = false) {
   using namespace marlin_gguf_ppu;
   const int gs = 32, max_par = 128;
   const int NG = K / gs;                             // groups per column
@@ -38,7 +45,10 @@ static int run_case(int M, int N, int K) {
   std::vector<half> d((size_t)N * NG);
   for (int n = 0; n < N; n++) {
     for (int k = 0; k < K; k++) Bq[(size_t)n * K + k] = qd(rng);
-    for (int g = 0; g < NG; g++) d[(size_t)n * NG + g] = __float2half(0.4f + 0.6f * ((rng() % 100) / 100.0f));
+    for (int g = 0; g < NG; g++) {
+      float dv = 0.4f + 0.6f * ((rng() % 100) / 100.0f);      // draw regardless, so rng state matches
+      d[(size_t)n * NG + g] = __float2half(uniform ? 1.0f : dv);
+    }
   }
 
   // Reference: C[m][n] = sum_k A[m][k] * Bq[n][k] * d[n][k/32]
@@ -92,7 +102,8 @@ static int run_case(int M, int N, int K) {
   }
   double rel = maxabs / (refmax + 1e-9);
   const bool bad = rel >= 3e-2;
-  printf("  Q4_0/gs=32  M%-4d N%-5d K%-5d  rel %.2e (|ref|max=%.1f) -> %s\n", M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
+  printf("  Q4_0/%-8s M%-4d N%-5d K%-5d  rel %.2e (|ref|max=%.1f) -> %s\n",
+         uniform ? "s=1.0" : "gs=32", M, N, K, rel, refmax, bad ? "MISMATCH" : "MATCH");
   cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dS); cudaFree(dWS);
   return bad ? 1 : 0;
 }
@@ -180,8 +191,16 @@ static int run_q4k(int M, int N, int K) {
 }
 
 int main() {
+  printf("BUILD %s  (%s %s)\n", GGUF_BUILD_SHA, __DATE__, __TIME__);
+  printf("--- probe: ALL scales == 1.0 (same staging path, index errors invisible) ---\n");
+  int probe = 0;
+  probe |= run_case(16,  128, 512,  true);
+  probe |= run_case(64,  256, 1024, true);
+  printf("  => %s\n", probe ? "BASE PATH IS BROKEN (B pack/dequant/mma) -- scales are NOT the bug"
+                             : "base path OK -- the bug is the scale GROUP INDEX");
   printf("GGUF int4 on PPU Marlin, gs=32 (per-32 in-tile scale):\n");
   int bad = 0;
+  int bad2 = probe;
   bad |= run_case(16,  128, 512);
   bad |= run_case(32,  256, 512);
   bad |= run_case(64,  256, 1024);
@@ -190,6 +209,7 @@ int main() {
   bad |= run_q4k(16,  128, 512);
   bad |= run_q4k(32,  256, 512);
   bad |= run_q4k(64,  256, 1024);
+  bad |= bad2;
   printf("%s\n", bad ? "SOME CASES FAILED" : "all gs=32 cases MATCH");
   return bad;
 }

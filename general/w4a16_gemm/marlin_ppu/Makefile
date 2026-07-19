@@ -32,8 +32,10 @@ marlin_classic_num: test_marlin_classic_num.cu marlin_classic_ppu.cuh .flags
 
 # GGUF int4 on the PPU Marlin (marlin_gguf_ppu.cuh): gs=32 per-32 in-tile scale (what Q4_0 needs).
 # Box only (ppu.mma). PTX check: nvcc -std=c++17 --expt-relaxed-constexpr -arch=sm_90 -ptx -c test_marlin_gguf.cu
+# The sha is compiled IN and printed at startup: a stale checkout / wrong branch shows up in the output
+# instead of masquerading as "the fix did not work" (that misread cost a full debug cycle once already).
 marlin_gguf: test_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
-	$(NVCC) $(NVCCFLAGS) -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -DGGUF_BUILD_SHA='"$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)$(shell git diff --quiet 2>/dev/null || echo -dirty)"' -o $@ $<
 
 # classic Marlin GROUPED-scale test (groupsize=128; the group_blocks != -1 path).
 # ANSWERED, on ppu001, all four configs, 1 group AND 4/8 groups: a vLLM / GPTQ-Marlin checkpoint's B AND
