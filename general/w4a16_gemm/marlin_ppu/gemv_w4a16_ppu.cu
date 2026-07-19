@@ -616,13 +616,21 @@ __global__ void gemv_reduce(const float* __restrict__ partial, half* __restrict_
 // path, which is the better choice only when the weights genuinely stay resident.
 //
 // Clamped to a power of two; K/16/sk must stay divisible by the 4 warps.
-// Blocks to aim for. Was a flat 1024, which on a 72-CU PPU is 14.2 blocks = 28 of 64 warps per CU, and acu
-// measured achieved occupancy at exactly that (41.3%). Made CU-aware: at 64 threads a block is 2 warps, so
-// 32 blocks per CU is full occupancy. GEMV_TARGET_BLOCKS=<n> overrides.
+// Blocks to aim for. The occupancy arithmetic said to raise this: acu had theoretical 62.5% against an
+// ACHIEVED 41.3%, and 1024 blocks over 72 CUs is 14.2 blocks = 28.4 of 64 warps per CU = 44%, matching the
+// achieved figure exactly. So the grid, not the register count, was what the kernel actually sat on.
+//
+// It was still WRONG for the PPU. Doubling the grid (CU-aware, 72*32 = 2304 -> SPLIT_K=32) made gs=32
+// SLOWER there: 33.26 -> 36.76 us sym, 35.26 -> 39.60 aff, while a 5090 improved to parity with gs=128.
+// More slices buy occupancy and pay for it in partial writes and reduce work, and on 72 CUs the second
+// term wins. Reverted to the measured-good 1024; GEMV_TARGET_BLOCKS=<n> sweeps it.
+//
+// The occupancy number was real and the arithmetic was right -- filling the CUs simply is not what this
+// kernel is short of. Fourth explanation for the gs=32 cost to die, and the third to look right on a 5090
+// and wrong on the PPU.
 static int gemv_target_blocks() {
     if (const char* e = getenv("GEMV_TARGET_BLOCKS")) { int v = atoi(e); if (v > 0) return v; }
-    int cus = 0; cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0);
-    return (cus > 0 ? cus : 32) * 32;
+    return 1024;
 }
 #ifdef GEMV_FUSED_REDUCE
 static const int GEMV_MAX_SPLIT_K = 8;    // fused contention grows with sk
