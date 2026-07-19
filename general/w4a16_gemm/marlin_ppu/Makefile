@@ -57,6 +57,11 @@ bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 # All three verified against one CPU reference before any timing.
 # GGUF Q4_K MoE (grouped) GEMM -- qwen35moe's expert FFN goes through mul_mat_id, which the dense kernels
 # do not cover at all and which IS the prefill compute for an A3B model.
+# Gate for the Q4_K MoE direction: can Marlin-format INT4 ride the AIU bulk load + swzl ldmatrix the way
+# the fp16 MoE GEMM moves bf16? Box only (ppu.* asm), NO -arch.
+aiu_int4_smoke: aiu_int4_smoke.cu .flags
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
 marlin_moe_gguf: test_marlin_moe_gguf.cu marlin_moe_gguf_ppu.cuh marlin_gguf_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
@@ -155,4 +160,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
