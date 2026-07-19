@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <cstdlib>   // getenv / atoi for the MARLIN_* runtime knobs
 #include <iostream>
+#include <vector>
 
 namespace marlin_gguf_ppu {
 
@@ -160,6 +161,19 @@ __device__ __forceinline__ void scale(FragB& frag_b, FragS& frag_s, int i) {
   half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
   frag_b[0] = __hmul2(frag_b[0], s); frag_b[1] = __hmul2(frag_b[1], s);
 }
+
+// AFFINE dequant (Q4_1, Q4_K): w = q*s + m. dequant() already produces (q-8), and
+//     q*s + m == (q-8)*s + (m + 8s)
+// so folding 8s into the min ON THE HOST (m' = m + 8s) lets the affine formats reuse the symmetric
+// dequant UNCHANGED -- the only kernel cost is hmul2 -> hfma2, which is the SAME instruction count.
+// That is the big structural advantage of the fp16 (W4A16) path over int8 (W4A8) for these formats:
+// in int8 the min cannot be folded into the mma at all (the tensor core sees raw integers), so it needs
+// a separate rank-1 correction AND an int32-accumulator flush at every scale boundary. Here it is free.
+__device__ __forceinline__ void scale_affine(FragB& frag_b, FragS& frag_s, FragS& frag_m, int i) {
+  half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
+  half2 m = __half2half2(reinterpret_cast<__half*>(&frag_m)[i]);
+  frag_b[0] = __hfma2(frag_b[0], s, m); frag_b[1] = __hfma2(frag_b[1], s, m);
+}
 // HOST: the grouped-scale layout the kernel expects by default. This is upstream Marlin's _scale_perm,
 // bit for bit -- an 8x8 transpose inside every 64-column chunk of each group row:
 //     out[64c + 8i + j] = plain[64c + i + 8j]
@@ -179,6 +193,77 @@ inline void marlin_permute_scales(const half* plain, half* out, int num_groups, 
         for (int j = 0; j < 8; j++)
           out[(size_t) g * prob_n + c0 + 8 * i + j] = plain[(size_t) g * prob_n + c0 + i + 8 * j];
 }
+
+// ============================================================================================
+// HOST: GGUF Q4_K -> this kernel's inputs (the "reorder" that makes the vectorized 16 B shared load
+// possible). Marlin's ktile-major per-lane B layout exists precisely so ONE int4 load gives a lane
+// every word it needs; GGUF's native layout scatters them, which is what costs ~4x on the PPU.
+//
+// Q4_K is affine and two-level: w = (d*sc_b)*q - dmin*m_b, per 32-value sub-block b of a 256 super-block,
+// with sc_b/m_b 6-bit packed in 12 bytes. Both levels are PRE-EXPANDED here into per-32 fp16 pairs:
+//     s  = d * sc_b
+//     m' = -dmin * m_b + 8*s          <- the +8s folds the (q-8) of the symmetric dequant, so the KERNEL
+//                                        needs no new dequant: it just does hfma2(q-8, s, m') == q*s + m.
+// Weights stay 4-bit; only the scale metadata grows (12 B per 256 -> 2 fp16 per 32), which is small.
+// ============================================================================================
+struct gguf_block_q4_K { half d; half dmin; uint8_t scales[12]; uint8_t qs[128]; };
+static_assert(sizeof(gguf_block_q4_K) == 144, "q4_K");
+
+// The 12 packed bytes -> 8 six-bit scales + 8 six-bit mins (llama.cpp's get_scale_min_k4).
+inline void gguf_q4k_scales(const uint8_t* q, uint8_t* sc, uint8_t* mn) {
+  for (int g = 0; g < 4; g++) { sc[g] = q[g] & 63; mn[g] = q[g + 4] & 63; }
+  for (int g = 4; g < 8; g++) {
+    sc[g] = (uint8_t)((q[g + 4] & 0xF) | ((q[g - 4] >> 6) << 4));
+    mn[g] = (uint8_t)((q[g + 4] >> 4)  | ((q[g - 0] >> 6) << 4));
+  }
+}
+
+// src: [prob_n][prob_k/256] Q4_K blocks (row-major over n). Outputs are ready for marlin_cuda(groupsize=32).
+//   B_out : (prob_k/16) * (prob_n*16/32) ints  -- Marlin ktile-major per-lane layout
+//   s_out : (prob_k/32) * prob_n halves        -- _scale_perm'd
+//   m_out : (prob_k/32) * prob_n halves        -- _scale_perm'd
+inline void marlin_repack_q4k(const gguf_block_q4_K* src, int prob_n, int prob_k,
+                              int* B_out, half* s_out, half* m_out) {
+  const int NG = prob_k / 32, nblk = prob_k / 256;
+  std::vector<half> sp((size_t)NG * prob_n), mp((size_t)NG * prob_n);
+
+  // nibble(n,k): sub-block b = (k%256)/32, value j = k%32; Q4_K stores value j of sub-block b in
+  // qs[(b/2)*32 + j], low nibble for even b and high for odd b.
+  auto nib = [&](int n, int k) -> int {
+    const gguf_block_q4_K& blk = src[(size_t)n * nblk + k / 256];
+    const int b = (k % 256) / 32, j = k % 32, byte = (b / 2) * 32 + j;
+    return (b % 2 == 0) ? (blk.qs[byte] & 0xF) : (blk.qs[byte] >> 4);
+  };
+
+  for (int n = 0; n < prob_n; n++)
+    for (int blk = 0; blk < nblk; blk++) {
+      const gguf_block_q4_K& B = src[(size_t)n * nblk + blk];
+      uint8_t sc[8], mn[8]; gguf_q4k_scales(B.scales, sc, mn);
+      const float d = __half2float(B.d), dmin = __half2float(B.dmin);
+      for (int b = 0; b < 8; b++) {
+        const float sv = d * sc[b];
+        sp[(size_t)(blk * 8 + b) * prob_n + n] = __float2half(sv);
+        mp[(size_t)(blk * 8 + b) * prob_n + n] = __float2half(-dmin * mn[b] + 8.0f * sv);
+      }
+    }
+  marlin_permute_scales(sp.data(), s_out, NG, prob_n);
+  marlin_permute_scales(mp.data(), m_out, NG, prob_n);
+
+  // Marlin B packing (identical to the classic layout; a pure nibble permutation, format-agnostic).
+  for (int ktile = 0; ktile < prob_k / 16; ktile++)
+    for (int nb = 0; nb < prob_n / 16; nb++)
+      for (int lane = 0; lane < 32; lane++) {
+        const int n = nb * 16 + lane / 4, kb = ktile * 16 + (lane % 4) * 2;
+        int q = 0;
+        q |= nib(n, kb)         << 0;  q |= nib(n, kb + 1)     << 16;
+        q |= nib(n, kb + 8)     << 4;  q |= nib(n, kb + 9)     << 20;
+        q |= nib(n + 8, kb)     << 8;  q |= nib(n + 8, kb + 1) << 24;
+        q |= nib(n + 8, kb + 8) << 12; q |= nib(n + 8, kb + 9) << 28;
+        const size_t idx = (size_t)(prob_n / 2) * ktile + (nb / 4) * 32 + lane;
+        B_out[idx * 4 + (nb % 4)] = q;
+      }
+}
+
 
 // HOST: gs == -1 (per-column scales). THIS ONE IS THE OPPOSITE CASE from the grouped scales above, and
 // the difference is worth stating because it is the whole reason the two behave differently.
@@ -237,10 +322,12 @@ __device__ inline void barrier_release(int* lock, bool reset = false) {
 #define MARLIN_MIN_BLOCKS 2
 #endif
 template <const int threads, const int thread_m_blocks, const int thread_n_blocks,
-          const int thread_k_blocks, const int stages, const int group_blocks = -1>
+          const int thread_k_blocks, const int stages, const int group_blocks = -1,
+          const bool AFFINE = false>   // AFFINE: w = q*s + m' (Q4_K/Q4_1); false = symmetric (q-8)*s
 __global__ void __launch_bounds__(threads, MARLIN_MIN_BLOCKS)
 Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict__ C,
-       const int4* __restrict__ s, int prob_m, int prob_n, int prob_k, int* locks) {
+       const int4* __restrict__ s, const int4* __restrict__ mn, int prob_m, int prob_n, int prob_k,
+       int* locks) {
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) { parallel = prob_m / (16 * thread_m_blocks); prob_m = 16 * thread_m_blocks; }
 
@@ -369,10 +456,12 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
   int4* sh_a = sh;
   int4* sh_b = sh_a + (stages * a_sh_stage);
   int4* sh_s = sh_b + (stages * b_sh_stage);
+  int4* sh_m = sh_s + (stages * s_sh_stage);   // AFFINE: mins staged in parallel with the scales
   FragA frag_a[2][thread_m_blocks];
   I4 frag_b_quant[2];
   FragC frag_c[thread_m_blocks][4];   // PPU: one 8-float n16 acc per (m-block, n-block), native mma order
   FragS frag_s[2][4];
+  FragS frag_m[2][4];   // AFFINE (Q4_K/Q4_1): the folded min m' = m + 8s, same layout as frag_s
 
   // PPU: index frag_c directly -- reinterpret_cast<float*>(frag_c) decays the array to a pointer, which alone is
   // enough to stop hggc from keeping the accumulator in registers.
@@ -397,9 +486,13 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       if constexpr (group_blocks == 2) {
         // GGUF gs=32: stage groups_per_stage (=2) group-rows every stage; each 32-block has its own scale.
         int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+        int4* sh_m_stage = sh_m + s_sh_stage * pipe;
         #pragma unroll
         for (int g = 0; g < groups_per_stage; g++)
-          if (s_sh_wr_pred) cp_async4_stream(&sh_s_stage[g * s_sh_stride + s_sh_wr], &s[s_gl_rd + g * s_gl_stride]);
+          if (s_sh_wr_pred) {
+            cp_async4_stream(&sh_s_stage[g * s_sh_stride + s_sh_wr], &s[s_gl_rd + g * s_gl_stride]);
+            if (AFFINE) cp_async4_stream(&sh_m_stage[g * s_sh_stride + s_sh_wr], &mn[s_gl_rd + g * s_gl_stride]);
+          }
         s_gl_rd += groups_per_stage * s_gl_rd_delta;
       } else if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
         int4* sh_s_stage = sh_s + s_sh_stage * pipe;
@@ -453,6 +546,8 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       int4* sh_s_stage = sh_s + s_sh_stage * pipe + (k / 2) * s_sh_stride;
       const int s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
+      if (AFFINE) reinterpret_cast<int4*>(&frag_m[k % 2])[0] =
+          (sh_m + s_sh_stage * pipe + (k / 2) * s_sh_stride)[s_sh_rd];
     } else if (group_blocks != -1) {
 #ifdef MARLIN_SCALE_NONE
       // SPEED-ONLY, RESULT IS WRONG. Removes ALL grouped-scale work from the mainloop (this load and the
@@ -540,11 +635,13 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
       fb0[j] = dequant(b_quant);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) scale(fb0[j], frag_s[k % 2][j], 0);
+      if (group_blocks != -1) { if (AFFINE) scale_affine(fb0[j], frag_s[k % 2][j], frag_m[k % 2][j], 0);
+                                else            scale(fb0[j], frag_s[k % 2][j], 0); }
 #endif
       fb1[j] = dequant(b_quant_shift);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) scale(fb1[j], frag_s[k % 2][j], 1);
+      if (group_blocks != -1) { if (AFFINE) scale_affine(fb1[j], frag_s[k % 2][j], frag_m[k % 2][j], 1);
+                                else            scale(fb1[j], frag_s[k % 2][j], 1); }
 #endif
     }
     #pragma unroll
@@ -558,11 +655,13 @@ Marlin(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict_
       int b_quant = frag_b_quant[k % 2][j], b_quant_shift = b_quant >> 8;
       FragB frag_b0 = dequant(b_quant);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) scale(frag_b0, frag_s[k % 2][j], 0);
+      if (group_blocks != -1) { if (AFFINE) scale_affine(frag_b0, frag_s[k % 2][j], frag_m[k % 2][j], 0);
+                                else            scale(frag_b0, frag_s[k % 2][j], 0); }
 #endif
       FragB frag_b1 = dequant(b_quant_shift);
 #ifndef MARLIN_SCALE_NONE
-      if (group_blocks != -1) scale(frag_b1, frag_s[k % 2][j], 1);
+      if (group_blocks != -1) { if (AFFINE) scale_affine(frag_b1, frag_s[k % 2][j], frag_m[k % 2][j], 1);
+                                else            scale(frag_b1, frag_s[k % 2][j], 1); }
 #endif
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++)
@@ -836,13 +935,14 @@ static const int THREADS = 256, STAGES = MARLIN_STAGES;
 // PPU: use the ACTUAL per-config shared (not a fixed 96KB) so occupancy isn't wasted. Per stage (int4):
 // a_sh_stage=32*KB*MB, b_sh_stage=8*NB*KB, s_sh_stage=2*NB. x STAGES x 16 bytes. (Reuse for the reduce fits.)
 // The scale term is 2*NB int4 per group per stage; GGUF gs=32 (GB==2) stages KB/2 groups per stage.
-#define MARLIN_SHMEM(MB, NB, KB, GB) (STAGES * (32 * (KB) * (MB) + 8 * (NB) * (KB) + ((GB) == 2 ? (KB) / 2 : 1) * 2 * (NB)) * 16)
+#define MARLIN_SHMEM(MB, NB, KB, GB, AFF) (STAGES * (32 * (KB) * (MB) + 8 * (NB) * (KB) + ((AFF) ? 2 : 1) * ((GB) == 2 ? (KB) / 2 : 1) * 2 * (NB)) * 16)
 
-#define CALL_IF(MB, NB, KB, GB) \
-  else if (thread_m_blocks == MB && thread_n_blocks == NB && thread_k_blocks == KB && group_blocks == GB) { \
-    const int shmem = MARLIN_SHMEM(MB, NB, KB, GB); \
-    cudaFuncSetAttribute(Marlin<THREADS, MB, NB, KB, STAGES, GB>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem); \
-    Marlin<THREADS, MB, NB, KB, STAGES, GB><<<blocks, THREADS, shmem, stream>>>(A_ptr, B_ptr, C_ptr, s_ptr, prob_m, prob_n, prob_k, locks); }
+#define CALL_IF_A(MB, NB, KB, GB, AFF) \
+  else if (thread_m_blocks == MB && thread_n_blocks == NB && thread_k_blocks == KB && group_blocks == GB && affine == AFF) { \
+    const int shmem = MARLIN_SHMEM(MB, NB, KB, GB, AFF); \
+    cudaFuncSetAttribute(Marlin<THREADS, MB, NB, KB, STAGES, GB, AFF>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem); \
+    Marlin<THREADS, MB, NB, KB, STAGES, GB, AFF><<<blocks, THREADS, shmem, stream>>>(A_ptr, B_ptr, C_ptr, s_ptr, m_ptr, prob_m, prob_n, prob_k, locks); }
+#define CALL_IF(MB, NB, KB, GB) CALL_IF_A(MB, NB, KB, GB, false) CALL_IF_A(MB, NB, KB, GB, true)
 
 // max_par = how many m-tiles ONE launch covers. This function issues ceil(tot_m_blocks / MARLIN_MAX_MB / par) kernels
 // back-to-back on `stream`, so a profiler only ever shows you ONE of them.
@@ -856,7 +956,7 @@ static const int THREADS = 256, STAGES = MARLIN_STAGES;
 // Measured on 4096^3: max_par 16 -> 266.3 TFLOP/s, 32 -> 272.4, 64 -> 293.9, 128 -> 303.6 (+14%). On
 // 2048x4096x14336 it saturates at par = tot_m_blocks/MB = 64: 294.9 -> 312.5. Hence the default below.
 // Decode (prob_m <= 16) has tot_m_blocks == 1, never enters the par branch, and is unaffected.
-static int marlin_cuda(const void* A, const void* B, void* C, void* s, int prob_m, int prob_n, int prob_k,
+static int marlin_cuda(const void* A, const void* B, void* C, void* s, void* mins, int prob_m, int prob_n, int prob_k,
         void* workspace, int groupsize = -1, int dev = 0, cudaStream_t stream = 0,
         int thread_k = -1, int thread_n = -1, int sms = -1, int max_par = 128) {
   int tot_m = prob_m, tot_m_blocks = ceildiv(tot_m, 16), pad = 16 * tot_m_blocks - tot_m;
@@ -900,6 +1000,8 @@ static int marlin_cuda(const void* A, const void* B, void* C, void* s, int prob_
   if (prob_m == 0 || prob_n == 0 || prob_k == 0) return 0;
   const int4* A_ptr = (const int4*) A; const int4* B_ptr = (const int4*) B;
   int4* C_ptr = (int4*) C; const int4* s_ptr = (const int4*) s;
+  const int4* m_ptr = (const int4*) mins;      // AFFINE mins (m' = m + 8s); may be null for symmetric
+  const bool affine = mins != nullptr;         // Q4_K/Q4_1 pass mins; Q4_0/IQ4 pass nullptr
   int* locks = (int*) workspace;
   int ret = 0;
   const int MB = MARLIN_MAX_MB;   // see MARLIN_MAX_MB: caps frag_c below hggc's ~512-byte SROA cliff
