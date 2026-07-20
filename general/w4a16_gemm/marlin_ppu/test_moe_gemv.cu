@@ -136,6 +136,9 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   int it_ = 0;
   auto Brot = [&](int i) { return (const int4*) ((char*) dB + (size_t) (i % rot) * b_bytes); };
   auto go = [&] {
+#ifdef MOEV_ATOMIC
+    CK(cudaMemset(dP, 0, (size_t) n_rows * N * 4));
+#endif
     // dynamic shared: the block's A slice (K/SPLIT_K halves) then the reduce scratch
     const size_t shm = (size_t) (K / SPLIT_K) * sizeof(half) + (size_t) (THREADS / 32) * MOEV_NPB * sizeof(float);
     moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS, shm>>>(Brot(it_++), dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows
@@ -143,10 +146,16 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
       , dbg
 #endif
       );
-#ifndef MOEV_FUSED_REDUCE
+#if defined(MOEV_ATOMIC)
+    // one f32 plane, already summed by the atomics -- just narrow it to half
+    moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, 1, n_rows);
+#elif !defined(MOEV_FUSED_REDUCE)
     if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
 #endif
   };
+#ifdef MOEV_ATOMIC
+  CK(cudaMemset(dP, 0, (size_t) n_rows * N * 4));    // atomics accumulate into it; must start at zero
+#endif
   go(); CK(cudaDeviceSynchronize());
 #ifdef MOEV_COUNT
   {   // what the kernel ACTUALLY touched, against what the shape says it should

@@ -74,6 +74,11 @@ moe_gemv: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
 # Counts tiles executed and B int4 loads issued, against what the shape predicts. acu reports 5.32 MB from
 # device memory and 87.55 K global requests, but B alone should need ~131 K requests -- so the kernel is
 # reading LESS than the shape says, and this says by how much.
+# fp32 atomics straight into C instead of partial+reduce, so SPLIT_K stops being taxed and can buy the
+# blocks the occupancy needs (only 2048 warps exist today against 4608 slots).
+moe_gemv_atomic: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -Wall -DMOEV_ATOMIC -o $@ $<
+
 moe_gemv_count: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -Wall -DMOEV_COUNT -DMOEV_PERSIST -o $@ $<
 
@@ -206,4 +211,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f moe_gemv_count moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f moe_gemv_atomic moe_gemv_count moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags

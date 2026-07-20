@@ -218,6 +218,29 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
         }
         return;
     }
+#ifdef MOEV_ATOMIC
+    // ATOMIC SPLIT-K. Occupancy is 39.2% because only 2048 warps EXIST (2048 blocks x 1 warp) against
+    // 4608 slots -- 44.4% is the ceiling and 39.2% is 88% of it. acu calls it scheduling overhead or load
+    // imbalance; it is neither, the warps are simply not there.
+    //
+    // Both ways to create more are taxed: higher SPLIT_K doubles the partial buffer and the reduce, more
+    // warps per block adds a real barrier and a shared round trip per block. Total work is fixed, so
+    // finer splitting always pays another epilogue. The fix is to make the epilogue cheap rather than to
+    // keep trading one tax for the other: accumulate straight into C with fp32 atomics, so there is no
+    // partial buffer, no second launch and no cross-block reduce, and SPLIT_K becomes free to buy blocks.
+    //
+    // C is 8x1024 fp32 here, so SPLIT_K-way contention spreads over 8192 addresses. Summation order
+    // becomes nondeterministic across runs -- fine at fp32 for this tolerance, but it is a real change in
+    // semantics, not just a scheduling one.
+    for (int c = threadIdx.x; c < MOEV_NPB; c += THREADS) {
+        float v = 0.f;
+        #pragma unroll
+        for (int w = 0; w < THREADS / 32; w++) v += sm[w][c];
+        atomicAdd(reinterpret_cast<float*>(partial) + (long long) r * N + nbg * MOEV_NPB + c, v);
+    }
+    (void) counter; (void) C;
+    goto moev_tile_done;
+#endif
 #ifndef MOEV_FUSED_REDUCE
     // SEPARATE reduce (default): each block writes its partial and a second kernel folds them IN PARALLEL.
     // Measured better than the fused path everywhere here, and the gap grows with SPLIT_K -- 9.11 vs 12.12
