@@ -21,7 +21,7 @@
 
 #define CK(x) do { cudaError_t e_=(x); if(e_){printf("cuda %s @%d\n",cudaGetErrorString(e_),__LINE__);exit(1);} } while(0)
 
-template <int NST, int BMR>
+template <int NST, int BMR, int MWARPS = 4>
 static double bench(int n_experts, int N, int K, int total_rows, const std::vector<int>& rows_expert, int iters) {
     using namespace marlin_moe_aiu_ppu;
     const int gs = 32, G = K / gs, IH = aiu_img_h(N), IW = aiu_img_w(K);
@@ -42,7 +42,7 @@ static double bench(int n_experts, int N, int K, int total_rows, const std::vect
     CK(cudaMemcpy(dB2, bounds.data(), (n_experts + 1) * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dM2, sch.mblk_prefix.data(), (n_experts + 1) * 4, cudaMemcpyHostToDevice));
 
-    auto run = [&] { launch_moe_q4k<NST, BMR>(dA, dImg, dS, dB2, dM2, dC, total_rows, N, K,
+    auto run = [&] { launch_moe_q4k<NST, BMR, MWARPS>(dA, dImg, dS, dB2, dM2, dC, total_rows, N, K,
                                               n_experts, sch.total_tiles, gs); };
     run(); CK(cudaDeviceSynchronize());
     // MOE_NCU=1: exactly ONE launch, no warmup, no timing loop -- a clean profiler capture. Same
@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
     // BMR sweep is the point: bigger BMR -> fewer m-tiles -> the weight is re-streamed less. That is the
     // fp16 kernel's central finding and the reason Marlin's 32-row tile was the wrong shape here.
     if (selBMR) {   // single config: for acu, or for A/B-ing one knob without the other four in the way
+        if (selBMR == 32) { bench<4, 32, 2>(n_experts,N,K,total_rows,re,20); return 0; }
         if (selNST == 2) { if (selBMR == 64) bench<2,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<2,256>(n_experts,N,K,total_rows,re,20); else bench<2,128>(n_experts,N,K,total_rows,re,20); }
         else if (selNST == 6) { if (selBMR == 64) bench<6,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<6,256>(n_experts,N,K,total_rows,re,20); else bench<6,128>(n_experts,N,K,total_rows,re,20); }
         else { if (selBMR == 64) bench<4,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<4,256>(n_experts,N,K,total_rows,re,20); else bench<4,128>(n_experts,N,K,total_rows,re,20); }
@@ -115,6 +116,9 @@ int main(int argc, char** argv) {
     printf("\n  BMR sweep (weight re-streaming is what this moves):\n");
     // BMR=32 is not expressible: 4 warps in m x 16 rows each makes 64 the minimum (static_assert in the
     // header). So the sweep starts at 64 -- which is also where Marlin's 32-row tile could never reach.
+    // BMR=32 needs MWARPS=2 (a 4-warp block); with avg 64 rows/expert and a ragged tail it is the first
+    // BMR that can stop computing rows nobody asked for.
+    bench<4, 32, 2>(n_experts, N, K, total_rows, re, 20);
     bench<4, 64> (n_experts, N, K, total_rows, re, 20);
     bench<4, 128>(n_experts, N, K, total_rows, re, 20);
     bench<4, 256>(n_experts, N, K, total_rows, re, 20);

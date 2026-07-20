@@ -119,18 +119,24 @@ __host__ __device__ inline int aiu_img_w(int K) { return 16 * (K / 16); }
 // CU slot, not one block per CU. Rows are MASKED, not padded: expert_bounds are the true ragged bounds,
 // padz zeroes the real OOB, and over-reading into the next expert's rows is harmless because those output
 // rows are never stored.
-template <int NST, int BMR>
-__global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __restrict__ Bimg,
+// MWARPS = warps in m. Fixed at 4 originally, which floored BMR at 64 (4 warps x 16 rows). With the real
+// Qwen3.5 config -- 256 experts, top-8, 2048 tokens -> avg 64 rows/expert and ragged -- even BMR=64
+// computes 1.47x the rows it needs, and BMR>=128 is already at 1.0x weight re-streaming so there is
+// nothing left to win on that axis. The remaining loss is entirely masked rows, and cutting it needs
+// BMR=32, which 4 warps in m cannot express. So MWARPS is a parameter: n is pinned at BN/64=2 warps by the
+// ld_swzl payload, m takes the rest, and MWARPS=2 gives a 4-warp block that can run BMR=32.
+template <int NST, int BMR, int MWARPS = 4>
+__global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __restrict__ Bimg,
         const half* __restrict__ s, const int* __restrict__ expert_bounds,
         const int* __restrict__ mblk_prefix, float* __restrict__ C,
         int total_rows, int N, int K, int n_experts, int total_tiles, int gs) {
-    constexpr int MWARPS = MOE_NWARP / MOE_WN;      // 4 warps in m
     constexpr int WROW = BMR / MWARPS;               // rows per warp
     constexpr int MIR = WROW / 16;                   // 16-row m-blocks per warp
     // 4 warps in m, each needing at least one 16-row block -> BMR must be a multiple of 64. Without this
     // BMR=32 gives MIR=0 and the failure is "zero-sized variable acc", which names the symptom and not the
     // constraint.
-    static_assert(BMR % 64 == 0, "BMR must be a multiple of 64: 4 warps in m x 16 rows minimum");
+    static_assert(BMR % (MWARPS * 16) == 0, "BMR must be a multiple of MWARPS*16");
+    static_assert(MIR >= 1, "BMR too small for MWARPS: each m-warp needs at least one 16-row block");
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / MOE_WN, wn = warp % MOE_WN;
     const int nk = K / MOE_BK, num_nb = N / MOE_BN;
@@ -266,14 +272,14 @@ inline MoeSched moe_sched(const int* expert_bounds, int n_experts, int N, int BM
   return s;
 }
 
-template <int NST, int BMR>
+template <int NST, int BMR, int MWARPS = 4>
 inline void launch_moe_q4k(const half* A, const unsigned short* Bimg, const half* s,
         const int* d_bounds, const int* d_mblk, float* C,
         int total_rows, int N, int K, int n_experts, int total_tiles, int gs, cudaStream_t stream = 0) {
   const int bcube_h = 16 * (MOE_BN / 64), bcube_w = 16 * (MOE_BK / 16);
   const size_t shmem = (size_t) NST * (BMR * MOE_BK * sizeof(half) + bcube_h * bcube_w * sizeof(unsigned short))
                      + (size_t) (MOE_BK / 32) * MOE_BN * sizeof(half);   // + the current tile's scales
-  cudaFuncSetAttribute(moe_q4k_aiu<NST, BMR>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem);
+  cudaFuncSetAttribute(moe_q4k_aiu<NST, BMR, MWARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem);
   // Grid fills every CU SLOT, not one block per CU -- the fp16 kernel's finding, and the reason its
   // persistent variant beat the static grid (idle blocks on empty experts, wave tail, 14% L2 hit).
   int cus = 0; cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0);
@@ -281,7 +287,7 @@ inline void launch_moe_q4k(const half* A, const unsigned short* Bimg, const half
   int grid = cus * (blk_cu > 0 ? blk_cu : 1);
   if (const char* g = getenv("MOE_GRID")) grid = atoi(g);
   if (grid > total_tiles) grid = total_tiles > 0 ? total_tiles : 1;
-  moe_q4k_aiu<NST, BMR><<<grid, MOE_NWARP * 32, shmem, stream>>>(
+  moe_q4k_aiu<NST, BMR, MWARPS><<<grid, (MWARPS * MOE_WN) * 32, shmem, stream>>>(
       A, Bimg, s, d_bounds, d_mblk, C, total_rows, N, K, n_experts, total_tiles, gs);
 }
 

@@ -26,10 +26,10 @@
 // folds it into the mainloop. Untested until now, and "it is the same shape as the dense split" is not
 // evidence -- gs=128 affine survived a whole round on exactly that reasoning while multiplying by an
 // uninitialised frag_m.
-static int run(int n_experts, int N, int K, int total_rows, int dist, bool affine = false) {
+static int run(int n_experts, int N, int K, int total_rows, int dist, bool affine = false, int BMR_ = 128) {
   using namespace marlin_moe_aiu_ppu;
   const int gs = 32, G = K / gs;
-  const int BMR = 128;
+  const int BMR = BMR_;
 
   std::mt19937 rng(9 + n_experts * 31 + N + K + total_rows + dist * 7);
   std::normal_distribution<float> nd(0.f, 1.f);
@@ -139,7 +139,8 @@ static int run(int n_experts, int N, int K, int total_rows, int dist, bool affin
   int maxmb = 0;
   for (int e = 0; e < n_experts; e++) maxmb = std::max(maxmb, sch.mblk_prefix[e + 1] - sch.mblk_prefix[e]);
 
-  launch_moe_q4k<4, 128>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
+  if (BMR == 32) launch_moe_q4k<4, 32, 2>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
+  else           launch_moe_q4k<4, 128>   (dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
   if (affine) {
     // Asum is per TOKEN and does NOT depend on the expert, so it is one pass for the whole batch; only the
     // second (G-deep) GEMM is grouped. mins go in PLAIN [G][N] here -- the permuted layout is Marlin's
@@ -205,6 +206,13 @@ int main() {
   bad |= run(4,   256,  512,  2000, 0, true);
   bad |= run(16,  256,  512,  4000, 1, true);
   bad |= run(8,   256,  512,  1500, 2, true);
+
+  // BMR=32 via MWARPS=2 -- a 4-warp block. Newly expressible, so it needs its own correctness pass: the
+  // warp grid changed, and the warp grid is what produced the earlier out-of-range column.
+  printf("--- BMR=32 (MWARPS=2, 4-warp block) ---\n");
+  bad |= run(4,   256,  512,  2000, 0, false, 32);
+  bad |= run(16,  256,  512,  4000, 1, false, 32);
+  bad |= run(8,   256,  512,  1500, 2, true,  32);
   printf("%s\n", bad ? "SOME CASES FAILED" : "all AIU MoE cases MATCH");
   return bad ? 1 : 0;
 }
