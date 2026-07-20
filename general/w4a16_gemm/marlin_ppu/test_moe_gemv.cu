@@ -145,6 +145,8 @@ int main(int argc, char** argv) {
   bad |= run<64, 4, 4>(1, 8, 8,  256, 512, false);
   bad |= run<32, 4, 8>(2, 8, 16, 256, 512, false);   // U spans several scale groups -- the new path
   bad |= run<32, 2, 8>(1, 8, 8,  256, 512, false);
+  bad |= run<128, 4, 2>(2, 8, 16, 256, 512, false);   // 4 warps/block: the cross-warp reduce path
+  bad |= run<128, 8, 4>(1, 8, 8,  256, 512, false);
   printf("%s\n", bad ? "SOME CASES FAILED" : "all decode cases MATCH");
   if (bad) return 1;
   printf("--- perf, batch 1 x top-8 over 256 experts (the real decode shape) ---\n");
@@ -188,5 +190,20 @@ int main(int argc, char** argv) {
   run<32, 64, 2>(1, 8, 256, N, K, true);
   run<32, 32, 4>(1, 8, 256, N, K, true);
   run<32, 64, 1>(1, 8, 256, N, K, true);
+  // RE-SWEEP THE THREAD COUNT. "T=32 beats T=64" was measured with the group-boundary bug in place, which
+  // punished larger T specifically: T=64 gives step=2, so each warp got ONE ktile per scale group, main_n
+  // went to 0 and the hoisted path never ran. That penalty is gone now.
+  //
+  // And 1 warp per block is the wrong shape on its own terms: hardware caps blocks per CU (32 is typical),
+  // so 1 warp/block caps resident warps at 32/CU = 50% however the theoretical figure is computed, and the
+  // cross-warp reduce through shared plus __syncthreads() is dead weight for a single warp. T=64 also
+  // doubles resident warps to 8192 against 4608 slots -- from under one wave to nearly two, which is
+  // exactly the occupancy problem.
+  printf("  -- thread count re-swept (the earlier T comparison predates the hoist fix) --\n");
+  run<64,  16, 2>(1, 8, 256, N, K, true);
+  run<64,  32, 2>(1, 8, 256, N, K, true);
+  run<128, 16, 2>(1, 8, 256, N, K, true);
+  run<128, 32, 2>(1, 8, 256, N, K, true);
+  run<128, 16, 4>(1, 8, 256, N, K, true);
   return 0;
 }
