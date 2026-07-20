@@ -14,24 +14,29 @@
 #include <cstdio>
 #include <vector>
 #include <random>
+#include <algorithm>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_) { printf("cuda %s @%d\n", cudaGetErrorString(e_), __LINE__); exit(1); } } while (0)
 
-int main() {
+// dist: 0 = uniform-ish, 1 = SKEWED (a few fat experts, many tiny) -- the fp16 kernel's own worst case,
+//        2 = some EMPTY experts.
+static int run(int n_experts, int N, int K, int total_rows, int dist) {
   using namespace marlin_moe_aiu_ppu;
-  const int n_experts = 4, N = 256, K = 512, gs = 32, G = K / gs;
-  const int BMR = 128, NST = 4;
-  printf("AIU Q4_K MoE vs Marlin-derived MoE: E=%d N=%d K=%d gs=%d BMR=%d NST=%d\n",
-         n_experts, N, K, gs, BMR, NST);
+  const int gs = 32, G = K / gs;
+  const int BMR = 128;
 
-  std::mt19937 rng(9);
+  std::mt19937 rng(9 + n_experts * 31 + N + K + total_rows + dist * 7);
   std::normal_distribution<float> nd(0.f, 1.f);
   std::uniform_int_distribution<int> qd(-8, 7), ed(0, n_experts - 1);
 
   // ragged routing, tokens already grouped by expert (the AIU kernel takes true bounds, no padding)
-  const int total_rows = 300;
   std::vector<int> rows_expert(total_rows);
-  for (auto& e : rows_expert) e = ed(rng);
+  if (dist == 0) { for (auto& e : rows_expert) e = ed(rng); }
+  else if (dist == 1) {   // skew: 1/8 of experts take most rows -> experts spanning MANY m-tiles
+    for (auto& e : rows_expert) e = (rng() % 8 == 0) ? (int) (rng() % n_experts) : (int) (rng() % (n_experts / 4 + 1));
+  } else {                // leave the upper half of the experts EMPTY
+    for (auto& e : rows_expert) e = (int) (rng() % (n_experts / 2));
+  }
   std::sort(rows_expert.begin(), rows_expert.end());
   std::vector<int> bounds(n_experts + 1, 0);
   for (int t = 0; t < total_rows; t++) bounds[rows_expert[t] + 1]++;
@@ -115,9 +120,8 @@ int main() {
   const auto sch = moe_sched(bounds.data(), n_experts, N, BMR);
   CK(cudaMalloc(&dMblk, (n_experts + 1) * 4));
   CK(cudaMemcpy(dMblk, sch.mblk_prefix.data(), (n_experts + 1) * 4, cudaMemcpyHostToDevice));
-  printf("  total_tiles=%d  rows/expert:", sch.total_tiles);
-  for (int e = 0; e < n_experts; e++) printf(" %d", bounds[e + 1] - bounds[e]);
-  printf("\n");
+  int maxmb = 0;
+  for (int e = 0; e < n_experts; e++) maxmb = std::max(maxmb, sch.mblk_prefix[e + 1] - sch.mblk_prefix[e]);
 
   launch_moe_q4k<4, 128>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
   cudaError_t e2 = cudaDeviceSynchronize();
@@ -128,6 +132,28 @@ int main() {
   double ma = 0, rm = 0;
   for (size_t i = 0; i < got.size(); i++) { ma = fmax(ma, fabs(got[i] - ref[i])); rm = fmax(rm, fabs(ref[i])); }
   const double rel = ma / (rm + 1e-9);
-  printf("  AIU vs Marlin-MoE: rel %.2e (|ref|max=%.1f) -> %s\n", rel, rm, rel < 3e-2 ? "MATCH" : "MISMATCH");
-  return rel < 3e-2 ? 0 : 1;
+  const bool bad = rel >= 3e-2;
+  printf("  E=%-3d N=%-4d K=%-4d rows=%-5d dist=%d  tiles=%-4d maxtiles/expert=%d  rel %.2e -> %s\n",
+         n_experts, N, K, total_rows, dist, sch.total_tiles, maxmb, rel, bad ? "MISMATCH" : "MATCH");
+  cudaFree(dA); cudaFree(dAg); cudaFree(dCg); cudaFree(dB); cudaFree(dS); cudaFree(dWS); cudaFree(dSrc);
+  cudaFree(dImg); cudaFree(dSp); cudaFree(dC); cudaFree(dBounds); cudaFree(dMblk);
+  return bad ? 1 : 0;
+}
+
+int main() {
+  printf("AIU Q4_K MoE vs Marlin-derived MoE (BMR=128, NST=4)\n");
+  int bad = 0;
+  // The first case is the one that already passed, kept as a control. Everything after it exists because
+  // that case did NOT exercise the scheduler: every expert had fewer rows than BMR, so each was exactly
+  // one m-block, mblk_prefix was [0,1,2,...], the binary search never had a choice to make, and
+  // (mblk_g - mblk_prefix[e]) was identically zero. The grid-stride queue never wrapped either. So the
+  // one thing this kernel adds over the reference was untested -- the same shape as the asum bug, which
+  // survived because only the groupsize that hides it was ever run.
+  bad |= run(4,   256,  512,  300,  0);   // control: every expert < BMR (1 m-tile each)
+  bad |= run(4,   256,  512,  2000, 0);   // experts span MANY m-tiles; m0 advances; queue wraps
+  bad |= run(16,  256,  512,  4000, 1);   // skewed: a few fat experts, many tiny -- the fp16 kernel's worst case
+  bad |= run(8,   256,  512,  1500, 2);   // half the experts EMPTY (zero rows -> zero m-blocks)
+  bad |= run(8,   512,  1024, 3000, 1);   // larger N/K, more n-blocks per tile row
+  printf("%s\n", bad ? "SOME CASES FAILED" : "all AIU MoE cases MATCH");
+  return bad ? 1 : 0;
 }
