@@ -94,14 +94,19 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 #ifdef MOEV_PERSIST
   // One wave: #CU * blocks-per-CU. Shared is tiny here, so the blocks/CU bound is warps: 64 / (T/32).
   int cus = 0; CK(cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0));
-  const int wave = cus * (64 / (THREADS / 32));
+  // The wave must come from the ACTUAL occupancy, not the theoretical warp maximum. At T=128 the kernel
+  // uses 66 registers, so 66*128 = 8448 per block and 131072/8448 = 15.5 caps it at 14 blocks/CU -- a wave
+  // of 72*14 = 1008, not the 72*16 = 1152 I assumed. Grid 1024 therefore already exceeded one wave and the
+  // 16-block remainder nearly doubled the runtime.
+  int bpc = 0;
+  CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpc, moe_gemv_q4k<THREADS, SPLIT_K, U>, THREADS, 0));
+  const int wave = cus * (bpc > 0 ? bpc : 1);
   const int tot = n_rows * (N / MOEV_NPB) * SPLIT_K;
-  // The grid must DIVIDE the tile count, not merely be smaller than it. Taking the wave size outright
-  // (1152 at T=128) against 2048 tiles gives 1.78 tiles per block: 896 blocks do two and 256 do one, so
-  // the kernel still runs for two tiles' worth and the tail is unchanged -- it moved from the block level
-  // to the tile level. Largest divisor of tot that fits in a wave: 1024 here, exactly 2 tiles each.
-  int g1 = 1;
-  for (int d = (wave < tot ? wave : tot); d >= 1; d--) if (tot % d == 0) { g1 = d; break; }
+  // And the objective is to minimise ceil(tot/grid) -- how many tiles the SLOWEST block gets -- subject to
+  // grid <= wave. Not "largest divisor": at tot=2048, wave=1008, an even 1024 costs 2 waves (4 tile-times)
+  // and an even 512 uses half the machine (also 4), while grid = wave gives most blocks 2 and some 3 (3).
+  // Slightly uneven inside one wave beats perfectly even across two.
+  int g1 = tot < wave ? tot : wave;
   if (const char* e = getenv("MOEV_GRID")) g1 = atoi(e);
   dim3 grid(g1, 1, 1);
 #else
@@ -149,8 +154,8 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 #ifdef MOEV_PERSIST
   {   // uneven tiles per block IS the tail; print it rather than leaving it to be inferred
     const int tot2 = n_rows * (N / MOEV_NPB) * SPLIT_K;
-    if (tot2 % blocks) printf("  WARNING tiles/block uneven: %d tiles over %d blocks (%d vs %d) -- tail remains\n",
-                              tot2, blocks, tot2 / blocks, (tot2 + blocks - 1) / blocks);
+    printf("  persist: %d tiles / %d blocks = %d..%d per block, wave=%d (%.2f waves)\n",
+           tot2, blocks, tot2 / blocks, (tot2 + blocks - 1) / blocks, wave, (double) blocks / wave);
   }
 #endif
   printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
