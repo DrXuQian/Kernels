@@ -136,6 +136,13 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
     extern __shared__ char smem_raw[];
     half* As = reinterpret_cast<half*>(smem_raw);
     unsigned short* Bs = reinterpret_cast<unsigned short*>(smem_raw) + (size_t) NST * BMR * MOE_BK;
+    // Scales for the CURRENT k-tile only. A BK-wide tile spans BK/gs groups over BN columns -- 2 x 128 =
+    // 256 halves = 512 B at gs=32 -- so one cooperative load per k-tile replaces the scalar global read
+    // every lane was doing per (nj, ks): 16 loads per lane per k-tile became one half per thread. Single
+    // buffered, not NST-staged, because the barrier at the end of each kk iteration already protects reuse
+    // and the load rides the barrier that follows the AIU wait, adding no synchronisation.
+    constexpr int GS_PER_TILE = MOE_BK / 32;      // gs=32
+    half* Ss = reinterpret_cast<half*>(Bs + (size_t) NST * bcube_h * bcube_w);
 
     for (int iter = 0; ; ++iter) {
         const int t = iter * (int) gridDim.x + blockIdx.x;
@@ -172,6 +179,11 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
                          bcube_h, bcube_w, b_row0, nx * bcube_w);
             }
             asm volatile("cp.async.commit_group;");
+            // Staged before the barrier below, which makes it visible at no extra cost.
+            for (int i = tid; i < GS_PER_TILE * MOE_BN; i += blockDim.x) {
+                const int gi = i / MOE_BN, ci = i % MOE_BN;
+                Ss[i] = se[(long long) ((kk * MOE_BK) / gs + gi) * N + nb * MOE_BN + ci];
+            }
             asm volatile("cp.async.wait_group %0;" :: "n"(NST - 2));
             __syncthreads();
 
@@ -180,7 +192,7 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
             const unsigned short* Bc = Bs + (size_t) stg * bcube_h * bcube_w;
             #pragma unroll
             for (int ks = 0; ks < MOE_KSUB; ++ks) {
-                const int ko = ks * 16, kabs = kk * MOE_BK + ko;
+                const int ko = ks * 16;
                 int fa[MIR][4], fb[4];
                 #pragma unroll
                 for (int mi = 0; mi < MIR; ++mi) ld_swzl(fa[mi], Ac, wm * WROW + mi * 16, ko, BMR);
@@ -196,7 +208,8 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
                     marlin_gguf_ppu::FragB b1 = marlin_gguf_ppu::dequant(fb[nj] >> 8);
                     // gs=32 per-32 scale. A lane's column within the n16 tile is lane/4 for b0 and +8 for
                     // b1, matching dequant's output positions.
-                    const int col0 = nb * MOE_BN + wn * 64 + nj * 16 + (lane / 4);
+                    const int ctile = wn * 64 + nj * 16 + (lane / 4);      // column within the BN tile
+                    const int col0 = nb * MOE_BN + ctile;
 #ifdef MOE_AIU_GUARD
                     // The scale read is the one global access here indexed by a column formula rather than
                     // by the tile machinery, so it is where a warp-grid mistake lands -- and it did land
@@ -204,12 +217,12 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
                     // flag; an out-of-range column is a wrong warp grid, not a bad input.
                     if (col0 + 8 >= N) { if (lane == 0) printf("MOE_AIU: col0=%d out of range N=%d (nb=%d wn=%d nj=%d)\n", col0, N, nb, wn, nj); return; }
 #endif
-                    const long long srow = (long long) (kabs / gs) * N;
+                    const half* srow = Ss + (ko / 32) * MOE_BN;           // group within this k-tile
                     marlin_gguf_ppu::FragS s0, s1;
-                    reinterpret_cast<half*>(&s0)[0] = se[srow + col0];
-                    reinterpret_cast<half*>(&s0)[1] = se[srow + col0];
-                    reinterpret_cast<half*>(&s1)[0] = se[srow + col0 + 8];
-                    reinterpret_cast<half*>(&s1)[1] = se[srow + col0 + 8];
+                    reinterpret_cast<half*>(&s0)[0] = srow[ctile];
+                    reinterpret_cast<half*>(&s0)[1] = srow[ctile];
+                    reinterpret_cast<half*>(&s1)[0] = srow[ctile + 8];
+                    reinterpret_cast<half*>(&s1)[1] = srow[ctile + 8];
                     marlin_gguf_ppu::scale(b0, s0, 0);
                     marlin_gguf_ppu::scale(b1, s1, 0);
                     int Bf[4];
@@ -254,7 +267,8 @@ inline void launch_moe_q4k(const half* A, const unsigned short* Bimg, const half
         const int* d_bounds, const int* d_mblk, float* C,
         int total_rows, int N, int K, int n_experts, int total_tiles, int gs, cudaStream_t stream = 0) {
   const int bcube_h = 16 * (MOE_BN / 64), bcube_w = 16 * (MOE_BK / 16);
-  const size_t shmem = (size_t) NST * (BMR * MOE_BK * sizeof(half) + bcube_h * bcube_w * sizeof(unsigned short));
+  const size_t shmem = (size_t) NST * (BMR * MOE_BK * sizeof(half) + bcube_h * bcube_w * sizeof(unsigned short))
+                     + (size_t) (MOE_BK / 32) * MOE_BN * sizeof(half);   // + the current tile's scales
   cudaFuncSetAttribute(moe_q4k_aiu<NST, BMR>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem);
   // Grid fills every CU SLOT, not one block per CU -- the fp16 kernel's finding, and the reason its
   // persistent variant beat the static grid (idle blocks on empty experts, wave tail, 14% L2 hit).
