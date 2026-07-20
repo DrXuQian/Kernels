@@ -15,6 +15,7 @@
 #include <vector>
 #include <random>
 #include <algorithm>
+#include <cstdlib>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_) { printf("cuda %s @%d\n", cudaGetErrorString(e_), __LINE__); exit(1); } } while (0)
 
@@ -154,6 +155,18 @@ int main() {
   bad |= run(16,  256,  512,  4000, 1);   // skewed: a few fat experts, many tiny -- the fp16 kernel's worst case
   bad |= run(8,   256,  512,  1500, 2);   // half the experts EMPTY (zero rows -> zero m-blocks)
   bad |= run(8,   512,  1024, 3000, 1);   // larger N/K, more n-blocks per tile row
+
+  // The grid-stride loop STILL has not wrapped: launch_moe_q4k clamps grid to total_tiles, which peaked at
+  // 112 against a #CU*blk/CU grid, so every block took exactly one tile and the `for (iter...)` body ran
+  // once. Forcing a small grid is the only way to make iter>0 happen, and a queue that never wraps is not
+  // a persistent scheduler -- it is a static grid wearing one.
+  printf("--- forced small grid (MOE_GRID): makes the grid-stride queue actually wrap ---\n");
+  setenv("MOE_GRID", "8", 1);
+  bad |= run(16,  256,  512,  4000, 1);   // 82 tiles over 8 blocks -> ~10 iterations per block
+  bad |= run(8,   512,  1024, 3000, 1);
+  setenv("MOE_GRID", "1", 1);
+  bad |= run(4,   256,  512,  2000, 0);   // one block does every tile: the extreme of the same path
+  unsetenv("MOE_GRID");
   printf("%s\n", bad ? "SOME CASES FAILED" : "all AIU MoE cases MATCH");
   return bad ? 1 : 0;
 }
