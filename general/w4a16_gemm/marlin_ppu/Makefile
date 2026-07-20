@@ -205,6 +205,18 @@ gemv_w4a16_t128_aiu16: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DMOE_AIU_LOAD -DMOE_AIU_H=16 -o $@ $<
 gemv_w4a16_t64_aiu: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DMOE_AIU_LOAD -o $@ $<
+# H=4: H=16 measured WORSE than H=8 (10.92 vs 10.23 us), so the single-buffer barrier between batches costs
+# more than a bigger batch saves -- walk the other way.
+gemv_w4a16_t128_aiu4: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DMOE_AIU_LOAD -DMOE_AIU_H=4 -o $@ $<
+# Both knobs stacked: AIU frees the registers, launch_bounds spends them on blocks. Neither alone can do it --
+# at 90 regs the cap is 10 blocks/CU no matter what launch_bounds asks for.
+gemv_w4a16_t128_aiu_r12: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DMOE_AIU_LOAD -DGEMV_MIN_BLOCKS=12 -o $@ $<
+gemv_w4a16_t128_aiu_r14: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DMOE_AIU_LOAD -DGEMV_MIN_BLOCKS=14 -o $@ $<
+gemv_w4a16_t128_aiu_r16: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DMOE_AIU_LOAD -DGEMV_MIN_BLOCKS=16 -o $@ $<
 
 gemv_w4a16_t128_r12: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DGEMV_MIN_BLOCKS=12 -o $@ $<
@@ -250,4 +262,4 @@ gemv_w4a16_h16: gemv_w4a16_ppu.cu .flags
 # needed for its X and MIN_BLOCKS.
 
 clean:
-	rm -f gemv_w4a16_t128_aiu gemv_w4a16_t128_aiu16 gemv_w4a16_t64_aiu gemv_w4a16_t128_r12 gemv_w4a16_t128_r14 gemv_w4a16_t128_r16 moe_gemv_atomic moe_gemv_count moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f gemv_w4a16_t128_aiu4 gemv_w4a16_t128_aiu_r12 gemv_w4a16_t128_aiu_r14 gemv_w4a16_t128_aiu_r16 gemv_w4a16_t128_aiu gemv_w4a16_t128_aiu16 gemv_w4a16_t64_aiu gemv_w4a16_t128_r12 gemv_w4a16_t128_r14 gemv_w4a16_t128_r16 moe_gemv_atomic moe_gemv_count moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
