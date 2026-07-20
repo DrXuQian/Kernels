@@ -45,6 +45,14 @@ static double bench(int n_experts, int N, int K, int total_rows, const std::vect
     auto run = [&] { launch_moe_q4k<NST, BMR>(dA, dImg, dS, dB2, dM2, dC, total_rows, N, K,
                                               n_experts, sch.total_tiles, gs); };
     run(); CK(cudaDeviceSynchronize());
+    // MOE_NCU=1: exactly ONE launch, no warmup, no timing loop -- a clean profiler capture. Same
+    // convention as GEMV_NCU / FA_NCU. The printed ms is meaningless then.
+    if (getenv("MOE_NCU")) {
+        printf("  MOE_NCU: single launch NST=%d BMR=%d (tiles=%d mtiles=%d) -- timing skipped\n",
+               NST, BMR, sch.total_tiles, sch.mblk_prefix[n_experts]);
+        cudaFree(dA); cudaFree(dImg); cudaFree(dS); cudaFree(dC); cudaFree(dB2); cudaFree(dM2);
+        return 0.0;
+    }
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
     for (int i = 0; i < 3; i++) run();
     CK(cudaDeviceSynchronize());
@@ -77,6 +85,8 @@ int main(int argc, char** argv) {
     const int N = argc > 1 ? atoi(argv[1]) : 1024, K = argc > 2 ? atoi(argv[2]) : 2048;
     const int tokens = argc > 3 ? atoi(argv[3]) : 2048, topk = argc > 4 ? atoi(argv[4]) : 8;
     const int n_experts = argc > 5 ? atoi(argv[5]) : 128;
+    // Pick ONE config so a profiler capture has one kernel in it. Without this the sweep launches five.
+    const int selBMR = argc > 6 ? atoi(argv[6]) : 0, selNST = argc > 7 ? atoi(argv[7]) : 4;
     const int total_rows = tokens * topk;
     printf("Q4_K MoE on AIU: N=%d K=%d tokens=%d topk=%d experts=%d -> rows=%d (avg %.0f/expert)\n",
            N, K, tokens, topk, n_experts, total_rows, (double) total_rows / n_experts);
@@ -88,6 +98,12 @@ int main(int argc, char** argv) {
 
     // BMR sweep is the point: bigger BMR -> fewer m-tiles -> the weight is re-streamed less. That is the
     // fp16 kernel's central finding and the reason Marlin's 32-row tile was the wrong shape here.
+    if (selBMR) {   // single config: for acu, or for A/B-ing one knob without the other four in the way
+        if (selNST == 2) { if (selBMR == 64) bench<2,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<2,256>(n_experts,N,K,total_rows,re,20); else bench<2,128>(n_experts,N,K,total_rows,re,20); }
+        else if (selNST == 6) { if (selBMR == 64) bench<6,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<6,256>(n_experts,N,K,total_rows,re,20); else bench<6,128>(n_experts,N,K,total_rows,re,20); }
+        else { if (selBMR == 64) bench<4,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<4,256>(n_experts,N,K,total_rows,re,20); else bench<4,128>(n_experts,N,K,total_rows,re,20); }
+        return 0;
+    }
     printf("\n  BMR sweep (weight re-streaming is what this moves):\n");
     // BMR=32 is not expressible: 4 warps in m x 16 rows each makes 64 the minimum (static_assert in the
     // header). So the sweep starts at 64 -- which is also where Marlin's 32-row tile could never reach.
