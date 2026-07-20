@@ -227,14 +227,16 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
                     // flag; an out-of-range column is a wrong warp grid, not a bad input.
                     if (col0 + 8 >= N) { if (lane == 0) printf("MOE_AIU: col0=%d out of range N=%d (nb=%d wn=%d nj=%d)\n", col0, N, nb, wn, nj); return; }
 #endif
+                    // Broadcast the scale straight into a half2. The previous version wrote the same
+                    // scalar into both halves of a FragS and then called scale(), which broadcasts it
+                    // AGAIN -- two redundant stores and a redundant splat per (nj), four times per k-sub.
+                    // The two halves of a FragB are two k values of ONE column, so they share a scale;
+                    // b0 and b1 are columns n and n+8, hence two broadcasts and four hmul2, not more.
                     const half* srow = Ss + (ko / 32) * MOE_BN;           // group within this k-tile
-                    marlin_gguf_ppu::FragS s0, s1;
-                    reinterpret_cast<half*>(&s0)[0] = srow[ctile];
-                    reinterpret_cast<half*>(&s0)[1] = srow[ctile];
-                    reinterpret_cast<half*>(&s1)[0] = srow[ctile + 8];
-                    reinterpret_cast<half*>(&s1)[1] = srow[ctile + 8];
-                    marlin_gguf_ppu::scale(b0, s0, 0);
-                    marlin_gguf_ppu::scale(b1, s1, 0);
+                    const half2 sv0 = __half2half2(srow[ctile]);
+                    const half2 sv1 = __half2half2(srow[ctile + 8]);
+                    b0[0] = __hmul2(b0[0], sv0); b0[1] = __hmul2(b0[1], sv0);
+                    b1[0] = __hmul2(b1[0], sv1); b1[1] = __hmul2(b1[1], sv1);
                     int Bf[4];
                     Bf[0] = *reinterpret_cast<int*>(&b0[0]); Bf[1] = *reinterpret_cast<int*>(&b0[1]);
                     Bf[2] = *reinterpret_cast<int*>(&b1[0]); Bf[3] = *reinterpret_cast<int*>(&b1[1]);
