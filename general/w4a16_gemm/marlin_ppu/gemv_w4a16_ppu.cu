@@ -507,7 +507,9 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
 }
 
 
-#ifdef GEMV_AIU
+// The AIU issue helpers are shared by the dense probe below and by the MoE kernel further down, so they are
+// gated on either flag; only the dense kernel itself needs GEMV_AIU.
+#if defined(GEMV_AIU) || defined(MOE_AIU_LOAD)
 // ============================================================================================================
 // PROBE -- RESULT: AIU LOSES. MEASURED, CORRECT, AND THE DOOR IS NOW CLOSED FOR GOOD.
 //
@@ -556,7 +558,9 @@ __device__ __forceinline__ void aiu_linear_b16(unsigned smem, const void* gmem,
 }
 __device__ __forceinline__ void aiu_commit() { asm volatile("cp.async.commit_group;\n"); }
 __device__ __forceinline__ void aiu_wait0()  { asm volatile("cp.async.wait_group 0;\n"); }
+#endif  // GEMV_AIU || MOE_AIU_LOAD
 
+#ifdef GEMV_AIU
 template <int SPLIT_K>
 __global__ void __launch_bounds__(GEMV_THREADS)
 gemv_w4a16_aiu(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
@@ -1164,14 +1168,160 @@ moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half
     }
 }
 
+#ifdef MOE_AIU_LOAD
+// ============================================================================================================
+// MoE decode with B staged through the AIU instead of per-thread LDG.
+//
+// THE DENSE VERSION OF THIS LOST (see the GEMV_AIU block above: 9.38 -> 10.23 us) and that measurement stands.
+// It is re-opened here because it was decided against a DIFFERENT constraint. That sweep ran at T=64, where
+// acu says the register limit (20 blocks/CU) sits well above what the grid supplies (14.2), so registers were
+// free and the only thing AIU could change was memory-level parallelism -- which it makes WORSE (single-thread
+// bulk DMA behind a barrier vs many warps x many independent LDGs).
+//
+// At T=128 the limit moved: 10 blocks/CU of registers against 14.2 from the grid, so the 90-register footprint
+// is now what caps occupancy at 40 theoretical warps. The unrolled LDG's live state -- q4[GEMV_UNROLL] (2 int4
+// = 8 regs) plus av0/av1 (4) -- is exactly what AIU removes, and 90-12 = 78 crosses the <=80 step to 48 warps.
+//
+// So this is a REGISTER trade, not a bandwidth one, and it should be judged that way: if acu shows registers
+// down and Block Limit Registers up but time flat or worse, the MLP loss ate the occupancy gain and the door
+// closes for the second time -- for a reason that will then apply at every T.
+//
+// Geometry is the dense AIU kernel's, verbatim: B as b16 is [k_tiles][4N] per expert; a block's 64 columns are
+// 256 b16 of each ktile row; cube_w maxes at 64 b16, so 4 cubes cover them. MOE_AIU_H ktiles per batch.
+//   shared int4 index for lane l at batch offset h:  (l/8)*H*8 + h*8 + (l%8)
+#ifndef MOE_AIU_H
+#define MOE_AIU_H 8
+#endif
+template <int SPLIT_K, bool AFFINE>
+__global__ void GEMV_LB
+moe_gemv_rows_aiu(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
+                  const half* __restrict__ mn, const int* __restrict__ row_expert,
+                  const int* __restrict__ row_token, float* __restrict__ partial, half* __restrict__ C,
+                  int N, int K, int kt_per_group, int n_rows,
+                  long long b_expert_stride, long long s_expert_stride) {
+    constexpr int AW = 64, H = MOE_AIU_H, NW = GEMV_THREADS / 32;
+    const int nb_group = blockIdx.x, slice = blockIdx.y;
+    const int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+    const int k_tiles = K / 16, kt_per_slice = k_tiles / SPLIT_K;
+    const int kt_begin = slice * kt_per_slice, kt_end = kt_begin + kt_per_slice;
+    const int lane_k = (lane % 4) * 2;
+
+    extern __shared__ half sh[];                       // 4 cubes x [H][AW] b16
+    const int4* sh4 = reinterpret_cast<const int4*>(sh);
+    __shared__ float sm[NW][N_PER_BLOCK];
+
+    const int r_lo = (int) blockIdx.z * MOE_ROWS_PER_BLOCK;
+    const int r_hi = min(r_lo + MOE_ROWS_PER_BLOCK, n_rows);
+    for (int r = r_lo; r < r_hi; r++) {
+        const int e = row_expert[r];
+        const half* Be = reinterpret_cast<const half*>(B + e * b_expert_stride);
+        const half* se = s + e * s_expert_stride;
+        const half* me = AFFINE ? mn + e * s_expert_stride : nullptr;
+        const half* At = A + (long long) row_token[r] * K;
+
+        float facc[4][2] = {{0.f}};
+        half2 hacc[4][2]; half sg[4][2], mg[4][2]; half2 asum2 = __float2half2_rn(0.f);
+        int cur_g = -1;
+        #define MA_OPEN(gg) do { cur_g = (gg);                                                       \
+            _Pragma("unroll") for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f);       \
+                                                           hacc[j][1] = __float2half2_rn(0.f); }     \
+            asum2 = __float2half2_rn(0.f);                                                            \
+            _Pragma("unroll") for (int j = 0; j < 4; j++)                                             \
+                _Pragma("unroll") for (int h2 = 0; h2 < 2; h2++) {                                    \
+                    const int c_ = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h2;                       \
+                    sg[j][h2] = se[(long long) cur_g * N + c_];                                       \
+                    if (AFFINE) mg[j][h2] = me[(long long) cur_g * N + c_]; } } while (0)
+        #define MA_FLUSH() do { if (cur_g >= 0) {                                                     \
+            float as_ = 0.f;                                                                          \
+            if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }                \
+            _Pragma("unroll") for (int j = 0; j < 4; j++)                                              \
+                _Pragma("unroll") for (int h2 = 0; h2 < 2; h2++) {                                     \
+                    const float2 f = __half22float2(hacc[j][h2]);                                      \
+                    facc[j][h2] += (f.x + f.y) * __half2float(sg[j][h2]);                              \
+                    if (AFFINE) facc[j][h2] += as_ * __half2float(mg[j][h2]); } } } while (0)
+
+        for (int kt0 = kt_begin; kt0 < kt_end; kt0 += H) {
+            // Thread 0 issues all four cubes. The AIU is a single-thread bulk DMA (ThrID = Layout<_1>), so its
+            // descriptor operands must be uniform -- four LANES of one warp issuing with different operands is
+            // lane-divergent issue of a single-thread instruction and produces garbage (rel 1.5, learned once
+            // already in the dense kernel). Every thread still commits, to keep the group stack consistent.
+            if (threadIdx.x == 0) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    aiu_linear_b16(cvta_s(sh + j * H * AW), Be, k_tiles, 4 * N, H, AW,
+                                   kt0, nb_group * 256 + j * AW);
+            }
+            aiu_commit();
+            aiu_wait0();
+            __syncthreads();
+
+            for (int h = wid; h < H; h += NW) {
+                const int kt = kt0 + h;
+                // A batch that runs past the slice reads padz zeros -- and zero is NOT a no-op here: dequant
+                // maps the nibble 0 to -8, so an unguarded tail would accumulate -8*A instead of nothing.
+                if (kt >= kt_end) break;
+                const int g_ = kt / kt_per_group;
+                if (g_ != cur_g) { MA_FLUSH(); MA_OPEN(g_); }
+                const int kb = kt * 16 + lane_k;
+                const half2 aa = *reinterpret_cast<const half2*>(&At[kb]);
+                const half2 ab = *reinterpret_cast<const half2*>(&At[kb + 8]);
+                if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));
+                const int4 q4 = sh4[(lane / 8) * H * 8 + h * 8 + (lane % 8)];
+                const int qs[4] = { q4.x, q4.y, q4.z, q4.w };
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const FragB b0 = dequant(qs[j]), b1 = dequant(qs[j] >> 8);
+                    hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);
+                    hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);
+                    hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);
+                    hacc[j][1] = __hfma2(b1.v[1], ab, hacc[j][1]);
+                }
+            }
+            __syncthreads();      // single-buffer TSM: everyone done reading before the next batch overwrites
+        }
+        MA_FLUSH();
+        #undef MA_FLUSH
+        #undef MA_OPEN
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int h2 = 0; h2 < 2; h2++) {
+                facc[j][h2] += __shfl_xor_sync(0xffffffff, facc[j][h2], 1);
+                facc[j][h2] += __shfl_xor_sync(0xffffffff, facc[j][h2], 2);
+            }
+        if (lane % 4 == 0)
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h2 = 0; h2 < 2; h2++) sm[wid][j * 16 + lane / 4 + 8 * h2] = facc[j][h2];
+        __syncthreads();
+        for (int c = threadIdx.x; c < N_PER_BLOCK; c += GEMV_THREADS) {
+            float v = 0.f;
+            #pragma unroll
+            for (int w = 0; w < NW; w++) v += sm[w][c];
+            if (SPLIT_K == 1) C[(long long) r * N + nb_group * N_PER_BLOCK + c] = __float2half(v);
+            else partial[((long long) r * SPLIT_K + slice) * N + nb_group * N_PER_BLOCK + c] = v;
+        }
+        __syncthreads();
+    }
+}
+#endif  // MOE_AIU_LOAD
+
 static void launch_moe(const int4* B, const half* A, const half* s, const half* mn,
                        const int* row_expert, const int* row_token, float* partial, half* C,
                        int N, int K, int kt_per_group, int n_rows,
                        long long b_str, long long s_str) {
     const int rz = (n_rows + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK;
     dim3 grid(N / N_PER_BLOCK, SPLIT_K, rz);
+#ifdef MOE_AIU_LOAD
+    const size_t smem = (size_t) 4 * MOE_AIU_H * 64 * sizeof(half);
+#define MOE_CASE(SK) case SK: if (mn) moe_gemv_rows_aiu<SK, true ><<<grid, GEMV_THREADS, smem>>>(B,A,s,mn,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); \
+                              else    moe_gemv_rows_aiu<SK, false><<<grid, GEMV_THREADS, smem>>>(B,A,s,nullptr,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); break;
+#else
 #define MOE_CASE(SK) case SK: if (mn) moe_gemv_rows<SK, true ><<<grid, GEMV_THREADS>>>(B,A,s,mn,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); \
                               else    moe_gemv_rows<SK, false><<<grid, GEMV_THREADS>>>(B,A,s,nullptr,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); break;
+#endif
     switch (SPLIT_K) {
         MOE_CASE(1) MOE_CASE(2) MOE_CASE(4) MOE_CASE(8) MOE_CASE(16) MOE_CASE(32)
         default: printf("  MoE SPLIT_K=%d unsupported\n", SPLIT_K); exit(1);
