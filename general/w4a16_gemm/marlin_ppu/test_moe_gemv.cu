@@ -93,8 +93,11 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   std::vector<char> seen(n_experts, 0); int distinct = 0;
   for (int r = 0; r < n_rows; r++) if (!seen[rexp[r]]) { seen[rexp[r]] = 1; distinct++; }
   const double wb = (double) distinct * N * K / 2.0;
-  printf("  T=%-3d sk=%-2d rows=%-4d distinct experts=%-4d | %7.2f us | weight %5.1f MB | %6.0f GB/s | %5.1f%% HBM\n",
-         THREADS, SPLIT_K, n_rows, distinct, ms * 1e3, wb / 1e6, wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0);
+  const int blocks = (N / MOEV_NPB) * SPLIT_K * n_rows;
+  printf("  T=%-3d sk=%-2d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
+         THREADS, SPLIT_K, blocks, SPLIT_K > 1 ? "2 launches" : "1 launch", ms * 1e3,
+         wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
+  (void) distinct;
   cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);
   return 0;
 }
@@ -111,6 +114,15 @@ int main(int argc, char** argv) {
   printf("%s\n", bad ? "SOME CASES FAILED" : "all decode cases MATCH");
   if (bad) return 1;
   printf("--- perf, batch 1 x top-8 over 256 experts (the real decode shape) ---\n");
+  // SPLIT_K=1 issues ONE kernel; everything above it also launches a reduce. This problem is small -- 8.4
+  // MB of weights, a 3.0 us floor at 2766 GB/s -- so a second launch is a large fixed fraction, and the
+  // dense GEMV measured exactly that (~2.1 us launch = 30%% of a 7 us kernel, which is why it has
+  // GEMV_FUSED_REDUCE). Sweeping sk=1/2/4 alongside 8/16 separates launch overhead from bandwidth before
+  // anything gets optimized: if sk=1 is already near the others, the reduce launch is the cost, not the loop.
+  run<32, 1> (1, 8, 256, N, K, true);
+  run<64, 1> (1, 8, 256, N, K, true);
+  run<32, 2> (1, 8, 256, N, K, true);
+  run<32, 4> (1, 8, 256, N, K, true);
   run<32, 8> (1, 8, 256, N, K, true);
   run<64, 8> (1, 8, 256, N, K, true);
   run<64, 16>(1, 8, 256, N, K, true);
