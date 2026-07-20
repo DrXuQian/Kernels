@@ -126,6 +126,13 @@ int main(int argc, char** argv) {
     // BMR that can stop computing rows nobody asked for.
     bench<4, 32, 2>(n_experts, N, K, total_rows, re, 20);
     bench<4, 64> (n_experts, N, K, total_rows, re, 20);
+    // MIR = BMR/(MWARPS*16) is how many mmas each B fragment feeds, i.e. how far one ld_swzl + dequant +
+    // scale is amortised. Issued utilisation tracks MIR, not BMR: MIR=1 gave 25-35% of peak, MIR=2 gave
+    // 48%. BMR=32 cut masked rows to 1.24x exactly as intended and still LOST, because MWARPS=2 left MIR
+    // at 1. The two are separable -- lowering MWARPS raises MIR without raising BMR -- and these are the
+    // combinations that do it, which nothing in the sweep had tried.
+    bench<4, 64, 2> (n_experts, N, K, total_rows, re, 20);   // MIR=2, rows 1.47x
+    bench<4, 128, 2>(n_experts, N, K, total_rows, re, 20);   // MIR=4, rows 2.00x
     bench<4, 128>(n_experts, N, K, total_rows, re, 20);
     bench<4, 256>(n_experts, N, K, total_rows, re, 20);
     printf("\n  NST sweep at BMR=128 (AIU bulk load is one descriptor, so depth is nearly free):\n");

@@ -139,8 +139,9 @@ static int run(int n_experts, int N, int K, int total_rows, int dist, bool affin
   int maxmb = 0;
   for (int e = 0; e < n_experts; e++) maxmb = std::max(maxmb, sch.mblk_prefix[e + 1] - sch.mblk_prefix[e]);
 
-  if (BMR == 32) launch_moe_q4k<4, 32, 2>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
-  else           launch_moe_q4k<4, 128>   (dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
+  if      (BMR == 32) launch_moe_q4k<4, 32,  2>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
+  else if (BMR == 64) launch_moe_q4k<4, 64,  2>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
+  else                launch_moe_q4k<4, 128, 2>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
   if (affine) {
     // Asum is per TOKEN and does NOT depend on the expert, so it is one pass for the whole batch; only the
     // second (G-deep) GEMM is grouped. mins go in PLAIN [G][N] here -- the permuted layout is Marlin's
@@ -213,6 +214,11 @@ int main() {
   bad |= run(4,   256,  512,  2000, 0, false, 32);
   bad |= run(16,  256,  512,  4000, 1, false, 32);
   bad |= run(8,   256,  512,  1500, 2, true,  32);
+  // MWARPS=2 at BMR 64 and 128 -- MIR becomes 2 and 4. New warp grids, and a wrong warp grid is what
+  // produced the out-of-range column earlier, so each gets a case rather than riding on BMR=32's.
+  bad |= run(4,   256,  512,  2000, 0, false, 64);
+  bad |= run(16,  256,  512,  4000, 1, true,  64);
+  bad |= run(8,   256,  512,  1500, 2, false, 128);
   printf("%s\n", bad ? "SOME CASES FAILED" : "all AIU MoE cases MATCH");
   return bad ? 1 : 0;
 }
