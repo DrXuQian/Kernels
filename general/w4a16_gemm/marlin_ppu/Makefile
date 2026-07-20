@@ -69,6 +69,11 @@ moe_gemv: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
 
 # Fused last-CTA reduce instead of the separate kernel. MEASURED WORSE here and kept for comparison: the
 # winner reads all SPLIT_K partials serially while everyone else waits at the fence.
+# Persistent grid: one wave, grid-stride over tiles. acu says T=128's partial wave of 32 blocks can cost
+# 33% of the runtime, and no SPLIT_K makes 128*sk a multiple of the ~1008-block wave.
+moe_gemv_persist: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -Wall -DMOEV_PERSIST -o $@ $<
+
 moe_gemv_fused: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -Wall -DMOEV_FUSED_REDUCE -o $@ $<
 
@@ -195,4 +200,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags

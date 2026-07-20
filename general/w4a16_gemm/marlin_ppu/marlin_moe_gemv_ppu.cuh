@@ -52,8 +52,25 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
              const int* __restrict__ row_expert, const int* __restrict__ row_token,
              float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
              int N, int K, int gs, int n_rows) {
+#ifdef MOEV_PERSIST
+    // PERSISTENT GRID. acu on T=128: 2 full waves plus a partial wave of 32 blocks, and that partial can
+    // cost up to 33% of the runtime -- 72 CUs waiting on 32 blocks. Enlarging the grid cannot fix it: a
+    // wave is ~1008 blocks while the grid is 16*sk*8 = 128*sk, which lands on no multiple of it (sk=16 ->
+    // 2048 = 2 waves + 32, sk=32 -> 4096 = 4 waves + 64), and T=128 at sk=32 measured WORSE anyway.
+    //
+    // So fix the grid at one wave and grid-stride over the flattened (row, n-block, slice) space. Same
+    // shape as marlin_moe_aiu_ppu.cuh's scheduler. Tiles are independent -- each writes its own partial
+    // slot -- so no ordering is required.
+    const int n_nb = N / MOEV_NPB, total_tiles = n_rows * n_nb * SPLIT_K;
+    for (int tile = blockIdx.x; tile < total_tiles; tile += gridDim.x) {
+        const int r = tile / (n_nb * SPLIT_K);
+        const int rem = tile % (n_nb * SPLIT_K);
+        const int slice = rem / n_nb, nbg = rem % n_nb;   // n-block minor: consecutive blocks share a slice
+#else
     const int nbg = blockIdx.x, slice = blockIdx.y, r = blockIdx.z;
     if (r >= n_rows) return;
+    {
+#endif
     const int lane = threadIdx.x % 32, wid = threadIdx.x / 32, step = THREADS / 32;
 
     const int e = row_expert[r], t = row_token[r];
@@ -221,6 +238,7 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
         C[(long long) r * N + nbg * MOEV_NPB + c] = __float2half(v);
     }
 #endif
+    }   // tile loop (persistent) / plain scope
 }
 
 __global__ void moe_gemv_reduce(const float* __restrict__ partial, half* __restrict__ C,

@@ -91,7 +91,17 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   CK(cudaMemcpy(dRe, rexp.data(), n_rows * 4, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dRt, rtok.data(), n_rows * 4, cudaMemcpyHostToDevice));
 
+#ifdef MOEV_PERSIST
+  // One wave: #CU * blocks-per-CU. Shared is tiny here, so the blocks/CU bound is warps: 64 / (T/32).
+  int cus = 0; CK(cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0));
+  int g1 = cus * (64 / (THREADS / 32));
+  const int tot = n_rows * (N / MOEV_NPB) * SPLIT_K;
+  if (g1 > tot) g1 = tot;
+  if (const char* e = getenv("MOEV_GRID")) g1 = atoi(e);
+  dim3 grid(g1, 1, 1);
+#else
   dim3 grid(N / MOEV_NPB, SPLIT_K, n_rows);
+#endif
   auto go = [&] {
     moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS>>>(dB, dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
 #ifndef MOEV_FUSED_REDUCE
@@ -130,7 +140,7 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   std::vector<char> seen(n_experts, 0); int distinct = 0;
   for (int r = 0; r < n_rows; r++) if (!seen[rexp[r]]) { seen[rexp[r]] = 1; distinct++; }
   const double wb = (double) distinct * N * K / 2.0;
-  const int blocks = (N / MOEV_NPB) * SPLIT_K * n_rows;
+  const int blocks = grid.x * grid.y * grid.z;
   printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
          THREADS, SPLIT_K, U, blocks, (SPLIT_K > 1 && !MOEV_FUSED) ? "2 launches" : "1 launch", ms * 1e3,
          wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
