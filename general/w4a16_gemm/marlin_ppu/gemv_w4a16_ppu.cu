@@ -1035,6 +1035,10 @@ static double bench_one(int N, int K, int iters, bool check) {
 //
 // Rows sharing an expert also stop re-reading its weights: the loop can group them, though at batch 1 the
 // draw is usually 8 distinct experts so that pays off only at larger batch.
+#ifndef MOE_ROWS_PER_BLOCK
+#define MOE_ROWS_PER_BLOCK 1
+#endif
+
 template <int SPLIT_K, bool AFFINE>
 __global__ void __launch_bounds__(GEMV_THREADS)
 moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
@@ -1050,7 +1054,15 @@ moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half
 
     __shared__ float sm[GEMV_THREADS / 32][N_PER_BLOCK];
 
-    for (int r = 0; r < n_rows; r++) {
+    // ROWS PER BLOCK is a knob, not a choice between two kernels. RPB=1 puts every row in its own block
+    // (maximum parallelism, A re-read and epilogue paid per row); RPB=n_rows gives one block all of them
+    // (A read once, one epilogue, but the grid loses the row dimension entirely). Measured on ppu001,
+    // N=1024 K=2048, 8 rows: RPB=1 gave 10.70 us at 1024 blocks, RPB=8 gave 17.94 at 512 -- so the A and
+    // epilogue savings are worth LESS than the parallelism they cost, and the right value is in between.
+    // GEMV_MAX_SPLIT_K=32 caps this grid at 16*32 = 512 blocks, which is why RPB=8 cannot buy them back.
+    const int r_lo = (int) blockIdx.z * MOE_ROWS_PER_BLOCK;
+    const int r_hi = min(r_lo + MOE_ROWS_PER_BLOCK, n_rows);
+    for (int r = r_lo; r < r_hi; r++) {
         const int e = row_expert[r];
         const int4* Be = B + e * b_expert_stride;
         const half* se = s + e * s_expert_stride;
@@ -1127,7 +1139,8 @@ static void launch_moe(const int4* B, const half* A, const half* s, const half* 
                        const int* row_expert, const int* row_token, float* partial, half* C,
                        int N, int K, int kt_per_group, int n_rows,
                        long long b_str, long long s_str) {
-    dim3 grid(N / N_PER_BLOCK, SPLIT_K);          // NO row dimension: a block owns all rows of its columns
+    const int rz = (n_rows + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK;
+    dim3 grid(N / N_PER_BLOCK, SPLIT_K, rz);
 #define MOE_CASE(SK) case SK: if (mn) moe_gemv_rows<SK, true ><<<grid, GEMV_THREADS>>>(B,A,s,mn,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); \
                               else    moe_gemv_rows<SK, false><<<grid, GEMV_THREADS>>>(B,A,s,nullptr,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); break;
     switch (SPLIT_K) {
@@ -1152,7 +1165,8 @@ static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool chec
     // (N/64) * SPLIT_K -- passing n_rows here (which I had just added for the z-dimension version) made
     // auto_split_k believe there were 8x the blocks and pick sk=8, giving 128 blocks on 72 CUs and 44 us.
     // Trading the row dimension for epilogue amortisation means SPLIT_K has to buy those blocks back.
-    SPLIT_K = get_split_k(N, K, gs / 16, 1);
+    // the grid's row dimension is ceil(n_rows / MOE_ROWS_PER_BLOCK), so that is what auto_split_k must see
+    SPLIT_K = get_split_k(N, K, gs / 16, (n_rows + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK);
     if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
         printf("  MoE N=%d K=%d SPLIT_K=%d unsupported\n", N, K, SPLIT_K); return 2; }
 
@@ -1230,9 +1244,9 @@ static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool chec
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 50;
     std::set<int> uniq(rexp.begin(), rexp.end());
     const double wb = (double) uniq.size() * N * K / 2.0;
-    const int blocks_ = (N / N_PER_BLOCK) * SPLIT_K;   // no row dimension now
-    printf("  MoE %-3s rows=%-4d E=%-4d N=%-5d K=%-5d sk=%-2d blk=%-5d %5.1f KB/blk | %7.2f us | %6.0f GB/s | %5.1f%% HBM\n",
-           affine ? "aff" : "sym", n_rows, n_experts, N, K, SPLIT_K, blocks_, wb / blocks_ / 1024.0, ms * 1e3,
+    const int blocks_ = (N / N_PER_BLOCK) * SPLIT_K * ((n_rows + MOE_ROWS_PER_BLOCK - 1) / MOE_ROWS_PER_BLOCK);
+    printf("  MoE %-3s rows=%-4d E=%-4d N=%-5d K=%-5d sk=%-2d rpb=%-2d blk=%-5d %5.1f KB/blk | %7.2f us | %6.0f GB/s | %5.1f%% HBM\n",
+           affine ? "aff" : "sym", n_rows, n_experts, N, K, SPLIT_K, MOE_ROWS_PER_BLOCK, blocks_, wb / blocks_ / 1024.0, ms * 1e3,
            wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / (getenv("MARLIN_HBM_GBS") ? atof(getenv("MARLIN_HBM_GBS")) : 2766.0));
     cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dM);cudaFree(dC);cudaFree(dP);cudaFree(dCnt);cudaFree(dRe);cudaFree(dRt);
     return 0;

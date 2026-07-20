@@ -180,6 +180,16 @@ gemv_nmajor: gemv_w4a16_nmajor.cu .flags
 gemv_w4a16: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# MoE rows per block. 1 = one row per block (max parallelism); n_rows = one block owns them all (A read
+# once, one epilogue, but the grid loses its row dimension). Measured 10.70 us at rpb=1 against 17.94 at
+# rpb=8, so the optimum is in between and is worth sweeping.
+gemv_w4a16_rpb2: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_ROWS_PER_BLOCK=2 -o $@ $<
+gemv_w4a16_rpb4: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_ROWS_PER_BLOCK=4 -o $@ $<
+gemv_w4a16_rpb8: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_ROWS_PER_BLOCK=8 -o $@ $<
+
 # Same GEMV with Marlin's _scale_perm applied to the scale/min tensors, so a lane's 8 scales are ONE int4
 # load instead of 8 scattered halves. Aimed at gs=32, where the scale:B load ratio is 4x worse than gs=128.
 gemv_w4a16_perm: gemv_w4a16_ppu.cu .flags
