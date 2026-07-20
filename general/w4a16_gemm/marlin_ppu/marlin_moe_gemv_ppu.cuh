@@ -83,6 +83,23 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
     const int kt_begin = slice * kt_per_slice, kt_end = kt_begin + kt_per_slice;
     const int b_stride = N / 2, lane_k = (lane % 4) * 2, kt_per_group = gs / 16;
 
+    // A THROUGH SHARED. acu: Stall Vector Memory Pipe Busy 1.535 (third-largest) while Stall Shared Memory
+    // Pipe Busy is 0.0102 -- the LSU is saturated and the shared pipe is idle. Per ktile a lane issues
+    // THREE memory instructions: one int4 of B (16 useful bytes) and two half2 of A (4 bytes each), so two
+    // thirds of the memory issue slots move one third of the bytes.
+    //
+    // The two A loads are structural, not sloppiness: Marlin's packing puts a lane's k values at
+    // {kb, kb+1, kb+8, kb+9}, two 32-bit words 16 bytes apart, which no single int4 covers. Replacing them
+    // with shuffles needs a runtime component index into a register array, which forces it to local memory.
+    // But the block's whole A slice is kt_per_slice*16 halves -- 256 B at sk=16 -- so stage it once and
+    // let those two reads land on the idle pipe instead.
+    extern __shared__ char moev_smem[];
+    half* Ash = reinterpret_cast<half*>(moev_smem);
+    const int a_lo = kt_begin * 16, a_n = (kt_end - kt_begin) * 16;
+    __syncthreads();                       // persistent: the previous tile may still be reading Ash
+    for (int i = threadIdx.x; i < a_n; i += THREADS) Ash[i] = At[a_lo + i];
+    __syncthreads();
+
     float facc[4][2] = {{0.f}};
 
     // LOADS ARE HOISTED ACROSS GROUP BOUNDARIES. The previous shape looped over scale groups and unrolled
@@ -143,8 +160,8 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
         for (int u = 0; u < U; u++) {                 // ALL U issued before any is consumed
             const int ktu = kt + u * step, kb = ktu * 16 + lane_k;
             q4[u]  = Be[(long long) b_stride * ktu + nbg * 32 + lane];
-            av0[u] = *reinterpret_cast<const half2*>(&At[kb]);
-            av1[u] = *reinterpret_cast<const half2*>(&At[kb + 8]);
+            av0[u] = *reinterpret_cast<const half2*>(&Ash[kb - a_lo]);
+            av1[u] = *reinterpret_cast<const half2*>(&Ash[kb - a_lo + 8]);
         }
         #pragma unroll
         for (int u = 0; u < U; u++) MOEV_BODY(kt + u * step, q4[u], av0[u], av1[u]);
@@ -153,8 +170,8 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
     for (; i < my_n; i++) {
         const int kb = kt * 16 + lane_k;
         MOEV_BODY(kt, Be[(long long) b_stride * kt + nbg * 32 + lane],
-                  *reinterpret_cast<const half2*>(&At[kb]),
-                  *reinterpret_cast<const half2*>(&At[kb + 8]));
+                  *reinterpret_cast<const half2*>(&Ash[kb - a_lo]),
+                  *reinterpret_cast<const half2*>(&Ash[kb - a_lo + 8]));
         kt += step;
     }
     MOEV_FLUSH();
@@ -170,7 +187,8 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
             facc[j][h] += __shfl_xor_sync(0xffffffff, facc[j][h], 1);
             facc[j][h] += __shfl_xor_sync(0xffffffff, facc[j][h], 2);
         }
-    __shared__ float sm[THREADS / 32][MOEV_NPB];
+    // reduce scratch lives after A in the same dynamic allocation
+    float (*sm)[MOEV_NPB] = reinterpret_cast<float (*)[MOEV_NPB]>(Ash + a_n);
     if (lane % 4 == 0)
         #pragma unroll
         for (int j = 0; j < 4; j++)

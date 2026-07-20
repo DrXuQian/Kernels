@@ -113,7 +113,9 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   dim3 grid(N / MOEV_NPB, SPLIT_K, n_rows);
 #endif
   auto go = [&] {
-    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS>>>(dB, dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
+    // dynamic shared: the block's A slice (K/SPLIT_K halves) then the reduce scratch
+    const size_t shm = (size_t) (K / SPLIT_K) * sizeof(half) + (size_t) (THREADS / 32) * MOEV_NPB * sizeof(float);
+    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS, shm>>>(dB, dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
 #ifndef MOEV_FUSED_REDUCE
     if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
 #endif
