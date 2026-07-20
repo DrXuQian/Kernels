@@ -76,9 +76,9 @@ static double bench(int n_experts, int N, int K, int total_rows, const std::vect
     // what acu sees. The hardware is not idle -- half the work is thrown away.
     const double rows_done = (double) sch.mblk_prefix[n_experts] * BMR;
     const double flop_issued = 2.0 * rows_done * N * K;
-    printf("  NST=%d BMR=%-4d mtiles=%-5d | %8.3f ms | useful %6.1f TF/s | issued %6.1f TF/s (%.0f%% peak) | "
+    printf("  NST=%d BMR=%-4d MW=%d MIR=%-2d mtiles=%-5d | %8.3f ms | useful %6.1f TF/s | issued %6.1f TF/s (%.0f%% peak) | "
            "weight %.1fx | rows %.2fx (%.0f/%d) | %5.0f GB/s\n",
-           NST, BMR, sch.mblk_prefix[n_experts], ms, flop / (ms * 1e9), flop_issued / (ms * 1e9),
+           NST, BMR, MWARPS, BMR / (MWARPS * 16), sch.mblk_prefix[n_experts], ms, flop / (ms * 1e9), flop_issued / (ms * 1e9),
            100.0 * flop_issued / (ms * 1e9) / 500.0, wbytes_tiles / wbytes_min,
            rows_done / total_rows, rows_done, total_rows, wbytes_min / (ms * 1e6));
     (void) active;
@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
     const int n_experts = argc > 5 ? atoi(argv[5]) : 256;
     // Pick ONE config so a profiler capture has one kernel in it. Without this the sweep launches five.
     const int selBMR = argc > 6 ? atoi(argv[6]) : 0, selNST = argc > 7 ? atoi(argv[7]) : 4;
+    const int selMW  = argc > 8 ? atoi(argv[8]) : 4;   // so the MWARPS=4 vs 2 pair can be captured apart
     const int total_rows = tokens * topk;
     printf("Q4_K MoE on AIU: N=%d K=%d tokens=%d topk=%d experts=%d -> rows=%d (avg %.0f/expert)\n",
            N, K, tokens, topk, n_experts, total_rows, (double) total_rows / n_experts);
@@ -114,6 +115,11 @@ int main(int argc, char** argv) {
     // fp16 kernel's central finding and the reason Marlin's 32-row tile was the wrong shape here.
     if (selBMR) {   // single config: for acu, or for A/B-ing one knob without the other four in the way
         if (selBMR == 32) { bench<4, 32, 2>(n_experts,N,K,total_rows,re,20); return 0; }
+        if (selMW == 2) {   // the controlled pair: same BMR/rows/weight/NST, only the warp grid differs
+            if (selBMR == 64) bench<4, 64, 2>(n_experts,N,K,total_rows,re,20);
+            else              bench<4, 128, 2>(n_experts,N,K,total_rows,re,20);
+            return 0;
+        }
         if (selNST == 2) { if (selBMR == 64) bench<2,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<2,256>(n_experts,N,K,total_rows,re,20); else bench<2,128>(n_experts,N,K,total_rows,re,20); }
         else if (selNST == 6) { if (selBMR == 64) bench<6,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<6,256>(n_experts,N,K,total_rows,re,20); else bench<6,128>(n_experts,N,K,total_rows,re,20); }
         else { if (selBMR == 64) bench<4,64>(n_experts,N,K,total_rows,re,20); else if (selBMR == 256) bench<4,256>(n_experts,N,K,total_rows,re,20); else bench<4,128>(n_experts,N,K,total_rows,re,20); }
