@@ -69,6 +69,13 @@ bench_moe_aiu: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
 bench_moe_aiu_cs: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -DMOE_SCALE_CONST -o $@ $<
 
+# Which ld_swzl carries the bank conflicts. WRONG RESULTS, profiling only. A's read is verbatim from the
+# fp16 kernel; B's image layout is new here and only ever checked numerically.
+bench_moe_aiu_noa: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_NO_A_LDSWZL -o $@ $<
+bench_moe_aiu_nob: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_NO_B_LDSWZL -o $@ $<
+
 moe_aiu: test_moe_aiu.cu marlin_moe_aiu_ppu.cuh marlin_moe_gguf_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
@@ -177,4 +184,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags

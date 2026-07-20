@@ -223,11 +223,33 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
                 const int ko = ks * 16;
                 const half* sg8 = reinterpret_cast<const half*>(&svg[ko / 32]);
                 int fa[MIR][4], fb[4];
+                // -DMOE_NO_A_LDSWZL / -DMOE_NO_B_LDSWZL: RESULTS WRONG ON PURPOSE, profiling only.
+                // The remaining bank conflicts are all in ld_swzl -- the scale reads contribute none now,
+                // measured by the v2-vs-nosc pair. That is backwards for a swzl layout, whose entire
+                // purpose is conflict-free reads, so the fault is in how one of the two cubes is set up.
+                // The suspects are NOT equal: A's read and cube are verbatim from the fp16 kernel and its
+                // shape is proven, while B's image layout (Marlin int32 words tiled 16x16 into b16, cube
+                // 32x64) is mine and aiu_int4_smoke only ever checked that it is NUMERICALLY right, never
+                // how it is accessed. Dropping one at a time says which.
+#ifndef MOE_NO_A_LDSWZL
                 #pragma unroll
                 for (int mi = 0; mi < MIR; ++mi) ld_swzl(fa[mi], Ac, wm * WROW + mi * 16, ko, BMR);
+#else
+                #pragma unroll
+                for (int mi = 0; mi < MIR; ++mi)
+                    #pragma unroll
+                    for (int r = 0; r < 4; ++r) fa[mi][r] = 0x3c003c00;
+                (void) Ac;
+#endif
                 // one ld_swzl gives this lane its four packed ints = the four n-blocks j=0..3 of a
                 // 64-column group; wn selects which 64-column group of the BN-wide tile.
+#ifndef MOE_NO_B_LDSWZL
                 ld_swzl(fb, Bc, 16 * wn, ko, bcube_h);
+#else
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) fb[r] = 0x11111111;
+                (void) Bc;
+#endif
                 #pragma unroll
                 for (int nj = 0; nj < 4; ++nj) {
                     // Marlin's consumption of one packed int, unchanged: the low byte-lane dequants to
