@@ -137,10 +137,19 @@ int main(int argc, char** argv) {
   const int N = argc > 1 ? atoi(argv[1]) : 1024, K = argc > 2 ? atoi(argv[2]) : 2048;
   printf("Q4_K MoE DECODE GEMV (bandwidth bound -- read %%HBM, not TFLOP/s)\n");
   // argv 3/4 pick ONE config so a profiler capture holds one kernel instead of the whole sweep.
+  // argv: N K [THREADS SPLIT_K [U]]. U was missing and defaulted to 1, so a capture of "the best config"
+  // would have profiled T=32/sk=16/U=1 (9.74 us) instead of U=2 (9.11) -- the wrong kernel, silently.
   if (argc > 4) {
-    const int T = atoi(argv[3]), sk = atoi(argv[4]);
-    if (T == 32) { if (sk == 8) run<32,8>(1,8,256,N,K,true); else if (sk == 32) run<32,32>(1,8,256,N,K,true); else run<32,16>(1,8,256,N,K,true); }
-    else         { if (sk == 8) run<64,8>(1,8,256,N,K,true); else if (sk == 32) run<64,32>(1,8,256,N,K,true); else run<64,16>(1,8,256,N,K,true); }
+    const int T = atoi(argv[3]), sk = atoi(argv[4]), u = argc > 5 ? atoi(argv[5]) : 1;
+    if (T == 32) {
+      if (sk == 8)       { if (u == 2) run<32,8,2>(1,8,256,N,K,true);  else if (u == 4) run<32,8,4>(1,8,256,N,K,true);  else run<32,8>(1,8,256,N,K,true); }
+      else if (sk == 32) { if (u == 2) run<32,32,2>(1,8,256,N,K,true); else if (u == 4) run<32,32,4>(1,8,256,N,K,true); else run<32,32>(1,8,256,N,K,true); }
+      else               { if (u == 2) run<32,16,2>(1,8,256,N,K,true); else if (u == 4) run<32,16,4>(1,8,256,N,K,true); else if (u == 8) run<32,16,8>(1,8,256,N,K,true); else run<32,16>(1,8,256,N,K,true); }
+    } else {
+      if (sk == 8)       { if (u == 2) run<64,8,2>(1,8,256,N,K,true);  else run<64,8>(1,8,256,N,K,true); }
+      else if (sk == 32) { if (u == 2) run<64,32,2>(1,8,256,N,K,true); else run<64,32>(1,8,256,N,K,true); }
+      else               { if (u == 2) run<64,16,2>(1,8,256,N,K,true); else run<64,16>(1,8,256,N,K,true); }
+    }
     return 0;
   }
   int bad = 0;
