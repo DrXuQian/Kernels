@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <vector>
 #include <random>
+#include <cstdlib>
 
 #define CK(x) do { cudaError_t e_=(x); if(e_){printf("cuda %s @%d\n",cudaGetErrorString(e_),__LINE__);exit(1);} } while(0)
 
@@ -82,6 +83,14 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
     if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
   };
   go(); CK(cudaDeviceSynchronize());
+  // MOEV_NCU=1: one launch of each kernel, no warmup, no timing loop -- a clean capture. Same convention
+  // as GEMV_NCU / MOE_NCU. The printed us is meaningless then.
+  if (getenv("MOEV_NCU")) {
+    printf("  MOEV_NCU: single launch T=%d sk=%d blocks=%d -- timing skipped\n",
+           THREADS, SPLIT_K, (N / MOEV_NPB) * SPLIT_K * n_rows);
+    cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);
+    return 0;
+  }
 
   if (!bench) {
     std::vector<half> got((size_t) n_rows * N);
@@ -114,6 +123,13 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 int main(int argc, char** argv) {
   const int N = argc > 1 ? atoi(argv[1]) : 1024, K = argc > 2 ? atoi(argv[2]) : 2048;
   printf("Q4_K MoE DECODE GEMV (bandwidth bound -- read %%HBM, not TFLOP/s)\n");
+  // argv 3/4 pick ONE config so a profiler capture holds one kernel instead of the whole sweep.
+  if (argc > 4) {
+    const int T = atoi(argv[3]), sk = atoi(argv[4]);
+    if (T == 32) { if (sk == 8) run<32,8>(1,8,256,N,K,true); else if (sk == 32) run<32,32>(1,8,256,N,K,true); else run<32,16>(1,8,256,N,K,true); }
+    else         { if (sk == 8) run<64,8>(1,8,256,N,K,true); else if (sk == 32) run<64,32>(1,8,256,N,K,true); else run<64,16>(1,8,256,N,K,true); }
+    return 0;
+  }
   int bad = 0;
   printf("--- correctness (small E so the CPU reference is affordable) ---\n");
   bad |= run<64, 1>(1, 8, 8,  256, 512,  false);
