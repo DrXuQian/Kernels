@@ -1040,7 +1040,7 @@ static double bench_one(int N, int K, int iters, bool check) {
 #endif
 
 template <int SPLIT_K, bool AFFINE>
-__global__ void __launch_bounds__(GEMV_THREADS)
+__global__ void GEMV_LB
 moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
               const half* __restrict__ mn, const int* __restrict__ row_expert,
               const int* __restrict__ row_token, float* __restrict__ partial, half* __restrict__ C,

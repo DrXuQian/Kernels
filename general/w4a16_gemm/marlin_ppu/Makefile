@@ -194,6 +194,15 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 gemv_w4a16_t128: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -o $@ $<
+# Register-capped variants of the T=128 build. At 128 threads/block the register limit (10 blocks/CU at
+# 90 regs) binds BEFORE the grid does (14.2 blocks/CU), so trading registers for blocks is real here --
+# unlike at T=64, where 20 blocks/CU of register headroom went unused. MIN_BLOCKS n => regs <= 131072/(128n).
+gemv_w4a16_t128_r12: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DGEMV_MIN_BLOCKS=12 -o $@ $<
+gemv_w4a16_t128_r14: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DGEMV_MIN_BLOCKS=14 -o $@ $<
+gemv_w4a16_t128_r16: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -DGEMV_MIN_BLOCKS=16 -o $@ $<
 gemv_w4a16_t256: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=256 -o $@ $<
 
@@ -232,4 +241,4 @@ gemv_w4a16_h16: gemv_w4a16_ppu.cu .flags
 # needed for its X and MIN_BLOCKS.
 
 clean:
-	rm -f moe_gemv_atomic moe_gemv_count moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f gemv_w4a16_t128_r12 gemv_w4a16_t128_r14 gemv_w4a16_t128_r16 moe_gemv_atomic moe_gemv_count moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
