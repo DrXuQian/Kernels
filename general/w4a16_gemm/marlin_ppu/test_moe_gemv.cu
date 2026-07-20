@@ -233,6 +233,13 @@ int main(int argc, char** argv) {
       } else {                                                                            \
         printf("--- verifying <T=%d, sk=%d, U=%d> (the instantiation being profiled) ---\n", TT, SK, UU); \
         if (run<TT, SK, UU>(1, 8, 8, 256, 512, false)) { printf("  WRONG -- not profiling it\n"); return 1; } \
+        /* and again with a grid that FORCES the tile loop to wrap. The default verification config has  */ \
+        /* 512 tiles and a 512-block grid, so it never wraps -- which is exactly how a `return` inside   */ \
+        /* the tile loop survived and dropped 44% of the profiled config's work.                        */ \
+        setenv("MOEV_GRID", "64", 1);                                                     \
+        const int vw_ = run<TT, SK, UU>(1, 8, 8, 256, 512, false);                        \
+        unsetenv("MOEV_GRID");                                                            \
+        if (vw_) { printf("  WRONG with a wrapping grid -- not profiling it\n"); return 1; } \
       }                                                                                   \
       return run<TT, SK, UU>(1, 8, 256, N, K, true);                                      \
     } while (0)

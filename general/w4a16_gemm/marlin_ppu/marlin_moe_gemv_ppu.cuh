@@ -229,7 +229,11 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
         partial[((long long) r * SPLIT_K + slice) * N + nbg * MOEV_NPB + c] = v;
     }
     (void) counter;
-    return;
+    // NOT `return` -- that ends the KERNEL, and under MOEV_PERSIST this sits inside the grid-stride tile
+    // loop, so the block quit after its FIRST tile and 44% of the work was never done (counted: 1152 of
+    // 2048 tiles). Harmless with a static grid, where a block has exactly one tile, which is why it
+    // survived: the correctness config has 512 tiles and a 512-block grid, so nothing ever wraps there.
+    goto moev_tile_done;
 #else
     // FUSED LAST-CTA REDUCE -- A REGRESSION HERE, kept only for comparison. It removes the second launch,
     // but the winning CTA then reads all SPLIT_K partials SERIALLY while every other CTA waits at the
@@ -269,6 +273,7 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
         C[(long long) r * N + nbg * MOEV_NPB + c] = __float2half(v);
     }
 #endif
+    moev_tile_done: ;
     }   // tile loop (persistent) / plain scope
 }
 
