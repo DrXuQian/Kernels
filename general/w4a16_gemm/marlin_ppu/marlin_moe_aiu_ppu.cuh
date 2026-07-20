@@ -102,8 +102,8 @@ inline void marlin_b_to_aiu_image(const int* B_marlin, int N, int K, unsigned sh
                     img[base + 1] = (unsigned short) ((unsigned) word >> 16);
                 }
 }
-inline int aiu_img_h(int N) { return 16 * (N / 64); }
-inline int aiu_img_w(int K) { return 16 * (K / 16); }
+__host__ __device__ inline int aiu_img_h(int N) { return 16 * (N / 64); }
+__host__ __device__ inline int aiu_img_w(int K) { return 16 * (K / 16); }
 
 // ---------------------------------------------------------------------------------------------------
 // Persistent scheduler, mirroring the fp16 kernel: grid-stride over a global (m-block, n-block) queue,
