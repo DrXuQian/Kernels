@@ -183,6 +183,14 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 # MoE rows per block. 1 = one row per block (max parallelism); n_rows = one block owns them all (A read
 # once, one epilogue, but the grid loses its row dimension). Measured 10.70 us at rpb=1 against 17.94 at
 # rpb=8, so the optimum is in between and is worth sweeping.
+# Thread count. 1024 blocks x 2 warps = 2048 warps against 4608 slots is a 44.4% ceiling, and acu measures
+# 40.6% -- 91% of what is reachable. More warps per block raises the total at the same block count. Careful:
+# step = T/32, so at gs=32 a group holds kt_per_group/step ktiles and the unroll shrinks with T.
+gemv_w4a16_t128: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -o $@ $<
+gemv_w4a16_t256: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=256 -o $@ $<
+
 gemv_w4a16_rpb2: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DMOE_ROWS_PER_BLOCK=2 -o $@ $<
 gemv_w4a16_rpb4: gemv_w4a16_ppu.cu .flags

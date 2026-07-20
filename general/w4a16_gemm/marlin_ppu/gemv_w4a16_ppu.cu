@@ -1084,22 +1084,49 @@ moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half
                     sg[j][h] = se[(long long) g * N + c];
                     if (AFFINE) mg[j][h] = me[(long long) g * N + c];
                 }
-            for (int kt = g0 + wid; kt < g1; kt += step) {
-                const int4 q4 = Be[(long long) b_stride * kt + nb_group * 32 + lane];
-                const int kb = kt * 16 + lane_k;
-                const half2 aa = *reinterpret_cast<const half2*>(&At[kb]);
-                const half2 ab = *reinterpret_cast<const half2*>(&At[kb + 8]);
-                if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));
-                const int qs[4] = { q4.x, q4.y, q4.z, q4.w };
+            // U independent loads issued before any is consumed. This loop had none at all -- I wrote it as
+            // a plain for-kt when splitting the kernel out, so every B load was consumed immediately.
+            //
+            // The unroll count is capped by the ktiles a warp owns IN THIS GROUP, which at gs=32 is
+            // kt_per_group/step = 2/step: ONE at GEMV_THREADS=128. That is the main_n cliff this file
+            // documents, and it is why raising the thread count to buy warps backfires at gs=32 unless the
+            // hoist can cross a group boundary. Here it cannot yet -- the loop is group-major -- so U is
+            // clamped to what the group actually holds rather than silently falling back to no hoist.
+            const int n_kt = (g1 - g0 > wid) ? ((g1 - g0 - wid + step - 1) / step) : 0;
+            const int UU = n_kt < GEMV_UNROLL ? (n_kt < 1 ? 1 : n_kt) : GEMV_UNROLL;
+            int kt = g0 + wid, done = 0;
+            #define MOE_BODY(q4_, aa_, ab_) do {                                                  \
+                const half2 aa = (aa_), ab = (ab_);                                               \
+                if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));                              \
+                const int qs[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                         \
+                _Pragma("unroll") for (int j = 0; j < 4; j++) {                                   \
+                    const FragB b0 = dequant(qs[j]), b1 = dequant(qs[j] >> 8);                    \
+                    hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);                                \
+                    hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);                                \
+                    hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);                                \
+                    hacc[j][1] = __hfma2(b1.v[1], ab, hacc[j][1]); } } while (0)
+            for (; done + GEMV_UNROLL <= n_kt; done += GEMV_UNROLL) {
+                int4 q4[GEMV_UNROLL]; half2 av0[GEMV_UNROLL], av1[GEMV_UNROLL];
                 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    const FragB b0 = dequant(qs[j]), b1 = dequant(qs[j] >> 8);
-                    hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);
-                    hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);
-                    hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);
-                    hacc[j][1] = __hfma2(b1.v[1], ab, hacc[j][1]);
+                for (int u = 0; u < GEMV_UNROLL; u++) {
+                    const int ktu = kt + u * step, kb = ktu * 16 + lane_k;
+                    q4[u]  = Be[(long long) b_stride * ktu + nb_group * 32 + lane];
+                    av0[u] = *reinterpret_cast<const half2*>(&At[kb]);
+                    av1[u] = *reinterpret_cast<const half2*>(&At[kb + 8]);
                 }
+                #pragma unroll
+                for (int u = 0; u < GEMV_UNROLL; u++) MOE_BODY(q4[u], av0[u], av1[u]);
+                kt += GEMV_UNROLL * step;
             }
+            for (; done < n_kt; done++) {
+                const int kb = kt * 16 + lane_k;
+                MOE_BODY(Be[(long long) b_stride * kt + nb_group * 32 + lane],
+                         *reinterpret_cast<const half2*>(&At[kb]),
+                         *reinterpret_cast<const half2*>(&At[kb + 8]));
+                kt += step;
+            }
+            #undef MOE_BODY
+            (void) UU;
             float as_ = 0.f;
             if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }
             #pragma unroll
