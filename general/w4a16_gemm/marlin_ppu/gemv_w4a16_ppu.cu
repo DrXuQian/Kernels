@@ -1069,43 +1069,53 @@ moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half
         const half* me = AFFINE ? mn + e * s_expert_stride : nullptr;
         const half* At = A + (long long) row_token[r] * K;
 
+        // KTILE-MAJOR, not group-major. With gs=32 a group is 2 ktiles, so a group-major loop gives each
+        // warp kt_per_group/step of them: one at 64 threads, and at 256 threads six of eight warps get
+        // NOTHING while still joining the cross-warp reduce. Measured at a fixed 1024 blocks: 2048 warps
+        // 10.86 us, 4096 warps 18.08, 8192 warps 24.95 -- more warps made it monotonically worse, because
+        // the group cannot feed them, not because warps are unhelpful.
+        //
+        // Walking ktiles across group boundaries fixes both: warps divide the whole SLICE (16 ktiles at
+        // sk=8) so none starve, and the unroll is no longer capped by what one group holds. Only the
+        // accumulate and the flush care about the group, so the flush moves to the boundary crossing.
         float facc[4][2] = {{0.f}};
-        for (int g0 = kt_begin; g0 < kt_end; g0 += kt_per_group) {
-            const int g = g0 / kt_per_group, g1 = min(g0 + kt_per_group, kt_end);
-            half2 hacc[4][2]; half2 asum2 = __float2half2_rn(0.f);
-            #pragma unroll
-            for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
-            half sg[4][2], mg[4][2];
-            #pragma unroll
-            for (int j = 0; j < 4; j++)
-                #pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    const int c = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h;
-                    sg[j][h] = se[(long long) g * N + c];
-                    if (AFFINE) mg[j][h] = me[(long long) g * N + c];
-                }
-            // U independent loads issued before any is consumed. This loop had none at all -- I wrote it as
-            // a plain for-kt when splitting the kernel out, so every B load was consumed immediately.
-            //
-            // The unroll count is capped by the ktiles a warp owns IN THIS GROUP, which at gs=32 is
-            // kt_per_group/step = 2/step: ONE at GEMV_THREADS=128. That is the main_n cliff this file
-            // documents, and it is why raising the thread count to buy warps backfires at gs=32 unless the
-            // hoist can cross a group boundary. Here it cannot yet -- the loop is group-major -- so U is
-            // clamped to what the group actually holds rather than silently falling back to no hoist.
-            const int n_kt = (g1 - g0 > wid) ? ((g1 - g0 - wid + step - 1) / step) : 0;
-            const int UU = n_kt < GEMV_UNROLL ? (n_kt < 1 ? 1 : n_kt) : GEMV_UNROLL;
-            int kt = g0 + wid, done = 0;
-            #define MOE_BODY(q4_, aa_, ab_) do {                                                  \
-                const half2 aa = (aa_), ab = (ab_);                                               \
-                if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));                              \
-                const int qs[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                         \
-                _Pragma("unroll") for (int j = 0; j < 4; j++) {                                   \
-                    const FragB b0 = dequant(qs[j]), b1 = dequant(qs[j] >> 8);                    \
-                    hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);                                \
-                    hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);                                \
-                    hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);                                \
+        {
+            const int my_first = kt_begin + wid;
+            const int my_n = (kt_end - kt_begin - wid + step - 1) / step;
+            int cur_g = -1;
+            half2 hacc[4][2]; half sg[4][2], mg[4][2]; half2 asum2 = __float2half2_rn(0.f);
+            #define MR_OPEN(gg) do { cur_g = (gg);                                                  \
+                _Pragma("unroll") for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f);  \
+                                                               hacc[j][1] = __float2half2_rn(0.f); }\
+                asum2 = __float2half2_rn(0.f);                                                       \
+                _Pragma("unroll") for (int j = 0; j < 4; j++)                                        \
+                    _Pragma("unroll") for (int h = 0; h < 2; h++) {                                  \
+                        const int c_ = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h;                   \
+                        sg[j][h] = se[(long long) cur_g * N + c_];                                   \
+                        if (AFFINE) mg[j][h] = me[(long long) cur_g * N + c_]; } } while (0)
+            #define MR_FLUSH() do { if (cur_g >= 0) {                                                \
+                float as_ = 0.f;                                                                     \
+                if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }           \
+                _Pragma("unroll") for (int j = 0; j < 4; j++)                                         \
+                    _Pragma("unroll") for (int h = 0; h < 2; h++) {                                   \
+                        const float2 f = __half22float2(hacc[j][h]);                                  \
+                        facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);                           \
+                        if (AFFINE) facc[j][h] += as_ * __half2float(mg[j][h]); } } } while (0)
+            #define MR_BODY(kt_, q4_, aa_, ab_) do {                                                 \
+                const int g_ = (kt_) / kt_per_group;                                                 \
+                if (g_ != cur_g) { MR_FLUSH(); MR_OPEN(g_); }                                        \
+                const half2 aa = (aa_), ab = (ab_);                                                  \
+                if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));                                 \
+                const int qs[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                            \
+                _Pragma("unroll") for (int j = 0; j < 4; j++) {                                      \
+                    const FragB b0 = dequant(qs[j]), b1 = dequant(qs[j] >> 8);                       \
+                    hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);                                   \
+                    hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);                                   \
+                    hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);                                   \
                     hacc[j][1] = __hfma2(b1.v[1], ab, hacc[j][1]); } } while (0)
-            for (; done + GEMV_UNROLL <= n_kt; done += GEMV_UNROLL) {
+
+            int kt = my_first, done = 0;
+            for (; done + GEMV_UNROLL <= my_n; done += GEMV_UNROLL) {
                 int4 q4[GEMV_UNROLL]; half2 av0[GEMV_UNROLL], av1[GEMV_UNROLL];
                 #pragma unroll
                 for (int u = 0; u < GEMV_UNROLL; u++) {
@@ -1115,28 +1125,20 @@ moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half
                     av1[u] = *reinterpret_cast<const half2*>(&At[kb + 8]);
                 }
                 #pragma unroll
-                for (int u = 0; u < GEMV_UNROLL; u++) MOE_BODY(q4[u], av0[u], av1[u]);
+                for (int u = 0; u < GEMV_UNROLL; u++) MR_BODY(kt + u * step, q4[u], av0[u], av1[u]);
                 kt += GEMV_UNROLL * step;
             }
-            for (; done < n_kt; done++) {
+            for (; done < my_n; done++) {
                 const int kb = kt * 16 + lane_k;
-                MOE_BODY(Be[(long long) b_stride * kt + nb_group * 32 + lane],
-                         *reinterpret_cast<const half2*>(&At[kb]),
-                         *reinterpret_cast<const half2*>(&At[kb + 8]));
+                MR_BODY(kt, Be[(long long) b_stride * kt + nb_group * 32 + lane],
+                        *reinterpret_cast<const half2*>(&At[kb]),
+                        *reinterpret_cast<const half2*>(&At[kb + 8]));
                 kt += step;
             }
-            #undef MOE_BODY
-            (void) UU;
-            float as_ = 0.f;
-            if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }
-            #pragma unroll
-            for (int j = 0; j < 4; j++)
-                #pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    const float2 f = __half22float2(hacc[j][h]);
-                    facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);
-                    if (AFFINE) facc[j][h] += as_ * __half2float(mg[j][h]);
-                }
+            MR_FLUSH();
+            #undef MR_BODY
+            #undef MR_FLUSH
+            #undef MR_OPEN
         }
         #pragma unroll
         for (int j = 0; j < 4; j++)
