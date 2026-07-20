@@ -1148,7 +1148,11 @@ static void launch_moe(const int4* B, const half* A, const half* s, const half* 
 static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool check) {
     const int gs = get_groupsize() < 0 ? 32 : get_groupsize();
     const int G = K / gs, n_rows = tokens * topk;
-    SPLIT_K = get_split_k(N, K, gs / 16, n_rows);
+    // n_rows is NOT in this grid any more. moe_gemv_rows gives one block all the rows, so the grid is
+    // (N/64) * SPLIT_K -- passing n_rows here (which I had just added for the z-dimension version) made
+    // auto_split_k believe there were 8x the blocks and pick sk=8, giving 128 blocks on 72 CUs and 44 us.
+    // Trading the row dimension for epilogue amortisation means SPLIT_K has to buy those blocks back.
+    SPLIT_K = get_split_k(N, K, gs / 16, 1);
     if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
         printf("  MoE N=%d K=%d SPLIT_K=%d unsupported\n", N, K, SPLIT_K); return 2; }
 
