@@ -146,10 +146,33 @@ __global__ void GEMV_LB
 gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
            const half* __restrict__ mn,
            float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
-           int N, int K, int kt_per_group) {
+           int N, int K, int kt_per_group,
+           // MoE (decode): blockIdx.z indexes the expanded (token, expert) rows. row_expert picks the
+           // weight matrix and the scale plane; row_token picks the activation row, so the k rows of one
+           // token share its A. nullptr => dense, blockIdx.z is 0 and every offset below vanishes.
+           //
+           // That is the WHOLE difference between dense decode and MoE decode. I wrote a separate 500-line
+           // kernel for it instead and re-hit, one by one, the problems this file had already solved and
+           // documented in its own comments: the main_n unroll cliff, a bench with no working-set rotation
+           // measuring cache, split-K slices that must hold whole scale groups, the fused-vs-separate
+           // reduce trade. Every one of those answers was already here.
+           const int* __restrict__ row_expert = nullptr,
+           const int* __restrict__ row_token  = nullptr,
+           long long b_expert_stride = 0, long long s_expert_stride = 0) {
     const int nb_group = blockIdx.x;                 // 4 nblocks = 64 columns
     const int slice    = blockIdx.y;
+    const int row      = row_expert ? (int) blockIdx.z : 0;
     const int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+    if (row_expert) {
+        const int e = row_expert[row];
+        B  += e * b_expert_stride;
+        s  += e * s_expert_stride;
+        if (mn) mn += e * s_expert_stride;
+        A  += (long long) row_token[row] * K;
+        C  += (long long) row * N;
+        partial += (long long) row * (long long) SPLIT_K * N;
+        counter += (long long) row * (N / N_PER_BLOCK);
+    }
 
     const int k_tiles = K / 16;
     const int kt_per_slice = k_tiles / SPLIT_K;
