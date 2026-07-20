@@ -178,40 +178,40 @@ int main(int argc, char** argv) {
   // would have profiled T=32/sk=16/U=1 (9.74 us) instead of U=2 (9.11) -- the wrong kernel, silently.
   if (argc > 4) {
     const int T = atoi(argv[3]), sk = atoi(argv[4]), u = argc > 5 ? atoi(argv[5]) : 1;
-    // VERIFY THE CONFIG BEING PROFILED, FIRST. This path used to go straight to bench=true, so every acu
-    // command I handed over was profiling a build whose numbers had never been checked -- the same trap as
-    // a bench that prints throughput for a wrong kernel, except I built it into the profiling path itself.
-    // MOEV_NCU is unset for the check so it does not return early, then restored.
-    {
-      char* ncu = getenv("MOEV_NCU");
-      std::string saved = ncu ? ncu : "";
-      if (ncu) unsetenv("MOEV_NCU");
-      printf("--- verifying the config about to be profiled (small E, CPU reference) ---\n");
-      int v = 0;
-      if (T == 32)       v = (u >= 4) ? run<32,4,4>(1,8,8,256,512,false)  : run<32,4,2>(1,8,8,256,512,false);
-      else if (T == 64)  v = (u >= 4) ? run<64,4,4>(1,8,8,256,512,false)  : run<64,4,2>(1,8,8,256,512,false);
-      else               v = (u >= 4) ? run<128,4,4>(1,8,8,256,512,false) : run<128,4,2>(1,8,8,256,512,false);
-      if (!saved.empty()) setenv("MOEV_NCU", saved.c_str(), 1);
-      if (v) { printf("  config is WRONG -- not profiling it\n"); return 1; }
-    }
+    // Verify and profile the SAME template instantiation. The previous version checked run<128,4,2> while
+    // profiling run<128,16,2> -- different SPLIT_K is a different compiled kernel, so it verified something
+    // else and said nothing about the thing being measured. Only the problem SIZE is shrunk (8 experts,
+    // 256x512) so the CPU reference is affordable; T, SPLIT_K and U are exactly the profiled ones.
+    char* ncu = getenv("MOEV_NCU");
+    const std::string saved = ncu ? ncu : "";
+#define MOEV_ONE(TT, SK, UU) do {                                                        \
+      if (ncu) unsetenv("MOEV_NCU");                                                      \
+      printf("--- verifying <T=%d, sk=%d, U=%d> (the instantiation being profiled) ---\n", TT, SK, UU); \
+      const int v_ = run<TT, SK, UU>(1, 8, 8, 256, 512, false);                           \
+      if (!saved.empty()) setenv("MOEV_NCU", saved.c_str(), 1);                           \
+      if (v_) { printf("  WRONG -- not profiling it\n"); return 1; }                      \
+      return run<TT, SK, UU>(1, 8, 256, N, K, true);                                      \
+    } while (0)
+
     if (T == 32) {
-      if (sk == 8)       { if (u == 2) run<32,8,2>(1,8,256,N,K,true);  else if (u == 4) run<32,8,4>(1,8,256,N,K,true);  else run<32,8>(1,8,256,N,K,true); }
-      else if (sk == 32) { if (u == 2) run<32,32,2>(1,8,256,N,K,true); else if (u == 4) run<32,32,4>(1,8,256,N,K,true); else run<32,32>(1,8,256,N,K,true); }
-      else               { if (u == 2) run<32,16,2>(1,8,256,N,K,true); else if (u == 4) run<32,16,4>(1,8,256,N,K,true); else if (u == 8) run<32,16,8>(1,8,256,N,K,true); else run<32,16>(1,8,256,N,K,true); }
+      if (sk == 4)       { if (u == 8) MOEV_ONE(32,4,8);  else if (u == 2) MOEV_ONE(32,4,2);  else MOEV_ONE(32,4,1); }
+      else if (sk == 8)  { if (u == 8) MOEV_ONE(32,8,8);  else if (u == 4) MOEV_ONE(32,8,4);  else if (u == 2) MOEV_ONE(32,8,2); else MOEV_ONE(32,8,1); }
+      else if (sk == 32) { if (u == 4) MOEV_ONE(32,32,4); else if (u == 2) MOEV_ONE(32,32,2); else MOEV_ONE(32,32,1); }
+      else               { if (u == 8) MOEV_ONE(32,16,8); else if (u == 4) MOEV_ONE(32,16,4); else if (u == 2) MOEV_ONE(32,16,2); else MOEV_ONE(32,16,1); }
     } else if (T == 64) {
-      if (sk == 8)       { if (u == 2) run<64,8,2>(1,8,256,N,K,true);  else run<64,8>(1,8,256,N,K,true); }
-      else if (sk == 32) { if (u == 2) run<64,32,2>(1,8,256,N,K,true); else run<64,32>(1,8,256,N,K,true); }
-      else               { if (u == 2) run<64,16,2>(1,8,256,N,K,true); else run<64,16>(1,8,256,N,K,true); }
+      if (sk == 8)       { if (u == 2) MOEV_ONE(64,8,2);  else MOEV_ONE(64,8,1); }
+      else if (sk == 32) { if (u == 2) MOEV_ONE(64,32,2); else MOEV_ONE(64,32,1); }
+      else               { if (u == 2) MOEV_ONE(64,16,2); else MOEV_ONE(64,16,1); }
     } else if (T == 128) {
-      if (sk == 32)      { if (u == 2) run<128,32,2>(1,8,256,N,K,true); else run<128,32>(1,8,256,N,K,true); }
-      else               { if (u == 4) run<128,16,4>(1,8,256,N,K,true); else if (u == 2) run<128,16,2>(1,8,256,N,K,true); else run<128,16>(1,8,256,N,K,true); }
+      if (sk == 32)      { if (u == 2) MOEV_ONE(128,32,2); else MOEV_ONE(128,32,1); }
+      else if (sk == 8)  { if (u == 4) MOEV_ONE(128,8,4);  else MOEV_ONE(128,8,2); }
+      else               { if (u == 4) MOEV_ONE(128,16,4); else if (u == 2) MOEV_ONE(128,16,2); else MOEV_ONE(128,16,1); }
     } else {
-      // A T the dispatcher does not know silently ran the T=64 branch before, so a capture asked for
-      // T=128 profiled T=64 and said nothing. Refuse instead.
       printf("  T=%d not in the single-config dispatcher (32/64/128)\n", T); return 1;
     }
-    return 0;
+#undef MOEV_ONE
   }
+
   int bad = 0;
   printf("--- correctness (small E so the CPU reference is affordable) ---\n");
   bad |= run<64, 1>(1, 8, 8,  256, 512,  false);
@@ -224,6 +224,8 @@ int main(int argc, char** argv) {
   bad |= run<32, 2, 8>(1, 8, 8,  256, 512, false);
   bad |= run<128, 4, 2>(2, 8, 16, 256, 512, false);   // 4 warps/block: the cross-warp reduce path
   bad |= run<128, 8, 4>(1, 8, 8,  256, 512, false);
+  bad |= run<128, 16, 2>(1, 8, 8,  256, 512, false);   // the instantiation the acu captures profile
+  bad |= run<32,  16, 2>(2, 8, 16, 256, 512, false);
   // slices that hold ONE ktile, i.e. a scale group split across two slices -- newly legal, so it needs a
   // reference rather than the argument above
   bad |= run<32, 32, 1>(1, 8, 8,  256, 512, false);
