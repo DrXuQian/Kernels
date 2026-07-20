@@ -264,87 +264,25 @@ int main(int argc, char** argv) {
   }
 
   int bad = 0;
-  printf("--- correctness (small E so the CPU reference is affordable) ---\n");
-  bad |= run<64, 1>(1, 8, 8,  256, 512,  false);
-  bad |= run<64, 4>(1, 8, 8,  256, 512,  false);
-  bad |= run<32, 8>(2, 8, 16, 256, 512,  false);
-  bad |= run<64, 8>(4, 4, 16, 512, 1024, false);
-  bad |= run<32, 8, 2>(2, 8, 16, 256, 512, false);    // unrolled path, and a tail (n_kt not a multiple of U)
-  bad |= run<64, 4, 4>(1, 8, 8,  256, 512, false);
-  bad |= run<32, 4, 8>(2, 8, 16, 256, 512, false);   // U spans several scale groups -- the new path
-  bad |= run<32, 2, 8>(1, 8, 8,  256, 512, false);
-  bad |= run<128, 4, 2>(2, 8, 16, 256, 512, false);   // 4 warps/block: the cross-warp reduce path
-  bad |= run<128, 8, 4>(1, 8, 8,  256, 512, false);
-  bad |= run<128, 16, 2>(1, 8, 8,  256, 512, false);   // the instantiation the acu captures profile
-  bad |= run<32,  16, 2>(2, 8, 16, 256, 512, false);
-  // slices that hold ONE ktile, i.e. a scale group split across two slices -- newly legal, so it needs a
-  // reference rather than the argument above
-  bad |= run<32, 32, 1>(1, 8, 8,  256, 512, false);
-  bad |= run<64, 32, 1>(2, 8, 16, 256, 512, false);
+  // ONE configuration. The sweep had grown to four binaries, six compile flags and twenty-odd
+  // combinations, which made the debugging surface larger than the problem. T=32/sk=16/U=2 on the static
+  // grid with the separate reduce was best or tied best in every run, and it is the only path the
+  // persistent `return` bug never touched. Everything else is still reachable by argv or a -D flag; it
+  // just no longer runs by default.
+  printf("--- correctness ---\n");
+  bad |= run<32, 16, 2>(1, 8, 8,  256, 512,  false);   // the shipped config
+  bad |= run<32, 16, 2>(2, 8, 16, 256, 512,  false);   // several tokens, more experts
+  bad |= run<32, 16, 2>(4, 4, 16, 512, 1024, false);   // different N/K/topk
+  bad |= run<32, 4,  8>(1, 8, 8,  256, 512,  false);   // U spanning scale groups, and a tail
   printf("%s\n", bad ? "SOME CASES FAILED" : "all decode cases MATCH");
   if (bad) return 1;
-  printf("--- perf, batch 1 x top-8 over 256 experts (the real decode shape) ---\n");
-  // SPLIT_K=1 issues ONE kernel; everything above it also launches a reduce. This problem is small -- 8.4
-  // MB of weights, a 3.0 us floor at 2766 GB/s -- so a second launch is a large fixed fraction, and the
-  // dense GEMV measured exactly that (~2.1 us launch = 30%% of a 7 us kernel, which is why it has
-  // GEMV_FUSED_REDUCE). Sweeping sk=1/2/4 alongside 8/16 separates launch overhead from bandwidth before
-  // anything gets optimized: if sk=1 is already near the others, the reduce launch is the cost, not the loop.
-  run<32, 1> (1, 8, 256, N, K, true);
-  run<64, 1> (1, 8, 256, N, K, true);
-  run<32, 2> (1, 8, 256, N, K, true);
-  run<32, 4> (1, 8, 256, N, K, true);
-  run<32, 8> (1, 8, 256, N, K, true);
-  run<64, 8> (1, 8, 256, N, K, true);
-  run<64, 16>(1, 8, 256, N, K, true);
-  run<32, 16>(1, 8, 256, N, K, true);
-  // sk=1 came back 6x SLOWER (59.6 vs 9.8 us) at 128 blocks = 1.8 per CU, so the second launch was never
-  // the cost -- this is parallelism-starved, and adding blocks has paid monotonically all the way to 2048
-  // with no sign of saturating at 30.8% HBM against a 3.0 us floor. Push further: kt_per_slice must stay a
-  // whole number of gs=32 groups (2 ktiles), so K=2048's 128 ktiles allow sk up to 64.
-  run<32, 32>(1, 8, 256, N, K, true);
-  run<32, 64>(1, 8, 256, N, K, true);
-  run<64, 32>(1, 8, 256, N, K, true);
-  // U = loads in flight per warp. sk=16 leaves 8 ktiles per warp, room for U up to 8; sk=32 leaves 4.
-  // Swept together because they pull opposite ways -- sk buys blocks and spends ktiles-per-warp.
-  printf("  -- unroll (loads in flight per warp; latency, not bandwidth, is the stall) --\n");
+
+  printf("\n--- T=32 sk=16 U=2, batch 1 x top-8 over 256 experts ---\n");
+  printf("  warm (weights sit in LLC -- this is CACHE bandwidth):\n");
   run<32, 16, 2>(1, 8, 256, N, K, true);
-  run<32, 16, 4>(1, 8, 256, N, K, true);
-  run<32, 8,  4>(1, 8, 256, N, K, true);
-  run<32, 32, 2>(1, 8, 256, N, K, true);
-  run<64, 16, 2>(1, 8, 256, N, K, true);
-  // U is no longer capped by the scale group (2 ktiles), so these are reachable for the first time.
-  // sk=16 leaves 8 ktiles per warp; U=8 issues every one of them before consuming any.
-  run<32, 16, 8>(1, 8, 256, N, K, true);
-  run<32, 8,  8>(1, 8, 256, N, K, true);
-  run<32, 4,  8>(1, 8, 256, N, K, true);
-  // With the reduce fused there is ONE launch, so SPLIT_K is free to buy blocks again -- and blocks is the
-  // only lever left: the grid was under one wave (4096 warps vs 4608 slots) and occupancy averaged 63%.
-  printf("  -- fused reduce: SPLIT_K can buy blocks again --\n");
-  run<32, 32, 2>(1, 8, 256, N, K, true);
-  run<32, 64, 2>(1, 8, 256, N, K, true);
-  run<32, 32, 4>(1, 8, 256, N, K, true);
-  run<32, 64, 1>(1, 8, 256, N, K, true);
-  // RE-SWEEP THE THREAD COUNT. "T=32 beats T=64" was measured with the group-boundary bug in place, which
-  // punished larger T specifically: T=64 gives step=2, so each warp got ONE ktile per scale group, main_n
-  // went to 0 and the hoisted path never ran. That penalty is gone now.
-  //
-  // And 1 warp per block is the wrong shape on its own terms: hardware caps blocks per CU (32 is typical),
-  // so 1 warp/block caps resident warps at 32/CU = 50% however the theoretical figure is computed, and the
-  // cross-warp reduce through shared plus __syncthreads() is dead weight for a single warp. T=64 also
-  // doubles resident warps to 8192 against 4608 slots -- from under one wave to nearly two, which is
-  // exactly the occupancy problem.
-  printf("  -- thread count re-swept (the earlier T comparison predates the hoist fix) --\n");
-  run<64,  16, 2>(1, 8, 256, N, K, true);
-  run<64,  32, 2>(1, 8, 256, N, K, true);
-  run<128, 16, 2>(1, 8, 256, N, K, true);
-  run<128, 32, 2>(1, 8, 256, N, K, true);
-  run<128, 16, 4>(1, 8, 256, N, K, true);
-  // The sk cap was my own guard, not the hardware's: with the per-ktile group index a slice may hold ONE
-  // ktile, so K=2048's 128 ktiles allow sk up to 128 -> 16384 blocks. Grid was the last lever left.
-  printf("  -- SPLIT_K past the old cap (the guard was obsolete after the loop restructure) --\n");
-  run<32,  128, 1>(1, 8, 256, N, K, true);
-  run<64,  128, 1>(1, 8, 256, N, K, true);
-  run<128, 128, 1>(1, 8, 256, N, K, true);
-  run<128, 64,  2>(1, 8, 256, N, K, true);
+  if (!getenv("MOEV_WORKSET_MB")) {
+    printf("  cold: re-run with MOEV_WORKSET_MB=512 to force the weights out of LLC.\n");
+    printf("        Every %%HBM figure above the workset line is cache, not HBM.\n");
+  }
   return 0;
 }
