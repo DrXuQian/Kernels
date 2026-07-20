@@ -253,19 +253,29 @@ int main(int argc, char** argv) {
       return run<TT, SK, UU>(1, 8, 256, N, K, true);                                      \
     } while (0)
 
+    // Every unrecognised value must REFUSE, not fall through. sk=64 and sk=128 landed in the sk=16 branch
+    // and ran 2048 blocks while printing "sk=16" -- so the whole point of the atomic change (that high
+    // SPLIT_K becomes affordable) was never actually tested. I added this guard for T and for U and left
+    // sk without one, which is the third time a silent config substitution has cost a round here.
     if (T == 32) {
-      if (sk == 4)       { if (u == 8) MOEV_ONE(32,4,8);  else if (u == 2) MOEV_ONE(32,4,2);  else MOEV_ONE(32,4,1); }
-      else if (sk == 8)  { if (u == 8) MOEV_ONE(32,8,8);  else if (u == 4) MOEV_ONE(32,8,4);  else if (u == 2) MOEV_ONE(32,8,2); else MOEV_ONE(32,8,1); }
-      else if (sk == 32) { if (u == 4) MOEV_ONE(32,32,4); else if (u == 2) MOEV_ONE(32,32,2); else MOEV_ONE(32,32,1); }
-      else               { if (u == 8) MOEV_ONE(32,16,8); else if (u == 4) MOEV_ONE(32,16,4); else if (u == 2) MOEV_ONE(32,16,2); else MOEV_ONE(32,16,1); }
+      if (sk == 4)        { if (u == 8) MOEV_ONE(32,4,8);   else if (u == 2) MOEV_ONE(32,4,2);   else MOEV_ONE(32,4,1); }
+      else if (sk == 8)   { if (u == 8) MOEV_ONE(32,8,8);   else if (u == 4) MOEV_ONE(32,8,4);   else if (u == 2) MOEV_ONE(32,8,2);   else MOEV_ONE(32,8,1); }
+      else if (sk == 16)  { if (u == 8) MOEV_ONE(32,16,8);  else if (u == 4) MOEV_ONE(32,16,4);  else if (u == 2) MOEV_ONE(32,16,2);  else MOEV_ONE(32,16,1); }
+      else if (sk == 32)  { if (u == 4) MOEV_ONE(32,32,4);  else if (u == 2) MOEV_ONE(32,32,2);  else MOEV_ONE(32,32,1); }
+      else if (sk == 64)  { if (u == 2) MOEV_ONE(32,64,2);  else MOEV_ONE(32,64,1); }
+      else if (sk == 128) { MOEV_ONE(32,128,1); }
+      else { printf("  sk=%d not dispatched (4/8/16/32/64/128)\n", sk); return 1; }
     } else if (T == 64) {
       if (sk == 8)       { if (u == 2) MOEV_ONE(64,8,2);  else MOEV_ONE(64,8,1); }
       else if (sk == 32) { if (u == 2) MOEV_ONE(64,32,2); else MOEV_ONE(64,32,1); }
-      else               { if (u == 2) MOEV_ONE(64,16,2); else MOEV_ONE(64,16,1); }
+      else if (sk == 16)  { if (u == 2) MOEV_ONE(64,16,2); else MOEV_ONE(64,16,1); }
+      else if (sk == 64)  { MOEV_ONE(64,64,1); }
+      else { printf("  sk=%d not dispatched for T=64\n", sk); return 1; }
     } else if (T == 128) {
       if (sk == 32)      { if (u == 2) MOEV_ONE(128,32,2); else MOEV_ONE(128,32,1); }
       else if (sk == 8)  { if (u == 4) MOEV_ONE(128,8,4);  else MOEV_ONE(128,8,2); }
-      else               { if (u == 4) MOEV_ONE(128,16,4); else if (u == 2) MOEV_ONE(128,16,2); else MOEV_ONE(128,16,1); }
+      else if (sk == 16)  { if (u == 4) MOEV_ONE(128,16,4); else if (u == 2) MOEV_ONE(128,16,2); else MOEV_ONE(128,16,1); }
+      else { printf("  sk=%d not dispatched for T=128\n", sk); return 1; }
     } else {
       printf("  T=%d not in the single-config dispatcher (32/64/128)\n", T); return 1;
     }
