@@ -182,14 +182,21 @@ int main(int argc, char** argv) {
     // profiling run<128,16,2> -- different SPLIT_K is a different compiled kernel, so it verified something
     // else and said nothing about the thing being measured. Only the problem SIZE is shrunk (8 experts,
     // 256x512) so the CPU reference is affordable; T, SPLIT_K and U are exactly the profiled ones.
-    char* ncu = getenv("MOEV_NCU");
+    const char* ncu = getenv("MOEV_NCU");
     const std::string saved = ncu ? ncu : "";
+    // MOEV_NCU is a PROFILING mode: exactly one launch, or the capture holds several kernels and the
+    // single-launch hook is pointless. Adding the verification to this same invocation broke that -- it
+    // put the check's main+reduce (and the post-bench re-check) into the capture alongside the kernel
+    // under study. So verification runs only WITHOUT MOEV_NCU, and its absence is announced rather than
+    // silent, since profiling an unverified build is the failure this was added to prevent.
 #define MOEV_ONE(TT, SK, UU) do {                                                        \
-      if (ncu) unsetenv("MOEV_NCU");                                                      \
-      printf("--- verifying <T=%d, sk=%d, U=%d> (the instantiation being profiled) ---\n", TT, SK, UU); \
-      const int v_ = run<TT, SK, UU>(1, 8, 8, 256, 512, false);                           \
-      if (!saved.empty()) setenv("MOEV_NCU", saved.c_str(), 1);                           \
-      if (v_) { printf("  WRONG -- not profiling it\n"); return 1; }                      \
+      if (!saved.empty()) {                                                               \
+        printf("--- MOEV_NCU set: verification SKIPPED so the capture holds one kernel.\n"     \
+               "    Verify first with the same args and no MOEV_NCU.\n");                     \
+      } else {                                                                            \
+        printf("--- verifying <T=%d, sk=%d, U=%d> (the instantiation being profiled) ---\n", TT, SK, UU); \
+        if (run<TT, SK, UU>(1, 8, 8, 256, 512, false)) { printf("  WRONG -- not profiling it\n"); return 1; } \
+      }                                                                                   \
       return run<TT, SK, UU>(1, 8, 256, N, K, true);                                      \
     } while (0)
 
