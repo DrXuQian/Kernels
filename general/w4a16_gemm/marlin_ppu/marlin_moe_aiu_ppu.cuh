@@ -196,8 +196,8 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
                     marlin_gguf_ppu::scale(b0, s0, 0);
                     marlin_gguf_ppu::scale(b1, s1, 0);
                     int Bf[4];
-                    Bf[0] = *reinterpret_cast<int*>(&b0.v[0]); Bf[1] = *reinterpret_cast<int*>(&b0.v[1]);
-                    Bf[2] = *reinterpret_cast<int*>(&b1.v[0]); Bf[3] = *reinterpret_cast<int*>(&b1.v[1]);
+                    Bf[0] = *reinterpret_cast<int*>(&b0[0]); Bf[1] = *reinterpret_cast<int*>(&b0[1]);
+                    Bf[2] = *reinterpret_cast<int*>(&b1[0]); Bf[3] = *reinterpret_cast<int*>(&b1[1]);
                     #pragma unroll
                     for (int mi = 0; mi < MIR; ++mi) mma_f16(acc[mi][nj], fa[mi], Bf);
                 }
