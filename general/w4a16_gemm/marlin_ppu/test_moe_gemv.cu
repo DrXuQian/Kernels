@@ -10,11 +10,7 @@ static const bool MOEV_FUSED = false;
 #include <vector>
 #include <random>
 #include <cstdlib>
-#ifdef MOEV_FUSED_REDUCE
-static const bool MOEV_FUSED = true;
-#else
-static const bool MOEV_FUSED = false;
-#endif
+
 
 #define CK(x) do { cudaError_t e_=(x); if(e_){printf("cuda %s @%d\n",cudaGetErrorString(e_),__LINE__);exit(1);} } while(0)
 
