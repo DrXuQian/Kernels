@@ -50,7 +50,7 @@ template <int THREADS, int SPLIT_K, int U = 1>
 __global__ void __launch_bounds__(THREADS)
 moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
              const int* __restrict__ row_expert, const int* __restrict__ row_token,
-             float* __restrict__ partial, half* __restrict__ C,
+             float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
              int N, int K, int gs, int n_rows) {
     const int nbg = blockIdx.x, slice = blockIdx.y, r = blockIdx.z;
     if (r >= n_rows) return;
@@ -161,12 +161,47 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
             for (int h = 0; h < 2; h++) sm[wid][j * 16 + lane / 4 + 8 * h] = facc[j][h];
     __syncthreads();
 
+    if (SPLIT_K == 1) {
+        for (int c = threadIdx.x; c < MOEV_NPB; c += THREADS) {
+            float v = 0.f;
+            #pragma unroll
+            for (int w = 0; w < THREADS / 32; w++) v += sm[w][c];
+            C[(long long) r * N + nbg * MOEV_NPB + c] = __float2half(v);
+        }
+        return;
+    }
+    // FUSED LAST-CTA REDUCE. The separate reduce kernel is what made SPLIT_K turn over: acu shows the main
+    // kernel still improving past sk=16 (8.65 us at 32 against 10.50 at 16) while the TOTAL regresses. And
+    // more blocks is the only lever left -- the grid is 4096 warps against 72*64 = 4608 slots, i.e. under
+    // one wave, with no steady state, so occupancy averages 63%. Removing the second launch lets sk rise
+    // to 32/64 (8192/16384 blocks = several waves) without paying for it.
+    //
+    // Ordering follows CUDA's threadFenceReduction: __syncthreads() retires this block's partial stores,
+    // thread 0 issues __threadfence() to make them device-visible, and only then takes a ticket. The block
+    // that draws the last ticket is guaranteed to observe every other slice. `partial` is read through
+    // volatile so the winner cannot serve another slice's value out of its own non-coherent L1.
     for (int c = threadIdx.x; c < MOEV_NPB; c += THREADS) {
         float v = 0.f;
         #pragma unroll
         for (int w = 0; w < THREADS / 32; w++) v += sm[w][c];
-        if (SPLIT_K == 1) C[(long long) r * N + nbg * MOEV_NPB + c] = __float2half(v);
-        else partial[((long long) r * SPLIT_K + slice) * N + nbg * MOEV_NPB + c] = v;
+        partial[((long long) r * SPLIT_K + slice) * N + nbg * MOEV_NPB + c] = v;
+    }
+    __syncthreads();
+    __shared__ bool last;
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const int ticket = atomicAdd(&counter[(long long) r * (N / MOEV_NPB) + nbg], 1);
+        last = (ticket == SPLIT_K - 1);
+        if (last) counter[(long long) r * (N / MOEV_NPB) + nbg] = 0;   // rearm for the next launch
+    }
+    __syncthreads();
+    if (!last) return;
+    const volatile float* pv = partial;
+    for (int c = threadIdx.x; c < MOEV_NPB; c += THREADS) {
+        float v = 0.f;
+        for (int sl = 0; sl < SPLIT_K; sl++)
+            v += pv[((long long) r * SPLIT_K + sl) * N + nbg * MOEV_NPB + c];
+        C[(long long) r * N + nbg * MOEV_NPB + c] = __float2half(v);
     }
 }
 

@@ -71,6 +71,8 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
       printf("  T=%d sk=%-2d: %d ktiles/slice vs a group of %d -- skipped (need >= and a multiple)\n",
              THREADS, SPLIT_K, kt_per_slice, ktpg); return 0; }
   CK(cudaMalloc(&dRe, n_rows * 4));    CK(cudaMalloc(&dRt, n_rows * 4));
+  int* dCnt; CK(cudaMalloc(&dCnt, (size_t) n_rows * (N / MOEV_NPB) * 4));
+  CK(cudaMemset(dCnt, 0, (size_t) n_rows * (N / MOEV_NPB) * 4));   // the winning CTA rearms it each launch
   CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dS, sP.data(), sP.size() * 2, cudaMemcpyHostToDevice));
@@ -79,8 +81,8 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 
   dim3 grid(N / MOEV_NPB, SPLIT_K, n_rows);
   auto go = [&] {
-    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS>>>(dB, dA, dS, dRe, dRt, dP, dC, N, K, gs, n_rows);
-    if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
+    // ONE launch now: the last CTA per (row, n-block) folds the partials in place.
+    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS>>>(dB, dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
   };
   go(); CK(cudaDeviceSynchronize());
   // MOEV_NCU=1: one launch of each kernel, no warmup, no timing loop -- a clean capture. Same convention
@@ -88,11 +90,14 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   if (getenv("MOEV_NCU")) {
     printf("  MOEV_NCU: single launch T=%d sk=%d blocks=%d -- timing skipped\n",
            THREADS, SPLIT_K, (N / MOEV_NPB) * SPLIT_K * n_rows);
-    cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);
+    cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);cudaFree(dCnt);
     return 0;
   }
 
   if (!bench) {
+    // Run TWICE and check the second: the fused reduce rearms `counter` from inside the winning CTA, so a
+    // leaked count corrupts every launch after the first -- which a single-shot check cannot see.
+    go(); CK(cudaDeviceSynchronize());
     std::vector<half> got((size_t) n_rows * N);
     CK(cudaMemcpy(got.data(), dC, got.size() * 2, cudaMemcpyDeviceToHost));
     double ma = 0, rm = 0;
@@ -100,7 +105,7 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
     const double rel = ma / (rm + 1e-9);
     printf("  T=%-3d sk=%-2d tok=%-3d topk=%d E=%-4d N=%-5d K=%-5d rows=%-4d rel %.2e -> %s\n",
            THREADS, SPLIT_K, tokens, topk, n_experts, N, K, n_rows, rel, rel < 3e-2 ? "MATCH" : "MISMATCH");
-    cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);
+    cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);cudaFree(dCnt);
     return rel < 3e-2 ? 0 : 1;
   }
   cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
@@ -113,10 +118,10 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   const double wb = (double) distinct * N * K / 2.0;
   const int blocks = (N / MOEV_NPB) * SPLIT_K * n_rows;
   printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
-         THREADS, SPLIT_K, U, blocks, SPLIT_K > 1 ? "2 launches" : "1 launch", ms * 1e3,
+         THREADS, SPLIT_K, U, blocks, "1 launch", ms * 1e3,
          wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
   (void) distinct;
-  cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);
+  cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);cudaFree(dCnt);
   return 0;
 }
 
@@ -176,5 +181,12 @@ int main(int argc, char** argv) {
   run<32, 16, 8>(1, 8, 256, N, K, true);
   run<32, 8,  8>(1, 8, 256, N, K, true);
   run<32, 4,  8>(1, 8, 256, N, K, true);
+  // With the reduce fused there is ONE launch, so SPLIT_K is free to buy blocks again -- and blocks is the
+  // only lever left: the grid was under one wave (4096 warps vs 4608 slots) and occupancy averaged 63%.
+  printf("  -- fused reduce: SPLIT_K can buy blocks again --\n");
+  run<32, 32, 2>(1, 8, 256, N, K, true);
+  run<32, 64, 2>(1, 8, 256, N, K, true);
+  run<32, 32, 4>(1, 8, 256, N, K, true);
+  run<32, 64, 1>(1, 8, 256, N, K, true);
   return 0;
 }
