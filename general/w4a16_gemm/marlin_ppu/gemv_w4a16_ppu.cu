@@ -1043,6 +1043,28 @@ static double bench_one(int N, int K, int iters, bool check) {
 #define MOE_ROWS_PER_BLOCK 1
 #endif
 
+// BRACKET for the gs=32 group cost. WRONG RESULTS BY DESIGN, timing only.
+//
+// The question: at gs=32 a group is 2 ktiles, so MR_OPEN runs every 2 ktiles and issues EIGHT scalar global
+// loads for the scales (sixteen with affine). At gs=128 the same eight loads cover 8 ktiles. That is a 4x
+// difference in scalar load instructions per unit of work, and it is a different thing from the flush
+// ARITHMETIC, which this leaves in place.
+//
+// MOE_SCALE_CONST replaces the loaded value with a constant and keeps every multiply. The constant is 0.5,
+// not 1.0, so the multiply cannot fold away -- that is the trap MARLIN_MINS_NOAPPLY fell into, where the
+// unread fragment was dead-code-eliminated along with its load and the build could no longer tell the
+// arithmetic from the load.
+//
+// If the time falls back toward the gs=128 structure, the cost is MOVING the scales and the fix is a packed
+// layout (the AIU prefill kernel already reads its eight scales as ONE int4 in _scale_perm order). If it
+// stays put, the cost is the group structure itself and the fix is folding the scale into the dequantized B
+// fragment so the accumulator never has to break at a group boundary.
+#ifdef MOE_SCALE_CONST
+#define MOE_SG(base, c) __float2half(0.5f)
+#else
+#define MOE_SG(base, c) (base)[(long long) cur_g * N + (c)]
+#endif
+
 template <int SPLIT_K, bool AFFINE>
 __global__ void GEMV_LB
 moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
@@ -1095,8 +1117,8 @@ moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half
                 _Pragma("unroll") for (int j = 0; j < 4; j++)                                        \
                     _Pragma("unroll") for (int h = 0; h < 2; h++) {                                  \
                         const int c_ = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h;                   \
-                        sg[j][h] = se[(long long) cur_g * N + c_];                                   \
-                        if (AFFINE) mg[j][h] = me[(long long) cur_g * N + c_]; } } while (0)
+                        sg[j][h] = MOE_SG(se, c_);                                                   \
+                        if (AFFINE) mg[j][h] = MOE_SG(me, c_); } } while (0)
             #define MR_FLUSH() do { if (cur_g >= 0) {                                                \
                 float as_ = 0.f;                                                                     \
                 if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }           \
@@ -1229,8 +1251,8 @@ moe_gemv_rows_aiu(const int4* __restrict__ B, const half* __restrict__ A, const 
             _Pragma("unroll") for (int j = 0; j < 4; j++)                                             \
                 _Pragma("unroll") for (int h2 = 0; h2 < 2; h2++) {                                    \
                     const int c_ = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h2;                       \
-                    sg[j][h2] = se[(long long) cur_g * N + c_];                                       \
-                    if (AFFINE) mg[j][h2] = me[(long long) cur_g * N + c_]; } } while (0)
+                    sg[j][h2] = MOE_SG(se, c_);                                                       \
+                    if (AFFINE) mg[j][h2] = MOE_SG(me, c_); } } while (0)
         #define MA_FLUSH() do { if (cur_g >= 0) {                                                     \
             float as_ = 0.f;                                                                          \
             if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }                \
