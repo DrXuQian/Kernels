@@ -186,6 +186,12 @@ gemv_w4a16: gemv_w4a16_ppu.cu .flags
 # Thread count. 1024 blocks x 2 warps = 2048 warps against 4608 slots is a 44.4% ceiling, and acu measures
 # 40.6% -- 91% of what is reachable. More warps per block raises the total at the same block count. Careful:
 # step = T/32, so at gs=32 a group holds kt_per_group/step ktiles and the unroll shrinks with T.
+# T=32 = ONE warp per block. The standalone MoE kernel's best was exactly this (9.11 us / 33.3%), better
+# than anything the merged kernel has reached, and I never tested it here -- the sweep started at 64 and
+# went up, while every measurement said fewer warps was better.
+gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
+	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=32 -o $@ $<
+
 gemv_w4a16_t128: gemv_w4a16_ppu.cu .flags
 	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=128 -o $@ $<
 gemv_w4a16_t256: gemv_w4a16_ppu.cu .flags
