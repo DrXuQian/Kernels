@@ -232,9 +232,25 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
                     // AGAIN -- two redundant stores and a redundant splat per (nj), four times per k-sub.
                     // The two halves of a FragB are two k values of ONE column, so they share a scale;
                     // b0 and b1 are columns n and n+8, hence two broadcasts and four hmul2, not more.
+                    // -DMOE_SCALE_CONST: RESULT IS WRONG ON PURPOSE. Keeps the staging of Ss and every
+                    // other instruction, and removes ONLY the two shared reads, so a bank-conflict count
+                    // that drops is the scale path and one that does not is ld_swzl (which the swzl layout
+                    // is supposed to make conflict-free). Same bracketing as MARLIN_MINS_CONST, which is
+                    // what separated the arithmetic from the load in the dense affine case.
+                    //
+                    // Why this read is the suspect: ctile = wn*64 + nj*16 + lane/4, so a warp's 32 lanes
+                    // touch only 8 distinct halves spanning 16 bytes = 4 banks. Identical addresses
+                    // broadcast, but 8 distinct ones across 4 banks do not. The store side (Ss[i], i=tid)
+                    // is consecutive halves, so two lanes share each 32-bit bank word. Both arrived with
+                    // the move of the scales out of global memory -- the fix for one problem.
                     const half* srow = Ss + (ko / 32) * MOE_BN;           // group within this k-tile
+#ifdef MOE_SCALE_CONST
+                    const half2 sv0 = __float2half2_rn(1.0f), sv1 = sv0;
+                    (void) srow; (void) ctile;
+#else
                     const half2 sv0 = __half2half2(srow[ctile]);
                     const half2 sv1 = __half2half2(srow[ctile + 8]);
+#endif
                     b0[0] = __hmul2(b0[0], sv0); b0[1] = __hmul2(b0[1], sv0);
                     b1[0] = __hmul2(b1[0], sv1); b1[1] = __hmul2(b1[1], sv1);
                     int Bf[4];

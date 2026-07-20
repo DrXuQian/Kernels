@@ -61,8 +61,18 @@ bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 # the fp16 MoE GEMM moves bf16? Box only (ppu.* asm), NO -arch.
 # AIU Q4_K MoE vs the Marlin-derived MoE (which passes ragged routing). Box only.
 # Perf for the AIU Q4_K MoE. Read the weight-traffic column, not TFLOP/s.
-bench_moe_aiu: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
+bench_# Bank-conflict bracket: keeps everything, drops only the two shared scale reads. WRONG RESULTS, profiling
+# only. Conflicts that vanish are the scale path; conflicts that stay are ld_swzl.
+bench_moe_aiu_cs: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_SCALE_CONST -o $@ $<
+
+moe_aiu: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+# Bank-conflict bracket: keeps everything, drops only the two shared scale reads. WRONG RESULTS, profiling
+# only. Conflicts that vanish are the scale path; conflicts that stay are ld_swzl.
+bench_moe_aiu_cs: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_SCALE_CONST -o $@ $<
 
 moe_aiu: test_moe_aiu.cu marlin_moe_aiu_ppu.cuh marlin_moe_gguf_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
@@ -172,4 +182,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
