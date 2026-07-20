@@ -94,9 +94,14 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 #ifdef MOEV_PERSIST
   // One wave: #CU * blocks-per-CU. Shared is tiny here, so the blocks/CU bound is warps: 64 / (T/32).
   int cus = 0; CK(cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0));
-  int g1 = cus * (64 / (THREADS / 32));
+  const int wave = cus * (64 / (THREADS / 32));
   const int tot = n_rows * (N / MOEV_NPB) * SPLIT_K;
-  if (g1 > tot) g1 = tot;
+  // The grid must DIVIDE the tile count, not merely be smaller than it. Taking the wave size outright
+  // (1152 at T=128) against 2048 tiles gives 1.78 tiles per block: 896 blocks do two and 256 do one, so
+  // the kernel still runs for two tiles' worth and the tail is unchanged -- it moved from the block level
+  // to the tile level. Largest divisor of tot that fits in a wave: 1024 here, exactly 2 tiles each.
+  int g1 = 1;
+  for (int d = (wave < tot ? wave : tot); d >= 1; d--) if (tot % d == 0) { g1 = d; break; }
   if (const char* e = getenv("MOEV_GRID")) g1 = atoi(e);
   dim3 grid(g1, 1, 1);
 #else
@@ -141,6 +146,13 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   for (int r = 0; r < n_rows; r++) if (!seen[rexp[r]]) { seen[rexp[r]] = 1; distinct++; }
   const double wb = (double) distinct * N * K / 2.0;
   const int blocks = grid.x * grid.y * grid.z;
+#ifdef MOEV_PERSIST
+  {   // uneven tiles per block IS the tail; print it rather than leaving it to be inferred
+    const int tot2 = n_rows * (N / MOEV_NPB) * SPLIT_K;
+    if (tot2 % blocks) printf("  WARNING tiles/block uneven: %d tiles over %d blocks (%d vs %d) -- tail remains\n",
+                              tot2, blocks, tot2 / blocks, (tot2 + blocks - 1) / blocks);
+  }
+#endif
   printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
          THREADS, SPLIT_K, U, blocks, (SPLIT_K > 1 && !MOEV_FUSED) ? "2 launches" : "1 launch", ms * 1e3,
          wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
