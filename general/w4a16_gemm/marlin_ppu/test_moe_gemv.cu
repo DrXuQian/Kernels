@@ -72,10 +72,16 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   // A slice must hold at least ONE whole scale group. Checking only divisibility let kt_per_slice=0
   // through -- 0 % 2 == 0 -- so FC2 at sk=64 launched a kernel that computes nothing and the bench happily
   // timed it at 16.08 us. A guard that passes the degenerate case is not a guard.
-  const int kt_per_slice = K / 16 / SPLIT_K, ktpg = gs / 16;
-  if (kt_per_slice < ktpg || kt_per_slice % ktpg) {
-      printf("  T=%d sk=%-2d: %d ktiles/slice vs a group of %d -- skipped (need >= and a multiple)\n",
-             THREADS, SPLIT_K, kt_per_slice, ktpg); return 0; }
+  // A slice no longer has to hold a whole scale group. That constraint came from the OLD group-major loop,
+  // where g = g0/kt_per_group with g0 = kt_begin read the wrong group row when a slice started mid-group.
+  // The restructured loop computes g = kt/kt_per_group PER KTILE, so it is right wherever the slice starts,
+  // and the arithmetic agrees: the scale is applied to a group's partial, and (p_A + p_B)*s == p_A*s +
+  // p_B*s, so splitting a group across slices and summing the partials is identical. Only whole ktiles and
+  // a non-empty slice are actually required.
+  const int kt_per_slice = K / 16 / SPLIT_K;
+  if (kt_per_slice < 1 || (K / 16) % SPLIT_K) {
+      printf("  T=%d sk=%-3d: %d ktiles/slice -- skipped (need >= 1 and k_tiles %% sk == 0)\n",
+             THREADS, SPLIT_K, kt_per_slice); return 0; }
   CK(cudaMalloc(&dRe, n_rows * 4));    CK(cudaMalloc(&dRt, n_rows * 4));
   int* dCnt; CK(cudaMalloc(&dCnt, (size_t) n_rows * (N / MOEV_NPB) * 4));
   CK(cudaMemset(dCnt, 0, (size_t) n_rows * (N / MOEV_NPB) * 4));   // the winning CTA rearms it each launch
@@ -164,6 +170,10 @@ int main(int argc, char** argv) {
   bad |= run<32, 2, 8>(1, 8, 8,  256, 512, false);
   bad |= run<128, 4, 2>(2, 8, 16, 256, 512, false);   // 4 warps/block: the cross-warp reduce path
   bad |= run<128, 8, 4>(1, 8, 8,  256, 512, false);
+  // slices that hold ONE ktile, i.e. a scale group split across two slices -- newly legal, so it needs a
+  // reference rather than the argument above
+  bad |= run<32, 32, 1>(1, 8, 8,  256, 512, false);
+  bad |= run<64, 32, 1>(2, 8, 16, 256, 512, false);
   printf("%s\n", bad ? "SOME CASES FAILED" : "all decode cases MATCH");
   if (bad) return 1;
   printf("--- perf, batch 1 x top-8 over 256 experts (the real decode shape) ---\n");
@@ -222,5 +232,12 @@ int main(int argc, char** argv) {
   run<128, 16, 2>(1, 8, 256, N, K, true);
   run<128, 32, 2>(1, 8, 256, N, K, true);
   run<128, 16, 4>(1, 8, 256, N, K, true);
+  // The sk cap was my own guard, not the hardware's: with the per-ktile group index a slice may hold ONE
+  // ktile, so K=2048's 128 ktiles allow sk up to 128 -> 16384 blocks. Grid was the last lever left.
+  printf("  -- SPLIT_K past the old cap (the guard was obsolete after the loop restructure) --\n");
+  run<32,  128, 1>(1, 8, 256, N, K, true);
+  run<64,  128, 1>(1, 8, 256, N, K, true);
+  run<128, 128, 1>(1, 8, 256, N, K, true);
+  run<128, 64,  2>(1, 8, 256, N, K, true);
   return 0;
 }
