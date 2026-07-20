@@ -60,6 +60,10 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   CK(cudaMalloc(&dB, hB.size() * 4));  CK(cudaMalloc(&dA, hA.size() * 2));
   CK(cudaMalloc(&dS, sP.size() * 2));  CK(cudaMalloc(&dC, (size_t) n_rows * N * 2));
   CK(cudaMalloc(&dP, (size_t) n_rows * SPLIT_K * N * 4));
+  // A slice must hold whole scale groups, or g = g0/kt_per_group lands mid-group and reads the wrong
+  // scale row -- silently, exactly as it did in the dense GEMV's auto_split_k.
+  if ((K / 16 / SPLIT_K) % (gs / 16)) { printf("  T=%d sk=%d: %d ktiles/slice is not a multiple of the "
+      "group's %d -- skipped\n", THREADS, SPLIT_K, K / 16 / SPLIT_K, gs / 16); return 0; }
   CK(cudaMalloc(&dRe, n_rows * 4));    CK(cudaMalloc(&dRt, n_rows * 4));
   CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
@@ -127,5 +131,12 @@ int main(int argc, char** argv) {
   run<64, 8> (1, 8, 256, N, K, true);
   run<64, 16>(1, 8, 256, N, K, true);
   run<32, 16>(1, 8, 256, N, K, true);
+  // sk=1 came back 6x SLOWER (59.6 vs 9.8 us) at 128 blocks = 1.8 per CU, so the second launch was never
+  // the cost -- this is parallelism-starved, and adding blocks has paid monotonically all the way to 2048
+  // with no sign of saturating at 30.8% HBM against a 3.0 us floor. Push further: kt_per_slice must stay a
+  // whole number of gs=32 groups (2 ktiles), so K=2048's 128 ktiles allow sk up to 64.
+  run<32, 32>(1, 8, 256, N, K, true);
+  run<32, 64>(1, 8, 256, N, K, true);
+  run<64, 32>(1, 8, 256, N, K, true);
   return 0;
 }
