@@ -2,6 +2,7 @@
 #include "marlin_moe_gemv_ppu.cuh"
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #ifdef MOEV_FUSED_REDUCE
 static const bool MOEV_FUSED = true;
 #else
@@ -10,6 +11,7 @@ static const bool MOEV_FUSED = false;
 #include <vector>
 #include <random>
 #include <cstdlib>
+#include <string>
 
 
 #define CK(x) do { cudaError_t e_=(x); if(e_){printf("cuda %s @%d\n",cudaGetErrorString(e_),__LINE__);exit(1);} } while(0)
@@ -176,6 +178,22 @@ int main(int argc, char** argv) {
   // would have profiled T=32/sk=16/U=1 (9.74 us) instead of U=2 (9.11) -- the wrong kernel, silently.
   if (argc > 4) {
     const int T = atoi(argv[3]), sk = atoi(argv[4]), u = argc > 5 ? atoi(argv[5]) : 1;
+    // VERIFY THE CONFIG BEING PROFILED, FIRST. This path used to go straight to bench=true, so every acu
+    // command I handed over was profiling a build whose numbers had never been checked -- the same trap as
+    // a bench that prints throughput for a wrong kernel, except I built it into the profiling path itself.
+    // MOEV_NCU is unset for the check so it does not return early, then restored.
+    {
+      char* ncu = getenv("MOEV_NCU");
+      std::string saved = ncu ? ncu : "";
+      if (ncu) unsetenv("MOEV_NCU");
+      printf("--- verifying the config about to be profiled (small E, CPU reference) ---\n");
+      int v = 0;
+      if (T == 32)       v = (u >= 4) ? run<32,4,4>(1,8,8,256,512,false)  : run<32,4,2>(1,8,8,256,512,false);
+      else if (T == 64)  v = (u >= 4) ? run<64,4,4>(1,8,8,256,512,false)  : run<64,4,2>(1,8,8,256,512,false);
+      else               v = (u >= 4) ? run<128,4,4>(1,8,8,256,512,false) : run<128,4,2>(1,8,8,256,512,false);
+      if (!saved.empty()) setenv("MOEV_NCU", saved.c_str(), 1);
+      if (v) { printf("  config is WRONG -- not profiling it\n"); return 1; }
+    }
     if (T == 32) {
       if (sk == 8)       { if (u == 2) run<32,8,2>(1,8,256,N,K,true);  else if (u == 4) run<32,8,4>(1,8,256,N,K,true);  else run<32,8>(1,8,256,N,K,true); }
       else if (sk == 32) { if (u == 2) run<32,32,2>(1,8,256,N,K,true); else if (u == 4) run<32,32,4>(1,8,256,N,K,true); else run<32,32>(1,8,256,N,K,true); }
