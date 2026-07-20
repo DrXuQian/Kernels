@@ -151,10 +151,17 @@ int main(int argc, char** argv) {
       if (sk == 8)       { if (u == 2) run<32,8,2>(1,8,256,N,K,true);  else if (u == 4) run<32,8,4>(1,8,256,N,K,true);  else run<32,8>(1,8,256,N,K,true); }
       else if (sk == 32) { if (u == 2) run<32,32,2>(1,8,256,N,K,true); else if (u == 4) run<32,32,4>(1,8,256,N,K,true); else run<32,32>(1,8,256,N,K,true); }
       else               { if (u == 2) run<32,16,2>(1,8,256,N,K,true); else if (u == 4) run<32,16,4>(1,8,256,N,K,true); else if (u == 8) run<32,16,8>(1,8,256,N,K,true); else run<32,16>(1,8,256,N,K,true); }
-    } else {
+    } else if (T == 64) {
       if (sk == 8)       { if (u == 2) run<64,8,2>(1,8,256,N,K,true);  else run<64,8>(1,8,256,N,K,true); }
       else if (sk == 32) { if (u == 2) run<64,32,2>(1,8,256,N,K,true); else run<64,32>(1,8,256,N,K,true); }
       else               { if (u == 2) run<64,16,2>(1,8,256,N,K,true); else run<64,16>(1,8,256,N,K,true); }
+    } else if (T == 128) {
+      if (sk == 32)      { if (u == 2) run<128,32,2>(1,8,256,N,K,true); else run<128,32>(1,8,256,N,K,true); }
+      else               { if (u == 4) run<128,16,4>(1,8,256,N,K,true); else if (u == 2) run<128,16,2>(1,8,256,N,K,true); else run<128,16>(1,8,256,N,K,true); }
+    } else {
+      // A T the dispatcher does not know silently ran the T=64 branch before, so a capture asked for
+      // T=128 profiled T=64 and said nothing. Refuse instead.
+      printf("  T=%d not in the single-config dispatcher (32/64/128)\n", T); return 1;
     }
     return 0;
   }
