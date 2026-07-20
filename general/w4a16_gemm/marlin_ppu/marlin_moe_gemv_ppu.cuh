@@ -170,7 +170,24 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
         }
         return;
     }
-    // FUSED LAST-CTA REDUCE. The separate reduce kernel is what made SPLIT_K turn over: acu shows the main
+#ifndef MOEV_FUSED_REDUCE
+    // SEPARATE reduce (default): each block writes its partial and a second kernel folds them IN PARALLEL.
+    // Measured better than the fused path everywhere here, and the gap grows with SPLIT_K -- 9.11 vs 12.12
+    // us at sk=16, 13.35 vs 39.75 at sk=64.
+    for (int c = threadIdx.x; c < MOEV_NPB; c += THREADS) {
+        float v = 0.f;
+        #pragma unroll
+        for (int w = 0; w < THREADS / 32; w++) v += sm[w][c];
+        partial[((long long) r * SPLIT_K + slice) * N + nbg * MOEV_NPB + c] = v;
+    }
+    (void) counter;
+    return;
+#else
+    // FUSED LAST-CTA REDUCE -- A REGRESSION HERE, kept only for comparison. It removes the second launch,
+    // but the winning CTA then reads all SPLIT_K partials SERIALLY while every other CTA waits at the
+    // fence and contends on the counter, where a separate kernel does that fold in parallel. It wins in
+    // gemv_w4a16_ppu.cu because that kernel is already saturated and runs at low SPLIT_K; neither holds
+    // here, and I carried the conclusion over without checking either premise. The separate reduce kernel is what made SPLIT_K turn over: acu shows the main
     // kernel still improving past sk=16 (8.65 us at 32 against 10.50 at 16) while the TOTAL regresses. And
     // more blocks is the only lever left -- the grid is 4096 warps against 72*64 = 4608 slots, i.e. under
     // one wave, with no steady state, so occupancy averages 63%. Removing the second launch lets sk rise
@@ -203,6 +220,7 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
             v += pv[((long long) r * SPLIT_K + sl) * N + nbg * MOEV_NPB + c];
         C[(long long) r * N + nbg * MOEV_NPB + c] = __float2half(v);
     }
+#endif
 }
 
 __global__ void moe_gemv_reduce(const float* __restrict__ partial, half* __restrict__ C,

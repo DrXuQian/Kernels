@@ -2,9 +2,19 @@
 #include "marlin_moe_gemv_ppu.cuh"
 #include <cstdio>
 #include <cstdlib>
+#ifdef MOEV_FUSED_REDUCE
+static const bool MOEV_FUSED = true;
+#else
+static const bool MOEV_FUSED = false;
+#endif
 #include <vector>
 #include <random>
 #include <cstdlib>
+#ifdef MOEV_FUSED_REDUCE
+static const bool MOEV_FUSED = true;
+#else
+static const bool MOEV_FUSED = false;
+#endif
 
 #define CK(x) do { cudaError_t e_=(x); if(e_){printf("cuda %s @%d\n",cudaGetErrorString(e_),__LINE__);exit(1);} } while(0)
 
@@ -81,8 +91,10 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 
   dim3 grid(N / MOEV_NPB, SPLIT_K, n_rows);
   auto go = [&] {
-    // ONE launch now: the last CTA per (row, n-block) folds the partials in place.
     moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS>>>(dB, dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
+#ifndef MOEV_FUSED_REDUCE
+    if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
+#endif
   };
   go(); CK(cudaDeviceSynchronize());
   // MOEV_NCU=1: one launch of each kernel, no warmup, no timing loop -- a clean capture. Same convention
@@ -118,7 +130,7 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   const double wb = (double) distinct * N * K / 2.0;
   const int blocks = (N / MOEV_NPB) * SPLIT_K * n_rows;
   printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
-         THREADS, SPLIT_K, U, blocks, "1 launch", ms * 1e3,
+         THREADS, SPLIT_K, U, blocks, (SPLIT_K > 1 && !MOEV_FUSED) ? "2 launches" : "1 launch", ms * 1e3,
          wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
   (void) distinct;
   cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);cudaFree(dCnt);

@@ -65,7 +65,12 @@ bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 # would compute a whole BMR tile and mask all but one line away (dense measured this: M=1 Marlin 16.8% HBM
 # against the purpose-built GEMV's ~52%).
 moe_gemv: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
-	$(NVCC) $(NVCCFLAGS) -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -Wall -o $@ $<
+
+# Fused last-CTA reduce instead of the separate kernel. MEASURED WORSE here and kept for comparison: the
+# winner reads all SPLIT_K partials serially while everyone else waits at the fence.
+moe_gemv_fused: test_moe_gemv.cu marlin_moe_gemv_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -Wall -DMOEV_FUSED_REDUCE -o $@ $<
 
 bench_moe_aiu: bench_moe_aiu.cu marlin_moe_aiu_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
@@ -190,4 +195,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
