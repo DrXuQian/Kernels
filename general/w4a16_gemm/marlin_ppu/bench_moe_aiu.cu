@@ -56,10 +56,18 @@ static double bench(int n_experts, int N, int K, int total_rows, const std::vect
     const double wbytes_min = (double) active * N * K / 2.0;                 // each active expert once
     const double wbytes_tiles = (double) sch.mblk_prefix[n_experts] * N * K / 2.0;  // once per m-tile
     const double flop = 2.0 * total_rows * N * K;
-    printf("  NST=%d BMR=%-4d tiles=%-5d mtiles=%-5d active=%-4d | %8.3f ms | %6.1f TFLOP/s | "
-           "weight %5.0f MB min, %5.0f MB if no L2 reuse (%.1fx) | %5.0f GB/s at min\n",
-           NST, BMR, sch.total_tiles, sch.mblk_prefix[n_experts], active, ms, flop / (ms * 1e9),
-           wbytes_min / 1e6, wbytes_tiles / 1e6, wbytes_tiles / wbytes_min, wbytes_min / (ms * 1e6));
+    // The OTHER half of the BMR trade, and the half the "minimize m-tiles" rule leaves out: rows actually
+    // COMPUTED is mtiles*BMR, not total_rows. Raising BMR cuts weight re-streaming and inflates masked
+    // work at the same time, so BMR=256 can have the fewest m-tiles (1.0x weight) and still lose badly --
+    // measured here, 0.762ms against 0.416 at BMR=128, with 2.0x the rows computed. Both columns or
+    // neither.
+    const double rows_done = (double) sch.mblk_prefix[n_experts] * BMR;
+    printf("  NST=%d BMR=%-4d tiles=%-5d mtiles=%-5d | %8.3f ms | %6.1f TFLOP/s | "
+           "weight %.1fx | rows computed %.2fx (%.0f/%d) | %5.0f GB/s at min\n",
+           NST, BMR, sch.total_tiles, sch.mblk_prefix[n_experts], ms, flop / (ms * 1e9),
+           wbytes_tiles / wbytes_min, rows_done / total_rows, rows_done, total_rows,
+           wbytes_min / (ms * 1e6));
+    (void) active;
     cudaEventDestroy(a); cudaEventDestroy(b);
     cudaFree(dA); cudaFree(dImg); cudaFree(dS); cudaFree(dC); cudaFree(dB2); cudaFree(dM2);
     return ms;
