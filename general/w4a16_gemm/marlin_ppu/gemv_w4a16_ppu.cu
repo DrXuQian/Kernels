@@ -1214,6 +1214,14 @@ static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool chec
     auto run = [&] { launch_moe(dB, dA, dS, affine ? dM : nullptr, dRe, dRt, dP, dC,
                                 N, K, gs / 16, n_rows, b_str, s_str); };
     run(); CUDA_CHECK(cudaDeviceSynchronize());
+    // GEMV_NCU was honoured in bench_one but not here, so `moe` put its two correctness cases plus warmup
+    // plus a 50-iteration loop into the capture -- six or more kernels where the hook exists to leave one.
+    if (getenv("GEMV_NCU")) {
+        printf("  GEMV_NCU: single launch rows=%d E=%d N=%d K=%d sk=%d rpb=%d -- timing skipped\n",
+               n_rows, n_experts, N, K, SPLIT_K, MOE_ROWS_PER_BLOCK);
+        cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dM);cudaFree(dC);cudaFree(dP);cudaFree(dCnt);cudaFree(dRe);cudaFree(dRt);
+        return 0;
+    }
 
     if (check) {
         std::vector<half> got((size_t) n_rows * N);
@@ -1258,6 +1266,11 @@ int main(int argc, char** argv) {
         const int tok = argc > 4 ? atoi(argv[4]) : 1, tk = argc > 5 ? atoi(argv[5]) : 8;
         const int E = argc > 6 ? atoi(argv[6]) : 256;
         printf("MoE decode GEMV -- dedicated kernel (one block owns 64 cols x ALL rows)\n");
+        if (getenv("GEMV_NCU")) {   // profiling: ONE kernel in the capture, nothing else
+            printf("  GEMV_NCU set: correctness cases skipped so the capture holds one kernel.\n"
+                   "  Verify first with the same args and no GEMV_NCU.\n");
+            return moe_case(N, K, tok, tk, E, false);
+        }
         int bad = 0;
         bad |= moe_case(256, 512, 1, 8, 8, true);      // correctness first, small E for the CPU reference
         bad |= moe_case(256, 512, 2, 8, 16, true);
