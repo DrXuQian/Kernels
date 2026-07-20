@@ -43,6 +43,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <set>
+#include <algorithm>
 
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_) { printf("CUDA %s @%d\n", cudaGetErrorString(e_), __LINE__); exit(1);} } while(0)
 
@@ -607,12 +609,17 @@ gemv_w4a16_aiu(const int4* __restrict__ B, const half* __restrict__ A, const hal
 
 // out[n] = half(sum_slice partial[slice][n]). The scales are applied per group inside the mainloop, so they must NOT
 // be applied again here -- with groupsize=128 there is no single s[n] to apply.
-__global__ void gemv_reduce(const float* __restrict__ partial, half* __restrict__ C, int N, int split_k) {
-    int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
+// n_rows folds the MoE case in: partial is [rows][split_k][N] and C is [rows][N]. rows=1 is the dense
+// layout unchanged, so the dense call sites need no edit.
+__global__ void gemv_reduce(const float* __restrict__ partial, half* __restrict__ C, int N, int split_k,
+                            int n_rows = 1) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long) n_rows * N) return;
+    const int r = (int) (i / N), n = (int) (i % N);
+    const float* pr = partial + (long long) r * split_k * N;
     float v = 0.f;
-    for (int i = 0; i < split_k; i++) v += partial[(long long) i * N + n];
-    C[n] = __float2half(v);
+    for (int k = 0; k < split_k; k++) v += pr[(long long) k * N + n];
+    C[i] = __float2half(v);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -731,18 +738,25 @@ static int get_groupsize() { const char* e = getenv("GEMV_GROUPSIZE"); return e 
 static int SPLIT_K = 8;
 
 // kt_per_group = groupsize/16, or k_tiles when groupsize == -1 (one group spanning all of K -> per-column scales).
+// n_rows > 1 with row_expert != nullptr is the MoE (grouped) decode: grid gains a z dimension over the
+// expanded (token, expert) rows, and the kernel offsets B / s / mins / A / C / partial / counter per row.
+// Dense callers pass nothing and get the identical launch they always did.
 static void launch(const int4* B, const half* A, const half* s, const half* mn, float* partial, half* C,
-                   int* counter, int N, int K, int kt_per_group) {
-    dim3 grid(N / N_PER_BLOCK, SPLIT_K);
+                   int* counter, int N, int K, int kt_per_group,
+                   const int* row_expert = nullptr, const int* row_token = nullptr,
+                   long long b_expert_stride = 0, long long s_expert_stride = 0, int n_rows = 1) {
+    dim3 grid(N / N_PER_BLOCK, SPLIT_K, row_expert ? n_rows : 1);
 #ifdef GEMV_AIU
     const int smem = 4 * kt_per_group * 64 * (int) sizeof(half);   // 4 cubes x [kt_per_group][64] b16
     // The AIU variant stays symmetric-only: it stages B through a different path and the min term would need
     // its own staging. Fail loudly rather than silently dropping the term.
     if (mn) { printf("  GEMV_AIU does not support affine (Q4_K min) yet\n"); exit(1); }
+    if (row_expert) { printf("  GEMV_AIU does not support the MoE row dimension yet\n"); exit(1); }
     #define GEMV_CASE(SK) case SK: gemv_w4a16_aiu<SK><<<grid, GEMV_THREADS, smem>>>(B, A, s, partial, C, counter, N, K, kt_per_group); break;
 #else
-    #define GEMV_CASE(SK) case SK: if (mn) gemv_w4a16<SK, true ><<<grid, GEMV_THREADS>>>(B, A, s, mn, partial, C, counter, N, K, kt_per_group); \
-                                   else    gemv_w4a16<SK, false><<<grid, GEMV_THREADS>>>(B, A, s, nullptr, partial, C, counter, N, K, kt_per_group); break;
+    #define GEMV_ARGS partial, C, counter, N, K, kt_per_group, row_expert, row_token, b_expert_stride, s_expert_stride
+    #define GEMV_CASE(SK) case SK: if (mn) gemv_w4a16<SK, true ><<<grid, GEMV_THREADS>>>(B, A, s, mn, GEMV_ARGS); \
+                                   else    gemv_w4a16<SK, false><<<grid, GEMV_THREADS>>>(B, A, s, nullptr, GEMV_ARGS); break;
 #endif
     switch (SPLIT_K) {
         GEMV_CASE(1) GEMV_CASE(2) GEMV_CASE(4) GEMV_CASE(8) GEMV_CASE(16) GEMV_CASE(32)
@@ -750,8 +764,13 @@ static void launch(const int4* B, const half* A, const half* s, const half* mn, 
     }
     #undef GEMV_CASE
 #ifndef GEMV_FUSED_REDUCE
-    if (SPLIT_K > 1) gemv_reduce<<<(N + 255) / 256, 256>>>(partial, C, N, SPLIT_K);
+    // one reduce over ALL rows: partial is [rows][SPLIT_K][N], C is [rows][N]
+    if (SPLIT_K > 1) {
+        const int rr = row_expert ? n_rows : 1;
+        gemv_reduce<<<((long long) rr * N + 255) / 256, 256>>>(partial, C, N, SPLIT_K, rr);
+    }
 #endif
+    #undef GEMV_ARGS
 }
 
 // Marlin's packing, verbatim from test_marlin_classic_num.cu's packq, generalized to any N.
@@ -948,7 +967,113 @@ static double bench_one(int N, int K, int iters, bool check) {
     return ms * 1e3;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// MoE DECODE. Same kernel, same B packing, same scales -- only a row dimension and an expert lookup. This
+// lives here rather than in a separate file because a separate file is what cost the last stretch: every
+// problem re-derived there (the main_n unroll cliff, a bench measuring cache, split-K slices needing whole
+// scale groups, the fused-vs-separate reduce) was already solved and commented in THIS one.
+//   ./gemv_w4a16 moe [N] [K] [tokens] [topk] [experts]
+static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool check) {
+    const int gs = get_groupsize() < 0 ? 32 : get_groupsize();
+    const int G = K / gs, n_rows = tokens * topk;
+    SPLIT_K = get_split_k(N, K, gs / 16);
+    if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
+        printf("  MoE N=%d K=%d SPLIT_K=%d unsupported\n", N, K, SPLIT_K); return 2; }
+
+    srand(4321);
+    std::vector<int> rexp(n_rows), rtok(n_rows);
+    for (int t = 0; t < tokens; t++) for (int k = 0; k < topk; k++) {
+        rexp[t * topk + k] = rand() % n_experts; rtok[t * topk + k] = t; }
+    std::vector<half> hA((size_t) tokens * K), hS((size_t) n_experts * G * N), hM((size_t) n_experts * G * N);
+    const bool affine = getenv("GEMV_AFFINE") != nullptr;
+    for (auto& x : hA) x = __float2half(0.05f * (rand() % 40 - 20));
+    for (size_t i = 0; i < hS.size(); i++) {
+        hS[i] = __float2half(0.5f + (rand() % 100) / 100.0f);
+        hM[i] = __float2half(affine ? ((rand() % 100) - 50) / 25.0f : 0.0f);
+    }
+    std::vector<int> Bdeq((size_t) n_experts * N * K), hB((size_t) n_experts * (K / 16) * (N / 2) * 4);
+    for (auto& x : Bdeq) x = (rand() & 0xf) - 8;
+    const size_t bw = (size_t) (K / 16) * (N / 2) * 4;
+    for (int e = 0; e < n_experts; e++) {
+        std::vector<int> one(Bdeq.begin() + (size_t) e * N * K, Bdeq.begin() + (size_t) (e + 1) * N * K);
+        std::vector<int> outv(bw);
+        pack_B(one, outv, N, K);
+        std::copy(outv.begin(), outv.end(), hB.begin() + (size_t) e * bw);
+    }
+
+    int4* dB; half *dA, *dS, *dM, *dC; float* dP; int *dCnt, *dRe, *dRt;
+    CUDA_CHECK(cudaMalloc(&dB, hB.size() * 4));        CUDA_CHECK(cudaMalloc(&dA, hA.size() * 2));
+    CUDA_CHECK(cudaMalloc(&dS, hS.size() * 2));        CUDA_CHECK(cudaMalloc(&dM, hM.size() * 2));
+    CUDA_CHECK(cudaMalloc(&dC, (size_t) n_rows * N * 2));
+    CUDA_CHECK(cudaMalloc(&dP, (size_t) n_rows * 32 * N * 4));
+    CUDA_CHECK(cudaMalloc(&dCnt, (size_t) n_rows * (N / N_PER_BLOCK) * 4));
+    CUDA_CHECK(cudaMalloc(&dRe, n_rows * 4));          CUDA_CHECK(cudaMalloc(&dRt, n_rows * 4));
+    CUDA_CHECK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dM, hM.data(), hM.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dRe, rexp.data(), n_rows * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dRt, rtok.data(), n_rows * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dCnt, 0, (size_t) n_rows * (N / N_PER_BLOCK) * 4));
+
+    // UNITS DIFFER because the pointer types do: B is const int4*, s is const half*. Passing the scale
+    // stride in int4 units made it 8x too small, so every expert past the first read the wrong scale rows
+    // -- rel 0.33, i.e. mostly right, which is what a wrong-but-plausible scale looks like.
+    const long long b_str = (long long) (K / 16) * (N / 2);        // int4  per expert
+    const long long s_str = (long long) G * N;                     // halves per expert
+    auto run = [&] { launch(dB, dA, dS, affine ? dM : nullptr, dP, dC, dCnt, N, K, gs / 16,
+                            dRe, dRt, b_str, s_str, n_rows); };
+    run(); CUDA_CHECK(cudaDeviceSynchronize());
+
+    if (check) {
+        std::vector<half> got((size_t) n_rows * N);
+        CUDA_CHECK(cudaMemcpy(got.data(), dC, got.size() * 2, cudaMemcpyDeviceToHost));
+        double ma = 0, rm = 0;
+        for (int r = 0; r < n_rows; r++) {
+            const int e = rexp[r], t = rtok[r];
+            for (int n = 0; n < N; n++) {
+                double acc = 0;
+                for (int k = 0; k < K; k++) {
+                    const size_t si = (size_t) e * G * N + (size_t) (k / gs) * N + n;
+                    acc += (double) __half2float(hA[(size_t) t * K + k]) *
+                           ((double) Bdeq[((size_t) e * N + n) * K + k] * __half2float(hS[si])
+                            + (affine ? __half2float(hM[si]) : 0.0));
+                }
+                ma = fmax(ma, fabs(__half2float(got[(size_t) r * N + n]) - acc)); rm = fmax(rm, fabs(acc));
+            }
+        }
+        const double rel = ma / (rm + 1e-9);
+        printf("  MoE %-3s rows=%-4d E=%-4d N=%-5d K=%-5d gs=%-3d sk=%-2d  rel %.2e -> %s\n",
+               affine ? "aff" : "sym", n_rows, n_experts, N, K, gs, SPLIT_K, rel, rel < 3e-2 ? "MATCH" : "MISMATCH");
+        cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dM);cudaFree(dC);cudaFree(dP);cudaFree(dCnt);cudaFree(dRe);cudaFree(dRt);
+        return rel < 3e-2 ? 0 : 1;
+    }
+    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    for (int i = 0; i < 5; i++) run(); CUDA_CHECK(cudaDeviceSynchronize());
+    cudaEventRecord(a); for (int i = 0; i < 50; i++) run(); cudaEventRecord(b); cudaEventSynchronize(b);
+    float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 50;
+    std::set<int> uniq(rexp.begin(), rexp.end());
+    const double wb = (double) uniq.size() * N * K / 2.0;
+    printf("  MoE %-3s rows=%-4d E=%-4d N=%-5d K=%-5d sk=%-2d | %7.2f us | %6.0f GB/s | %5.1f%% HBM\n",
+           affine ? "aff" : "sym", n_rows, n_experts, N, K, SPLIT_K, ms * 1e3,
+           wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / (getenv("MARLIN_HBM_GBS") ? atof(getenv("MARLIN_HBM_GBS")) : 2766.0));
+    cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dM);cudaFree(dC);cudaFree(dP);cudaFree(dCnt);cudaFree(dRe);cudaFree(dRt);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && argv[1][0] == 'm') {    // moe [N] [K] [tokens] [topk] [experts]
+        const int N = argc > 2 ? atoi(argv[2]) : 1024, K = argc > 3 ? atoi(argv[3]) : 2048;
+        const int tok = argc > 4 ? atoi(argv[4]) : 1, tk = argc > 5 ? atoi(argv[5]) : 8;
+        const int E = argc > 6 ? atoi(argv[6]) : 256;
+        printf("MoE decode GEMV on the dense kernel (row dim + expert lookup)\n");
+        int bad = 0;
+        bad |= moe_case(256, 512, 1, 8, 8, true);      // correctness first, small E for the CPU reference
+        bad |= moe_case(256, 512, 2, 8, 16, true);
+        printf("%s\n", bad ? "SOME CASES FAILED" : "all MoE cases MATCH");
+        if (bad) return 1;
+        return moe_case(N, K, tok, tk, E, false);
+    }
     if (argc >= 3) {
         int N = atoi(argv[1]), K = atoi(argv[2]);
         int iters = (argc >= 4) ? atoi(argv[3]) : 200;
