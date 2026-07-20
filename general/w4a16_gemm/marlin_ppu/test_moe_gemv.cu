@@ -129,17 +129,35 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 #else
   dim3 grid(N / MOEV_NPB, SPLIT_K, n_rows);
 #endif
+#ifdef MOEV_COUNT
+  unsigned long long* dbg; CK(cudaMalloc(&dbg, 2 * sizeof(unsigned long long)));
+  CK(cudaMemset(dbg, 0, 2 * sizeof(unsigned long long)));
+#endif
   int it_ = 0;
   auto Brot = [&](int i) { return (const int4*) ((char*) dB + (size_t) (i % rot) * b_bytes); };
   auto go = [&] {
     // dynamic shared: the block's A slice (K/SPLIT_K halves) then the reduce scratch
     const size_t shm = (size_t) (K / SPLIT_K) * sizeof(half) + (size_t) (THREADS / 32) * MOEV_NPB * sizeof(float);
-    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS, shm>>>(Brot(it_++), dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
+    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS, shm>>>(Brot(it_++), dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows
+#ifdef MOEV_COUNT
+      , dbg
+#endif
+      );
 #ifndef MOEV_FUSED_REDUCE
     if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
 #endif
   };
   go(); CK(cudaDeviceSynchronize());
+#ifdef MOEV_COUNT
+  {   // what the kernel ACTUALLY touched, against what the shape says it should
+    unsigned long long h[2]; CK(cudaMemcpy(h, dbg, sizeof(h), cudaMemcpyDeviceToHost));
+    const long long exp_tiles = (long long) n_rows * (N / MOEV_NPB) * SPLIT_K;
+    const long long exp_ld = exp_tiles * (K / 16 / SPLIT_K) * 32;
+    printf("  COUNT: tiles %llu / %lld expected | B int4 loads %llu / %lld (%.2f MB / %.2f MB)\n",
+           h[0], exp_tiles, h[1], exp_ld, h[1] * 16.0 / 1e6, exp_ld * 16.0 / 1e6);
+    CK(cudaMemset(dbg, 0, sizeof(h)));
+  }
+#endif
   // MOEV_NCU=1: one launch of each kernel, no warmup, no timing loop -- a clean capture. Same convention
   // as GEMV_NCU / MOE_NCU. The printed us is meaningless then.
   if (getenv("MOEV_NCU")) {

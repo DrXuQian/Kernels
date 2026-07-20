@@ -51,7 +51,11 @@ __global__ void __launch_bounds__(THREADS)
 moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
              const int* __restrict__ row_expert, const int* __restrict__ row_token,
              float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
-             int N, int K, int gs, int n_rows) {
+             int N, int K, int gs, int n_rows
+#ifdef MOEV_COUNT
+             , unsigned long long* __restrict__ dbg   // [0]=tiles run, [1]=B int4 loads issued
+#endif
+             ) {
 #ifdef MOEV_PERSIST
     // PERSISTENT GRID. acu on T=128: 2 full waves plus a partial wave of 32 blocks, and that partial can
     // cost up to 33% of the runtime -- 72 CUs waiting on 32 blocks. Enlarging the grid cannot fix it: a
@@ -63,6 +67,9 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
     // slot -- so no ordering is required.
     const int n_nb = N / MOEV_NPB, total_tiles = n_rows * n_nb * SPLIT_K;
     for (int tile = blockIdx.x; tile < total_tiles; tile += gridDim.x) {
+#ifdef MOEV_COUNT
+        if (threadIdx.x == 0) atomicAdd(&dbg[0], 1ull);
+#endif
         const int r = tile / (n_nb * SPLIT_K);
         const int rem = tile % (n_nb * SPLIT_K);
         const int slice = rem / n_nb, nbg = rem % n_nb;   // n-block minor: consecutive blocks share a slice
@@ -70,6 +77,9 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
     const int nbg = blockIdx.x, slice = blockIdx.y, r = blockIdx.z;
     if (r >= n_rows) return;
     {
+#ifdef MOEV_COUNT
+        if (threadIdx.x == 0) atomicAdd(&dbg[0], 1ull);
+#endif
 #endif
     const int lane = threadIdx.x % 32, wid = threadIdx.x / 32, step = THREADS / 32;
 
@@ -169,6 +179,9 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
     }
     for (; i < my_n; i++) {
         const int kb = kt * 16 + lane_k;
+#ifdef MOEV_COUNT
+        if (lane == 0) atomicAdd(&dbg[1], 32ull);
+#endif
         MOEV_BODY(kt, Be[(long long) b_stride * kt + nbg * 32 + lane],
                   *reinterpret_cast<const half2*>(&Ash[kb - a_lo]),
                   *reinterpret_cast<const half2*>(&Ash[kb - a_lo + 8]));
