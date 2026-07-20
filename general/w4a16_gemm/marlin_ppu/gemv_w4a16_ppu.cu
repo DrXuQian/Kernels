@@ -148,33 +148,10 @@ __global__ void GEMV_LB
 gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
            const half* __restrict__ mn,
            float* __restrict__ partial, half* __restrict__ C, int* __restrict__ counter,
-           int N, int K, int kt_per_group,
-           // MoE (decode): blockIdx.z indexes the expanded (token, expert) rows. row_expert picks the
-           // weight matrix and the scale plane; row_token picks the activation row, so the k rows of one
-           // token share its A. nullptr => dense, blockIdx.z is 0 and every offset below vanishes.
-           //
-           // That is the WHOLE difference between dense decode and MoE decode. I wrote a separate 500-line
-           // kernel for it instead and re-hit, one by one, the problems this file had already solved and
-           // documented in its own comments: the main_n unroll cliff, a bench with no working-set rotation
-           // measuring cache, split-K slices that must hold whole scale groups, the fused-vs-separate
-           // reduce trade. Every one of those answers was already here.
-           const int* __restrict__ row_expert = nullptr,
-           const int* __restrict__ row_token  = nullptr,
-           long long b_expert_stride = 0, long long s_expert_stride = 0) {
+           int N, int K, int kt_per_group) {
     const int nb_group = blockIdx.x;                 // 4 nblocks = 64 columns
     const int slice    = blockIdx.y;
-    const int row      = row_expert ? (int) blockIdx.z : 0;
     const int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
-    if (row_expert) {
-        const int e = row_expert[row];
-        B  += e * b_expert_stride;
-        s  += e * s_expert_stride;
-        if (mn) mn += e * s_expert_stride;
-        A  += (long long) row_token[row] * K;
-        C  += (long long) row * N;
-        partial += (long long) row * (long long) SPLIT_K * N;
-        counter += (long long) row * (N / N_PER_BLOCK);
-    }
 
     const int k_tiles = K / 16;
     const int kt_per_slice = k_tiles / SPLIT_K;
@@ -198,6 +175,84 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
     // groupsize=128) instead of the whole slice, and everything across groups is fp32.
     float facc[4][2] = {{0.f}};
 
+    // THE gs=32 CLIFF. This loop is group-major and GEMV_UNROLL hoists INSIDE one group, so the ktiles a
+    // warp owns per group is kt_per_group/step -- at gs=32 that is 2/step, i.e. ONE at GEMV_THREADS=64.
+    // main_n = (1/4)*4 = 0, so the hoisted path is skipped entirely and every B load is consumed
+    // immediately. gs=-1 makes the group the whole slice, so n_kt is large and the hoist works.
+    //
+    // Measured on ppu001, same kernel, N=4096 K=14336: gs=-1 87.9% HBM against gs=32 47.2%. The scale
+    // reads are not the difference -- GEMV_SCALE_PERM was tried and lost on PPU. Losing the unroll is.
+    //
+    // -DGEMV_XGROUP walks KTILES instead of groups and flushes when the group changes: nothing about the
+    // B or A loads depends on the group, only the accumulate and flush do, so U independent loads can be
+    // issued across a group boundary. This file's own note predicted the cliff; the fix belongs here too.
+#ifdef GEMV_XGROUP
+    {
+        const int my_first = kt_begin + wid;
+        const int my_n = (kt_end - kt_begin - wid + (GEMV_THREADS/32) - 1) / (GEMV_THREADS/32);
+        int cur_g = -1;
+        half2 hacc[4][2]; half sg[4][2], mg[4][2]; half2 asum2 = __float2half2_rn(0.f);
+        #define GX_OPEN(gg) do { cur_g = (gg);                                                     \
+            _Pragma("unroll") for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f);     \
+                                                           hacc[j][1] = __float2half2_rn(0.f); }   \
+            asum2 = __float2half2_rn(0.f);                                                          \
+            _Pragma("unroll") for (int j = 0; j < 4; j++)                                           \
+                _Pragma("unroll") for (int h = 0; h < 2; h++) {                                     \
+                    const int c_ = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h;                      \
+                    sg[j][h] = s[(long long) cur_g * N + c_];                                       \
+                    if (AFFINE) mg[j][h] = mn[(long long) cur_g * N + c_]; }                        \
+        } while (0)
+        #define GX_FLUSH() do { if (cur_g >= 0) {                                                   \
+            float as_ = 0.f;                                                                        \
+            if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }              \
+            _Pragma("unroll") for (int j = 0; j < 4; j++)                                            \
+                _Pragma("unroll") for (int h = 0; h < 2; h++) {                                      \
+                    const float2 f = __half22float2(hacc[j][h]);                                     \
+                    facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);                              \
+                    if (AFFINE) facc[j][h] += as_ * __half2float(mg[j][h]); } } } while (0)
+        #define GX_BODY(kt_, q4_, aa_, ab_) do {                                                     \
+            const int g_ = (kt_) / kt_per_group;                                                     \
+            if (g_ != cur_g) { GX_FLUSH(); GX_OPEN(g_); }                                            \
+            const half2 aa = (aa_), ab = (ab_);                                                      \
+            if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));                                     \
+            const int qs[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                                \
+            _Pragma("unroll") for (int j = 0; j < 4; j++) {                                          \
+                const FragB b0 = dequant(qs[j]);                                                     \
+                const FragB b1 = dequant(qs[j] >> 8);                                                \
+                hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);                                       \
+                hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);                                       \
+                hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);                                       \
+                hacc[j][1] = __hfma2(b1.v[1], ab, hacc[j][1]); } } while (0)
+
+        const int main_n2 = (my_n / GEMV_UNROLL) * GEMV_UNROLL;
+        int kt2 = my_first, i2 = 0;
+        for (; i2 < main_n2; i2 += GEMV_UNROLL) {
+            int4 q4[GEMV_UNROLL]; half2 av0[GEMV_UNROLL], av1[GEMV_UNROLL];
+            #pragma unroll
+            for (int u = 0; u < GEMV_UNROLL; u++) {
+                const int ktu = kt2 + u * (GEMV_THREADS / 32), kb = ktu * 16 + lane_k;
+                q4[u]  = B[(long long) b_stride * ktu + nb_group * 32 + lane];
+                av0[u] = *reinterpret_cast<const half2*>(&A[kb]);
+                av1[u] = *reinterpret_cast<const half2*>(&A[kb + 8]);
+            }
+            #pragma unroll
+            for (int u = 0; u < GEMV_UNROLL; u++) GX_BODY(kt2 + u * (GEMV_THREADS / 32), q4[u], av0[u], av1[u]);
+            kt2 += GEMV_UNROLL * (GEMV_THREADS / 32);
+        }
+        for (; i2 < my_n; i2++) {
+            const int kb = kt2 * 16 + lane_k;
+            GX_BODY(kt2, B[(long long) b_stride * kt2 + nb_group * 32 + lane],
+                    *reinterpret_cast<const half2*>(&A[kb]),
+                    *reinterpret_cast<const half2*>(&A[kb + 8]));
+            kt2 += (GEMV_THREADS / 32);
+        }
+        GX_FLUSH();
+        #undef GX_BODY
+        #undef GX_FLUSH
+        #undef GX_OPEN
+    }
+    goto gemv_acc_done;
+#endif
     for (int g0 = kt_begin; g0 < kt_end; g0 += kt_per_group) {
         const int g  = g0 / kt_per_group;                     // scale row
         const int g1 = min(g0 + kt_per_group, kt_end);
@@ -368,6 +423,7 @@ gemv_w4a16(const int4* __restrict__ B, const half* __restrict__ A, const half* _
             }
     }
 
+    gemv_acc_done: ;
     float acc[4][2];
     #pragma unroll
     for (int j = 0; j < 4; j++)
@@ -743,23 +799,17 @@ static int get_groupsize() { const char* e = getenv("GEMV_GROUPSIZE"); return e 
 static int SPLIT_K = 8;
 
 // kt_per_group = groupsize/16, or k_tiles when groupsize == -1 (one group spanning all of K -> per-column scales).
-// n_rows > 1 with row_expert != nullptr is the MoE (grouped) decode: grid gains a z dimension over the
-// expanded (token, expert) rows, and the kernel offsets B / s / mins / A / C / partial / counter per row.
-// Dense callers pass nothing and get the identical launch they always did.
 static void launch(const int4* B, const half* A, const half* s, const half* mn, float* partial, half* C,
-                   int* counter, int N, int K, int kt_per_group,
-                   const int* row_expert = nullptr, const int* row_token = nullptr,
-                   long long b_expert_stride = 0, long long s_expert_stride = 0, int n_rows = 1) {
-    dim3 grid(N / N_PER_BLOCK, SPLIT_K, row_expert ? n_rows : 1);
+                   int* counter, int N, int K, int kt_per_group) {
+    dim3 grid(N / N_PER_BLOCK, SPLIT_K);
 #ifdef GEMV_AIU
     const int smem = 4 * kt_per_group * 64 * (int) sizeof(half);   // 4 cubes x [kt_per_group][64] b16
     // The AIU variant stays symmetric-only: it stages B through a different path and the min term would need
     // its own staging. Fail loudly rather than silently dropping the term.
     if (mn) { printf("  GEMV_AIU does not support affine (Q4_K min) yet\n"); exit(1); }
-    if (row_expert) { printf("  GEMV_AIU does not support the MoE row dimension yet\n"); exit(1); }
     #define GEMV_CASE(SK) case SK: gemv_w4a16_aiu<SK><<<grid, GEMV_THREADS, smem>>>(B, A, s, partial, C, counter, N, K, kt_per_group); break;
 #else
-    #define GEMV_ARGS partial, C, counter, N, K, kt_per_group, row_expert, row_token, b_expert_stride, s_expert_stride
+    #define GEMV_ARGS partial, C, counter, N, K, kt_per_group
     #define GEMV_CASE(SK) case SK: if (mn) gemv_w4a16<SK, true ><<<grid, GEMV_THREADS>>>(B, A, s, mn, GEMV_ARGS); \
                                    else    gemv_w4a16<SK, false><<<grid, GEMV_THREADS>>>(B, A, s, nullptr, GEMV_ARGS); break;
 #endif
@@ -770,10 +820,7 @@ static void launch(const int4* B, const half* A, const half* s, const half* mn, 
     #undef GEMV_CASE
 #ifndef GEMV_FUSED_REDUCE
     // one reduce over ALL rows: partial is [rows][SPLIT_K][N], C is [rows][N]
-    if (SPLIT_K > 1) {
-        const int rr = row_expert ? n_rows : 1;
-        gemv_reduce<<<((long long) rr * N + 255) / 256, 256>>>(partial, C, N, SPLIT_K, rr);
-    }
+    if (SPLIT_K > 1) gemv_reduce<<<(N + 255) / 256, 256>>>(partial, C, N, SPLIT_K);
 #endif
     #undef GEMV_ARGS
 }
@@ -973,6 +1020,126 @@ static double bench_one(int N, int K, int iters, bool check) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// MoE DECODE -- ITS OWN KERNEL, because bolting a blockIdx.z onto the dense one is just running the GEMV
+// n_rows times and exploits nothing about the MoE structure.
+//
+// What that version wasted, at batch 1 x top-8: all 8 rows belong to the SAME token, so they share one
+// activation vector, yet each row re-read it; and each row paid a full epilogue (shuffle -> shared ->
+// partial write) for the same 64 output columns, eight times over. A block did 8 KB of weight work and
+// then a complete reduce.
+//
+// Here ONE block owns 64 columns x ALL rows: A is read once, the K loop runs per row over that row's
+// expert, and the epilogue is paid once for the whole column block. Work per block goes from 8 KB to
+// n_rows * 8 KB (64 KB at 8 rows, above the dense case's 28.7 KB), and the grid drops from
+// (N/64)*sk*rows to (N/64)*sk.
+//
+// Rows sharing an expert also stop re-reading its weights: the loop can group them, though at batch 1 the
+// draw is usually 8 distinct experts so that pays off only at larger batch.
+template <int SPLIT_K, bool AFFINE>
+__global__ void __launch_bounds__(GEMV_THREADS)
+moe_gemv_rows(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
+              const half* __restrict__ mn, const int* __restrict__ row_expert,
+              const int* __restrict__ row_token, float* __restrict__ partial, half* __restrict__ C,
+              int N, int K, int kt_per_group, int n_rows,
+              long long b_expert_stride, long long s_expert_stride) {
+    const int nb_group = blockIdx.x, slice = blockIdx.y;
+    const int lane = threadIdx.x % 32, wid = threadIdx.x / 32, step = GEMV_THREADS / 32;
+    const int k_tiles = K / 16, kt_per_slice = k_tiles / SPLIT_K;
+    const int kt_begin = slice * kt_per_slice, kt_end = kt_begin + kt_per_slice;
+    const int b_stride = N / 2, lane_k = (lane % 4) * 2;
+
+    __shared__ float sm[GEMV_THREADS / 32][N_PER_BLOCK];
+
+    for (int r = 0; r < n_rows; r++) {
+        const int e = row_expert[r];
+        const int4* Be = B + e * b_expert_stride;
+        const half* se = s + e * s_expert_stride;
+        const half* me = AFFINE ? mn + e * s_expert_stride : nullptr;
+        const half* At = A + (long long) row_token[r] * K;
+
+        float facc[4][2] = {{0.f}};
+        for (int g0 = kt_begin; g0 < kt_end; g0 += kt_per_group) {
+            const int g = g0 / kt_per_group, g1 = min(g0 + kt_per_group, kt_end);
+            half2 hacc[4][2]; half2 asum2 = __float2half2_rn(0.f);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
+            half sg[4][2], mg[4][2];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int c = (nb_group * 4 + j) * 16 + lane / 4 + 8 * h;
+                    sg[j][h] = se[(long long) g * N + c];
+                    if (AFFINE) mg[j][h] = me[(long long) g * N + c];
+                }
+            for (int kt = g0 + wid; kt < g1; kt += step) {
+                const int4 q4 = Be[(long long) b_stride * kt + nb_group * 32 + lane];
+                const int kb = kt * 16 + lane_k;
+                const half2 aa = *reinterpret_cast<const half2*>(&At[kb]);
+                const half2 ab = *reinterpret_cast<const half2*>(&At[kb + 8]);
+                if (AFFINE) asum2 = __hadd2(asum2, __hadd2(aa, ab));
+                const int qs[4] = { q4.x, q4.y, q4.z, q4.w };
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const FragB b0 = dequant(qs[j]), b1 = dequant(qs[j] >> 8);
+                    hacc[j][0] = __hfma2(b0.v[0], aa, hacc[j][0]);
+                    hacc[j][0] = __hfma2(b0.v[1], ab, hacc[j][0]);
+                    hacc[j][1] = __hfma2(b1.v[0], aa, hacc[j][1]);
+                    hacc[j][1] = __hfma2(b1.v[1], ab, hacc[j][1]);
+                }
+            }
+            float as_ = 0.f;
+            if (AFFINE) { const float2 fa = __half22float2(asum2); as_ = fa.x + fa.y; }
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const float2 f = __half22float2(hacc[j][h]);
+                    facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);
+                    if (AFFINE) facc[j][h] += as_ * __half2float(mg[j][h]);
+                }
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                facc[j][h] += __shfl_xor_sync(0xffffffff, facc[j][h], 1);
+                facc[j][h] += __shfl_xor_sync(0xffffffff, facc[j][h], 2);
+            }
+        if (lane % 4 == 0)
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) sm[wid][j * 16 + lane / 4 + 8 * h] = facc[j][h];
+        __syncthreads();
+        for (int c = threadIdx.x; c < N_PER_BLOCK; c += GEMV_THREADS) {
+            float v = 0.f;
+            #pragma unroll
+            for (int w = 0; w < GEMV_THREADS / 32; w++) v += sm[w][c];
+            if (SPLIT_K == 1) C[(long long) r * N + nb_group * N_PER_BLOCK + c] = __float2half(v);
+            else partial[((long long) r * SPLIT_K + slice) * N + nb_group * N_PER_BLOCK + c] = v;
+        }
+        __syncthreads();
+    }
+}
+
+static void launch_moe(const int4* B, const half* A, const half* s, const half* mn,
+                       const int* row_expert, const int* row_token, float* partial, half* C,
+                       int N, int K, int kt_per_group, int n_rows,
+                       long long b_str, long long s_str) {
+    dim3 grid(N / N_PER_BLOCK, SPLIT_K);          // NO row dimension: a block owns all rows of its columns
+#define MOE_CASE(SK) case SK: if (mn) moe_gemv_rows<SK, true ><<<grid, GEMV_THREADS>>>(B,A,s,mn,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); \
+                              else    moe_gemv_rows<SK, false><<<grid, GEMV_THREADS>>>(B,A,s,nullptr,row_expert,row_token,partial,C,N,K,kt_per_group,n_rows,b_str,s_str); break;
+    switch (SPLIT_K) {
+        MOE_CASE(1) MOE_CASE(2) MOE_CASE(4) MOE_CASE(8) MOE_CASE(16) MOE_CASE(32)
+        default: printf("  MoE SPLIT_K=%d unsupported\n", SPLIT_K); exit(1);
+    }
+#undef MOE_CASE
+    if (SPLIT_K > 1)
+        gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(partial, C, N, SPLIT_K, n_rows);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // MoE DECODE. Same kernel, same B packing, same scales -- only a row dimension and an expert lookup. This
 // lives here rather than in a separate file because a separate file is what cost the last stretch: every
 // problem re-derived there (the main_n unroll cliff, a bench measuring cache, split-K slices needing whole
@@ -1026,8 +1193,8 @@ static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool chec
     // -- rel 0.33, i.e. mostly right, which is what a wrong-but-plausible scale looks like.
     const long long b_str = (long long) (K / 16) * (N / 2);        // int4  per expert
     const long long s_str = (long long) G * N;                     // halves per expert
-    auto run = [&] { launch(dB, dA, dS, affine ? dM : nullptr, dP, dC, dCnt, N, K, gs / 16,
-                            dRe, dRt, b_str, s_str, n_rows); };
+    auto run = [&] { launch_moe(dB, dA, dS, affine ? dM : nullptr, dRe, dRt, dP, dC,
+                                N, K, gs / 16, n_rows, b_str, s_str); };
     run(); CUDA_CHECK(cudaDeviceSynchronize());
 
     if (check) {
@@ -1059,7 +1226,7 @@ static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool chec
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 50;
     std::set<int> uniq(rexp.begin(), rexp.end());
     const double wb = (double) uniq.size() * N * K / 2.0;
-    const int blocks_ = (N / N_PER_BLOCK) * SPLIT_K * n_rows;
+    const int blocks_ = (N / N_PER_BLOCK) * SPLIT_K;   // no row dimension now
     printf("  MoE %-3s rows=%-4d E=%-4d N=%-5d K=%-5d sk=%-2d blk=%-5d %5.1f KB/blk | %7.2f us | %6.0f GB/s | %5.1f%% HBM\n",
            affine ? "aff" : "sym", n_rows, n_experts, N, K, SPLIT_K, blocks_, wb / blocks_ / 1024.0, ms * 1e3,
            wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / (getenv("MARLIN_HBM_GBS") ? atof(getenv("MARLIN_HBM_GBS")) : 2766.0));
@@ -1072,7 +1239,7 @@ int main(int argc, char** argv) {
         const int N = argc > 2 ? atoi(argv[2]) : 1024, K = argc > 3 ? atoi(argv[3]) : 2048;
         const int tok = argc > 4 ? atoi(argv[4]) : 1, tk = argc > 5 ? atoi(argv[5]) : 8;
         const int E = argc > 6 ? atoi(argv[6]) : 256;
-        printf("MoE decode GEMV on the dense kernel (row dim + expert lookup)\n");
+        printf("MoE decode GEMV -- dedicated kernel (one block owns 64 cols x ALL rows)\n");
         int bad = 0;
         bad |= moe_case(256, 512, 1, 8, 8, true);      // correctness first, small E for the CPU reference
         bad |= moe_case(256, 512, 2, 8, 16, true);
