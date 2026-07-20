@@ -203,13 +203,25 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
             const int stg = kk % NST;
             const half* Ac = As + (size_t) stg * BMR * MOE_BK;
             const unsigned short* Bc = Bs + (size_t) stg * bcube_h * bcube_w;
+            // ALL of this k-tile's scales, up front. There are only BK/32 = 2 distinct groups per tile,
+            // but the read sat inside the ks loop and ran KSUB=4 times -- half of them redundant, and
+            // every one of them immediately before its use.
+            //
+            // Vectorising these to one int4 removed the bank conflicts and bought 1.2% (0.569 -> 0.562 ms),
+            // while the bracket that DELETES the reads is 19%. So conflicts were not the cost; what the
+            // bracket also removed was the load-to-use distance, since a shared read feeding
+            // hmul2 -> mma with nothing in between exposes its full latency. Hoisting to the top of the
+            // k-tile puts the entire mma sequence between the load and its first use.
+            constexpr int NSG = MOE_BK / 32;                  // scale groups per k-tile
+            int4 svg[NSG];
+            #pragma unroll
+            for (int g = 0; g < NSG; ++g)
+                svg[g] = reinterpret_cast<const int4*>(Ss + g * MOE_BN)[wn * 8 + lane / 4];
+
             #pragma unroll
             for (int ks = 0; ks < MOE_KSUB; ++ks) {
                 const int ko = ks * 16;
-                // _scale_perm layout: per 64-column chunk, lane/4 selects the int4; wn selects the chunk.
-                // Loaded once per k-sub-step and reused across all four nj.
-                const int4 sv = reinterpret_cast<const int4*>(Ss + (ko / 32) * MOE_BN)[wn * 8 + lane / 4];
-                const half* sg8 = reinterpret_cast<const half*>(&sv);
+                const half* sg8 = reinterpret_cast<const half*>(&svg[ko / 32]);
                 int fa[MIR][4], fb[4];
                 #pragma unroll
                 for (int mi = 0; mi < MIR; ++mi) ld_swzl(fa[mi], Ac, wm * WROW + mi * 16, ko, BMR);
