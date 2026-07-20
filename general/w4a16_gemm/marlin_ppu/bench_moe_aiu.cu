@@ -69,12 +69,18 @@ static double bench(int n_experts, int N, int K, int total_rows, const std::vect
     // work at the same time, so BMR=256 can have the fewest m-tiles (1.0x weight) and still lose badly --
     // measured here, 0.762ms against 0.416 at BMR=128, with 2.0x the rows computed. Both columns or
     // neither.
+    // TWO throughputs, and the gap between them is the point. `useful` counts total_rows; `issued` counts
+    // mtiles*BMR, which is what the tensor cores actually execute -- MASKED ROWS STILL BURN MMA CYCLES,
+    // their results are just discarded. Printing only `useful` made a 115 TFLOP/s line look irreconcilable
+    // with acu reporting ~50% tensor utilisation; issued is 231 = 46% of the 500 peak, which is exactly
+    // what acu sees. The hardware is not idle -- half the work is thrown away.
     const double rows_done = (double) sch.mblk_prefix[n_experts] * BMR;
-    printf("  NST=%d BMR=%-4d tiles=%-5d mtiles=%-5d | %8.3f ms | %6.1f TFLOP/s | "
-           "weight %.1fx | rows computed %.2fx (%.0f/%d) | %5.0f GB/s at min\n",
-           NST, BMR, sch.total_tiles, sch.mblk_prefix[n_experts], ms, flop / (ms * 1e9),
-           wbytes_tiles / wbytes_min, rows_done / total_rows, rows_done, total_rows,
-           wbytes_min / (ms * 1e6));
+    const double flop_issued = 2.0 * rows_done * N * K;
+    printf("  NST=%d BMR=%-4d mtiles=%-5d | %8.3f ms | useful %6.1f TF/s | issued %6.1f TF/s (%.0f%% peak) | "
+           "weight %.1fx | rows %.2fx (%.0f/%d) | %5.0f GB/s\n",
+           NST, BMR, sch.mblk_prefix[n_experts], ms, flop / (ms * 1e9), flop_issued / (ms * 1e9),
+           100.0 * flop_issued / (ms * 1e9) / 500.0, wbytes_tiles / wbytes_min,
+           rows_done / total_rows, rows_done, total_rows, wbytes_min / (ms * 1e6));
     (void) active;
     cudaEventDestroy(a); cudaEventDestroy(b);
     cudaFree(dA); cudaFree(dImg); cudaFree(dS); cudaFree(dC); cudaFree(dB2); cudaFree(dM2);
