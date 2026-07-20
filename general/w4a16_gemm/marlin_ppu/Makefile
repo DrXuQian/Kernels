@@ -63,6 +63,10 @@ bench_marlin_gguf_nomin: bench_marlin_gguf.cu marlin_gguf_ppu.cuh .flags
 moe_aiu: test_moe_aiu.cu marlin_moe_aiu_ppu.cuh marlin_moe_gguf_ppu.cuh .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
+# Same, with the column-range guard compiled in: turns an illegal access into a printed reason.
+moe_aiu_guard: test_moe_aiu.cu marlin_moe_aiu_ppu.cuh marlin_moe_gguf_ppu.cuh .flags
+	$(NVCC) $(NVCCFLAGS) -DMOE_AIU_GUARD -o $@ $<
+
 aiu_int4_smoke: aiu_int4_smoke.cu .flags
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
@@ -164,4 +168,4 @@ gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
 
 
 clean:
-	rm -f moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
+	rm -f moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags

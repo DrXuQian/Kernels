@@ -44,7 +44,15 @@ namespace marlin_moe_aiu_ppu {
 #define MOE_BN 128
 #define MOE_BK 64            // == AIU cube width in k; 4 mma k-substeps
 #define MOE_KSUB (MOE_BK / 16)
-#define MOE_WN 4
+// WARP GRID. TWO warps in n, not four. One ld_swzl hands a lane four packed ints = four n-blocks = 64
+// columns, so a warp that owns fewer than 64 columns cannot consume its own load. With BN=128 that fixes
+// n at 2 warps x 64 columns, leaving 4 warps in m.
+//
+// Getting this wrong is what caused the first illegal access: MOE_WN=4 carried over from the fp16 kernel
+// (whose NI=2 gives a warp 32 columns) while each warp here consumes 64, so col0 reached nb*128 + 3*64 +
+// ... = 320 against N=256 and read the scale array out of bounds. The fp16 kernel's warp grid is not
+// transferable when the B fragment's width changes.
+#define MOE_WN 2
 #define MOE_NWARP 8
 
 static __device__ __forceinline__ unsigned cvta(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
@@ -116,7 +124,9 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
         const half* __restrict__ s, const int* __restrict__ expert_bounds,
         const int* __restrict__ mblk_prefix, float* __restrict__ C,
         int total_rows, int N, int K, int n_experts, int total_tiles, int gs) {
-    constexpr int MIR = BMR / 32, WROW = MIR * 16;
+    constexpr int MWARPS = MOE_NWARP / MOE_WN;      // 4 warps in m
+    constexpr int WROW = BMR / MWARPS;               // rows per warp
+    constexpr int MIR = WROW / 16;                   // 16-row m-blocks per warp
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / MOE_WN, wn = warp % MOE_WN;
     const int nk = K / MOE_BK, num_nb = N / MOE_BN;
@@ -187,6 +197,13 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
                     // gs=32 per-32 scale. A lane's column within the n16 tile is lane/4 for b0 and +8 for
                     // b1, matching dequant's output positions.
                     const int col0 = nb * MOE_BN + wn * 64 + nj * 16 + (lane / 4);
+#ifdef MOE_AIU_GUARD
+                    // The scale read is the one global access here indexed by a column formula rather than
+                    // by the tile machinery, so it is where a warp-grid mistake lands -- and it did land
+                    // there once (MOE_WN=4 put col0 at 320 against N=256). Cheap enough to leave behind a
+                    // flag; an out-of-range column is a wrong warp grid, not a bad input.
+                    if (col0 + 8 >= N) { if (lane == 0) printf("MOE_AIU: col0=%d out of range N=%d (nb=%d wn=%d nj=%d)\n", col0, N, nb, wn, nj); return; }
+#endif
                     const long long srow = (long long) (kabs / gs) * N;
                     marlin_gguf_ppu::FragS s0, s1;
                     reinterpret_cast<half*>(&s0)[0] = se[srow + col0];
