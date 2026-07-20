@@ -65,8 +65,21 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
         }
   }
 
+  // A 50-iteration loop over ONE B buffer measures CACHE, not HBM: only 8 experts are routed to, so the
+  // working set is 8*N*K/2 -- 8.4 MB at N=1024 K=2048 -- which sits in LLC after the first iteration.
+  // acu on a "cold" single launch already showed it: 5.32 MB from device memory against 8.39 MB of unique
+  // weight, because the setup memcpy of all 256 experts (256 MB) leaves its tail resident and three of the
+  // drawn experts (237, 153, 132) live there. Every %HBM number in this bench has been optimistic.
+  // MOEV_WORKSET_MB rotates through identical copies so consecutive iterations cannot reuse lines, the
+  // same device gemv_w4a16_ppu.cu has for exactly this reason and which I did not carry over.
+  const size_t b_bytes = hB.size() * 4;
+  int rot = 1;
+  if (const char* e = getenv("MOEV_WORKSET_MB")) {
+    const size_t want = (size_t) atoi(e) << 20;
+    rot = (int) ((want + b_bytes - 1) / b_bytes); if (rot < 1) rot = 1;
+  }
   int4* dB; half *dA, *dS, *dC; float* dP; int *dRe, *dRt;
-  CK(cudaMalloc(&dB, hB.size() * 4));  CK(cudaMalloc(&dA, hA.size() * 2));
+  CK(cudaMalloc(&dB, b_bytes * (size_t) rot));  CK(cudaMalloc(&dA, hA.size() * 2));
   CK(cudaMalloc(&dS, sP.size() * 2));  CK(cudaMalloc(&dC, (size_t) n_rows * N * 2));
   CK(cudaMalloc(&dP, (size_t) n_rows * SPLIT_K * N * 4));
   // A slice must hold whole scale groups, or g = g0/kt_per_group lands mid-group and reads the wrong
@@ -87,7 +100,9 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   CK(cudaMalloc(&dRe, n_rows * 4));    CK(cudaMalloc(&dRt, n_rows * 4));
   int* dCnt; CK(cudaMalloc(&dCnt, (size_t) n_rows * (N / MOEV_NPB) * 4));
   CK(cudaMemset(dCnt, 0, (size_t) n_rows * (N / MOEV_NPB) * 4));   // the winning CTA rearms it each launch
-  CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(dB, hB.data(), b_bytes, cudaMemcpyHostToDevice));
+  for (int r2 = 1; r2 < rot; r2++)     // identical copies; correctness unaffected, cache residency is not
+    CK(cudaMemcpy((char*) dB + (size_t) r2 * b_bytes, dB, b_bytes, cudaMemcpyDeviceToDevice));
   CK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dS, sP.data(), sP.size() * 2, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dRe, rexp.data(), n_rows * 4, cudaMemcpyHostToDevice));
@@ -114,10 +129,12 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 #else
   dim3 grid(N / MOEV_NPB, SPLIT_K, n_rows);
 #endif
+  int it_ = 0;
+  auto Brot = [&](int i) { return (const int4*) ((char*) dB + (size_t) (i % rot) * b_bytes); };
   auto go = [&] {
     // dynamic shared: the block's A slice (K/SPLIT_K halves) then the reduce scratch
     const size_t shm = (size_t) (K / SPLIT_K) * sizeof(half) + (size_t) (THREADS / 32) * MOEV_NPB * sizeof(float);
-    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS, shm>>>(dB, dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
+    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS, shm>>>(Brot(it_++), dA, dS, dRe, dRt, dP, dC, dCnt, N, K, gs, n_rows);
 #ifndef MOEV_FUSED_REDUCE
     if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
 #endif
@@ -165,6 +182,8 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
          THREADS, SPLIT_K, U, blocks, (SPLIT_K > 1 && !MOEV_FUSED) ? "2 launches" : "1 launch", ms * 1e3,
          wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
+  if (rot == 1) printf("       (workset %.1f MB fits LLC -- this is CACHE bandwidth; set MOEV_WORKSET_MB to force DRAM)\n",
+                       wb / 1e6);
   (void) distinct;
   cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);cudaFree(dCnt);
   return 0;
