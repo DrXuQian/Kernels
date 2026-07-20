@@ -84,12 +84,20 @@ static double bench(int n_experts, int N, int K, int total_rows, const std::vect
 int main(int argc, char** argv) {
     const int N = argc > 1 ? atoi(argv[1]) : 1024, K = argc > 2 ? atoi(argv[2]) : 2048;
     const int tokens = argc > 3 ? atoi(argv[3]) : 2048, topk = argc > 4 ? atoi(argv[4]) : 8;
-    const int n_experts = argc > 5 ? atoi(argv[5]) : 128;
+    // Qwen3.5-MoE config: num_experts 256, num_experts_per_tok 8, moe_intermediate_size 512, hidden 2048.
+    // So FC1 is N=1024 (gate+up fused) K=2048 and FC2 is N=2048 K=512, and there are 256 experts -- I had
+    // benched 128, which at 2048 tokens x top-8 put avg rows/expert at exactly 128 and therefore made
+    // BMR=128 look optimal. The real average is 64, and the model from that same sweep says BMR belongs
+    // near avg rows/expert -- so the earlier "BMR=128 wins" was measured on the one expert count that
+    // makes it win.
+    const int n_experts = argc > 5 ? atoi(argv[5]) : 256;
     // Pick ONE config so a profiler capture has one kernel in it. Without this the sweep launches five.
     const int selBMR = argc > 6 ? atoi(argv[6]) : 0, selNST = argc > 7 ? atoi(argv[7]) : 4;
     const int total_rows = tokens * topk;
     printf("Q4_K MoE on AIU: N=%d K=%d tokens=%d topk=%d experts=%d -> rows=%d (avg %.0f/expert)\n",
            N, K, tokens, topk, n_experts, total_rows, (double) total_rows / n_experts);
+    printf("  weight this layer: %.0f MB across all experts (x40 layers x FC1+FC2 for the model)\n",
+           (double) n_experts * N * K / 2.0 / 1e6);
 
     std::mt19937 rng(7);
     std::vector<int> re(total_rows);
