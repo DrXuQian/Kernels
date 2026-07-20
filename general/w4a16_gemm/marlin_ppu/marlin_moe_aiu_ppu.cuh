@@ -214,5 +214,60 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
     }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// HOST: routing plan -> the scheduler's inputs. bounds are the TRUE ragged per-expert row bounds (no
+// padding -- the kernel masks); mblk_prefix is the per-expert m-block prefix sum the tile queue binary
+// searches. total_tiles = mblk_prefix[n_experts] * (N/BN).
+struct MoeSched {
+  std::vector<int> mblk_prefix;   // n_experts+1
+  int total_tiles;
+};
+inline MoeSched moe_sched(const int* expert_bounds, int n_experts, int N, int BMR) {
+  MoeSched s; s.mblk_prefix.assign(n_experts + 1, 0);
+  for (int e = 0; e < n_experts; e++) {
+    const int rows = expert_bounds[e + 1] - expert_bounds[e];
+    s.mblk_prefix[e + 1] = s.mblk_prefix[e] + (rows + BMR - 1) / BMR;
+  }
+  s.total_tiles = s.mblk_prefix[n_experts] * (N / MOE_BN);
+  return s;
+}
+
+template <int NST, int BMR>
+inline void launch_moe_q4k(const half* A, const unsigned short* Bimg, const half* s,
+        const int* d_bounds, const int* d_mblk, float* C,
+        int total_rows, int N, int K, int n_experts, int total_tiles, int gs, cudaStream_t stream = 0) {
+  const int bcube_h = 16 * (MOE_BN / 64), bcube_w = 16 * (MOE_BK / 16);
+  const size_t shmem = (size_t) NST * (BMR * MOE_BK * sizeof(half) + bcube_h * bcube_w * sizeof(unsigned short));
+  cudaFuncSetAttribute(moe_q4k_aiu<NST, BMR>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem);
+  // Grid fills every CU SLOT, not one block per CU -- the fp16 kernel's finding, and the reason its
+  // persistent variant beat the static grid (idle blocks on empty experts, wave tail, 14% L2 hit).
+  int cus = 0; cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, 0);
+  const int blk_cu = (int) ((size_t) 256 * 1024 / shmem);
+  int grid = cus * (blk_cu > 0 ? blk_cu : 1);
+  if (const char* g = getenv("MOE_GRID")) grid = atoi(g);
+  if (grid > total_tiles) grid = total_tiles > 0 ? total_tiles : 1;
+  moe_q4k_aiu<NST, BMR><<<grid, MOE_NWARP * 32, shmem, stream>>>(
+      A, Bimg, s, d_bounds, d_mblk, C, total_rows, N, K, n_experts, total_tiles, gs);
+}
+
+// AFFINE min, split out -- the dense measurement put the fused min's whole cost in the per-k shared load
+// of frag_m, and here it factors even more cleanly: Asum[t][g] is per TOKEN and INDEPENDENT of the expert,
+// so it is computed ONCE for the whole batch and only the second (K/gs-deep) GEMM is grouped.
+//   C[t][n] += sum_g m'[e(t)][g][n] * Asum[t][g]
+// One block per (token, n-block chunk); m' is PLAIN [G][N] per expert, not _scale_perm -- that layout is
+// for Marlin's fragment reads and means nothing here, and passing the permuted buffer is silently wrong.
+__global__ void moe_min_correct(const half* __restrict__ Asum, const half* __restrict__ mins,
+        const int* __restrict__ row_expert, float* __restrict__ C, int total_rows, int N, int G) {
+  const int row = blockIdx.x;
+  if (row >= total_rows) return;
+  const int e = row_expert[row];
+  const half* me = mins + (long long) e * G * N;
+  for (int n = threadIdx.x; n < N; n += blockDim.x) {
+    float acc = 0.f;
+    for (int g = 0; g < G; g++) acc += __half2float(Asum[(long long) row * G + g]) * __half2float(me[(long long) g * N + n]);
+    C[(long long) row * N + n] += acc;
+  }
+}
+
 }  // namespace marlin_moe_aiu_ppu
 #endif
