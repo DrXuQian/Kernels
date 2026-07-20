@@ -113,7 +113,7 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   const double wb = (double) distinct * N * K / 2.0;
   const int blocks = (N / MOEV_NPB) * SPLIT_K * n_rows;
   printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
-         THREADS, SPLIT_K, blocks, SPLIT_K > 1 ? "2 launches" : "1 launch", ms * 1e3,
+         THREADS, SPLIT_K, U, blocks, SPLIT_K > 1 ? "2 launches" : "1 launch", ms * 1e3,
          wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
   (void) distinct;
   cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dC);cudaFree(dP);cudaFree(dRe);cudaFree(dRt);
