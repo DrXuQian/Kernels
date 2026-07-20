@@ -127,6 +127,10 @@ __global__ void moe_q4k_aiu(const half* __restrict__ A, const unsigned short* __
     constexpr int MWARPS = MOE_NWARP / MOE_WN;      // 4 warps in m
     constexpr int WROW = BMR / MWARPS;               // rows per warp
     constexpr int MIR = WROW / 16;                   // 16-row m-blocks per warp
+    // 4 warps in m, each needing at least one 16-row block -> BMR must be a multiple of 64. Without this
+    // BMR=32 gives MIR=0 and the failure is "zero-sized variable acc", which names the symptom and not the
+    // constraint.
+    static_assert(BMR % 64 == 0, "BMR must be a multiple of 64: 4 warps in m x 16 rows minimum");
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / MOE_WN, wn = warp % MOE_WN;
     const int nk = K / MOE_BK, num_nb = N / MOE_BN;
