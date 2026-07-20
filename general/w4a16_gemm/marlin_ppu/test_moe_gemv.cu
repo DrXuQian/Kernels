@@ -8,7 +8,7 @@
 
 #define CK(x) do { cudaError_t e_=(x); if(e_){printf("cuda %s @%d\n",cudaGetErrorString(e_),__LINE__);exit(1);} } while(0)
 
-template <int THREADS, int SPLIT_K>
+template <int THREADS, int SPLIT_K, int U = 1>
 static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   using namespace marlin_moe_gemv_ppu;
   const int gs = 32, G = K / gs, n_rows = tokens * topk;
@@ -79,7 +79,7 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
 
   dim3 grid(N / MOEV_NPB, SPLIT_K, n_rows);
   auto go = [&] {
-    moe_gemv_q4k<THREADS, SPLIT_K><<<grid, THREADS>>>(dB, dA, dS, dRe, dRt, dP, dC, N, K, gs, n_rows);
+    moe_gemv_q4k<THREADS, SPLIT_K, U><<<grid, THREADS>>>(dB, dA, dS, dRe, dRt, dP, dC, N, K, gs, n_rows);
     if (SPLIT_K > 1) moe_gemv_reduce<<<(int) (((long long) n_rows * N + 255) / 256), 256>>>(dP, dC, N, SPLIT_K, n_rows);
   };
   go(); CK(cudaDeviceSynchronize());
@@ -112,7 +112,7 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   for (int r = 0; r < n_rows; r++) if (!seen[rexp[r]]) { seen[rexp[r]] = 1; distinct++; }
   const double wb = (double) distinct * N * K / 2.0;
   const int blocks = (N / MOEV_NPB) * SPLIT_K * n_rows;
-  printf("  T=%-3d sk=%-2d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
+  printf("  T=%-3d sk=%-2d U=%d blocks=%-6d %-11s | %7.2f us | %6.0f GB/s | %5.1f%% HBM (floor %.1f us)\n",
          THREADS, SPLIT_K, blocks, SPLIT_K > 1 ? "2 launches" : "1 launch", ms * 1e3,
          wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / 2766.0, wb / 2766.0 / 1e3);
   (void) distinct;
@@ -136,6 +136,8 @@ int main(int argc, char** argv) {
   bad |= run<64, 4>(1, 8, 8,  256, 512,  false);
   bad |= run<32, 8>(2, 8, 16, 256, 512,  false);
   bad |= run<64, 8>(4, 4, 16, 512, 1024, false);
+  bad |= run<32, 8, 2>(2, 8, 16, 256, 512, false);    // unrolled path, and a tail (n_kt not a multiple of U)
+  bad |= run<64, 4, 4>(1, 8, 8,  256, 512, false);
   printf("%s\n", bad ? "SOME CASES FAILED" : "all decode cases MATCH");
   if (bad) return 1;
   printf("--- perf, batch 1 x top-8 over 256 experts (the real decode shape) ---\n");
@@ -159,5 +161,13 @@ int main(int argc, char** argv) {
   run<32, 32>(1, 8, 256, N, K, true);
   run<32, 64>(1, 8, 256, N, K, true);
   run<64, 32>(1, 8, 256, N, K, true);
+  // U = loads in flight per warp. sk=16 leaves 8 ktiles per warp, room for U up to 8; sk=32 leaves 4.
+  // Swept together because they pull opposite ways -- sk buys blocks and spends ktiles-per-warp.
+  printf("  -- unroll (loads in flight per warp; latency, not bandwidth, is the stall) --\n");
+  run<32, 16, 2>(1, 8, 256, N, K, true);
+  run<32, 16, 4>(1, 8, 256, N, K, true);
+  run<32, 8,  4>(1, 8, 256, N, K, true);
+  run<32, 32, 2>(1, 8, 256, N, K, true);
+  run<64, 16, 2>(1, 8, 256, N, K, true);
   return 0;
 }

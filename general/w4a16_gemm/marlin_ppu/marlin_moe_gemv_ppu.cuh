@@ -35,7 +35,18 @@ __device__ __forceinline__ void dq4(int q, half2* out) {
 
 // One block = (64-column chunk, k-slice, expanded row). row_expert[r] picks the weight matrix; row_token[r]
 // picks the activation row, so several rows of one token share its A without duplicating it.
-template <int THREADS, int SPLIT_K>
+// U = independent int4 loads issued before ANY is consumed. acu on this kernel: Memory Dependency is the
+// dominant stall while DRAM sits at 39.5%, i.e. LATENCY bound, not bandwidth bound -- too few loads in
+// flight. Occupancy cannot fix it either: grid is 4096 warps against 4608 slots, so the kernel is under
+// ONE wave, has no steady state, and averages 63% achieved against 100% theoretical. More blocks was
+// already tried and turned over (the reduce takes the win back), so the parallelism has to come from
+// INSIDE the warp.
+//
+// U and SPLIT_K pull against each other: sk raises block count but cuts ktiles per warp (sk=32 leaves 4,
+// sk=64 leaves 2, and there is nothing left to unroll). So sweep them together rather than maximising
+// either. The dense bf16 GEMV found U=2 best, but it has no dequant and an order of magnitude fewer
+// instructions per byte, so its optimum is not assumed to carry.
+template <int THREADS, int SPLIT_K, int U = 1>
 __global__ void __launch_bounds__(THREADS)
 moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half* __restrict__ s,
              const int* __restrict__ row_expert, const int* __restrict__ row_token,
@@ -69,22 +80,45 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
             for (int h = 0; h < 2; h++)
                 sg[j][h] = se[(long long) g * N + (nbg * 4 + j) * 16 + lane / 4 + 8 * h];
 
-        for (int kt = g0 + wid; kt < g1; kt += step) {
-            const int4 q4 = Be[(long long) b_stride * kt + nbg * 32 + lane];
-            const int kb = kt * 16 + lane_k;
-            const half2 aa = *reinterpret_cast<const half2*>(&At[kb]);
-            const half2 ab = *reinterpret_cast<const half2*>(&At[kb + 8]);
-            const int qs[4] = { q4.x, q4.y, q4.z, q4.w };
+        #define MOEV_BODY(q4_, aa_, ab_) do {                                        \
+            const half2 aa = (aa_), ab = (ab_);                                       \
+            const int qs[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                 \
+            _Pragma("unroll")                                                          \
+            for (int j = 0; j < 4; j++) {                                             \
+                half2 b0[2], b1[2];                                                   \
+                dq4(qs[j], b0); dq4(qs[j] >> 8, b1);                                  \
+                hacc[j][0] = __hfma2(b0[0], aa, hacc[j][0]);                          \
+                hacc[j][0] = __hfma2(b0[1], ab, hacc[j][0]);                          \
+                hacc[j][1] = __hfma2(b1[0], aa, hacc[j][1]);                          \
+                hacc[j][1] = __hfma2(b1[1], ab, hacc[j][1]);                          \
+            }                                                                          \
+        } while (0)
+
+        // ktiles THIS thread owns in this group, then U at a time with ALL loads issued before any use.
+        const int n_kt = (g1 - g0 > wid) ? ((g1 - g0 - wid + step - 1) / step) : 0;
+        const int main_n = (n_kt / U) * U;
+        int kt = g0 + wid, i = 0;
+        for (; i < main_n; i += U) {
+            int4 q4[U]; half2 av0[U], av1[U];
             #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                half2 b0[2], b1[2];
-                dq4(qs[j], b0); dq4(qs[j] >> 8, b1);
-                hacc[j][0] = __hfma2(b0[0], aa, hacc[j][0]);
-                hacc[j][0] = __hfma2(b0[1], ab, hacc[j][0]);
-                hacc[j][1] = __hfma2(b1[0], aa, hacc[j][1]);
-                hacc[j][1] = __hfma2(b1[1], ab, hacc[j][1]);
+            for (int u = 0; u < U; u++) {
+                const int ktu = kt + u * step, kb = ktu * 16 + lane_k;
+                q4[u]  = Be[(long long) b_stride * ktu + nbg * 32 + lane];
+                av0[u] = *reinterpret_cast<const half2*>(&At[kb]);
+                av1[u] = *reinterpret_cast<const half2*>(&At[kb + 8]);
             }
+            #pragma unroll
+            for (int u = 0; u < U; u++) MOEV_BODY(q4[u], av0[u], av1[u]);
+            kt += U * step;
         }
+        for (; i < n_kt; i++) {                    // tail when n_kt is not a multiple of U
+            const int kb = kt * 16 + lane_k;
+            MOEV_BODY(Be[(long long) b_stride * kt + nbg * 32 + lane],
+                      *reinterpret_cast<const half2*>(&At[kb]),
+                      *reinterpret_cast<const half2*>(&At[kb + 8]));
+            kt += step;
+        }
+        #undef MOEV_BODY
         #pragma unroll
         for (int j = 0; j < 4; j++)
             #pragma unroll
