@@ -697,8 +697,13 @@ static const int GEMV_MAX_SPLIT_K = 32;   // separate reduce has no contention
 //
 // It also cuts the other way: gs=32 has the SMALLEST group and so the loosest divisibility, meaning it can
 // take the most slices -- which is what it needs, since it was the case starved for blocks.
-static int auto_split_k(int N, int K, int kt_per_group) {
-    const int cols = N / N_PER_BLOCK, k_tiles = K / 16, tgt = gemv_target_blocks();
+// n_rows is part of the grid and was missing from this decision. grid = (N/64) * SPLIT_K * n_rows, so at
+// MoE decode the row dimension already supplies 8x the blocks and choosing SPLIT_K as if it did not cuts
+// the work per block by the same factor. Measured: the dense case reads 29.4 MB with 1024 blocks (28.7 KB
+// each) and hits 88% HBM; MoE read 8.4 MB with 4096 blocks (2 KB each) and got 24.9%, on the SAME kernel.
+// A block that issues four warp-loads cannot amortise its own epilogue.
+static int auto_split_k(int N, int K, int kt_per_group, int n_rows = 1) {
+    const int cols = (N / N_PER_BLOCK) * (n_rows > 0 ? n_rows : 1), k_tiles = K / 16, tgt = gemv_target_blocks();
     // gs == -1 sets kt_per_group = k_tiles, i.e. ONE group spanning all of K. Splitting is still fine there:
     // g = g0/kt_per_group is 0 in every slice, so nothing straddles. Only a real per-group scale constrains.
     const int kpg = (kt_per_group >= k_tiles) ? 1 : kt_per_group;
@@ -727,9 +732,9 @@ static int get_rot(size_t b_bytes) {
     return r < 1 ? 1 : r;
 }
 
-static int get_split_k(int N, int K, int kt_per_group) {
+static int get_split_k(int N, int K, int kt_per_group, int n_rows = 1) {
     const char* e = getenv("GEMV_SPLIT_K"); int v = e ? atoi(e) : 0;
-    return v > 0 ? v : auto_split_k(N, K, kt_per_group);
+    return v > 0 ? v : auto_split_k(N, K, kt_per_group, n_rows);
 }
 
 // -1 = per-column scales; 128 = grouped, WHAT REAL QUANTIZED MODELS USE. Grouped scales vary along K, so they cannot be
@@ -976,7 +981,7 @@ static double bench_one(int N, int K, int iters, bool check) {
 static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool check) {
     const int gs = get_groupsize() < 0 ? 32 : get_groupsize();
     const int G = K / gs, n_rows = tokens * topk;
-    SPLIT_K = get_split_k(N, K, gs / 16);
+    SPLIT_K = get_split_k(N, K, gs / 16, n_rows);
     if (N % 64 || K % (16 * SPLIT_K) || (K / 16 / SPLIT_K) % (GEMV_THREADS / 32)) {
         printf("  MoE N=%d K=%d SPLIT_K=%d unsupported\n", N, K, SPLIT_K); return 2; }
 
@@ -1054,8 +1059,9 @@ static int moe_case(int N, int K, int tokens, int topk, int n_experts, bool chec
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 50;
     std::set<int> uniq(rexp.begin(), rexp.end());
     const double wb = (double) uniq.size() * N * K / 2.0;
-    printf("  MoE %-3s rows=%-4d E=%-4d N=%-5d K=%-5d sk=%-2d | %7.2f us | %6.0f GB/s | %5.1f%% HBM\n",
-           affine ? "aff" : "sym", n_rows, n_experts, N, K, SPLIT_K, ms * 1e3,
+    const int blocks_ = (N / N_PER_BLOCK) * SPLIT_K * n_rows;
+    printf("  MoE %-3s rows=%-4d E=%-4d N=%-5d K=%-5d sk=%-2d blk=%-5d %5.1f KB/blk | %7.2f us | %6.0f GB/s | %5.1f%% HBM\n",
+           affine ? "aff" : "sym", n_rows, n_experts, N, K, SPLIT_K, blocks_, wb / blocks_ / 1024.0, ms * 1e3,
            wb / (ms * 1e6), 100.0 * wb / (ms * 1e6) / (getenv("MARLIN_HBM_GBS") ? atof(getenv("MARLIN_HBM_GBS")) : 2766.0));
     cudaFree(dB);cudaFree(dA);cudaFree(dS);cudaFree(dM);cudaFree(dC);cudaFree(dP);cudaFree(dCnt);cudaFree(dRe);cudaFree(dRt);
     return 0;
