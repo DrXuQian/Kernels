@@ -62,8 +62,13 @@ static int run(int tokens, int topk, int n_experts, int N, int K, bool bench) {
   CK(cudaMalloc(&dP, (size_t) n_rows * SPLIT_K * N * 4));
   // A slice must hold whole scale groups, or g = g0/kt_per_group lands mid-group and reads the wrong
   // scale row -- silently, exactly as it did in the dense GEMV's auto_split_k.
-  if ((K / 16 / SPLIT_K) % (gs / 16)) { printf("  T=%d sk=%d: %d ktiles/slice is not a multiple of the "
-      "group's %d -- skipped\n", THREADS, SPLIT_K, K / 16 / SPLIT_K, gs / 16); return 0; }
+  // A slice must hold at least ONE whole scale group. Checking only divisibility let kt_per_slice=0
+  // through -- 0 % 2 == 0 -- so FC2 at sk=64 launched a kernel that computes nothing and the bench happily
+  // timed it at 16.08 us. A guard that passes the degenerate case is not a guard.
+  const int kt_per_slice = K / 16 / SPLIT_K, ktpg = gs / 16;
+  if (kt_per_slice < ktpg || kt_per_slice % ktpg) {
+      printf("  T=%d sk=%-2d: %d ktiles/slice vs a group of %d -- skipped (need >= and a multiple)\n",
+             THREADS, SPLIT_K, kt_per_slice, ktpg); return 0; }
   CK(cudaMalloc(&dRe, n_rows * 4));    CK(cudaMalloc(&dRt, n_rows * 4));
   CK(cudaMemcpy(dB, hB.data(), hB.size() * 4, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
