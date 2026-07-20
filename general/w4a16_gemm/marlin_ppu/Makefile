@@ -230,9 +230,6 @@ gemv_w4a16_h16: gemv_w4a16_ppu.cu .flags
 # Small group -> T=32 (it can take sk=32, which is what pays for the halved warps-per-block).
 # gs>=128     -> T=64. There is no single default; this is the same per-format templating the MMQ port
 # needed for its X and MIN_BLOCKS.
-gemv_w4a16_t32: gemv_w4a16_ppu.cu .flags
-	$(NVCC) $(NVCCFLAGS) -DGEMV_THREADS=32 -DGEMV_UNROLL=2 -o $@ $<
-
 
 clean:
 	rm -f moe_gemv_atomic moe_gemv_count moe_gemv_persist moe_gemv_fused moe_gemv bench_moe_aiu_noa bench_moe_aiu_nob bench_moe_aiu_cs bench_moe_aiu moe_aiu_guard moe_aiu aiu_int4_smoke marlin_moe_gguf bench_prefill_paths bench_affine_split bench_marlin_gguf_cmin bench_marlin_gguf_nomin gemv_w4a16_t32 gemv_w4a16_h16 gemv_w4a16_perm bench_marlin_gguf dequant_smoke mma_int8_smoke mmq_ppu mma_peak marlin_gguf dump_ldmatrix marlin_ppu_test marlin_classic_test marlin_classic_num marlin_classic_splitk marlin_classic_group bench_marlin gemv_w4a16 gemv_nmajor bw_probe *.o .flags
