@@ -67,66 +67,83 @@ moe_gemv_q4k(const int4* __restrict__ B, const half* __restrict__ A, const half*
     const int b_stride = N / 2, lane_k = (lane % 4) * 2, kt_per_group = gs / 16;
 
     float facc[4][2] = {{0.f}};
-    for (int g0 = kt_begin; g0 < kt_end; g0 += kt_per_group) {
-        const int g = g0 / kt_per_group, g1 = min(g0 + kt_per_group, kt_end);
-        half2 hacc[4][2];
-        #pragma unroll
-        for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f); hacc[j][1] = __float2half2_rn(0.f); }
-        // this group's 8 scales, hoisted (same reason as the GEMM: the read otherwise sits on the flush)
-        half sg[4][2];
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-            #pragma unroll
-            for (int h = 0; h < 2; h++)
-                sg[j][h] = se[(long long) g * N + (nbg * 4 + j) * 16 + lane / 4 + 8 * h];
 
-        #define MOEV_BODY(q4_, aa_, ab_) do {                                        \
-            const half2 aa = (aa_), ab = (ab_);                                       \
-            const int qs[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                 \
-            _Pragma("unroll")                                                          \
-            for (int j = 0; j < 4; j++) {                                             \
-                half2 b0[2], b1[2];                                                   \
-                dq4(qs[j], b0); dq4(qs[j] >> 8, b1);                                  \
-                hacc[j][0] = __hfma2(b0[0], aa, hacc[j][0]);                          \
-                hacc[j][0] = __hfma2(b0[1], ab, hacc[j][0]);                          \
-                hacc[j][1] = __hfma2(b1[0], aa, hacc[j][1]);                          \
-                hacc[j][1] = __hfma2(b1[1], ab, hacc[j][1]);                          \
-            }                                                                          \
+    // LOADS ARE HOISTED ACROSS GROUP BOUNDARIES. The previous shape looped over scale groups and unrolled
+    // INSIDE one, but a group is gs/16 = 2 ktiles and step is 1 at T=32, so in-flight loads were capped at
+    // 2 no matter what U said -- and U=4 made main_n = (2/4)*4 = 0, silently skipping the hoisted path
+    // entirely and running one load at a time. That is exactly the main_n cliff documented in
+    // gemv_w4a16_ppu.cu, hit again here.
+    //
+    // Nothing about the B or A loads depends on the group; only the accumulate and the flush do. So walk
+    // ktiles directly, issue U loads regardless of where the group boundary falls, and flush when the
+    // group changes. In-flight loads are then U, not min(U, ktiles-per-group).
+    const int my_first = kt_begin + wid;
+    const int my_n = (kt_end - kt_begin - wid + step - 1) / step;
+    int cur_g = -1;
+    half2 hacc[4][2];
+    half sg[4][2];
+    #define MOEV_FLUSH() do {                                                            \
+        if (cur_g >= 0) {                                                                \
+            _Pragma("unroll")                                                             \
+            for (int j = 0; j < 4; j++)                                                  \
+                _Pragma("unroll")                                                         \
+                for (int h = 0; h < 2; h++) {                                            \
+                    const float2 f = __half22float2(hacc[j][h]);                         \
+                    facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);                  \
+                }                                                                         \
+        } } while (0)
+    #define MOEV_OPEN(g_) do {                                                           \
+        cur_g = (g_);                                                                     \
+        _Pragma("unroll")                                                                 \
+        for (int j = 0; j < 4; j++) { hacc[j][0] = __float2half2_rn(0.f);                \
+                                      hacc[j][1] = __float2half2_rn(0.f); }              \
+        _Pragma("unroll")                                                                 \
+        for (int j = 0; j < 4; j++)                                                      \
+            _Pragma("unroll")                                                             \
+            for (int h = 0; h < 2; h++)                                                  \
+                sg[j][h] = se[(long long) cur_g * N + (nbg * 4 + j) * 16 + lane / 4 + 8 * h]; \
         } while (0)
+    #define MOEV_BODY(kt_, q4_, aa_, ab_) do {                                           \
+        const int g_ = (kt_) / kt_per_group;                                             \
+        if (g_ != cur_g) { MOEV_FLUSH(); MOEV_OPEN(g_); }                                \
+        const half2 aa = (aa_), ab = (ab_);                                              \
+        const int qs[4] = { (q4_).x, (q4_).y, (q4_).z, (q4_).w };                        \
+        _Pragma("unroll")                                                                 \
+        for (int j = 0; j < 4; j++) {                                                    \
+            half2 b0[2], b1[2];                                                          \
+            dq4(qs[j], b0); dq4(qs[j] >> 8, b1);                                         \
+            hacc[j][0] = __hfma2(b0[0], aa, hacc[j][0]);                                 \
+            hacc[j][0] = __hfma2(b0[1], ab, hacc[j][0]);                                 \
+            hacc[j][1] = __hfma2(b1[0], aa, hacc[j][1]);                                 \
+            hacc[j][1] = __hfma2(b1[1], ab, hacc[j][1]);                                 \
+        } } while (0)
 
-        // ktiles THIS thread owns in this group, then U at a time with ALL loads issued before any use.
-        const int n_kt = (g1 - g0 > wid) ? ((g1 - g0 - wid + step - 1) / step) : 0;
-        const int main_n = (n_kt / U) * U;
-        int kt = g0 + wid, i = 0;
-        for (; i < main_n; i += U) {
-            int4 q4[U]; half2 av0[U], av1[U];
-            #pragma unroll
-            for (int u = 0; u < U; u++) {
-                const int ktu = kt + u * step, kb = ktu * 16 + lane_k;
-                q4[u]  = Be[(long long) b_stride * ktu + nbg * 32 + lane];
-                av0[u] = *reinterpret_cast<const half2*>(&At[kb]);
-                av1[u] = *reinterpret_cast<const half2*>(&At[kb + 8]);
-            }
-            #pragma unroll
-            for (int u = 0; u < U; u++) MOEV_BODY(q4[u], av0[u], av1[u]);
-            kt += U * step;
-        }
-        for (; i < n_kt; i++) {                    // tail when n_kt is not a multiple of U
-            const int kb = kt * 16 + lane_k;
-            MOEV_BODY(Be[(long long) b_stride * kt + nbg * 32 + lane],
-                      *reinterpret_cast<const half2*>(&At[kb]),
-                      *reinterpret_cast<const half2*>(&At[kb + 8]));
-            kt += step;
-        }
-        #undef MOEV_BODY
+    const int main_n = (my_n / U) * U;
+    int kt = my_first, i = 0;
+    for (; i < main_n; i += U) {
+        int4 q4[U]; half2 av0[U], av1[U];
         #pragma unroll
-        for (int j = 0; j < 4; j++)
-            #pragma unroll
-            for (int h = 0; h < 2; h++) {
-                const float2 f = __half22float2(hacc[j][h]);
-                facc[j][h] += (f.x + f.y) * __half2float(sg[j][h]);
-            }
+        for (int u = 0; u < U; u++) {                 // ALL U issued before any is consumed
+            const int ktu = kt + u * step, kb = ktu * 16 + lane_k;
+            q4[u]  = Be[(long long) b_stride * ktu + nbg * 32 + lane];
+            av0[u] = *reinterpret_cast<const half2*>(&At[kb]);
+            av1[u] = *reinterpret_cast<const half2*>(&At[kb + 8]);
+        }
+        #pragma unroll
+        for (int u = 0; u < U; u++) MOEV_BODY(kt + u * step, q4[u], av0[u], av1[u]);
+        kt += U * step;
     }
+    for (; i < my_n; i++) {
+        const int kb = kt * 16 + lane_k;
+        MOEV_BODY(kt, Be[(long long) b_stride * kt + nbg * 32 + lane],
+                  *reinterpret_cast<const half2*>(&At[kb]),
+                  *reinterpret_cast<const half2*>(&At[kb + 8]));
+        kt += step;
+    }
+    MOEV_FLUSH();
+    #undef MOEV_BODY
+    #undef MOEV_OPEN
+    #undef MOEV_FLUSH
 
     // fold the 4 lanes that share a column (they differ only in k phase), then across warps
     #pragma unroll

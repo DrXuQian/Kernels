@@ -138,6 +138,8 @@ int main(int argc, char** argv) {
   bad |= run<64, 8>(4, 4, 16, 512, 1024, false);
   bad |= run<32, 8, 2>(2, 8, 16, 256, 512, false);    // unrolled path, and a tail (n_kt not a multiple of U)
   bad |= run<64, 4, 4>(1, 8, 8,  256, 512, false);
+  bad |= run<32, 4, 8>(2, 8, 16, 256, 512, false);   // U spans several scale groups -- the new path
+  bad |= run<32, 2, 8>(1, 8, 8,  256, 512, false);
   printf("%s\n", bad ? "SOME CASES FAILED" : "all decode cases MATCH");
   if (bad) return 1;
   printf("--- perf, batch 1 x top-8 over 256 experts (the real decode shape) ---\n");
@@ -169,5 +171,10 @@ int main(int argc, char** argv) {
   run<32, 8,  4>(1, 8, 256, N, K, true);
   run<32, 32, 2>(1, 8, 256, N, K, true);
   run<64, 16, 2>(1, 8, 256, N, K, true);
+  // U is no longer capped by the scale group (2 ktiles), so these are reachable for the first time.
+  // sk=16 leaves 8 ktiles per warp; U=8 issues every one of them before consuming any.
+  run<32, 16, 8>(1, 8, 256, N, K, true);
+  run<32, 8,  8>(1, 8, 256, N, K, true);
+  run<32, 4,  8>(1, 8, 256, N, K, true);
   return 0;
 }
