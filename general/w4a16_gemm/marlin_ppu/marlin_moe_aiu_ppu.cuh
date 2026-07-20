@@ -23,7 +23,9 @@
 // j=0..3 directly. The permutation folds into the load-time repack we already perform for GGUF Q4_K, so it
 // costs nothing at runtime.
 //
-// SCALES: gs=32, per-32, as in the dense path. The affine min is NOT folded into the mainloop -- dense
+// SCALES: gs=32, per-32, and in _scale_perm ORDER (the kernel reads one int4 per lane; plain layout is
+// silently wrong). The MINS of the affine pass are the opposite -- plain [G][N] -- because that pass is a
+// dense GEMM to which the permutation means nothing. Two buffers, two layouts, no error either way. The affine min is NOT folded into the mainloop -- dense
 // measurements put its whole cost in the per-k shared load of frag_m, and splitting it out recovered 7.6
 // of 10.7 MFU points. Here it splits even more cleanly: Asum is per TOKEN and INDEPENDENT of the expert,
 // so it is computed once for the whole batch and only the second (tiny) GEMM is grouped.
@@ -146,7 +148,8 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
     extern __shared__ char smem_raw[];
     half* As = reinterpret_cast<half*>(smem_raw);
     unsigned short* Bs = reinterpret_cast<unsigned short*>(smem_raw) + (size_t) NST * BMR * MOE_BK;
-    // Scales for the CURRENT k-tile only. A BK-wide tile spans BK/gs groups over BN columns -- 2 x 128 =
+    // Scales for the CURRENT k-tile only, in _scale_perm order (see the int4 read below) -- so the host
+    // must hand this kernel PERMUTED scales, the same layout the dense Marlin takes. A BK-wide tile spans BK/gs groups over BN columns -- 2 x 128 =
     // 256 halves = 512 B at gs=32 -- so one cooperative load per k-tile replaces the scalar global read
     // every lane was doing per (nj, ks): 16 loads per lane per k-tile became one half per thread. Single
     // buffered, not NST-staged, because the barrier at the end of each kk iteration already protects reuse
@@ -203,6 +206,10 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
             #pragma unroll
             for (int ks = 0; ks < MOE_KSUB; ++ks) {
                 const int ko = ks * 16;
+                // _scale_perm layout: per 64-column chunk, lane/4 selects the int4; wn selects the chunk.
+                // Loaded once per k-sub-step and reused across all four nj.
+                const int4 sv = reinterpret_cast<const int4*>(Ss + (ko / 32) * MOE_BN)[wn * 8 + lane / 4];
+                const half* sg8 = reinterpret_cast<const half*>(&sv);
                 int fa[MIR][4], fb[4];
                 #pragma unroll
                 for (int mi = 0; mi < MIR; ++mi) ld_swzl(fa[mi], Ac, wm * WROW + mi * 16, ko, BMR);
@@ -219,7 +226,7 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
                     // gs=32 per-32 scale. A lane's column within the n16 tile is lane/4 for b0 and +8 for
                     // b1, matching dequant's output positions.
                     const int ctile = wn * 64 + nj * 16 + (lane / 4);      // column within the BN tile
-                    const int col0 = nb * MOE_BN + ctile;
+                    const int col0 = nb * MOE_BN + ctile; (void) col0;
 #ifdef MOE_AIU_GUARD
                     // The scale read is the one global access here indexed by a column formula rather than
                     // by the tile machinery, so it is where a warp-grid mistake lands -- and it did land
@@ -243,13 +250,18 @@ __global__ void __launch_bounds__((MWARPS * MOE_WN) * 32) moe_q4k_aiu(const half
                     // broadcast, but 8 distinct ones across 4 banks do not. The store side (Ss[i], i=tid)
                     // is consecutive halves, so two lanes share each 32-bit bank word. Both arrived with
                     // the move of the scales out of global memory -- the fix for one problem.
-                    const half* srow = Ss + (ko / 32) * MOE_BN;           // group within this k-tile
 #ifdef MOE_SCALE_CONST
                     const half2 sv0 = __float2half2_rn(1.0f), sv1 = sv0;
-                    (void) srow; (void) ctile;
 #else
-                    const half2 sv0 = __half2half2(srow[ctile]);
-                    const half2 sv1 = __half2half2(srow[ctile + 8]);
+                    // ONE int4 per lane per k-group instead of eight scalar halves. The eight columns a
+                    // lane needs are wn*64 + {0,8,...,56} + lane/4 -- the SAME set as its B fragment --
+                    // and _scale_perm exists to make exactly that set contiguous, so the dense path's
+                    // trick applies unchanged. Scalar reads had 32 lanes touching 8 distinct halves over
+                    // 4 banks; now each lane reads its own 16 B chunk, so the banks are distinct too.
+                    // Measured cost of the scalar version: removing the reads entirely was 562.7 -> 453.8
+                    // us, 19.4%, at 126 vs 120 registers -- so it was the access pattern, not a spill.
+                    const half2 sv0 = __half2half2(sg8[2 * nj]);
+                    const half2 sv1 = __half2half2(sg8[2 * nj + 1]);
 #endif
                     b0[0] = __hmul2(b0[0], sv0); b0[1] = __hmul2(b0[1], sv0);
                     b1[0] = __hmul2(b1[0], sv1); b1[1] = __hmul2(b1[1], sv1);

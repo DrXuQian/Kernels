@@ -130,7 +130,9 @@ static int run(int n_experts, int N, int K, int total_rows, int dist, bool affin
   CK(cudaMalloc(&dC, (size_t) total_rows * N * 4));
   CK(cudaMalloc(&dBounds, (n_experts + 1) * 4));
   CK(cudaMemcpy(dImg, img.data(), img.size() * 2, cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(dSp, sPlain.data(), sPlain.size() * 2, cudaMemcpyHostToDevice));
+  // PERMUTED scales: the kernel now reads them as one int4 per lane in _scale_perm order. Passing the
+  // plain layout would be silently wrong -- same trap the dense split path documents for its mins.
+  CK(cudaMemcpy(dSp, sDev.data(), sDev.size() * 2, cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dBounds, bounds.data(), (n_experts + 1) * 4, cudaMemcpyHostToDevice));
   CK(cudaMemset(dC, 0, (size_t) total_rows * N * 4));
   const auto sch = moe_sched(bounds.data(), n_experts, N, BMR);
