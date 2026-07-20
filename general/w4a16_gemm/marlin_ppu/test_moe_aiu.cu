@@ -11,6 +11,7 @@
 // the base path is right. Wiring both at once would leave two candidates for any mismatch.
 #include "marlin_moe_aiu_ppu.cuh"
 #include "marlin_moe_gguf_ppu.cuh"
+#include "affine_split_ppu.cuh"   // asum: per TOKEN and expert-independent, so one pass for the whole batch
 #include <cstdio>
 #include <vector>
 #include <random>
@@ -21,7 +22,11 @@
 
 // dist: 0 = uniform-ish, 1 = SKEWED (a few fat experts, many tiny) -- the fp16 kernel's own worst case,
 //        2 = some EMPTY experts.
-static int run(int n_experts, int N, int K, int total_rows, int dist) {
+// affine: run the min as a SEPARATE pass (symmetric AIU kernel + Asum @ m') against a reference that
+// folds it into the mainloop. Untested until now, and "it is the same shape as the dense split" is not
+// evidence -- gs=128 affine survived a whole round on exactly that reasoning while multiplying by an
+// uninitialised frag_m.
+static int run(int n_experts, int N, int K, int total_rows, int dist, bool affine = false) {
   using namespace marlin_moe_aiu_ppu;
   const int gs = 32, G = K / gs;
   const int BMR = 128;
@@ -47,8 +52,12 @@ static int run(int n_experts, int N, int K, int total_rows, int dist) {
   for (auto& x : hA) x = __float2half(0.1f * nd(rng));
   std::vector<int> Bq((size_t) n_experts * N * K);
   for (auto& x : Bq) x = qd(rng);
-  std::vector<half> sPlain((size_t) n_experts * G * N);
-  for (auto& x : sPlain) x = __float2half(0.4f + 0.6f * ((rng() % 100) / 100.0f));
+  std::vector<half> sPlain((size_t) n_experts * G * N), mPlain((size_t) n_experts * G * N);
+  for (size_t i = 0; i < sPlain.size(); i++) {
+    sPlain[i] = __float2half(0.4f + 0.6f * ((rng() % 100) / 100.0f));
+    // both signs, magnitude comparable to |q|*s, so dropping the term cannot pass
+    mPlain[i] = __float2half(affine ? ((int) (rng() % 100) - 50) / 20.0f : 0.0f);
+  }
 
   // Marlin packing per expert, then the AIU image (the swzl permutation of the same bytes).
   const size_t bwords = (size_t) (K / 16) * (N * 16 / 32) * 4;
@@ -75,10 +84,13 @@ static int run(int n_experts, int N, int K, int total_rows, int dist) {
     marlin_b_to_aiu_image(hB.data() + (size_t) e * bwords, N, K, img.data() + (size_t) e * IH * IW);
 
   // ---- reference: the Marlin-derived MoE (padded plan + per-expert launches) ----
-  std::vector<half> sDev(sPlain.size());
-  for (int e = 0; e < n_experts; e++)
+  std::vector<half> sDev(sPlain.size()), mDev(mPlain.size());
+  for (int e = 0; e < n_experts; e++) {
     marlin_gguf_ppu::marlin_permute_scales(sPlain.data() + (size_t) e * G * N,
                                            sDev.data() + (size_t) e * G * N, G, N);
+    marlin_gguf_ppu::marlin_permute_scales(mPlain.data() + (size_t) e * G * N,
+                                           mDev.data() + (size_t) e * G * N, G, N);
+  }
   const int m_tile = 16 * MARLIN_MAX_MB;
   const auto plan = marlin_moe_gguf_ppu::moe_plan(rows_expert.data(), total_rows, n_experts, m_tile);
 
@@ -97,7 +109,10 @@ static int run(int n_experts, int N, int K, int total_rows, int dist) {
     const long long nv = (long long) plan.padded_rows * (K / 8);
     marlin_moe_gguf_ppu::gather_rows<<<(int) ((nv + 255) / 256), 256>>>(dA, dAg, dSrc, plan.padded_rows, K);
   }
-  const int rr = marlin_moe_gguf_ppu::moe_cuda(dAg, dB, dCg, dS, nullptr, plan, N, K, dWS, gs, n_experts);
+  half* dMref = nullptr;
+  if (affine) { CK(cudaMalloc(&dMref, mDev.size() * 2));
+                CK(cudaMemcpy(dMref, mDev.data(), mDev.size() * 2, cudaMemcpyHostToDevice)); }
+  const int rr = marlin_moe_gguf_ppu::moe_cuda(dAg, dB, dCg, dS, dMref, plan, N, K, dWS, gs, n_experts);
   CK(cudaDeviceSynchronize());
   if (rr) { printf("reference failed ret=%d\n", rr); return 2; }
   std::vector<half> refPad((size_t) plan.padded_rows * N);
@@ -125,6 +140,20 @@ static int run(int n_experts, int N, int K, int total_rows, int dist) {
   for (int e = 0; e < n_experts; e++) maxmb = std::max(maxmb, sch.mblk_prefix[e + 1] - sch.mblk_prefix[e]);
 
   launch_moe_q4k<4, 128>(dA, dImg, dSp, dBounds, dMblk, dC, total_rows, N, K, n_experts, sch.total_tiles, gs);
+  if (affine) {
+    // Asum is per TOKEN and does NOT depend on the expert, so it is one pass for the whole batch; only the
+    // second (G-deep) GEMM is grouped. mins go in PLAIN [G][N] here -- the permuted layout is Marlin's
+    // fragment contract and means nothing to this pass.
+    half *dAsum, *dMp; int* dRowE;
+    CK(cudaMalloc(&dAsum, (size_t) total_rows * G * 2));
+    CK(cudaMalloc(&dMp, mPlain.size() * 2)); CK(cudaMalloc(&dRowE, total_rows * 4));
+    CK(cudaMemcpy(dMp, mPlain.data(), mPlain.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dRowE, rows_expert.data(), total_rows * 4, cudaMemcpyHostToDevice));
+    affine_split_ppu::asum_launch(dA, dAsum, total_rows, K, gs);
+    moe_min_correct<<<total_rows, 128>>>(dAsum, dMp, dRowE, dC, total_rows, N, G);
+    CK(cudaDeviceSynchronize());
+    cudaFree(dAsum); cudaFree(dMp); cudaFree(dRowE);
+  }
   cudaError_t e2 = cudaDeviceSynchronize();
   if (e2) { printf("  AIU kernel error: %s\n", cudaGetErrorString(e2)); return 2; }
   std::vector<float> got((size_t) total_rows * N);
@@ -134,10 +163,11 @@ static int run(int n_experts, int N, int K, int total_rows, int dist) {
   for (size_t i = 0; i < got.size(); i++) { ma = fmax(ma, fabs(got[i] - ref[i])); rm = fmax(rm, fabs(ref[i])); }
   const double rel = ma / (rm + 1e-9);
   const bool bad = rel >= 3e-2;
-  printf("  E=%-3d N=%-4d K=%-4d rows=%-5d dist=%d  tiles=%-4d maxtiles/expert=%d  rel %.2e -> %s\n",
-         n_experts, N, K, total_rows, dist, sch.total_tiles, maxmb, rel, bad ? "MISMATCH" : "MATCH");
+  printf("  E=%-3d N=%-4d K=%-4d rows=%-5d dist=%d %-3s tiles=%-4d maxtiles/expert=%d  rel %.2e -> %s\n",
+         n_experts, N, K, total_rows, dist, affine ? "aff" : "sym", sch.total_tiles, maxmb, rel,
+         bad ? "MISMATCH" : "MATCH");
   cudaFree(dA); cudaFree(dAg); cudaFree(dCg); cudaFree(dB); cudaFree(dS); cudaFree(dWS); cudaFree(dSrc);
-  cudaFree(dImg); cudaFree(dSp); cudaFree(dC); cudaFree(dBounds); cudaFree(dMblk);
+  cudaFree(dImg); cudaFree(dSp); cudaFree(dC); cudaFree(dBounds); cudaFree(dMblk); if (dMref) cudaFree(dMref);
   return bad ? 1 : 0;
 }
 
@@ -167,6 +197,14 @@ int main() {
   setenv("MOE_GRID", "1", 1);
   bad |= run(4,   256,  512,  2000, 0);   // one block does every tile: the extreme of the same path
   unsetenv("MOE_GRID");
+
+  // AFFINE: the min as its own pass, against a reference that folds it into the mainloop. Both
+  // distributions, since the correction is indexed by each row's expert and a skewed routing is where a
+  // row->expert mix-up would actually show.
+  printf("--- affine: min as a separate pass (symmetric AIU + Asum @ m') ---\n");
+  bad |= run(4,   256,  512,  2000, 0, true);
+  bad |= run(16,  256,  512,  4000, 1, true);
+  bad |= run(8,   256,  512,  1500, 2, true);
   printf("%s\n", bad ? "SOME CASES FAILED" : "all AIU MoE cases MATCH");
   return bad ? 1 : 0;
 }
