@@ -31,12 +31,22 @@ fi
 export PATH="$PPU_SDK_ROOT/bin:$PATH"
 
 cleanup() {
-  # Restore the example list and remove the overlay so the submodule's pinned content stays clean.
-  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt 2>/dev/null || true
+  # Restore the example list + any patched submodule files, and remove the overlay, so the pinned submodule
+  # content stays clean.
+  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt include/cutlass/gemm/kernel/ppu_aiu_gemm_mixed_input.hpp 2>/dev/null || true
   rm -rf "$EX_DIR"
 }
 trap cleanup EXIT
 echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
+
+# --- apply the MoE disambiguation patch(es) so the grouped mixed-input specialization is unambiguous ---
+shopt -s nullglob
+for p in "$HERE"/*.patch; do
+  if git -C "$ACTLIZE" apply --reverse --check "$p" 2>/dev/null; then echo "[build.sh] $(basename "$p") already applied";
+  elif git -C "$ACTLIZE" apply --check "$p" 2>/dev/null; then git -C "$ACTLIZE" apply "$p"; echo "[build.sh] applied $(basename "$p")";
+  else echo "ERROR: $(basename "$p") does not apply to the submodule" >&2; exit 1; fi
+done
+shopt -u nullglob
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
