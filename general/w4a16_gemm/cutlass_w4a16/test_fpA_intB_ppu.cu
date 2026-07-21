@@ -30,15 +30,21 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<int4_t> B((size_t)n*k);       // int4b_t elements (packed by the allocator)
   cutlass::DeviceAllocation<char>   ws(ws_bytes);
 
+  // weight traffic (the binding cost at small m / decode): B is int4 = N*K/2 bytes, plus N*ceil(K/gs) fp16
+  // scales. split_k partitions K so total B bytes are unchanged. Achievable HBM read ~2200 GB/s (bw_probe).
+  const double wbytes = (double)n*k/2.0 + (double)n*scale_k*2.0;
+  const double HBM_PEAK = 2200.0, TF_PEAK = 500.0;
+
   std::printf("fpA_intB official path sweep: m=%d n=%d k=%d gs=%d (FinegrainedGs128, scale-only)\n", m,n,k,g);
-  std::printf("%-24s %-10s %s\n", "TILE(MxNxK)/WARP/ST", "TFLOP/s", "MFU");
+  std::printf("  compute-bound metric = MFU vs 500 TFLOP/s ; memory-bound (small m) = %% of 2200 GB/s\n");
+  std::printf("%-32s %-9s %-6s %-9s %s\n", "TILE(MxNxK)/WARP/ST/spk", "TFLOP/s", "MFU", "GB/s", "%HBM");
 
   // GEMM timing is data-independent, so uninitialized buffers give a valid perf number (correctness checked
   // separately via the bench harness). Each TIME(...) is a distinct compiled instantiation. block_k (TK) is
   // now swept too: TK=128 satisfies the official block_k>=gs gate; TK=64 probes the relaxed gate (does the
   // FinegrainedGs128 kernel accept a group spanning 2 k-tiles?).
   const int warmup = 20, iters = 100;
-  char best_name[64] = ""; double best_tf = 0.0;
+  char best_name[64] = ""; double best_tf = 0.0, best_gbps = 0.0, best_score = 0.0;
 #define TIME(TM,TN,TK,WM,WN,ST,SPLITK) do {                                                          \
     auto launch = [&]{ fpa_intb_ppu::filter_and_run<fpa_intb_ppu::QuantMode::FinegrainedScaleOnly,   \
         TM, TN, TK, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, D.get(), m, n, k, g,        \
@@ -48,11 +54,16 @@ int main(int argc, char** argv) {
     PpuTimer t; t.start(); for (int i = 0; i < iters; i++) launch(); t.stop();                       \
     double us = double(t.elapsed_millis()) * 1e3 / iters;                                            \
     double tf = 2.0 * m * n * k / (us * 1e-6) / 1e12;                                                \
+    double gbps = wbytes / (us * 1e-6) / 1e9;                                                        \
     const char* nm = #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK;                     \
-    bool ran = tf <= 500.0;  /* faster-than-peak == kernel no-op (init/can_implement bailed) */       \
-    if (ran) std::printf("%-32s %-10.1f %.1f%%\n", nm, tf, 100.0*tf/500.0);                            \
-    else     std::printf("%-32s %-10s %s\n", nm, "-", "FAIL (no-op: init/can_implement)");            \
-    if (ran && tf > best_tf) { best_tf = tf; std::snprintf(best_name, sizeof(best_name), "%s", nm); }  \
+    /* no-op guard both regimes: faster than compute peak OR faster than HBM peak == kernel never ran */ \
+    bool ran = (tf <= TF_PEAK) && (gbps <= 1.5*HBM_PEAK);                                             \
+    if (ran) std::printf("%-32s %-9.1f %-6.1f %-9.0f %.1f%%\n", nm, tf, 100.0*tf/TF_PEAK, gbps, 100.0*gbps/HBM_PEAK); \
+    else     std::printf("%-32s %-9s %-6s %-9s %s\n", nm, "-", "-", "-", "FAIL (no-op)");             \
+    /* rank by the binding metric: MFU for large m (compute-bound), GB/s for small m (memory-bound) */ \
+    double score = (m >= 256) ? tf : gbps;                                                           \
+    if (ran && score > best_score) { best_score = score; best_tf = tf; best_gbps = gbps;             \
+                                     std::snprintf(best_name, sizeof(best_name), "%s", nm); }         \
   } while (0)
 
   // EXPANDED SEARCH SPACE. tactic+sweep (not the official LUT): we measure every config and keep the best.
@@ -75,7 +86,8 @@ int main(int argc, char** argv) {
   TIME(64,  128, 64,  32, 64, 3, 1);  TIME(128, 128, 64,  64, 64, 3, 1);
 #undef TIME
 
-  std::printf("  WINNER m=%d: %s at %.1f TFLOP/s (%.1f%%)\n", m, best_name, best_tf, 100.0*best_tf/500.0);
+  std::printf("  WINNER m=%d: %s -> %.1f TFLOP/s (%.1f%% MFU) | %.0f GB/s (%.1f%% HBM)\n",
+              m, best_name, best_tf, 100.0*best_tf/TF_PEAK, best_gbps, 100.0*best_gbps/HBM_PEAK);
   // Append the winner to a shape-keyed tactic cache (m,n,k,g|config=,tflops=), our sweep-built LUT analogue.
   {
     std::ofstream f("tactics_fpA_intB_ppu.cache", std::ios::app);
