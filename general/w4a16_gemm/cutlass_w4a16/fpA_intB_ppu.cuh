@@ -11,7 +11,7 @@
 //   - AiuInterleaved chosen from n%256==0 && k%256==0.
 //
 // ADAPTED (verified against the actlize submodule, not guessed)
-//   - builder signature: cutlass::gemm::collective::CollectiveBuilder<Sm80, OpClassTensorOp, ElementA,
+//   - builder signature: cutlass::gemm::collective::CollectiveBuilder<PPU0010, OpClassTensorOp, ElementA,
 //     LayoutA, AlignA, ElementBInfo, LayoutB, AlignB, Accum, cute::tuple<TileShape,ScaleTileShape>,
 //     ClusterShape(=WarpShape), Int<Stages>, Schedule>  (ppu_mma_builder.inl lines ~430+).
 //   - kernel Arguments {mode, problem_shape, mainloop, epilogue, batch_count, hw_info, scheduler}
@@ -59,7 +59,7 @@ template <QuantMode QuantOp, class KernelSchedule,
 void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
                       const cutlass::half_t* scales, const cutlass::half_t* zeros, cutlass::half_t* D,
                       int m, int n, int k, int group_size, int split_k,
-                      char* workspace, size_t workspace_bytes, cudaStream_t stream) {
+                      char* workspace, size_t workspace_bytes, hggcStream_t stream) {
   using ElementA = cutlass::half_t;
   using LayoutA  = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
@@ -89,12 +89,12 @@ void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm80, OperatorClass, TileShape, ClusterShape, EpilogueTileType,
+      cutlass::arch::PPU0010, OperatorClass, TileShape, ClusterShape, EpilogueTileType,
       ElementAccumulator, ElementAccumulator, ElementC, LayoutC, AlignmentC,
       ElementD, LayoutD, AlignmentD, EpilogueSchedule>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm80, OperatorClass, ElementA, LayoutA, AlignmentA,
+      cutlass::arch::PPU0010, OperatorClass, ElementA, LayoutA, AlignmentA,
       ElementBInfo, LayoutB, AlignmentB, ElementAccumulator,
       cute::tuple<TileShape, ScaleTileShape>, ClusterShape, cute::Int<Stages>, KernelSchedule>::CollectiveOp;
 
@@ -138,7 +138,7 @@ void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
 template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages, bool AiuInterleaved>
 void dispatch_gs(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
                  const cutlass::half_t* zeros, cutlass::half_t* D, int m, int n, int k, int group_size,
-                 int split_k, char* ws, size_t ws_bytes, cudaStream_t stream) {
+                 int split_k, char* ws, size_t ws_bytes, hggcStream_t stream) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   if (k % 64 || n % 64) { std::printf("[fpA_intB] n,k must be multiples of 64\n"); return; }
@@ -174,7 +174,7 @@ void dispatch_gs(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutl
 template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages>
 void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
                     const cutlass::half_t* zeros, cutlass::half_t* D, int m, int n, int k, int group_size,
-                    int split_k, char* ws, size_t ws_bytes, cudaStream_t stream) {
+                    int split_k, char* ws, size_t ws_bytes, hggcStream_t stream) {
   if (n % 256 == 0 && k % 256 == 0)
     dispatch_gs<QuantOp, TM, TN, TK, WM, WN, Stages, true >(A,B,scales,zeros,D,m,n,k,group_size,split_k,ws,ws_bytes,stream);
   else
