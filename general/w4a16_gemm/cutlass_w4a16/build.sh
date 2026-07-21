@@ -20,8 +20,15 @@ ACTLIZE="$(cd "$HERE/../../../third_party/actlize" && pwd)"
 EX_NAME="99_kernels_w4a16_compare"
 EX_DIR="$ACTLIZE/examples/$EX_NAME"
 EX_LIST="$ACTLIZE/examples/CMakeLists.txt"
-ARCH="${PPU_ARCHS:-ppu0010}"
+# This box's hgcc takes `--gpu-architecture=ppu001|ppu0015|all` (verified via `hgcc --help`); ppu001 is our
+# chip. The shipped v1.0.0 CMake instead emits the OLD naming `-arch=ppu_10`, which this hgcc does not accept
+# and silently mis-targets -- the kernel came out as a non-ppu001 ELF and the runtime aborted with
+# "e_machine ... probably a NV binary / Failed to query occupancy". actlize_ppu001.patch makes CMake pass the
+# arch name straight through (ppu001 -> -arch=ppu001, library arch 80a). Applied to the submodule before the
+# build and reverted after, so the pinned submodule content is unchanged.
+ARCH="${PPU_ARCHS:-ppu001}"
 PPU_SDK_ROOT="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
+PATCH="$HERE/actlize_ppu001.patch"
 
 if [ ! -x "$PPU_SDK_ROOT/bin/hgcc" ]; then
   echo "ERROR: hgcc not found at $PPU_SDK_ROOT/bin/hgcc. Set PPU_SDK=<path> and re-run." >&2
@@ -30,11 +37,24 @@ fi
 export PATH="$PPU_SDK_ROOT/bin:$PATH"
 
 cleanup() {
-  # Restore the example list and remove the overlay so the submodule's pinned content stays clean.
-  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt 2>/dev/null || true
+  # Restore everything we touched so the submodule's pinned content stays clean: the arch patch, the example
+  # list, and the overlay dir.
+  git -C "$ACTLIZE" checkout -- CMakeLists.txt cmake/PPUToolchain.cmake examples/CMakeLists.txt 2>/dev/null || true
   rm -rf "$EX_DIR"
 }
 trap cleanup EXIT
+
+# --- retarget the toolchain to this box's ppu001 arch naming (idempotent) ---
+if git -C "$ACTLIZE" apply --reverse --check "$PATCH" 2>/dev/null; then
+  echo "[build.sh] actlize_ppu001.patch already applied"
+elif git -C "$ACTLIZE" apply --check "$PATCH" 2>/dev/null; then
+  git -C "$ACTLIZE" apply "$PATCH"
+  echo "[build.sh] applied actlize_ppu001.patch (ppu_10 -> ppu001)"
+else
+  echo "ERROR: actlize_ppu001.patch does not apply to the submodule at $ACTLIZE" >&2
+  echo "       the pinned submodule may have moved off v1.0.0." >&2
+  exit 1
+fi
 echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 
 # --- overlay our example into the actlize example tree ---
