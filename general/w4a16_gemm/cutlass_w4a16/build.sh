@@ -49,10 +49,16 @@ if ! grep -q "$EX_NAME" "$EX_LIST"; then
 fi
 grep -q "$EX_NAME" "$EX_LIST" || { echo "ERROR: failed to register example in $EX_LIST" >&2; exit 1; }
 
+# --- tile/warp/stages tuning: forward from the environment (defaults match the stock example) ---
+TILE_M="${TILE_M:-32}"; TILE_N="${TILE_N:-32}"; WARP_M="${WARP_M:-16}"; WARP_N="${WARP_N:-16}"; STAGES="${STAGES:-3}"
+echo "[build.sh] TILE=${TILE_M}x${TILE_N} WARP=${WARP_M}x${WARP_N} STAGES=${STAGES}"
+
 # --- configure & build just our target ---
 BUILD="$ACTLIZE/build_w4a16_compare"
 rm -rf "$BUILD" && mkdir -p "$BUILD" && cd "$BUILD"
-cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
+cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" \
+  -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" \
+  >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
 make -j"$(nproc)" bench_cutlass_w4a16 2>&1 | tee make.log
 
 BIN="$(find "$BUILD" -name bench_cutlass_w4a16 -type f -perm -u+x | head -1)"

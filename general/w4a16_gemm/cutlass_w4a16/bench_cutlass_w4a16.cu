@@ -126,10 +126,29 @@ using ElementAccumulator  = float;                                          // E
 using ElementCompute      = float;                                          // Element type for epilogue computation
 using ArchTag             = cutlass::arch::PPU0010;                         // Tag indicating the minimum CU that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_32,_32,cute::Int<TileShapeK>>;           // Threadblock-level tile size
-using WarpShape           = Shape<_16,_16,cute::Int<TileShapeK>>;           // Warp Shape
+// TUNING KNOBS. The stock example ships TILE 32x32 / WARP 16x16 / 3 stages -- fine for a correctness demo,
+// but at a prefill M (compute-bound) a 32x32 threadblock tile with only 2x2=4 warps leaves the MMA pipe
+// mostly idle (measured: 25% MFU). Bigger tiles raise reuse and warp count. Overridable at compile time
+// (build.sh forwards TILE_M / TILE_N / WARP_M / WARP_N / STAGES from the environment).
+#ifndef TILE_M
+#define TILE_M 32
+#endif
+#ifndef TILE_N
+#define TILE_N 32
+#endif
+#ifndef WARP_M
+#define WARP_M 16
+#endif
+#ifndef WARP_N
+#define WARP_N 16
+#endif
+#ifndef STAGES
+#define STAGES 3
+#endif
+using TileShape           = Shape<cute::Int<TILE_M>,cute::Int<TILE_N>,cute::Int<TileShapeK>>;  // Threadblock tile
+using WarpShape           = Shape<cute::Int<WARP_M>,cute::Int<WARP_N>,cute::Int<TileShapeK>>;  // Warp tile
 
-using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperativeMixedInput;  // Kernel to launch based on the default setting in the Collective Builder 
+using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperativeMixedInput;  // Kernel to launch based on the default setting in the Collective Builder
 using EpilogueSchedule    = cutlass::epilogue::EpilogueSimtVectorized;
 using EpilogueTileType    = cutlass::epilogue::collective::EpilogueTileAuto;
 
@@ -152,7 +171,7 @@ using CollectiveMainloopConvertOnly = typename cutlass::gemm::collective::Collec
     ElementB, LayoutB_opt, AlignmentB,
     ElementAccumulator,
     cute::tuple<TileShape>, WarpShape,
-    Int<3>,
+    Int<STAGES>,
     KernelSchedule
   >::CollectiveOp;
 
@@ -173,7 +192,7 @@ using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::Collecti
     cute::tuple<ElementB, ElementScale>, LayoutB_opt, AlignmentB,
     ElementAccumulator,
     cute::tuple<TileShape>, WarpShape,
-    Int<3>,
+    Int<STAGES>,
     KernelSchedule
   >::CollectiveOp;
 
@@ -193,7 +212,7 @@ using CollectiveMainloopScaleWithZeroPoint = typename cutlass::gemm::collective:
     cute::tuple<ElementB, ElementScale, ElementZero>, LayoutB_opt, AlignmentB,
     ElementAccumulator,
     cute::tuple<TileShape>, WarpShape,
-    Int<3>,
+    Int<STAGES>,
     KernelSchedule
   >::CollectiveOp;
 

@@ -51,8 +51,31 @@ cd ../marlin_ppu && make bench_marlin_gguf && ./bench_marlin_gguf 2048 4096 4096
 #   -> read the gs=128, aff=false line (symmetric dense W4A16), same shape as the actlize --mode=1 run
 ```
 
-Both print a `us` / weight-`GB/s` line; the actlize line is labelled `[CUTLASS gs=128]`. Divide bandwidth by
-the **achievable** read bandwidth (~2200 GB/s from `bw_probe`), not the 2766 nameplate.
+At a prefill M the GEMM is compute-bound, so the metric is **MFU vs the 500 TFLOP/s fp16 peak**, not %HBM
+(that only binds at decode M~1). Both lines report it; the actlize line is `[CUTLASS gs=128]`.
+
+## First result (2048x4096x4096, gs=128)
+
+| | time | MFU |
+|---|---|---|
+| marlin gs=128 sym | 319 us | **43.1%** |
+| actlize, stock 32x32 tile | 548 us | 25% |
+
+actlize's default loses purely on tile size: a 32x32 threadblock tile with 2x2=4 warps starves the MMA pipe.
+It is tunable — see below. (marlin itself is also undersubscribed here, only 16 CTAs on 72 CUs.)
+
+## Tuning the actlize tile
+
+`bench_cutlass_w4a16.cu` exposes `TILE_M / TILE_N / WARP_M / WARP_N / STAGES` (defaults = the stock
+32/32/16/16/3). build.sh forwards them from the environment to both the host and device compiles:
+
+```bash
+TILE_M=128 TILE_N=128 WARP_M=64 WARP_N=64 STAGES=4 ./build.sh
+TILE_M=128 TILE_N=256 WARP_M=64 WARP_N=64 STAGES=3 ./build.sh
+```
+
+Sweep tile/warp/stages and read the `[CUTLASS gs=128]` MFU line. Not every combination will compile or run
+on the mixed-input AIU mainloop — keep WARP a divisor of TILE and a multiple of the 16x16 MMA atom.
 
 ## Entry file
 
