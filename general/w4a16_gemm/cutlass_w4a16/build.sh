@@ -20,10 +20,10 @@ ACTLIZE="$(cd "$HERE/../../../third_party/actlize" && pwd)"
 EX_NAME="99_kernels_w4a16_compare"
 EX_DIR="$ACTLIZE/examples/$EX_NAME"
 EX_LIST="$ACTLIZE/examples/CMakeLists.txt"
-# This box's hgcc takes -arch=ppu001 (mapped to library arch 80a); the shipped v1.0.0 CMake hard-codes the
-# ppu0010 / -arch=ppu_10 naming instead. actlize_ppu001.patch retargets it. Applied to the submodule before
-# build and reverted after, so the pinned submodule content is unchanged.
-ARCH="${PPU_ARCHS:-ppu001}"
+# The arch naming depends on which PPU SDK is installed. Some SDKs' hgcc takes -arch=ppu001 (library arch
+# 80a); shipped v1.0.0 hard-codes ppu0010 / -arch=ppu_10. actlize_ppu001.patch retargets the former. It is
+# AUTO-DETECTED below: applied only if it applies cleanly (old-naming SDK), skipped otherwise (an SDK whose
+# naming already matches shipped). ARCH follows: ppu001 when patched, ppu0010 when not. Override with PPU_ARCHS.
 PPU_SDK_ROOT="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
 PATCH="$HERE/actlize_ppu001.patch"
 
@@ -41,17 +41,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- retarget the toolchain to this box's ppu001 arch naming ---
-if git -C "$ACTLIZE" apply --check "$PATCH" 2>/dev/null; then
+# --- auto-detect arch naming: patch the toolchain only if the patch applies to the shipped naming ---
+DEFAULT_ARCH="ppu0010"
+if git -C "$ACTLIZE" apply --reverse --check "$PATCH" 2>/dev/null; then
+  echo "[build.sh] actlize_ppu001.patch already applied"
+  DEFAULT_ARCH="ppu001"
+elif git -C "$ACTLIZE" apply --check "$PATCH" 2>/dev/null; then
   git -C "$ACTLIZE" apply "$PATCH"
   echo "[build.sh] applied actlize_ppu001.patch (ppu0010/-arch=ppu_10 -> ppu001)"
-elif git -C "$ACTLIZE" apply --reverse --check "$PATCH" 2>/dev/null; then
-  echo "[build.sh] actlize_ppu001.patch already applied"
+  DEFAULT_ARCH="ppu001"
 else
-  echo "ERROR: actlize_ppu001.patch does not apply to the submodule at $ACTLIZE" >&2
-  echo "       the pinned submodule may have moved off v1.0.0." >&2
-  exit 1
+  echo "[build.sh] actlize_ppu001.patch does not apply -- SDK naming already matches shipped, building ppu0010"
 fi
+ARCH="${PPU_ARCHS:-$DEFAULT_ARCH}"
+echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
