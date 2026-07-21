@@ -832,26 +832,39 @@ void xcheck_grouped(Options const& options) {
       ws.get(), ws_bytes, /*stream=*/nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
-  bool const ok = cutlass::reference::device::BlockCompareRelativelyEqual(
+  // Two independent comparisons, both zero-new-math:
+  //   (A) grp vs block_ref_D  -- the fp16 dequant->GemmRef reference (algorithm-independent golden).
+  //   (B) grp vs block_D      -- the VERIFIED mixed kernel's OWN output (same collective, same shuffled B).
+  //       (B) is the sharpest: grouped just wraps the same collective, so on identical data it should be
+  //       near-bit-identical to block_D. A big (B) delta localizes the bug to the group wrapper itself.
+  bool const okR = cutlass::reference::device::BlockCompareRelativelyEqual(
       block_ref_D.get(), Dgrp.get(), (size_t)m * n, ElementD(1e-2f), ElementD(1e-4f));
+  bool const okK = cutlass::reference::device::BlockCompareRelativelyEqual(
+      block_D.get(), Dgrp.get(), (size_t)m * n, ElementD(1e-2f), ElementD(1e-4f));
 
-  std::vector<ElementD> hr((size_t)m * n), hg((size_t)m * n);
-  block_ref_D.copy_to_host(hr.data()); Dgrp.copy_to_host(hg.data());
-  double maxrel = 0; int bad = 0;
+  std::vector<ElementD> hr((size_t)m * n), hk((size_t)m * n), hg((size_t)m * n);
+  block_ref_D.copy_to_host(hr.data()); block_D.copy_to_host(hk.data()); Dgrp.copy_to_host(hg.data());
+  double maxrelR = 0, maxrelK = 0; int badR = 0, badK = 0;
   for (size_t i = 0; i < (size_t)m * n; ++i) {
-    double r = float(hr[i]), gt = float(hg[i]);
-    double rel = std::abs(gt - r) / (std::abs(r) + 1e-3);
-    if (rel > maxrel) maxrel = rel;
-    if (rel > 5e-2) ++bad;
+    double r = float(hr[i]), kk = float(hk[i]), gt = float(hg[i]);
+    double relR = std::abs(gt - r) / (std::abs(r) + 1e-3);
+    double relK = std::abs(gt - kk) / (std::abs(kk) + 1e-3);
+    if (relR > maxrelR) maxrelR = relR;  if (relR > 5e-2) ++badR;
+    if (relK > maxrelK) maxrelK = relK;  if (relK > 5e-2) ++badK;
   }
-  std::printf("\n[xcheck grouped L=1] m=%d n=%d k=%d g=%d  BlockCompare=%s  max_rel=%.3e  bad=%d/%zu -> %s\n",
-              m, n, k, g, ok ? "PASS" : "FAIL", maxrel, bad, (size_t)m * n, bad == 0 ? "MATCH" : "MISMATCH");
-  std::printf("  ref_D[0..5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hr[i]));
-  std::printf("\n  grp_D[0..5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[i]));
-  // Also dump the second row start (index n) to check for a transpose/stride error signature.
-  std::printf("\n  ref_D[n..n+5]="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hr[n + i]));
+  std::printf("\n[xcheck grouped L=1] m=%d n=%d k=%d g=%d\n", m, n, k, g);
+  std::printf("  (A) grp vs ref_D (dequant golden): max_rel=%.3e bad=%d/%zu -> %s\n",
+              maxrelR, badR, (size_t)m * n, badR == 0 ? "MATCH" : "MISMATCH");
+  std::printf("  (B) grp vs block_D (verified kernel): max_rel=%.3e bad=%d/%zu -> %s\n",
+              maxrelK, badK, (size_t)m * n, badK == 0 ? "MATCH" : "MISMATCH");
+  std::printf("  ref_D[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hr[i]));
+  std::printf("\n  blkD[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[i]));
+  std::printf("\n  grp_D[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[i]));
+  // Second row start (index n): a transpose/stride bug shows as grp reading a different row/col here.
   std::printf("\n  grp_D[n..n+5]="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[n + i]));
+  std::printf("\n  blkD[n..n+5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[n + i]));
   std::printf("\n");
+  (void)okR; (void)okK;
 }
 #endif
 
