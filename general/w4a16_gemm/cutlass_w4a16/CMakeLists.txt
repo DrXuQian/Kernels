@@ -52,3 +52,10 @@ cutlass_example_add_executable(
   test_moe_grouped_ppu.cu
 )
 target_compile_options(test_moe_grouped_ppu PRIVATE -w)
+
+# STEP 2b correctness gate: ragged grouped mixed-input vs CPU reference. TARGET=test_moe_grouped_verify ./build.sh
+cutlass_example_add_executable(
+  test_moe_grouped_verify
+  test_moe_grouped_verify.cu
+)
+target_compile_options(test_moe_grouped_verify PRIVATE -w)
