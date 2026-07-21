@@ -56,6 +56,24 @@ int main() {
   { std::vector<half_t> tmp(hA.size()); for (size_t i=0;i<hA.size();i++) tmp[i]=half_t(hA[i]); A.copy_from_host(tmp.data()); }
   { std::vector<half_t> tmp(hSc.size()); for (size_t i=0;i<hSc.size();i++) tmp[i]=half_t(hSc[i]); scales.copy_from_host(tmp.data()); }
   B.copy_from_host(reinterpret_cast<int4_t const*>(Bbuf.data()));
+
+  // Reference weight = OFFICIAL dequantize_weight(raw B) -- the ground truth the kernel matches (example 16's
+  // verify relies on this pairing). Do NOT hand-roll the dequant convention. raw int4 (packed) on device;
+  // dequant per expert -> Wdq[e] fp16 [N][K]; zeros = 0.
+  cutlass::DeviceAllocation<int4_t> Braw((size_t)L*N*K);
+  Braw.copy_from_host(reinterpret_cast<int4_t const*>(packed.data()));
+  cutlass::DeviceAllocation<half_t> Wdq((size_t)L*N*K), zeros((size_t)L*N*scale_k);
+  { std::vector<half_t> z((size_t)L*N*scale_k, half_t(0.f)); zeros.copy_from_host(z.data()); }
+  using SB = cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>;
+  for (int e=0;e<L;e++) {
+    auto lB  = cute::make_layout(cute::make_shape(N,K,1), cutlass::make_cute_packed_stride(SB{}, cute::make_shape(N,K,1)));
+    auto lsz = cute::make_layout(cute::make_shape(N,scale_k,1));
+    dequantize_weight(Wdq.get()+(size_t)e*N*K, Braw.get()+(size_t)e*N*K, lB,
+                      scales.get()+(size_t)e*N*scale_k, zeros.get()+(size_t)e*N*scale_k, lsz, gs);
+  }
+  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+  std::vector<half_t> hWdq((size_t)L*N*K); Wdq.copy_to_host(hWdq.data());
+
   using GS = moe_grouped_ppu::GroupShape;
   std::vector<GS> rshapes(L); for (int e=0;e<L;e++) rshapes[e]=cute::make_shape(me[e],N,K);
   cutlass::DeviceAllocation<GS> rdev(L); rdev.copy_from_host(rshapes.data());
@@ -71,14 +89,15 @@ int main() {
 
   std::vector<half_t> hD((size_t)L*Mmax*N); D.copy_to_host(hD.data());
 
-  // CPU reference per expert, compare its M_e rows.
+  // CPU reference per expert = A @ Wdq (Wdq from the official dequant). Compare its M_e rows.
   double max_rel = 0; int bad = 0;
   for (int e=0;e<L;e++)
     for (int i=0;i<me[e];i++)
       for (int j=0;j<N;j++){
         double ref = 0;
         for (int kk=0;kk<K;kk++)
-          ref += hA[(size_t)(offs[e]+i)*K + kk] * (double)hSc[(size_t)e*N*scale_k + j*scale_k + kk/gs] * (double)rawB[(size_t)e*N*K + j*K + kk];
+          // Wdq is ColumnMajor (N-contiguous) per dequantize_weight's operand_layout: element (n,k) at n + k*N.
+          ref += hA[(size_t)(offs[e]+i)*K + kk] * (double)float(hWdq[(size_t)e*N*K + j + (size_t)kk*N]);
         double got = (double)float(hD[(size_t)e*Mmax*N + i*N + j]);   // cutlass::half_t -> float (no cuda_fp16)
         double rel = std::abs(got-ref)/(std::abs(ref)+1e-3);
         if (rel > max_rel) max_rel = rel;
