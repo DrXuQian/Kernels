@@ -27,18 +27,10 @@ cutlass_example_add_executable(
 target_compile_definitions(bench_cutlass_w4a16 PRIVATE
   TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES})
 target_compile_options(bench_cutlass_w4a16 PRIVATE -w)
-
-# Root-cause cross-check: same source, compiled with -DMOEG_XCHECK, which runs the grouped kernel (L=1) on the
-# VERIFIED bench data (block_A / shuffled block_B_buff / block_scale) and compares vs block_ref_D. No hand-rolled
-# reference. Build: TARGET=bench_xcheck_grouped ./build.sh ; run with --mode=1 --n=... --k=... (multiples of 256).
-cutlass_example_add_executable(
-  bench_xcheck_grouped
-  bench_cutlass_w4a16.cu
-  DEV_COMPILE_FLAGS ${_W4A16_DEFS} -DMOEG_XCHECK
-)
-target_compile_definitions(bench_xcheck_grouped PRIVATE
-  TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES} MOEG_XCHECK)
-target_compile_options(bench_xcheck_grouped PRIVATE -w)
+# Root-cause cross-check is now a RUNTIME flag on this same binary (--xcheck): it runs the grouped kernel (L=1)
+# on the verified bench data (block_A / shuffled block_B_buff / block_scale) and compares vs block_ref_D and the
+# mixed kernel's block_D. No separate target / no -D (the two-stage PPU build did not propagate -DMOEG_XCHECK to
+# host main reliably). Build stock: ./build.sh ; run: <bin> --xcheck --m=256 --n=4096 --k=4096 --g=128 --mode=1.
 
 # Official-structured finegrained launcher (fpA_intB_ppu.cuh) mixed-input sweep. Build with:
 #   TARGET=test_fpA_intB_ppu ./build.sh

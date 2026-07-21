@@ -75,12 +75,11 @@
 #include "ppu_include.hpp"
 #include "cutlass/gemm/collective/builders/ppu_mma_builder.inl"
 
-#ifdef MOEG_XCHECK
-// Cross-check hook: pull in the grouped mixed-input launcher so we can run it (L=1) on THIS file's own
-// verified data. Guarded so the stock bench target is byte-identical. ppu_mma_builder.inl is #pragma once, so
-// re-inclusion via moe_grouped_ppu.cuh is safe.
+// Cross-check hook: pull in the grouped mixed-input launcher so we can run it (L=1) on THIS file's own verified
+// data via a runtime --xcheck flag. Always included (no compile-time guard): the two-stage PPU host/device
+// build made -DMOEG_XCHECK unreliable to propagate to host main(), so we gate at runtime instead.
+// ppu_mma_builder.inl is #pragma once, so re-inclusion via moe_grouped_ppu.cuh is safe.
 #include "moe_grouped_ppu.cuh"
-#endif
 
 using namespace cute;
 
@@ -361,6 +360,7 @@ struct Options {
   std::string save_tactic_file;  // write the searched winner to a cache
   bool list_configs = false;
   bool search_configs = false;
+  bool xcheck = false;           // --xcheck: run the grouped kernel (L=1) on this run's verified data and compare
 
   // Parses the command line
   void parse(int argc, char const **args) {
@@ -385,6 +385,7 @@ struct Options {
     cmd.get_cmd_line_argument("save_tactic", save_tactic_file);
     list_configs   = cmd.check_cmd_line_flag("list_configs");
     search_configs = cmd.check_cmd_line_flag("search_configs");
+    xcheck         = cmd.check_cmd_line_flag("xcheck");
   }
 
   /// Prints the usage statement.
@@ -802,7 +803,6 @@ void save_tactic(std::string const& path, Options const& o, std::string const& n
   out << key << "|config=" << name << ",tflops=" << tflops << "\n";
 }
 
-#ifdef MOEG_XCHECK
 // ================================ GROUPED KERNEL CROSS-CHECK (L=1) ================================
 // The decisive root-cause test. Reuses this file's initialize()-produced data VERBATIM:
 //   block_A         -- the same A the verified mixed kernel uses,
@@ -866,7 +866,6 @@ void xcheck_grouped(Options const& options) {
   std::printf("\n");
   (void)okR; (void)okK;
 }
-#endif
 
 int main(int argc, char const **args) {
   hggcDeviceProp props;
@@ -908,17 +907,15 @@ int main(int argc, char const **args) {
   }
   std::cout << (options.g == options.k ? "PPU1.0 per-column scale mode.\n" : "PPU1.0 group scale mode.\n");
 
-#ifdef MOEG_XCHECK
-  // Root-cause cross-check: run the VERIFIED mixed kernel once (fills block_ref_D + the shuffled block_B_buff),
-  // then run the grouped kernel L=1 on that exact data and compare. Bypasses the tactic path entirely.
-  {
+  // Root-cause cross-check (runtime --xcheck): run the VERIFIED mixed kernel once (fills block_ref_D + the
+  // shuffled block_B_buff), then run the grouped kernel L=1 on that exact data and compare. Bypasses tactics.
+  if (options.xcheck) {
     std::cout << "[xcheck] verified mixed kernel -> reference, then grouped L=1 on the SAME data\n";
     Options o = options; o.iterations = 0;   // correctness only, skip timing
     run<GemmScaleOnly>(o);                    // fills block_A / block_B_buff / block_scale / block_ref_D
     xcheck_grouped(o);
     return 0;
   }
-#endif
 
   // --search_configs: time every compiled config (in-process, no recompile), keep the best that PASSED,
   // print a table, optionally persist to a tactic cache, then run the winner once.
