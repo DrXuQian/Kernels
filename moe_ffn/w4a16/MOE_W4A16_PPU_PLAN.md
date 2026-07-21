@@ -52,6 +52,34 @@ port, mirroring exactly how BatchArray got grouped:
 This is the actlize analogue of `MoeFCGemm<mixed-input Mma>`. It is a real cutlass3 collective+kernel port and
 needs on-box compile iteration (private SDK; cannot compile here).
 
+### Step-2 recipe (MINIMAL ragged: only A is ragged; B/S/Z stay L-strided)
+
+Key simplification found by reading the collectives: in a MoE grouped GEMM only **A** is ragged (variable
+tokens/expert). **B, scale, zero are uniform per-expert stride** (`[experts][N][K]`, `[experts][N][scale_k]`),
+which the mixed-input collective ALREADY addresses via its `l_coord` L-slice (verified: lines 367/380/391).
+So we do NOT need to grouped-ize B/S/Z pointers -- only A. That is much smaller than fully mirroring
+BatchArray (which arrays all of ptr_A/ptr_B).
+
+Delivered as an actlize patch (like actlize_ppu001.patch; submodule stays pinned) applied by build.sh:
+
+1. **Mixed-input collective** (`ppu_mma_aiu_multistage_mixed_input.hpp`): add a per-expert A base to its
+   Params/Arguments -- `ElementA const* const* ptr_A_array` + a per-expert row offset (or pass
+   `total_tokens_including_expert`). In `load_init`, when grouped, build `mA` from
+   `ptr_A_array[l_coord]` with shape `(M_e, K)` instead of `mA_mkl(_,_,l_coord)`. B/scale/zero paths unchanged
+   (keep the l_coord L-slice). `M_e` comes from the group problem shape.
+
+2. **Grouped kernel** (copy `ppu_aiu_gemm_mixed_input.hpp`, NOT array_group -- the mixed-input kernel already
+   drives the mixed-input collective's `load_init(blk_coord)`/scale-aware `operator()`): add the GroupScheduler
+   + `GroupProblemShape` (per-expert `[M_e,N,K]`) from `ppu_aiu_gemm_array_group.hpp`, so tiles map to
+   (expert, m-offset) over ragged M. `l_coord` from the scheduler selects B/S/Z (L-slice) and indexes the A
+   base array. Relax nothing about scales -- the mixed-input collective already carries them.
+
+3. **Host**: routing -> per-expert token counts -> `GroupProblemShape` + `ptr_A_array[e] = A + cumtokens[e]*K`.
+   A is one contiguous `[sum_tokens][K]` (tokens permuted by expert), exactly like trtllm.
+
+This keeps the entire scale/dequant path (the hard, tuned part) untouched and adds only ragged-A addressing +
+the group tile scheduler -- the smallest change that yields a true ragged mixed-precision grouped GEMM.
+
 ### Uniform-m fast path (stepping stone, NOT the goal)  -- DONE, VALIDATED
 Step 1 result on ppu001 (moe_gemm_ppu.cuh + test_moe_gemm_ppu.cu), qwen35moe FC1 n=1024 k=2048, 8 experts,
 uniform m_per_expert, winner tile 64x64x128/s3 (same as dense): m=128 43.6% MFU, m=512 49.6%, m=2048 55.6%;
