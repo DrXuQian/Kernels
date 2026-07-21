@@ -52,7 +52,12 @@ port, mirroring exactly how BatchArray got grouped:
 This is the actlize analogue of `MoeFCGemm<mixed-input Mma>`. It is a real cutlass3 collective+kernel port and
 needs on-box compile iteration (private SDK; cannot compile here).
 
-### Uniform-m fast path (stepping stone, NOT the goal)
+### Uniform-m fast path (stepping stone, NOT the goal)  -- DONE, VALIDATED
+Step 1 result on ppu001 (moe_gemm_ppu.cuh + test_moe_gemm_ppu.cu), qwen35moe FC1 n=1024 k=2048, 8 experts,
+uniform m_per_expert, winner tile 64x64x128/s3 (same as dense): m=128 43.6% MFU, m=512 49.6%, m=2048 55.6%;
+FC2 (n=2048 k=512) m=512 36.9%. So rank-4 mixed-input compiles/runs, the per-expert GEMM works, and the dense
+tuning transfers. Step 2 (ragged) changes ONLY the addressing; the collective math is identical.
+
 `general/w4a16_gemm/cutlass_w4a16/moe_gemm_ppu.cuh` drives the EXISTING batched mixed-input kernel (rank-4
 [M,N,K,L], `l_coord=blockIdx.z`) -- works when every expert has the same m_per_expert (what the machete bench
 assumes). Useful to validate the mixed-input-per-expert GEMM math + tuning before the ragged scheduler, but it
