@@ -40,6 +40,7 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
             const cutlass::half_t* zeros, cutlass::half_t* D,
             int m, int n, int k, int L, int group_size,
             GroupShape* group_shapes_dev, GroupShape const* group_shapes_host,
+            int const* group_row_offsets,   // ragged: per-expert cumulative A row start; null=uniform
             char* workspace, size_t workspace_bytes, hggcStream_t stream) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
@@ -88,7 +89,7 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   typename Gemm::Arguments args{
     cutlass::gemm::GemmUniversalMode::kGrouped,
     ps,
-    { A, sA, B, sB, scales, sS, group_size, zeros },
+    { A, sA, B, sB, scales, sS, group_size, zeros, group_row_offsets },
     { {ElementAccumulator(1.f), ElementAccumulator(0.f)}, (ElementC*)nullptr, sC, D, sD },
     hw
   };
@@ -105,12 +106,13 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
 template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages>
 void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
                     const cutlass::half_t* zeros, cutlass::half_t* D, int m, int n, int k, int L, int group_size,
-                    GroupShape* gsd, GroupShape const* gsh, char* ws, size_t ws_bytes, hggcStream_t stream) {
+                    GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
+                    char* ws, size_t ws_bytes, hggcStream_t stream) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL>( \
-      A,B,scales,zeros,D,m,n,k,L,group_size,gsd,gsh,ws,ws_bytes,stream)
+      A,B,scales,zeros,D,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream)
   if constexpr (is_finegrained(QuantOp)) {
     if (group_size == 128) { constexpr int SK=(TK+127)/128;
       if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs128, cute::Int<SK>, true);

@@ -33,7 +33,9 @@ export PATH="$PPU_SDK_ROOT/bin:$PATH"
 cleanup() {
   # Restore the example list + any patched submodule files, and remove the overlay, so the pinned submodule
   # content stays clean.
-  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt include/cutlass/gemm/kernel/ppu_aiu_gemm_mixed_input.hpp 2>/dev/null || true
+  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt \
+    include/cutlass/gemm/kernel/ppu_aiu_gemm_mixed_input.hpp \
+    include/cutlass/gemm/collective/ppu_mma_aiu_multistage_mixed_input.hpp 2>/dev/null || true
   rm -rf "$EX_DIR"
 }
 trap cleanup EXIT

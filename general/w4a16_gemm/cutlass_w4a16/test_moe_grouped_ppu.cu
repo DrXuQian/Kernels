@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
   auto launch = [&]{
     moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64,64,128, 32,32, 3>(
         A.get(), B.get(), scales.get(), nullptr, D.get(), m, n, k, L, g,
-        dev_shapes.get(), host_shapes.data(), ws.get(), ws_bytes, nullptr);
+        dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr, ws.get(), ws_bytes, nullptr);
   };
   launch();
   std::printf("launch issued (compile + can_implement + run gate).\n");
