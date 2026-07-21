@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <algorithm>
 #include "cutlass/util/device_memory.h"
 #include "helper.h"
 #include "moe_grouped_ppu.cuh"
@@ -42,6 +43,36 @@ int main(int argc, char** argv) {
   PpuTimer t; t.start(); for (int i=0;i<iters;i++) launch(); t.stop();
   double us = double(t.elapsed_millis())*1e3/iters;
   double tf = 2.0*L*m*n*k/(us*1e-6)/1e12;
-  std::printf("  [MoE grouped 64x64x128/s3] %.2f us | %.1f TFLOP/s (%.1f%% MFU)\n", us, tf, 100.0*tf/500.0);
+  std::printf("  [MoE grouped uniform 64x64x128/s3] %.2f us | %.1f TFLOP/s (%.1f%% MFU)\n", us, tf, 100.0*tf/500.0);
+
+  // ---- RAGGED (step 2b): variable tokens per expert ----
+  // A is one contiguous [sum_tokens][K]; group_row_offsets = exclusive prefix sum of per-expert token counts.
+  // B/scales stay [L][.] uniform. D is padded [L][M_max][N] (epilogue L-slice writes expert e's rows into
+  // D[e]); a contiguous ragged D is 2c (epilogue offset). group shapes give per-expert M_e to the scheduler.
+  std::vector<int> me(L), offs(L);
+  int total = 0, Mmax = 0;
+  for (int e = 0; e < L; e++) { me[e] = 64 * (e % 4 + 1); offs[e] = total; total += me[e]; Mmax = std::max(Mmax, me[e]); }
+  std::vector<GS> rshapes(L);
+  for (int e = 0; e < L; e++) rshapes[e] = cute::make_shape(me[e], n, k);
+  cutlass::DeviceAllocation<GS>  rdev(L);  rdev.copy_from_host(rshapes.data());
+  cutlass::DeviceAllocation<int> offdev(L); offdev.copy_from_host(offs.data());
+  cutlass::DeviceAllocation<half_t> Arag((size_t)total*k), Drag((size_t)L*Mmax*n);
+  const size_t ws2 = (size_t)cutlass::ceil_div(Mmax,16)*cutlass::ceil_div(n,64)*L*64;
+  cutlass::DeviceAllocation<char> wsr(ws2);
+
+  std::printf("MoE grouped RAGGED: experts=%d tokens/expert=[", L);
+  for (int e=0;e<L;e++) std::printf("%d%s", me[e], e+1<L?",":"]"); std::printf(" total=%d n=%d k=%d gs=%d\n", total, n, k, g);
+  auto launch_r = [&]{
+    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64,64,128, 32,32, 3>(
+        Arag.get(), B.get(), scales.get(), nullptr, Drag.get(), Mmax, n, k, L, g,
+        rdev.get(), rshapes.data(), offdev.get(), wsr.get(), ws2, nullptr);
+  };
+  launch_r();
+  std::printf("ragged launch issued.\n");
+  for (int i=0;i<warmup;i++) launch_r();
+  PpuTimer tr; tr.start(); for (int i=0;i<iters;i++) launch_r(); tr.stop();
+  double usr = double(tr.elapsed_millis())*1e3/iters;
+  double tfr = 2.0*total*n*k/(usr*1e-6)/1e12;
+  std::printf("  [MoE grouped RAGGED 64x64x128/s3] %.2f us | %.1f TFLOP/s (%.1f%% MFU)\n", usr, tfr, 100.0*tfr/500.0);
   return 0;
 }
