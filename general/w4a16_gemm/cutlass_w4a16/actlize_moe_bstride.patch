@@ -1,0 +1,17 @@
+diff --git a/include/cutlass/gemm/collective/ppu_mma_aiu_multistage_mixed_input.hpp b/include/cutlass/gemm/collective/ppu_mma_aiu_multistage_mixed_input.hpp
+index a49891d7..9a0fd7e4 100644
+--- a/include/cutlass/gemm/collective/ppu_mma_aiu_multistage_mixed_input.hpp
++++ b/include/cutlass/gemm/collective/ppu_mma_aiu_multistage_mixed_input.hpp
+@@ -629,7 +629,11 @@ private:
+     if constexpr (kCon != 1) {
+       Tensor mB_nkl = make_tensor(make_gmem_ptr(mainloop_params.ptr_B),
+         make_shape(N, make_shape(kCon, K / kCon), L),
+-        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N), cute::Int<0>{})
++        // GROUPED FIX: L-stride was hardcoded cute::Int<0>{} -- correct for L=1 (example 16) but it
++        // makes every expert read plane 0 when L>1, so grouped MoE returned expert-0 for all experts. One
++        // interleaved-256 expert weight spans N*K int4 elements, so the real L-stride is N*K (matches the
++        // non-interleaved branch dB L-stride n*k).
++        make_stride(kCon, make_stride(cute::Int<1>{}, kCon * N), int64_t(N) * int64_t(K))
+       );
+       Tensor mB_nk = mB_nkl(_,_,l_coord);
+       auto layout_counting = make_layout(
