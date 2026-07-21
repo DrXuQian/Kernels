@@ -85,6 +85,14 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   StrideC sC = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(n, m, L));
   StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
 
+#ifdef MOEG_DEBUG
+  // GET THE LAYOUT, don't guess: print the actual strides the kernel uses for A/B/C/D/scale + the swap flag.
+  { static bool once = true; if (once) { once = false;
+    std::printf("[moe_grouped layout] m=%d n=%d k=%d L=%d gs=%d\n", m,n,k,L,group_size);
+    std::printf("  StrideA="); cute::print(sA); std::printf("\n  StrideB="); cute::print(sB);
+    std::printf("\n  StrideC="); cute::print(sC); std::printf("\n  StrideD="); cute::print(sD);
+    std::printf("\n  StrideScale="); cute::print(sS); std::printf("\n"); } }
+#endif
   GroupProblemShape ps; ps.num_groups = L; ps.problem_shapes = group_shapes_dev; ps.host_problem_shapes = group_shapes_host;
   cutlass::KernelHardwareInfo hw{};   // cu_count auto-queried in to_underlying_arguments
 

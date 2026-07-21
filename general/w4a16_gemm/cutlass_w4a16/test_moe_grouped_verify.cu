@@ -8,6 +8,7 @@
 // (ColumnMajor) path, so preprocess with RowsPerTile=-1 to match filter_and_run's il=false branch.
 //
 // UNTESTED on box; likely needs iteration on the int4 packing / preprocess convention.
+#define MOEG_DEBUG   // print the kernel's actual A/B/C/D/scale strides (get the layout, don't guess)
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
