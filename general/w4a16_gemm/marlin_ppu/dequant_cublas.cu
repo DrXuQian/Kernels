@@ -65,9 +65,11 @@ int main(int argc, char** argv) {
   };
 
   printf("dequant+cublas fp16: M=%d N=%d K=%d gs=%d\n", M, N, K, gs);
-  // gemm-only: reads the fp16 weight (N*K*2, the 2x cost) + activations (M*K*2).
-  report("dequant+cublas gemm-only", tm(gemm),     (double)N*K*2 + (double)M*K*2);
-  // per-call: also reads int4 (N*K/2) + writes the fp16 weight (N*K*2) in the dequant step.
+  // PER-CALL ONLY. The "offline" (pre-dequantized, gemm-only) variant was dropped: it keeps a fp16 weight
+  // resident = 2x the int4 in HBM, which defeats W4A16's whole point ("不能两份在显存"). per-call is the
+  // honest number -- dequant expanded, used by one GEMM, discarded -- and tm() brackets { dequant; gemm; }
+  // together so the dequant->cublas launch overhead between the two kernels IS counted.
+  // Bytes: int4 read (N*K/2) + fp16 weight write in dequant (N*K*2) + fp16 weight read in gemm (N*K*2) + A.
   report("dequant+cublas per-call",  tm(per_call), (double)N*K/2 + (double)N*K*2 + (double)N*K*2 + (double)M*K*2);
   cublasDestroy(cub);
   return 0;

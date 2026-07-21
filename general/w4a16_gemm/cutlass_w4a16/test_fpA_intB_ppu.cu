@@ -9,15 +9,8 @@
 #include <cstdlib>
 #include <fstream>
 #include "cutlass/util/device_memory.h"
-#include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "fpA_intB_ppu.cuh"
-#include "unfused_weight_dequantize.hpp"   // official CuTe dequantize_weight (same file example 16 verifies with)
-
-// cublas lives in a SEPARATE host TU (cublas_backend.cpp): cublas_v2.h drags CUDA's cuda_fp16/cuda_bf16 whose
-// ::__half2 / ::__nv_bfloat16 clash with the PPU SDK's hggc headers, so it must never share this TU. We call
-// it through this prototype; all timing is done here so the candidate stays in the one unified sweep.
-extern "C" void cublas_hgemm_once(const void* W, const void* A, void* D, int m, int n, int k);
 
 int main(int argc, char** argv) {
   int m = argc > 1 ? atoi(argv[1]) : 2048;
@@ -36,7 +29,6 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<half_t> A((size_t)m*k), scales((size_t)n*scale_k), D((size_t)m*n);
   cutlass::DeviceAllocation<int4_t> B((size_t)n*k);       // int4b_t elements (packed by the allocator)
   cutlass::DeviceAllocation<char>   ws(ws_bytes);
-  cutlass::DeviceAllocation<half_t> Zeros((size_t)n*scale_k), Wdq((size_t)n*k);  // for the dequant+cublas candidate
 
   // weight traffic (the binding cost at small m / decode): B is int4 = N*K/2 bytes, plus N*ceil(K/gs) fp16
   // scales. split_k partitions K so total B bytes are unchanged. Achievable HBM read ~2200 GB/s (bw_probe).
@@ -94,37 +86,11 @@ int main(int argc, char** argv) {
   TIME(64,  128, 64,  32, 64, 3, 1);  TIME(128, 128, 64,  64, 64, 3, 1);
 #undef TIME
 
-  // ---- CANDIDATE: dequant weight -> cublas fp16 GEMM (the NVIDIA fpA_intB reference backend) ----
-  // fpA_intB registers non-cutlass backends (e.g. the CUDA kernel via enableCudaKernel) as candidates in the
-  // SAME profiling loop; this is that structure -- dequant+cublas competes here, not in a separate binary.
-  // Uses the official CuTe dequantize_weight (unfused_weight_dequantize.hpp) so the source int4 + scales match
-  // the mixed-input path. Two entries: offline (weight pre-dequantized -> just the fp16 GEMM, but 2x weight in
-  // HBM) and per-call (dequant charged every pass).
-  {
-    using StrideB = cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>;
-    auto shape_b   = cute::make_shape(n, k, 1);
-    auto layout_B  = cute::make_layout(shape_b, cutlass::make_cute_packed_stride(StrideB{}, shape_b));
-    auto layout_sz = cute::make_layout(cute::make_shape(n, scale_k, 1));
-    auto dequant = [&]{
-      dequantize_weight(Wdq.get(), B.get(), layout_B, scales.get(), Zeros.get(), layout_sz, g);
-    };
-    auto gemm = [&]{ cublas_hgemm_once(Wdq.get(), A.get(), D.get(), m, n, k); };  // cublas in cublas_backend.cpp
-    auto bench = [&](const char* nm, auto fn, double wbytes){
-      fn(); for (int i=0;i<warmup;i++) fn();
-      PpuTimer t; t.start(); for (int i=0;i<iters;i++) fn(); t.stop();
-      double us = double(t.elapsed_millis())*1e3/iters;
-      double tf = 2.0*m*n*k/(us*1e-6)/1e12, gbps = wbytes/(us*1e-6)/1e9;
-      bool ran = (tf <= TF_PEAK) && (gbps <= 1.5*HBM_PEAK);
-      if (ran) std::printf("%-32s %-9.1f %-6.1f %-9.0f %.1f%%\n", nm, tf, 100.0*tf/TF_PEAK, gbps, 100.0*gbps/HBM_PEAK);
-      else     std::printf("%-32s %-9s %-6s %-9s %s\n", nm, "-","-","-","FAIL (no-op)");
-      double score = (m >= 256) ? tf : gbps;
-      if (ran && score > best_score) { best_score=score; best_tf=tf; best_gbps=gbps;
-                                       std::snprintf(best_name,sizeof(best_name),"%s",nm); }
-    };
-    dequant();  // pre-dequantize once for the offline case
-    bench("dequant+cublas(offline)", gemm,                       (double)n*k*2 + (double)m*k*2);
-    bench("dequant+cublas(per-call)", [&]{ dequant(); gemm(); }, (double)n*k/2 + (double)n*k*2*2 + (double)m*k*2);
-  }
+  // NOTE: dequant+cublas is NOT a candidate here. It needs OUR fast dequant (dequant_w4_ppu.cuh, cuda_fp16 +
+  // custom device kernel) + cublas -- both CUDA-toolchain, and cuda_fp16's __half2 clashes with the PPU SDK's
+  // hggc headers that hgcc auto-includes here. Device .o from nvcc cannot link with hgcc device .o either, so
+  // it cannot ride this actlize binary. It lives on the nvcc side: ../marlin_ppu dequant_cublas (per-call,
+  // our fast dequant). Compare by running both. The official CuTe dequant is accuracy-reference only (slow).
 
   std::printf("  WINNER m=%d: %s -> %.1f TFLOP/s (%.1f%% MFU) | %.0f GB/s (%.1f%% HBM)\n",
               m, best_name, best_tf, 100.0*best_tf/TF_PEAK, best_gbps, 100.0*best_gbps/HBM_PEAK);
