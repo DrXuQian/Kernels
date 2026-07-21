@@ -79,8 +79,12 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   const int scale_k = (k + group_size - 1) / group_size;
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));
   StrideB sB = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, L));
-  // C/D strides are NORMAL (m,n,L): the FinegrainedGs AIU mixed-input collective does NOT swap
-  // (Has_SwapAB=0, measured), unlike example 16's coop schedule. So D is row-major [M][N], no transpose.
+  // C/D strides are NORMAL (m,n,L). GROUND TRUTH (actlize builder ppu_mma_builder.inl:420-455): example 16's
+  // KernelTmaWarpSpecializedCooperativeMixedInput and our AIU schedules route through the SAME collective
+  // (ppu_mma_aiu_multistage_mixed_input.hpp); SwapAB is toggled ONLY by whether the quantized tuple sits in the
+  // A or B slot (SwapAB = IsATransformed, collective:112/166). We (and example 16) put int4 in B -> SwapAB=0 ->
+  // no M/N swap, strides bound as-is. Example 16's reversed (n,m,L) stride_C/stride_D are DEAD CODE (never
+  // referenced; its live args use the normal stride_*_ref). So D is row-major [M][N], no transpose. Confirmed.
   StrideD sD = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, L));
   StrideC sC = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, L));
   StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
@@ -92,9 +96,9 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     std::printf("  StrideA="); cute::print(sA); std::printf("\n  StrideB="); cute::print(sB);
     std::printf("\n  StrideC="); cute::print(sC); std::printf("\n  StrideD="); cute::print(sD);
     std::printf("\n  StrideScale="); cute::print(sS);
-    // THE decisive flag: mixed-input swaps M/N in to_underlying when B is narrow. actlize's single-GEMM kernel
-    // does that swap; this grouped kernel does NOT (yet). If this prints 1, that's the L=1 bug.
-    std::printf("\n  Has_SwapAB=%d  (strides above are the ARGUMENT/host stage, pre-to_underlying/pre-swap)\n",
+    // Has_SwapAB is 0 here BY DESIGN (int4 tuple in B slot). This is the SAME collective example 16 uses and
+    // example 16 is also SwapAB=0 -- so a 0 here is CORRECT, not the bug. (Prints the ARGUMENT-stage strides.)
+    std::printf("\n  Has_SwapAB=%d  (strides above are the ARGUMENT/host stage, pre-to_underlying)\n",
                 int(cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>)); } }
 #endif
   GroupProblemShape ps; ps.num_groups = L; ps.problem_shapes = group_shapes_dev; ps.host_problem_shapes = group_shapes_host;
