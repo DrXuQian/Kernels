@@ -7,6 +7,7 @@
 // Official finegrained path needs block_k >= group_size, so gs=128 uses TK=128 (NOT the generic path's 64).
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include "cutlass/util/device_memory.h"
 #include "helper.h"
 #include "fpA_intB_ppu.cuh"
@@ -34,6 +35,7 @@ int main(int argc, char** argv) {
   // now swept too: TK=128 satisfies the official block_k>=gs gate; TK=64 probes the relaxed gate (does the
   // FinegrainedGs128 kernel accept a group spanning 2 k-tiles?).
   const int warmup = 20, iters = 100;
+  char best_name[64] = ""; double best_tf = 0.0;
 #define TIME(TM,TN,TK,WM,WN,ST,SPLITK) do {                                                          \
     auto launch = [&]{ fpa_intb_ppu::filter_and_run<fpa_intb_ppu::QuantMode::FinegrainedScaleOnly,   \
         TM, TN, TK, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, D.get(), m, n, k, g,        \
@@ -43,28 +45,37 @@ int main(int argc, char** argv) {
     PpuTimer t; t.start(); for (int i = 0; i < iters; i++) launch(); t.stop();                       \
     double us = double(t.elapsed_millis()) * 1e3 / iters;                                            \
     double tf = 2.0 * m * n * k / (us * 1e-6) / 1e12;                                                \
-    std::printf("%-30s %-10.1f %.1f%%\n",                                                            \
-        #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK, tf, 100.0*tf/500.0);            \
+    const char* nm = #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK;                     \
+    std::printf("%-32s %-10.1f %.1f%%\n", nm, tf, 100.0*tf/500.0);                                    \
+    if (tf > best_tf) { best_tf = tf; std::snprintf(best_name, sizeof(best_name), "%s", nm); }        \
   } while (0)
 
-  // The OFFICIAL heuristic configs (Bk=256, Bn=64, stage=2, split_k) -- the regime I had missed.
-  // Indexed by m in the official table; run this at m=1/32/64/128 to compare against the heuristic's intent,
-  // and at m=2048 for the prefill point.
-  TIME(16, 64, 256, 16, 16, 2, 2);   // official m in 1..32
-  TIME(32, 64, 256, 32, 16, 2, 2);   // official m=64
-  TIME(32, 64, 256, 32, 16, 2, 1);   // official m=128
-  TIME(64, 64, 256, 32, 32, 2, 1);   // Bk=256, larger Bm
+  // EXPANDED SEARCH SPACE. tactic+sweep (not the official LUT): we measure every config and keep the best.
+  // Axes: Bm{16,32,64,128} x Bn{64,128} x Bk{64,128,256} x stage{2,3,4} x split_k{1,2,4}. Curated to the
+  // promising region so compile time (one cutlass kernel per row) stays bounded. Bk=64/128 with gs=128 uses
+  // the relaxed block_k>=gs gate. Run at small m (decode) and m=2048 (prefill); the winner differs by m.
 
-  // K=64 with the RELAXED block_k>=gs gate (gs=128 => a group spans 2 k-tiles, CTA_SCALE_K=1). Matches the
-  // generic path's winning K; split_k added since small m + K=64 gives few tiles to fill the grid.
-  TIME(16, 64, 64, 16, 16, 2, 2);
-  TIME(32, 64, 64, 32, 16, 2, 2);
-  TIME(64, 64, 64, 32, 32, 2, 2);
-  TIME(64, 64, 64, 32, 32, 3, 1);    // the generic-path winner shape
-  TIME(64, 64, 64, 32, 32, 4, 1);
+  // --- small Bm (decode regime): Bn=64, vary Bk / stage / split_k ---
+  TIME(16, 64, 64,  16, 16, 2, 1);  TIME(16, 64, 64,  16, 16, 2, 2);  TIME(16, 64, 64,  16, 16, 2, 4);
+  TIME(16, 64, 128, 16, 16, 2, 1);  TIME(16, 64, 128, 16, 16, 2, 2);
+  TIME(16, 64, 256, 16, 16, 2, 1);  TIME(16, 64, 256, 16, 16, 2, 2);
+  TIME(32, 64, 64,  32, 16, 2, 1);  TIME(32, 64, 64,  32, 16, 2, 2);  TIME(32, 64, 64,  32, 16, 3, 1);
+  TIME(32, 64, 128, 32, 16, 2, 1);  TIME(32, 64, 128, 32, 16, 2, 2);
+  TIME(32, 64, 256, 32, 16, 2, 1);  TIME(32, 64, 256, 32, 16, 2, 2);
 
-  // K=128 reference
-  TIME(64, 64, 128, 32, 32, 3, 1);
+  // --- mid/large Bm (prefill regime): split_k=1 ---
+  TIME(64,  64,  64,  32, 32, 3, 1);  TIME(64,  64,  64,  32, 32, 4, 1);  TIME(64,  64,  64,  32, 32, 2, 2);
+  TIME(64,  64,  128, 32, 32, 3, 1);  TIME(64,  64,  256, 32, 32, 2, 1);
+  TIME(128, 64,  64,  64, 32, 3, 1);  TIME(128, 64,  128, 64, 32, 3, 1);
+  TIME(64,  128, 64,  32, 64, 3, 1);  TIME(128, 128, 64,  64, 64, 3, 1);
 #undef TIME
+
+  std::printf("  WINNER m=%d: %s at %.1f TFLOP/s (%.1f%%)\n", m, best_name, best_tf, 100.0*best_tf/500.0);
+  // Append the winner to a shape-keyed tactic cache (m,n,k,g|config=,tflops=), our sweep-built LUT analogue.
+  {
+    std::ofstream f("tactics_fpA_intB_ppu.cache", std::ios::app);
+    if (f) f << m << "," << n << "," << k << "," << g << "|config=" << best_name
+             << ",tflops=" << best_tf << "\n";
+  }
   return 0;
 }
