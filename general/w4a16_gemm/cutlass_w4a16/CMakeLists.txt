@@ -38,10 +38,13 @@ target_compile_options(bench_cutlass_w4a16 PRIVATE -w)
 # Point at the CUDA SDK's per-target dir where cublas_v2.h / libcublas live on this box:
 #   .../PPU_SDK/CUDA_SDK/targets/x86_64-linux/{include,lib}. Override with -DCUDA_SDK_ROOT= if elsewhere.
 set(CUDA_SDK_ROOT "/sim/eec/shared/junfu.qx/PPU_SDK/CUDA_SDK/targets/x86_64-linux" CACHE STRING "CUDA SDK target dir providing cublas")
+# cublas_backend.cpp is a HOST (.cpp -> g++) TU that sees cublas/CUDA only. test_fpA_intB_ppu.cu (hgcc/cute)
+# no longer includes cublas, so no -I on the device compile is needed -- the cublas -I reaches g++ via
+# target_include_directories below.
 cutlass_example_add_executable(
   test_fpA_intB_ppu
   test_fpA_intB_ppu.cu
-  DEV_COMPILE_FLAGS "-I${CUDA_SDK_ROOT}/include"
+  cublas_backend.cpp
 )
 target_compile_options(test_fpA_intB_ppu PRIVATE -w)
 target_include_directories(test_fpA_intB_ppu PRIVATE "${CUDA_SDK_ROOT}/include")

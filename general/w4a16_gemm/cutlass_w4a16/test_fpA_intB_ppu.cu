@@ -8,12 +8,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <cublas_v2.h>
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "fpA_intB_ppu.cuh"
 #include "unfused_weight_dequantize.hpp"   // official CuTe dequantize_weight (same file example 16 verifies with)
+
+// cublas lives in a SEPARATE host TU (cublas_backend.cpp): cublas_v2.h drags CUDA's cuda_fp16/cuda_bf16 whose
+// ::__half2 / ::__nv_bfloat16 clash with the PPU SDK's hggc headers, so it must never share this TU. We call
+// it through this prototype; all timing is done here so the candidate stays in the one unified sweep.
+extern "C" void cublas_hgemm_once(const void* W, const void* A, void* D, int m, int n, int k);
 
 int main(int argc, char** argv) {
   int m = argc > 1 ? atoi(argv[1]) : 2048;
@@ -104,14 +108,7 @@ int main(int argc, char** argv) {
     auto dequant = [&]{
       dequantize_weight(Wdq.get(), B.get(), layout_B, scales.get(), Zeros.get(), layout_sz, g);
     };
-    cublasHandle_t cub; cublasCreate(&cub); cublasSetMathMode(cub, CUBLAS_TENSOR_OP_MATH);
-    const __half hone = __float2half(1.f), hzero = __float2half(0.f);
-    auto gemm = [&]{
-      cublasHgemm(cub, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &hone,
-                  reinterpret_cast<const __half*>(Wdq.get()), k,
-                  reinterpret_cast<const __half*>(A.get()),   k, &hzero,
-                  reinterpret_cast<__half*>(D.get()), n);
-    };
+    auto gemm = [&]{ cublas_hgemm_once(Wdq.get(), A.get(), D.get(), m, n, k); };  // cublas in cublas_backend.cpp
     auto bench = [&](const char* nm, auto fn, double wbytes){
       fn(); for (int i=0;i<warmup;i++) fn();
       PpuTimer t; t.start(); for (int i=0;i<iters;i++) fn(); t.stop();
@@ -127,7 +124,6 @@ int main(int argc, char** argv) {
     dequant();  // pre-dequantize once for the offline case
     bench("dequant+cublas(offline)", gemm,                       (double)n*k*2 + (double)m*k*2);
     bench("dequant+cublas(per-call)", [&]{ dequant(); gemm(); }, (double)n*k/2 + (double)n*k*2*2 + (double)m*k*2);
-    cublasDestroy(cub);
   }
 
   std::printf("  WINNER m=%d: %s -> %.1f TFLOP/s (%.1f%% MFU) | %.0f GB/s (%.1f%% HBM)\n",

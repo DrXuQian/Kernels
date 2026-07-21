@@ -40,7 +40,7 @@ echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
-cp "$HERE"/*.cu "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*.h "$HERE/CMakeLists.txt" "$EX_DIR/"
+cp "$HERE"/*.cu "$HERE"/*.cpp "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*.h "$HERE/CMakeLists.txt" "$EX_DIR/"
 
 # register it in the foreach list (idempotent: only if absent)
 if ! grep -q "$EX_NAME" "$EX_LIST"; then
