@@ -45,3 +45,10 @@ cutlass_example_add_executable(
   test_moe_gemm_ppu.cu
 )
 target_compile_options(test_moe_gemm_ppu PRIVATE -w)
+
+# STEP 2a of MoE W4A16: grouped mixed-input via GroupScheduler. Build: TARGET=test_moe_grouped_ppu ./build.sh
+cutlass_example_add_executable(
+  test_moe_grouped_ppu
+  test_moe_grouped_ppu.cu
+)
+target_compile_options(test_moe_grouped_ppu PRIVATE -w)
