@@ -23,6 +23,41 @@ The two GEMMs per layer (qwen35moe, Q4_K_M, 256 experts, topk 8):
 - **FC2** (down): `N=2048, K=512` per expert.
 Rows per GEMM = `tokens * topk` (expanded), grouped by expert.
 
+## THE cutlass mixed-precision grouped GEMM (ragged, trtllm-style) -- the real target
+
+Reference is trtllm's `MoeFCGemm` (`moe_cutlass_kernel.h`), NOT machete's batched bench. It is RAGGED: a
+`GemmMoeProblemVisitor` reads `total_tokens_including_expert` and maps each threadblock tile to (expert,
+m-offset); A is one contiguous `[sum_tokens][K]` (tokens permuted by expert), B/scales are `[experts][...]`
+uniform-stride. Variable tokens per expert. The mixed precision is the weight-only Mma; the grouping is the
+problem visitor. `MoeFCGemm<mixed-input Mma>`.
+
+**actlize already has the entire ragged machinery -- but only wired to the PLAIN mainloop:**
+- `GroupProblemShape` (group_array_problem_shape.hpp): array of per-expert `[M_e, N, K]`.
+- BatchArray collective (`ppu_mma_aiu_multistage_batch_array.hpp`): `ElementA const** ptr_A; ElementB const**
+  ptr_B;` per-expert pointer arrays; `IsGroupedGemmKernel = !is_same<InternalStrideA, StrideA>` (StrideA a
+  pointer type => grouped).
+- `ppu_aiu_gemm_array_group.hpp`: GroupScheduler iterates tiles over the ragged GroupProblemShape; per tile
+  uses `ptr_A[l_coord]`, `get_problem_shape(l_coord)`.
+
+**The gap = the mixed-input collective lacks this grouped ptr-array form** (it is single base + L-slice). The
+port, mirroring exactly how BatchArray got grouped:
+1. Add a grouped-args variant to the mixed-input collective (`ppu_mma_aiu_multistage_mixed_input.hpp`):
+   `ptr_A**`, `ptr_B**`, `ptr_S**`, `ptr_Z**` per-expert arrays; `StrideA/B/Scale` as pointer types to trip
+   `IsGroupedGemmKernel`; `load_init` indexes `ptr_*[l_coord]` instead of L-slicing a single base.
+2. A grouped kernel (copy `ppu_aiu_gemm_array_group.hpp`) whose enable_if accepts the mixed-input schedule and
+   whose `operator()` also builds `gS`(+`gZ`) from `ptr_S[l_coord]` + `group_size` and drives the mixed-input
+   collective's scale-aware interface (not BatchArray's gA/gB-only one).
+3. Host: build `GroupProblemShape` (per-expert token counts from routing) + the ptr arrays.
+
+This is the actlize analogue of `MoeFCGemm<mixed-input Mma>`. It is a real cutlass3 collective+kernel port and
+needs on-box compile iteration (private SDK; cannot compile here).
+
+### Uniform-m fast path (stepping stone, NOT the goal)
+`general/w4a16_gemm/cutlass_w4a16/moe_gemm_ppu.cuh` drives the EXISTING batched mixed-input kernel (rank-4
+[M,N,K,L], `l_coord=blockIdx.z`) -- works when every expert has the same m_per_expert (what the machete bench
+assumes). Useful to validate the mixed-input-per-expert GEMM math + tuning before the ragged scheduler, but it
+pads/wastes on real ragged routing, so it is not the deliverable.
+
 ## The core gap: grouped mixed-input GEMM
 
 Two routes, and we already own most of route B.
