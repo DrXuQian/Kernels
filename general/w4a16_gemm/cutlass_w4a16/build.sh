@@ -40,7 +40,7 @@ echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
-cp "$HERE/bench_cutlass_w4a16.cu" "$HERE/unfused_weight_dequantize.hpp" "$HERE/helper.h" "$HERE/CMakeLists.txt" "$EX_DIR/"
+cp "$HERE"/*.cu "$HERE"/*.cuh "$HERE/helper.h" "$HERE/CMakeLists.txt" "$EX_DIR/"
 
 # register it in the foreach list (idempotent: only if absent)
 if ! grep -q "$EX_NAME" "$EX_LIST"; then
@@ -59,9 +59,10 @@ rm -rf "$BUILD" && mkdir -p "$BUILD" && cd "$BUILD"
 cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" \
   -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" \
   >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
-make -j"$(nproc)" bench_cutlass_w4a16 2>&1 | tee make.log
+TARGET="${TARGET:-bench_cutlass_w4a16}"
+make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log
 
-BIN="$(find "$BUILD" -name bench_cutlass_w4a16 -type f -perm -u+x | head -1)"
+BIN="$(find "$BUILD" -name "$TARGET" -type f -perm -u+x | head -1)"
 echo
 echo "built: $BIN"
 echo "run:   $BIN --m=2048 --n=4096 --k=4096 --g=128 --mode=1 --iterations=100"

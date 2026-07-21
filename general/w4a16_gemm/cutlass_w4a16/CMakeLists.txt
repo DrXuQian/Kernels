@@ -27,3 +27,11 @@ cutlass_example_add_executable(
 target_compile_definitions(bench_cutlass_w4a16 PRIVATE
   TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES})
 target_compile_options(bench_cutlass_w4a16 PRIVATE -w)
+
+# Official-structured finegrained launcher (fpA_intB_ppu.cuh) compile+run gate. Build with:
+#   TARGET=test_fpA_intB_ppu ./build.sh
+cutlass_example_add_executable(
+  test_fpA_intB_ppu
+  test_fpA_intB_ppu.cu
+)
+target_compile_options(test_fpA_intB_ppu PRIVATE -w)
