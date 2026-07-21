@@ -85,7 +85,7 @@ void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
   using ElementAccumulator = float;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using ClusterShape  = WarpShape;                      // ppu1.0 has no cluster; the builder takes WarpShape here
-  using EpilogueSchedule = cutlass::epilogue::EpilogueSimtVectorized;   // [F1]
+  using EpilogueSchedule = cutlass::epilogue::EpilogueSimtVectorizedWithoutEvt;  // [F1] non-EVT: splitk kernel needs .thread.beta
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
