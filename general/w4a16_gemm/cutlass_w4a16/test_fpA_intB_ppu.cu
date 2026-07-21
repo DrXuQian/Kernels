@@ -53,13 +53,18 @@ int main(int argc, char** argv) {
   TIME(16, 64, 256, 16, 16, 2, 2);   // official m in 1..32
   TIME(32, 64, 256, 32, 16, 2, 2);   // official m=64
   TIME(32, 64, 256, 32, 16, 2, 1);   // official m=128
-  // neighbours of the official configs (split_k and stage variations)
-  TIME(16, 64, 256, 16, 16, 2, 4);
-  TIME(32, 64, 256, 32, 16, 3, 2);
-  TIME(64, 64, 256, 32, 32, 2, 1);
-  // my earlier prefill configs, for reference
-  TIME(64,  64,  64,  32, 32, 4, 1);
-  TIME(64,  64,  128, 32, 32, 3, 1);
+  TIME(64, 64, 256, 32, 32, 2, 1);   // Bk=256, larger Bm
+
+  // K=64 with the RELAXED block_k>=gs gate (gs=128 => a group spans 2 k-tiles, CTA_SCALE_K=1). Matches the
+  // generic path's winning K; split_k added since small m + K=64 gives few tiles to fill the grid.
+  TIME(16, 64, 64, 16, 16, 2, 2);
+  TIME(32, 64, 64, 32, 16, 2, 2);
+  TIME(64, 64, 64, 32, 32, 2, 2);
+  TIME(64, 64, 64, 32, 32, 3, 1);    // the generic-path winner shape
+  TIME(64, 64, 64, 32, 32, 4, 1);
+
+  // K=128 reference
+  TIME(64, 64, 128, 32, 32, 3, 1);
 #undef TIME
   return 0;
 }
