@@ -9,11 +9,11 @@
 # from the environment as -D cache vars. They must reach BOTH compiles: the host g++ (TileShape is used in
 # host code for strides/args) via target_compile_definitions, and the device hgcc via DEV_COMPILE_FLAGS
 # (hgcc is driven by a custom command that does not see target_compile_definitions).
-set(TILE_M  "32" CACHE STRING "threadblock tile M")
-set(TILE_N  "32" CACHE STRING "threadblock tile N")
-set(WARP_M  "16" CACHE STRING "warp tile M")
-set(WARP_N  "16" CACHE STRING "warp tile N")
-set(STAGES  "3"  CACHE STRING "pipeline stages")
+set(TILE_M  "64" CACHE STRING "threadblock tile M")
+set(TILE_N  "64" CACHE STRING "threadblock tile N")
+set(WARP_M  "32" CACHE STRING "warp tile M")
+set(WARP_N  "32" CACHE STRING "warp tile N")
+set(STAGES  "4"  CACHE STRING "pipeline stages")
 
 set(_W4A16_DEFS
   -DTILE_M=${TILE_M} -DTILE_N=${TILE_N} -DWARP_M=${WARP_M} -DWARP_N=${WARP_N} -DSTAGES=${STAGES})

@@ -127,23 +127,23 @@ using ElementCompute      = float;                                          // E
 using ArchTag             = cutlass::arch::PPU0010;                         // Tag indicating the minimum CU that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
 // TUNING KNOBS. The stock example ships TILE 32x32 / WARP 16x16 / 3 stages -- fine for a correctness demo,
-// but at a prefill M (compute-bound) a 32x32 threadblock tile with only 2x2=4 warps leaves the MMA pipe
+// the default here is the sweep winner 64x64/32x32/s4 (61% MFU). The stock 32x32 tile leaves the MMA pipe
 // mostly idle (measured: 25% MFU). Bigger tiles raise reuse and warp count. Overridable at compile time
 // (build.sh forwards TILE_M / TILE_N / WARP_M / WARP_N / STAGES from the environment).
 #ifndef TILE_M
-#define TILE_M 32
+#define TILE_M 64
 #endif
 #ifndef TILE_N
-#define TILE_N 32
+#define TILE_N 64
 #endif
 #ifndef WARP_M
-#define WARP_M 16
+#define WARP_M 32
 #endif
 #ifndef WARP_N
-#define WARP_N 16
+#define WARP_N 32
 #endif
 #ifndef STAGES
-#define STAGES 3
+#define STAGES 4
 #endif
 using TileShape           = Shape<cute::Int<TILE_M>,cute::Int<TILE_N>,cute::Int<TileShapeK>>;  // Threadblock tile
 using WarpShape           = Shape<cute::Int<WARP_M>,cute::Int<WARP_N>,cute::Int<TileShapeK>>;  // Warp tile

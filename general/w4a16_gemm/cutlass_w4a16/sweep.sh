@@ -21,14 +21,18 @@ RUN_ARGS="--m=$M --n=$N --k=$K --g=$G --mode=$MODE"
 # Candidate tiles. WARP must divide TILE and be a multiple of the 16x16 MMA atom. Not all will compile/run on
 # the mixed-input AIU mainloop; failures are skipped. Stock 32x32 is kept as the baseline.
 CONFIGS=(
-  "32 32 16 16 3"
-  "64 64 32 32 3"
-  "64 64 32 32 4"
-  "128 128 64 64 3"
-  "128 128 64 64 4"
+  "32 32 16 16 3"     # stock baseline (~27% MFU)
+  "64 64 32 32 3"     # 59%
+  "64 64 32 32 4"     # 61% -- winner of the first sweep; refine around it
+  "64 64 32 32 5"
+  "64 64 32 32 6"
+  "64 128 32 64 4"
+  "128 64 64 32 4"
+  "32 64 16 32 4"
+  "64 32 32 16 4"
+  "128 128 64 64 3"   # 49% -- bigger tiles undersubscribe 72 CU at these shapes
   "128 256 64 64 3"
   "256 128 64 64 3"
-  "256 256 64 64 3"
 )
 
 LOGDIR="$(mktemp -d)"
@@ -62,6 +66,29 @@ if [ -z "$best_cfg" ]; then
   echo "[sweep] no config built and passed -- nothing to run." >&2
   exit 1
 fi
+# Persist the winner as a tactic, machete-style: an exact-match cache keyed by shape, plus a human-readable
+# markdown table. Key = "m,n,k,g|config=<label>,tflops=<x>". Load the winning tile from the cache with the
+# same key later, or just read TACTICS.md.
+CACHE="${OUT_CACHE:-$HERE/tactics_ppu001.cache}"
+MD="${OUT_MD:-$HERE/TACTICS_PPU001.md}"
+key="${M},${N},${K},${G}"
+tmpc="$(mktemp)"; [ -f "$CACHE" ] && grep -v "^${key}|" "$CACHE" > "$tmpc" || true
+echo "${key}|config=${best_line},tflops=${best_tflops}" >> "$tmpc"
+sort -o "$CACHE" "$tmpc"; rm -f "$tmpc"
+{
+  echo "# CUTLASS W4A16 (actlize) tactics on ppu001 -- best tile per shape (mode=1, gs from key)"
+  echo
+  echo "| M | N | K | G | best config (TILE/WARP/ST) | TFLOP/s |"
+  echo "|---|---|---|---|---|---|"
+  while IFS='|' read -r k rest; do
+    IFS=',' read -r m n kk g <<<"$k"
+    cfg="$(sed -E 's/.*config=([^,]*),.*/\1/' <<<"$rest")"
+    tf="$(sed -E 's/.*tflops=([0-9.]*).*/\1/' <<<"$rest")"
+    echo "| $m | $n | $kk | $g | $cfg | $tf |"
+  done < "$CACHE"
+} > "$MD"
+echo "[sweep] wrote tactic cache $CACHE and table $MD"
+
 echo "[sweep] best = $best_line at $best_tflops TFLOP/s. Rebuilding and running once at $ITERS_FINAL iters."
 read -r TILE_M TILE_N WARP_M WARP_N STAGES <<<"$best_cfg"
 TILE_M=$TILE_M TILE_N=$TILE_N WARP_M=$WARP_M WARP_N=$WARP_N STAGES=$STAGES "$HERE/build.sh" >/dev/null 2>&1

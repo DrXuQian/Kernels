@@ -54,15 +54,19 @@ cd ../marlin_ppu && make bench_marlin_gguf && ./bench_marlin_gguf 2048 4096 4096
 At a prefill M the GEMM is compute-bound, so the metric is **MFU vs the 500 TFLOP/s fp16 peak**, not %HBM
 (that only binds at decode M~1). Both lines report it; the actlize line is `[CUTLASS gs=128]`.
 
-## First result (2048x4096x4096, gs=128)
+## Result (2048x4096x4096, gs=128)
+
+Tuned, actlize BEATS the hand-written marlin kernel:
 
 | | time | MFU |
 |---|---|---|
-| marlin gs=128 sym | 319 us | **43.1%** |
+| actlize **64x64/32x32/s4** (tuned) | ~215 us | **61%** |
+| marlin gs=128 sym | 319 us | 43% |
 | actlize, stock 32x32 tile | 548 us | 25% |
 
-actlize's default loses purely on tile size: a 32x32 threadblock tile with 2x2=4 warps starves the MMA pipe.
-It is tunable — see below. (marlin itself is also undersubscribed here, only 16 CTAs on 72 CUs.)
+The stock 32x32 tile (2x2=4 warps) starves the MMA pipe; the win is entirely tile choice. Non-obvious: 64x64
+is the sweet spot, not the biggest tile — 128/256 tiles undersubscribe the 72 CUs at these shapes, and 4
+stages help 64x64 but collapse 128x128 (24%, shared/occupancy). 64x64/s4 is now the compiled default.
 
 ## Tuning the actlize tile
 
@@ -89,6 +93,13 @@ M=4096 N=4096 K=4096 ./sweep.sh     # shape is fixed across the sweep, env-overr
 ```
 
 Failed/unsupported configs are skipped (logged to a temp dir); edit `CONFIGS` to add or trim candidates.
+
+It also persists the winner as a **tactic**, the way vLLM Machete / TRT-LLM fpA_intB do: an exact-match
+cache `tactics_ppu001.cache` keyed by shape (`m,n,k,g|config=<label>,tflops=<x>`) plus a `TACTICS_PPU001.md`
+table. Override paths with `OUT_CACHE=` / `OUT_MD=`. This is the build-time analogue of those harnesses'
+in-binary `--search`/`--save_tactic`; see `../machete_standalone` and `../fpA_intB_standalone` for the
+compile-once/runtime-dispatch version (all tile configs compiled into one binary, selected at runtime — the
+better long-term form, a TODO for this bench).
 
 ## Entry file
 
