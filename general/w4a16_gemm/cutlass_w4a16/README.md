@@ -35,12 +35,10 @@ git submodule update --init third_party/actlize
 ./build.sh
 ```
 
-`build.sh` (1) applies `actlize_ppu001.patch`, which fixes only the hgcc arch-flag spelling: this box's hgcc
-wants `-arch=ppu0010` verbatim, while the shipped v1.0.0 CMake emits `-arch=ppu_10`, which it rejects — an
-unpatched build silently mis-targets and the runtime aborts ("probably a NV binary / Failed to query
-occupancy"); (2) overlays `bench_cutlass_w4a16.cu` into actlize's `examples/` as a new example; (3) builds
-just that target (`CUTLASS_PPU_ARCHS=ppu0010`, override with `PPU_ARCHS=`); (4) restores the submodule (patch,
-example list, overlay) on exit, so the pinned submodule content stays clean.
+`build.sh` (1) overlays `bench_cutlass_w4a16.cu` into actlize's `examples/` as a new example; (2) builds just
+that target through actlize's proven example machinery (`CUTLASS_PPU_ARCHS=ppu0010`, override with
+`PPU_ARCHS=`); (3) restores the submodule (example list, overlay) on exit, so the pinned submodule content
+stays clean.
 
 ## Run the comparison
 
