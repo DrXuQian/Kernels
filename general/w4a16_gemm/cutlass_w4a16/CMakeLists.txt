@@ -40,4 +40,4 @@ target_compile_options(test_fpA_intB_ppu PRIVATE -w)
 set(CUDA_SDK_ROOT "/usr/local/PPU_SDK/CUDA_SDK" CACHE STRING "CUDA SDK root providing cublas")
 target_include_directories(test_fpA_intB_ppu PRIVATE "${CUDA_SDK_ROOT}/include")
 target_link_directories(test_fpA_intB_ppu PRIVATE "${CUDA_SDK_ROOT}/lib64" "${CUDA_SDK_ROOT}/lib")
-target_link_libraries(test_fpA_intB_ppu cublas)
+target_link_libraries(test_fpA_intB_ppu PRIVATE cublas)  # PRIVATE to match the keyword signature the cutlass macro already used
