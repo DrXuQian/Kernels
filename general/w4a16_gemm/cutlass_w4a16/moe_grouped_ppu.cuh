@@ -79,8 +79,10 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   const int scale_k = (k + group_size - 1) / group_size;
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));
   StrideB sB = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, L));
-  StrideD sD = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, L));
-  StrideC sC = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, L));
+  // C/D strides are REVERSED (n,m,L) because mixed-input swaps+transposes when B is the narrow (int4) operand
+  // -> the kernel writes D transposed as [N][M]. (example 16: "Reverse stride here due to swap and transpose".)
+  StrideD sD = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(n, m, L));
+  StrideC sC = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(n, m, L));
   StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
 
   GroupProblemShape ps; ps.num_groups = L; ps.problem_shapes = group_shapes_dev; ps.host_problem_shapes = group_shapes_host;

@@ -21,10 +21,16 @@
 using half_t = cutlass::half_t;
 using int4_t = cutlass::int4b_t;
 
-int main() {
-  const int L = 3, N = 64, K = 128, gs = 64;
+int main(int argc, char** argv) {
+  // Debug decomposition: run experts=1 first (isolates the single GEMM + swap/dequant); then multi-expert
+  // uniform (isolates grouping); then ragged (isolates the per-expert offset).
+  const int L  = argc > 1 ? atoi(argv[1]) : 1;       // experts (default 1 = single GEMM)
+  const int Mu = argc > 2 ? atoi(argv[2]) : 32;      // base m per expert
+  const bool ragged = argc > 3;                      // any 4th arg => ragged (Mu*(e%4+1)), else uniform Mu
+  const int N = 64, K = 128, gs = 64;
   const int scale_k = K / gs;                        // 2
-  std::vector<int> me = {16, 32, 48};                // ragged per-expert rows
+  std::vector<int> me(L);
+  for (int e=0;e<L;e++) me[e] = ragged ? Mu*((e%4)+1) : Mu;
   int total = 0, Mmax = 0; std::vector<int> offs(L);
   for (int e=0;e<L;e++){ offs[e]=total; total+=me[e]; Mmax=std::max(Mmax,me[e]); }
 
@@ -98,12 +104,13 @@ int main() {
         for (int kk=0;kk<K;kk++)
           // Wdq is ColumnMajor (N-contiguous) per dequantize_weight's operand_layout: element (n,k) at n + k*N.
           ref += hA[(size_t)(offs[e]+i)*K + kk] * (double)float(hWdq[(size_t)e*N*K + j + (size_t)kk*N]);
-        double got = (double)float(hD[(size_t)e*Mmax*N + i*N + j]);   // cutlass::half_t -> float (no cuda_fp16)
+        // D is TRANSPOSED [N][M] per expert (mixed-input swap+transpose): element (m,n) at e*N*Mmax + n*Mmax + m.
+        double got = (double)float(hD[(size_t)e*N*Mmax + (size_t)j*Mmax + i]);
         double rel = std::abs(got-ref)/(std::abs(ref)+1e-3);
         if (rel > max_rel) max_rel = rel;
         if (rel > 5e-2) bad++;
       }
-  std::printf("ragged verify: L=%d me=[16,32,48] N=%d K=%d gs=%d  max_rel=%.3e  bad=%d -> %s\n",
-              L, N, K, gs, max_rel, bad, bad==0 ? "MATCH" : "MISMATCH");
+  std::printf("verify: L=%d %s Mu=%d N=%d K=%d gs=%d total=%d  max_rel=%.3e  bad=%d -> %s\n",
+              L, ragged?"ragged":"uniform", Mu, N, K, gs, total, max_rel, bad, bad==0 ? "MATCH" : "MISMATCH");
   return 0;
 }
