@@ -114,34 +114,25 @@ public:
       cu_count = KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
     KernelHardwareInfo hw_info{args.hw_info.device_id, cu_count};
 
-    uint8_t* wp = reinterpret_cast<uint8_t*>(workspace);
-    size_t off = 0;
-    void* scheduler_workspace = wp;
-    off += TileScheduler::template get_workspace_size<typename ProblemShape::UnderlyingProblemShape, ElementAccumulator>(
-        args.scheduler, typename ProblemShape::UnderlyingProblemShape{}, args.hw_info, NumMmaWarpGroups);
-    off = round_nearest(off, MinWorkspaceAlignment);
-    void* epilogue_workspace = wp + off;
-    off += CollectiveEpilogue::get_workspace_size(problem_shapes, args.epilogue, cu_count);
-    off = round_nearest(off, MinWorkspaceAlignment);
+    // Only the GroupScheduler needs workspace. The mixed-input vectorized epilogue needs none (its
+    // get_workspace_size is (ProblemShape,Args) and returns 0 for this non-persistent path).
+    void* scheduler_workspace = workspace;
 
     constexpr uint32_t NumEpilogueSubTiles = 1;
     TileSchedulerParams scheduler = TileScheduler::to_underlying_arguments(
         problem_shapes, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
 
-    // [Q2] The mixed-input collective's to_underlying_arguments wants ONE (M,N,K[,L]) to compute scale_k=K/gs
-    // and the (N,scale_k,L) scale layout. K,N are uniform across experts; L = number of groups. Build a
-    // representative rank-4 shape [M=nominal, N, K, L=num_groups] from the group shapes so the collective's
-    // L-strided B/scale/zero span all experts.
-    auto host0 = problem_shapes.get_host_problem_shape(0);   // [Q2] API: per-group host shape accessor
-    int Nrep = get<1>(host0), Krep = get<2>(host0);
-    int Lrep = problem_shapes.groups();                      // [Q2] API: group count
-    auto rep_mnkl = cute::make_shape(int(get<0>(host0)), Nrep, Krep, Lrep);
+    // [Q2] The mixed-input collective + epilogue want ONE (M,N,K,L) shape (K,N uniform across experts; L=groups)
+    // to compute scale_k=K/gs, the (N,scale_k,L) scale layout, and the L-strided D. Build a representative
+    // rank-4 shape from the group shapes so those L-strided planes span all experts.
+    auto host0 = problem_shapes.get_host_problem_shape(0);
+    auto rep_mnkl = cute::make_shape(int(get<0>(host0)), int(get<1>(host0)), int(get<2>(host0)), problem_shapes.groups());
 
     return {
       args.mode,
       problem_shapes,
       CollectiveMainloop::to_underlying_arguments(rep_mnkl, args.mainloop, /*workspace=*/nullptr),
-      CollectiveEpilogue::to_underlying_arguments(problem_shapes, args.epilogue, epilogue_workspace),
+      CollectiveEpilogue::to_underlying_arguments(rep_mnkl, args.epilogue, /*workspace=*/nullptr),
       hw_info, scheduler, workspace
     };
   }
@@ -150,13 +141,9 @@ public:
     return args.mode == GemmUniversalMode::kGrouped || args.mode == GemmUniversalMode::kArray;
   }
   static int get_workspace_size(Arguments const& args) {
-    // scheduler + epilogue workspace (mirrors to_underlying_arguments)
-    int cu = args.hw_info.cu_count > 0 ? args.hw_info.cu_count
-           : KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
+    // GroupScheduler workspace only (epilogue needs none on this path).
     size_t s = TileScheduler::template get_workspace_size<typename ProblemShape::UnderlyingProblemShape, ElementAccumulator>(
         args.scheduler, typename ProblemShape::UnderlyingProblemShape{}, args.hw_info, NumMmaWarpGroups);
-    s = round_nearest(s, MinWorkspaceAlignment);
-    s += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue, cu);
     return int(round_nearest(s, MinWorkspaceAlignment));
   }
   static cutlass::Status initialize_workspace(Arguments const&, void* = nullptr, hggcStream_t = nullptr, HostAdapter* = nullptr) {
