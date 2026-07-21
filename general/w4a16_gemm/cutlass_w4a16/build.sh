@@ -20,13 +20,13 @@ ACTLIZE="$(cd "$HERE/../../../third_party/actlize" && pwd)"
 EX_NAME="99_kernels_w4a16_compare"
 EX_DIR="$ACTLIZE/examples/$EX_NAME"
 EX_LIST="$ACTLIZE/examples/CMakeLists.txt"
-# This box's hgcc takes `--gpu-architecture=ppu001|ppu0015|all` (verified via `hgcc --help`); ppu001 is our
-# chip. The shipped v1.0.0 CMake instead emits the OLD naming `-arch=ppu_10`, which this hgcc does not accept
-# and silently mis-targets -- the kernel came out as a non-ppu001 ELF and the runtime aborted with
-# "e_machine ... probably a NV binary / Failed to query occupancy". actlize_ppu001.patch makes CMake pass the
-# arch name straight through (ppu001 -> -arch=ppu001, library arch 80a). Applied to the submodule before the
-# build and reverted after, so the pinned submodule content is unchanged.
-ARCH="${PPU_ARCHS:-ppu001}"
+# This box's hgcc wants the arch name verbatim: -arch=ppu0010 (ppu001 is rejected; ppu0010 is our chip). The
+# shipped v1.0.0 CMake instead emits the -arch=ppu_10 spelling, which this hgcc does not accept, so the build
+# silently mis-targets -- the kernel came out as a non-ppu001 ELF and the runtime aborted ("e_machine ...
+# probably a NV binary / Failed to query occupancy"). actlize_ppu001.patch changes only the flag emission to
+# pass the name through (ppu0010 -> -arch=ppu0010); the ppu0010 -> library arch 80a mapping was already right.
+# Applied to the submodule before the build and reverted after, so the pinned submodule content is unchanged.
+ARCH="${PPU_ARCHS:-ppu0010}"
 PPU_SDK_ROOT="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
 PATCH="$HERE/actlize_ppu001.patch"
 
@@ -39,17 +39,17 @@ export PATH="$PPU_SDK_ROOT/bin:$PATH"
 cleanup() {
   # Restore everything we touched so the submodule's pinned content stays clean: the arch patch, the example
   # list, and the overlay dir.
-  git -C "$ACTLIZE" checkout -- CMakeLists.txt cmake/PPUToolchain.cmake examples/CMakeLists.txt 2>/dev/null || true
+  git -C "$ACTLIZE" checkout -- cmake/PPUToolchain.cmake examples/CMakeLists.txt 2>/dev/null || true
   rm -rf "$EX_DIR"
 }
 trap cleanup EXIT
 
-# --- retarget the toolchain to this box's ppu001 arch naming (idempotent) ---
+# --- retarget the hgcc -arch flag to the spelling this SDK accepts (idempotent) ---
 if git -C "$ACTLIZE" apply --reverse --check "$PATCH" 2>/dev/null; then
   echo "[build.sh] actlize_ppu001.patch already applied"
 elif git -C "$ACTLIZE" apply --check "$PATCH" 2>/dev/null; then
   git -C "$ACTLIZE" apply "$PATCH"
-  echo "[build.sh] applied actlize_ppu001.patch (ppu_10 -> ppu001)"
+  echo "[build.sh] applied actlize_ppu001.patch (-arch=ppu_10 -> -arch=ppu0010)"
 else
   echo "ERROR: actlize_ppu001.patch does not apply to the submodule at $ACTLIZE" >&2
   echo "       the pinned submodule may have moved off v1.0.0." >&2
