@@ -103,8 +103,8 @@ int main(int argc, char** argv) {
       for (int j=0;j<N;j++){
         double ref = 0;
         for (int kk=0;kk<K;kk++)
-          // Wdq is ColumnMajor (N-contiguous) per dequantize_weight's operand_layout: element (n,k) at n + k*N.
-          ref += hA[(size_t)(offs[e]+i)*K + kk] * (double)float(hWdq[(size_t)e*N*K + j + (size_t)kk*N]);
+          // Wdq is ROW-major [N][K] (measured: StrideB=(K,1,0)): element (n,k) at n*K + k.
+          ref += hA[(size_t)(offs[e]+i)*K + kk] * (double)float(hWdq[(size_t)e*N*K + (size_t)j*K + kk]);
         // D is TRANSPOSED [N][M] per expert (mixed-input swap+transpose): element (m,n) at e*N*Mmax + n*Mmax + m.
         double got = (double)float(hD[(size_t)e*N*Mmax + (size_t)j*Mmax + i]);
         double rel = std::abs(got-ref)/(std::abs(ref)+1e-3);
