@@ -38,3 +38,10 @@ cutlass_example_add_executable(
   test_fpA_intB_ppu.cu
 )
 target_compile_options(test_fpA_intB_ppu PRIVATE -w)
+
+# STEP 1 of MoE W4A16: batched (uniform m_per_expert) mixed-input GEMM. Build: TARGET=test_moe_gemm_ppu ./build.sh
+cutlass_example_add_executable(
+  test_moe_gemm_ppu
+  test_moe_gemm_ppu.cu
+)
+target_compile_options(test_moe_gemm_ppu PRIVATE -w)
