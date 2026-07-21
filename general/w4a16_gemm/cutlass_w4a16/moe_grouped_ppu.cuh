@@ -95,7 +95,7 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     // THE decisive flag: mixed-input swaps M/N in to_underlying when B is narrow. actlize's single-GEMM kernel
     // does that swap; this grouped kernel does NOT (yet). If this prints 1, that's the L=1 bug.
     std::printf("\n  Has_SwapAB=%d  (strides above are the ARGUMENT/host stage, pre-to_underlying/pre-swap)\n",
-                int(cutlass::gemm::detail::Has_SwapAB_v<CollectiveMainloop>)); } }
+                int(cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>)); } }
 #endif
   GroupProblemShape ps; ps.num_groups = L; ps.problem_shapes = group_shapes_dev; ps.host_problem_shapes = group_shapes_host;
   cutlass::KernelHardwareInfo hw{};   // cu_count auto-queried in to_underlying_arguments
