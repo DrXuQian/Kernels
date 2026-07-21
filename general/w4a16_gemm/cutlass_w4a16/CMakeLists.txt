@@ -35,3 +35,9 @@ cutlass_example_add_executable(
   test_fpA_intB_ppu.cu
 )
 target_compile_options(test_fpA_intB_ppu PRIVATE -w)
+# The dequant+cublas candidate needs cublas from the CUDA_SDK (host lib). CUDA_SDK is next to the box nvcc
+# (which nvcc -> .../PPU_SDK/CUDA_SDK/bin/nvcc). Override with -DCUDA_SDK_ROOT= if elsewhere.
+set(CUDA_SDK_ROOT "/usr/local/PPU_SDK/CUDA_SDK" CACHE STRING "CUDA SDK root providing cublas")
+target_include_directories(test_fpA_intB_ppu PRIVATE "${CUDA_SDK_ROOT}/include")
+target_link_directories(test_fpA_intB_ppu PRIVATE "${CUDA_SDK_ROOT}/lib64" "${CUDA_SDK_ROOT}/lib")
+target_link_libraries(test_fpA_intB_ppu cublas)
