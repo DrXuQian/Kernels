@@ -81,25 +81,31 @@ TILE_M=128 TILE_N=256 WARP_M=64 WARP_N=64 STAGES=3 ./build.sh
 Sweep tile/warp/stages and read the `[CUTLASS gs=128]` MFU line. Not every combination will compile or run
 on the mixed-input AIU mainloop — keep WARP a divisor of TILE and a multiple of the 16x16 MMA atom.
 
-### Autotune: `./sweep.sh`
+### Autotune — in-binary tactics (machete / fpA_intB style)
 
-Because the tile is compile-time, autotune is build-time (as in cutlass/vLLM): `sweep.sh` builds each
-candidate in `CONFIGS`, runs a short warmup timing, keeps the best-MFU config that PASSED, then rebuilds that
-one and runs it once at full iterations.
+The binary now compiles a **fixed set of tile configs** (see `supported_configs()` / the `W4A16_DISPATCH`
+if-chain) and selects one at **runtime** — no recompile to switch. Same model as `../machete_standalone` and
+`../fpA_intB_standalone`. Build once, then:
 
 ```bash
-./sweep.sh                          # sweep at the default 2048x4096x4096, gs=128, mode=1
-M=4096 N=4096 K=4096 ./sweep.sh     # shape is fixed across the sweep, env-overridable (M N K G MODE)
+./build.sh    # one build with all configs baked in
+BIN=$(find "$PWD/../../../third_party/actlize/build_w4a16_compare" -name bench_cutlass_w4a16 -type f)
+
+$BIN --list_configs                                                    # enumerate compiled tactics
+$BIN --m=2048 --n=4096 --k=4096 --g=128 --config=64x64:32x32:s4        # force one
+$BIN --m=2048 --n=4096 --k=4096 --g=128 --search_configs \             # in-process sweep, pick best, run it
+     --save_tactic=tactics_ppu001.cache
+$BIN --m=2048 --n=4096 --k=4096 --g=128 --tactic=tactics_ppu001.cache  # load best for this shape from cache
 ```
 
-Failed/unsupported configs are skipped (logged to a temp dir); edit `CONFIGS` to add or trim candidates.
+`--search_configs` times every compiled config in-process (skips any that don't verify), prints a table,
+optionally writes the shape-keyed cache, and runs the winner. The cache is exact-match text
+`m,n,k,g|config=<name>,tflops=<x>` — add a shape by searching it, load it by `--tactic`. To add/remove
+candidate tiles, edit `supported_configs()` **and** the `W4A16_DISPATCH` arms (each arm is a compiled
+instantiation), then rebuild once.
 
-It also persists the winner as a **tactic**, the way vLLM Machete / TRT-LLM fpA_intB do: an exact-match
-cache `tactics_ppu001.cache` keyed by shape (`m,n,k,g|config=<label>,tflops=<x>`) plus a `TACTICS_PPU001.md`
-table. Override paths with `OUT_CACHE=` / `OUT_MD=`. This is the build-time analogue of those harnesses'
-in-binary `--search`/`--save_tactic`; see `../machete_standalone` and `../fpA_intB_standalone` for the
-compile-once/runtime-dispatch version (all tile configs compiled into one binary, selected at runtime — the
-better long-term form, a TODO for this bench).
+`sweep.sh` (build-time recompile-per-config) is kept as a fallback for exploring tiles not compiled into the
+binary; the in-binary `--search_configs` is preferred for anything in `supported_configs()`.
 
 ## Entry file
 

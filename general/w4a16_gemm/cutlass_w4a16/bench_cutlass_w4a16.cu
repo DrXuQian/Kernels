@@ -47,6 +47,11 @@
 */
 
 #include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
 
 #include "cutlass/cutlass.h"
 
@@ -225,6 +230,65 @@ using GemmKernelScaleWithZeroPoint = cutlass::gemm::kernel::GemmUniversal<
 using GemmScaleWithZeroPoint = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleWithZeroPoint>;
 // =================================================================================================================================================================
 
+// ================================ TACTIC REGISTRY (machete / fpA_intB style) =====================================
+// The tile is a compile-time template argument, so autotuning it means compiling a FIXED SET of instantiations
+// into ONE binary and dispatching at runtime -- exactly how vLLM Machete (../machete_standalone) and TRT-LLM
+// fpA_intB (../fpA_intB_standalone) do it. Cfg<> rebuilds the ScaleOnly (mode-1) type stack with a given
+// tile/warp/stages; TileCfg is the runtime descriptor; supported_configs() is the registry; the dispatch macro
+// below maps a runtime TileCfg to the matching compiled Cfg<>. This replaces the recompile-per-config sweep.sh.
+template <int TM, int TN, int WM, int WN, int St>
+struct Cfg {
+  using CfgTile = Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TileShapeK>>;
+  using CfgWarp = Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TileShapeK>>;
+  using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, CfgTile, CfgWarp, EpilogueTileType,
+      ElementAccumulator, ElementAccumulator, ElementC, LayoutC, AlignmentC,
+      ElementD, LayoutD, AlignmentD, EpilogueSchedule>::CollectiveOp;
+  using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA,
+      cute::tuple<ElementB, ElementScale>, LayoutB_opt, AlignmentB,
+      ElementAccumulator, cute::tuple<CfgTile>, CfgWarp, Int<St>, KernelSchedule>::CollectiveOp;
+  using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+
+struct TileCfg { char const* name; int tm, tn, wm, wn, st; };
+
+// The compiled set. Every entry here is a distinct template instantiation baked into the binary; add one and
+// it costs compile time, not a rebuild at search time. Keep WM|TM, WN|TN, and both multiples of the 16x16 atom.
+inline std::vector<TileCfg> supported_configs() {
+  return {
+    {"64x64:32x32:s4",   64,  64, 32, 32, 4},   // sweep winner (61% MFU @ 2048x4096x4096)
+    {"64x64:32x32:s3",   64,  64, 32, 32, 3},
+    {"64x64:32x32:s5",   64,  64, 32, 32, 5},
+    {"32x32:16x16:s3",   32,  32, 16, 16, 3},   // stock example default
+    {"128x64:64x32:s4", 128,  64, 64, 32, 4},
+    {"64x128:32x64:s4",  64, 128, 32, 64, 4},
+    {"128x128:64x64:s3",128, 128, 64, 64, 3},
+    {"128x256:64x64:s3",128, 256, 64, 64, 3},
+    {"256x128:64x64:s3",256, 128, 64, 64, 3},
+  };
+}
+
+// Map a runtime TileCfg to its compiled Cfg<>::Gemm and run BODY with `using G = ...;` in scope. Mirrors
+// machete's CUTLASS55_DISPATCH_CONFIG if-chain. Any config not listed here is a runtime error.
+#define W4A16_DISPATCH(cfg, BODY)                                                                    \
+  do {                                                                                               \
+    bool _matched = false;                                                                           \
+    auto _try = [&](int tm,int tn,int wm,int wn,int st){ return (cfg).tm==tm&&(cfg).tn==tn&&(cfg).wm==wm&&(cfg).wn==wn&&(cfg).st==st; }; \
+    if (_try(64,64,32,32,4))   { using G = Cfg<64,64,32,32,4>::Gemm;   _matched=true; BODY; }        \
+    if (_try(64,64,32,32,3))   { using G = Cfg<64,64,32,32,3>::Gemm;   _matched=true; BODY; }        \
+    if (_try(64,64,32,32,5))   { using G = Cfg<64,64,32,32,5>::Gemm;   _matched=true; BODY; }        \
+    if (_try(32,32,16,16,3))   { using G = Cfg<32,32,16,16,3>::Gemm;   _matched=true; BODY; }        \
+    if (_try(128,64,64,32,4))  { using G = Cfg<128,64,64,32,4>::Gemm;  _matched=true; BODY; }        \
+    if (_try(64,128,32,64,4))  { using G = Cfg<64,128,32,64,4>::Gemm;  _matched=true; BODY; }        \
+    if (_try(128,128,64,64,3)) { using G = Cfg<128,128,64,64,3>::Gemm; _matched=true; BODY; }        \
+    if (_try(128,256,64,64,3)) { using G = Cfg<128,256,64,64,3>::Gemm; _matched=true; BODY; }        \
+    if (_try(256,128,64,64,3)) { using G = Cfg<256,128,64,64,3>::Gemm; _matched=true; BODY; }        \
+    if (!_matched) { std::fprintf(stderr, "config %s not compiled in (see supported_configs)\n", (cfg).name); std::exit(1); } \
+  } while (0)
+// =================================================================================================================
+
 using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
 using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
 using StrideC = typename GemmKernelConvertOnly::StrideC;
@@ -284,6 +348,13 @@ struct Options {
   int g = 128;
   int l = 1;
 
+  // Tactic controls (machete / fpA_intB style). Empty config => use the tactic cache if given, else default.
+  std::string config;            // force one compiled tile, e.g. "64x64:32x32:s4"
+  std::string tactic_file;       // load best config for this shape from a cache
+  std::string save_tactic_file;  // write the searched winner to a cache
+  bool list_configs = false;
+  bool search_configs = false;
+
   // Parses the command line
   void parse(int argc, char const **args) {
     cutlass::CommandLine cmd(argc, args);
@@ -302,6 +373,11 @@ struct Options {
     cmd.get_cmd_line_argument("alpha", alpha, 1.f);
     cmd.get_cmd_line_argument("beta", beta, 0.f);
     cmd.get_cmd_line_argument("iterations", iterations);
+    cmd.get_cmd_line_argument("config", config);
+    cmd.get_cmd_line_argument("tactic", tactic_file);
+    cmd.get_cmd_line_argument("save_tactic", save_tactic_file);
+    list_configs   = cmd.check_cmd_line_flag("list_configs");
+    search_configs = cmd.check_cmd_line_flag("search_configs");
   }
 
   /// Prints the usage statement.
@@ -607,9 +683,10 @@ bool verify(const Options &options) {
   return passed;
 }
 
-/// Execute a given example GEMM computation
+/// Execute a given example GEMM computation. Returns the Result (does not exit on failure, so the tactic
+/// search can skip a config that does not verify and move on). `label` is printed on the comparable line.
 template <typename Gemm>
-int run(Options &options)
+Result run(Options &options, char const* label = "default")
 {
   initialize(options);
 
@@ -625,23 +702,22 @@ int run(Options &options)
   // Allocate workspace memory
   cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
-  // Check if the problem size is supported or not
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-
-  // Initialize kernel with arguments and workspace pointer
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
+  Result result;
+  // Check if the problem size is supported or not. Do not hard-CHECK (which aborts): during a search an
+  // unsupported tile must be skippable, so return a failed Result instead of killing the process.
+  if (gemm.can_implement(arguments) != cutlass::Status::kSuccess) { result.passed = false; return result; }
+  if (gemm.initialize(arguments, workspace.get()) != cutlass::Status::kSuccess) { result.passed = false; return result; }
 
   // Correctness / Warmup iteration
   CUTLASS_CHECK(gemm.run());
 
   // Check if output from kernel and reference kernel are equal or not
-  Result result;
   result.passed = verify(options);
 
   std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
 
   if (!result.passed) {
-    exit(-1);
+    return result;
   }
 
   // Run profiling loop
@@ -669,14 +745,55 @@ int run(Options &options)
     // weight-bandwidth framing only becomes the binding one at decode M~1, where the GEMV lives.)
     const double us = result.avg_runtime_ms * 1e3;
     const double tflops = result.gflops / 1e3;
-    std::printf("  [CUTLASS gs=%d] M=%d %7.2f us | %6.1f TFLOP/s | %.1f%% of 500 (fp16 peak)\n",
-                options.g, options.m, us, tflops, 100.0 * tflops / 500.0);
+    std::printf("  [CUTLASS gs=%d cfg=%s] M=%d %7.2f us | %6.1f TFLOP/s | %.1f%% of 500 (fp16 peak)\n",
+                options.g, label, options.m, us, tflops, 100.0 * tflops / 500.0);
   }
 
-  return 0;
+  return result;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+// Tactic dispatch + shape-keyed cache (exact-match text, like machete's cutlass55_tactics.cache).
+
+// Run one named/descriptor config through the compiled dispatch. Returns its Result.
+Result run_config(Options& options, TileCfg const& cfg) {
+  Result r;
+  W4A16_DISPATCH(cfg, { r = run<G>(options, cfg.name); });
+  return r;
+}
+
+TileCfg find_config(std::string const& name) {
+  for (auto const& c : supported_configs()) if (name == c.name) return c;
+  std::fprintf(stderr, "unknown config '%s'; use --list_configs\n", name.c_str());
+  std::exit(1);
+}
+
+std::string tactic_key(Options const& o) {  // shape identity for the cache
+  return std::to_string(o.m) + "," + std::to_string(o.n) + "," + std::to_string(o.k) + "," + std::to_string(o.g);
+}
+
+// Cache line: "m,n,k,g|config=<name>,tflops=<x>". Returns the config name for this shape, or "" if absent.
+std::string load_tactic(std::string const& path, Options const& o) {
+  std::ifstream f(path); if (!f) return "";
+  std::string const prefix = tactic_key(o) + "|config=";
+  std::string line;
+  while (std::getline(f, line)) {
+    auto p = line.find(prefix);
+    if (p == 0) { auto s = line.substr(prefix.size()); return s.substr(0, s.find(',')); }
+  }
+  return "";
+}
+
+void save_tactic(std::string const& path, Options const& o, std::string const& name, double tflops) {
+  std::vector<std::string> keep; std::ifstream in(path); std::string line;
+  std::string const key = tactic_key(o);
+  while (std::getline(in, line)) if (line.rfind(key + "|", 0) != 0 && !line.empty()) keep.push_back(line);
+  in.close();
+  std::ofstream out(path);
+  if (!out) { std::fprintf(stderr, "cannot write tactic cache %s\n", path.c_str()); return; }
+  for (auto const& l : keep) out << l << "\n";
+  out << key << "|config=" << name << ",tflops=" << tflops << "\n";
+}
 
 int main(int argc, char const **args) {
   hggcDeviceProp props;
@@ -702,31 +819,49 @@ int main(int argc, char const **args) {
     return 0;
   }
 
-  //
-  // Evaluate kernels
-  //
-
-  if (options.mode == GemmMode::ConvertOnly) {
-    std::cout << "PPU1.0 Running in no scale mode." << std::endl;
-    run<GemmConvertOnly>(options);
-  }
-  else if (options.mode == GemmMode::ScaleOnly) {
-    if (options.g == options.k) {
-      std::cout << "PPU1.0 Running in per-column scale mode." << std::endl;
-    } else {
-      std::cout << "PPU1.0 Running in group scale mode." << std::endl;
-    }
-    run<GemmScaleOnly>(options);
-  }
-  else if (options.mode == GemmMode::ScaleWithZeroPoint) {
-    if (options.g == options.k) {
-      std::cout << "PPU1.0 Running in per-column scale and zero mode." << std::endl;
-    } else {
-      std::cout << "PPU1.0 Running in group scale and zero mode." << std::endl;
-    }
-    run<GemmScaleWithZeroPoint>(options);
+  // --list_configs: enumerate the compiled tactics and exit.
+  if (options.list_configs) {
+    std::printf("compiled CUTLASS W4A16 tile configs:\n");
+    for (auto const& c : supported_configs())
+      std::printf("  %-18s  tile %dx%d  warp %dx%d  stages %d\n", c.name, c.tm, c.tn, c.wm, c.wn, c.st);
+    return 0;
   }
 
+  // The tactic path is ScaleOnly (mode 1). Modes 0/2 keep the original fixed-config run.
+  if (options.mode != GemmMode::ScaleOnly) {
+    if (options.mode == GemmMode::ConvertOnly) { std::cout << "PPU1.0 no-scale mode.\n";  run<GemmConvertOnly>(options); }
+    else                                       { std::cout << "PPU1.0 scale+zero mode.\n"; run<GemmScaleWithZeroPoint>(options); }
+    return 0;
+  }
+  std::cout << (options.g == options.k ? "PPU1.0 per-column scale mode.\n" : "PPU1.0 group scale mode.\n");
+
+  // --search_configs: time every compiled config (in-process, no recompile), keep the best that PASSED,
+  // print a table, optionally persist to a tactic cache, then run the winner once.
+  if (options.search_configs) {
+    std::printf("%-18s %-10s %s\n", "CONFIG", "TFLOP/s", "status");
+    std::string best_name; double best_tf = 0.0;
+    for (auto const& c : supported_configs()) {
+      Result r = run_config(options, c);
+      if (!r.passed) { std::printf("%-18s %-10s %s\n", c.name, "-", "skipped (unsupported/failed)"); continue; }
+      double tf = r.gflops / 1e3;
+      std::printf("%-18s %-10.1f ok\n", c.name, tf);
+      if (tf > best_tf) { best_tf = tf; best_name = c.name; }
+    }
+    if (best_name.empty()) { std::fprintf(stderr, "no config passed\n"); return 1; }
+    if (!options.save_tactic_file.empty()) save_tactic(options.save_tactic_file, options, best_name, best_tf);
+    std::printf("\n==== WINNER: %s at %.1f TFLOP/s ====\n", best_name.c_str(), best_tf);
+    run_config(options, find_config(best_name));
+    return 0;
+  }
+
+  // Single run. Config precedence: --config > --tactic cache > compiled default (first supported).
+  std::string name = options.config;
+  if (name.empty() && !options.tactic_file.empty()) {
+    name = load_tactic(options.tactic_file, options);
+    if (!name.empty()) std::printf("[tactic] %s -> %s\n", tactic_key(options).c_str(), name.c_str());
+  }
+  if (name.empty()) name = supported_configs().front().name;
+  run_config(options, find_config(name));
   return 0;
 }
 
