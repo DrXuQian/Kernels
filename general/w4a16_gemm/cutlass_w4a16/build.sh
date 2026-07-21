@@ -20,8 +20,12 @@ ACTLIZE="$(cd "$HERE/../../../third_party/actlize" && pwd)"
 EX_NAME="99_kernels_w4a16_compare"
 EX_DIR="$ACTLIZE/examples/$EX_NAME"
 EX_LIST="$ACTLIZE/examples/CMakeLists.txt"
-ARCH="${PPU_ARCHS:-ppu0010}"
+# This box's hgcc takes -arch=ppu001 (mapped to library arch 80a); the shipped v1.0.0 CMake hard-codes the
+# ppu0010 / -arch=ppu_10 naming instead. actlize_ppu001.patch retargets it. Applied to the submodule before
+# build and reverted after, so the pinned submodule content is unchanged.
+ARCH="${PPU_ARCHS:-ppu001}"
 PPU_SDK_ROOT="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
+PATCH="$HERE/actlize_ppu001.patch"
 
 if [ ! -x "$PPU_SDK_ROOT/bin/hgcc" ]; then
   echo "ERROR: hgcc not found at $PPU_SDK_ROOT/bin/hgcc. Set PPU_SDK=<path> and re-run." >&2
@@ -30,11 +34,24 @@ fi
 export PATH="$PPU_SDK_ROOT/bin:$PATH"
 
 cleanup() {
-  # Restore the submodule's example list and remove the overlay so the submodule stays clean.
-  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt 2>/dev/null || true
+  # Restore everything we touched in the submodule so its pinned content stays clean:
+  # the ppu001 arch patch, the example list, and the overlay dir.
+  git -C "$ACTLIZE" checkout -- CMakeLists.txt cmake/PPUToolchain.cmake examples/CMakeLists.txt 2>/dev/null || true
   rm -rf "$EX_DIR"
 }
 trap cleanup EXIT
+
+# --- retarget the toolchain to this box's ppu001 arch naming ---
+if git -C "$ACTLIZE" apply --check "$PATCH" 2>/dev/null; then
+  git -C "$ACTLIZE" apply "$PATCH"
+  echo "[build.sh] applied actlize_ppu001.patch (ppu0010/-arch=ppu_10 -> ppu001)"
+elif git -C "$ACTLIZE" apply --reverse --check "$PATCH" 2>/dev/null; then
+  echo "[build.sh] actlize_ppu001.patch already applied"
+else
+  echo "ERROR: actlize_ppu001.patch does not apply to the submodule at $ACTLIZE" >&2
+  echo "       the pinned submodule may have moved off v1.0.0." >&2
+  exit 1
+fi
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"

@@ -31,12 +31,15 @@ actlize builds with the PPU toolchain — `hgcc` device compiler + the `hggc` ru
 
 ```bash
 git submodule update --init third_party/actlize
-export PPU_SDK=/path/to/PPU_SDK          # must contain bin/hgcc
-./build.sh                                # overlays this dir as an actlize example, builds one target
+# PPU_SDK defaults to /usr/local/PPU_SDK (where bin/hgcc lives on this box); set it only if elsewhere.
+./build.sh
 ```
 
-`build.sh` overlays `bench_cutlass_w4a16.cu` into actlize's `examples/` as a new example, builds just that
-target through actlize's proven example machinery, and restores the submodule afterward.
+`build.sh` (1) applies `actlize_ppu001.patch` to retarget the toolchain from the shipped `ppu0010` /
+`-arch=ppu_10` naming to this box's `ppu001` (`-arch=ppu001`, library arch `80a`); (2) overlays
+`bench_cutlass_w4a16.cu` into actlize's `examples/` as a new example; (3) builds just that target through
+actlize's proven example machinery; (4) restores the submodule (patch, example list, overlay) on exit, so
+the pinned submodule content stays clean.
 
 ## Run the comparison
 
