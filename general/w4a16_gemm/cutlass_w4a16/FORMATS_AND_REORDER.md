@@ -20,9 +20,18 @@ GEMM kernel except for non-linear codebooks (IQ4).
 | IQ4_NL / IQ4_XS | — | needs a custom `NumericConverter` (int4→fp16 through the NL codebook); the stock mixed-input converter is linear only |
 
 **Unifying intermediate format:** `(int4 weights, fp16 group scale [+ fp16 group zero], group_size)`. Every
-GGUF/GPTQ/AWQ 4-bit format decodes to this on the host; the GEMM is then format-agnostic. gs=32 rides
-actlize's **runtime** group path (`options.g`, StaticGroupSize=0), not a compile-time FinegrainedGs64/128 —
-needs one validation run at g=32.
+GGUF/GPTQ/AWQ 4-bit format decodes to this on the host; the GEMM is then format-agnostic.
+
+**gs=32 caveat (corrected against the official acext launcher).** There are TWO actlize mixed-input paths:
+- The **generic** schedule `KernelTmaWarpSpecializedCooperativeMixedInput` with a **runtime** group size
+  (`options.g`) — this is what example 16 and our bench use. It has NO `block_k >= group_size` constraint
+  (our 64x64 winner, TileShapeK=64, passed at gs=128), and plausibly runs gs=32 directly. Verify.
+- The **official high-perf** path (`cutlass3/fpA_intB_gemm_template_cutlass3.cu`) uses **compile-time**
+  `KernelAiuMultistageMixedInputFinegrainedGs128/Gs64` with an explicit `ScaleTileShape =
+  Shape<CTA_N, ceil(CTA_K/gs)>`, a `cute::tuple<TileShape, ScaleTileShape>` mainloop arg, and
+  `switch(group_size){case 128; case 64; default: throw}`. It also validates `block_k >= group_size`. So it
+  supports ONLY gs 128/64. **Q4_K's gs=32 needs a new `FinegrainedGs32` specialization on this path** (or
+  stays on the generic runtime-g schedule, which is what our bench proves out).
 
 ## Offline reorder — required
 
@@ -36,6 +45,24 @@ must move it offline:
 - **"不能两份在显存":** the interleaved B replaces the original weight in HBM — one copy, not two.
 - Consistent with the marlin note (a GPTQ/vLLM checkpoint's B is directly edible there), except actlize
   mixed-input wants its OWN interleave-256, not Marlin's layout — so the offline conversion is mandatory here.
+- **The interleave is conditional on shape.** The official launcher picks `ColumnMajorInterleaved<256>` only
+  when `n % 256 == 0 && k % 256 == 0` (and a16w4), else plain `ColumnMajor`. Our bench hard-codes the
+  interleaved layout (fine for qwen's 4096-multiples); a general loader must branch on divisibility.
+
+## Reference: the official cutlass3 launcher (for a real runner)
+
+`cutlass3/fpA_intB_gemm_template_cutlass3.cu` is the mature version and the template for a real runner. Beyond
+what our bench has:
+- **split-k**: `cutlass::gemm::SplitKSerialScheduler` + `gemm_config.split_k_factor` (a real config axis;
+  source of fpA_intB's `sm80:MxNxK:stages:split_k` naming).
+- **LUT config selection**: `get_gemm_lut<T,WeightType>(device_info)` keyed by `{m,n,k}` → a `GemmLoopHelper`
+  compile-time loop over `TypeCfgArray` configs, with `dispatchGemmConfig` heuristic as fallback. Validity gate
+  `!(isFinegrained(QuantOp) && block_k < group_size)`. This is the grown-up form of our shape-keyed tactic
+  cache + `W4A16_DISPATCH`.
+- **arg layout is NOT swapped** (passes A,B at {m,n,k} directly, `stride_C = make_shape(m,0,1)` broadcast
+  bias); example 16 (and our bench) use the swap-and-transpose formulation instead. Both work; ours is the
+  one that compiled green.
+- `EpilogueSimtVectorizedWithoutEvt`, `ClusterShape = WarpShape` (cluster unused on ppu1.0).
 
 ## Path to a runner (when this graduates from a bench)
 
