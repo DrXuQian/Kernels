@@ -28,10 +28,25 @@ int main(int argc, char** argv) {
 
   std::printf("fpA_intB official path: m=%d n=%d k=%d gs=%d (TK=128, FinegrainedGs128, scale-only)\n", m,n,k,g);
   // block 128x128x128, warp 64x64 -- block_k=128 >= gs=128 (the official constraint), split_k=1.
-  fpa_intb_ppu::filter_and_run<fpa_intb_ppu::QuantMode::FinegrainedScaleOnly,
-      128, 128, 128, 64, 64, /*Stages=*/3>(
-      A.get(), B.get(), scales.get(), /*zeros=*/nullptr, D.get(), m, n, k, g,
-      /*split_k=*/1, ws.get(), ws_bytes, /*stream=*/nullptr);
-  std::printf("launch issued (no verify; this gate only checks compile + can_implement + run)\n");
+  auto launch = [&]{
+    fpa_intb_ppu::filter_and_run<fpa_intb_ppu::QuantMode::FinegrainedScaleOnly,
+        128, 128, 128, 64, 64, /*Stages=*/3>(
+        A.get(), B.get(), scales.get(), /*zeros=*/nullptr, D.get(), m, n, k, g,
+        /*split_k=*/1, ws.get(), ws_bytes, /*stream=*/nullptr);
+  };
+  launch();
+  std::printf("launch issued (compile + can_implement + run OK). timing next.\n");
+
+  // GEMM timing is data-independent (no data-dependent branches), so this is a valid perf number even on
+  // uninitialized buffers. Correctness is checked separately by routing through the bench data+verify harness.
+  const int warmup = 20, iters = 100;
+  for (int i = 0; i < warmup; i++) launch();
+  PpuTimer timer; timer.start();
+  for (int i = 0; i < iters; i++) launch();
+  timer.stop();
+  double us = double(timer.elapsed_millis()) * 1e3 / iters;
+  double tflops = 2.0 * m * n * k / (us * 1e-6) / 1e12;
+  std::printf("  [CUTLASS-official gs=%d TK=128] %7.2f us | %6.1f TFLOP/s | %.1f%% of 500\n",
+              g, us, tflops, 100.0 * tflops / 500.0);
   return 0;
 }
