@@ -28,16 +28,22 @@ target_compile_definitions(bench_cutlass_w4a16 PRIVATE
   TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES})
 target_compile_options(bench_cutlass_w4a16 PRIVATE -w)
 
-# Official-structured finegrained launcher (fpA_intB_ppu.cuh) compile+run gate. Build with:
+# Official-structured finegrained launcher (fpA_intB_ppu.cuh) + the dequant+cublas candidate. Build with:
 #   TARGET=test_fpA_intB_ppu ./build.sh
+#
+# The dequant+cublas candidate needs cublas from the CUDA_SDK (next to the box nvcc:
+# which nvcc -> .../PPU_SDK/CUDA_SDK/bin/nvcc). Override with -DCUDA_SDK_ROOT= if elsewhere. The cublas -I must
+# go through DEV_COMPILE_FLAGS (hgcc compiles the .cu via a custom command that ignores
+# target_include_directories); the link goes through target_link_libraries (host link stage).
+# Point at the CUDA SDK's per-target dir where cublas_v2.h / libcublas live on this box:
+#   .../PPU_SDK/CUDA_SDK/targets/x86_64-linux/{include,lib}. Override with -DCUDA_SDK_ROOT= if elsewhere.
+set(CUDA_SDK_ROOT "/sim/eec/shared/junfu.qx/PPU_SDK/CUDA_SDK/targets/x86_64-linux" CACHE STRING "CUDA SDK target dir providing cublas")
 cutlass_example_add_executable(
   test_fpA_intB_ppu
   test_fpA_intB_ppu.cu
+  DEV_COMPILE_FLAGS "-I${CUDA_SDK_ROOT}/include"
 )
 target_compile_options(test_fpA_intB_ppu PRIVATE -w)
-# The dequant+cublas candidate needs cublas from the CUDA_SDK (host lib). CUDA_SDK is next to the box nvcc
-# (which nvcc -> .../PPU_SDK/CUDA_SDK/bin/nvcc). Override with -DCUDA_SDK_ROOT= if elsewhere.
-set(CUDA_SDK_ROOT "/usr/local/PPU_SDK/CUDA_SDK" CACHE STRING "CUDA SDK root providing cublas")
 target_include_directories(test_fpA_intB_ppu PRIVATE "${CUDA_SDK_ROOT}/include")
 target_link_directories(test_fpA_intB_ppu PRIVATE "${CUDA_SDK_ROOT}/lib64" "${CUDA_SDK_ROOT}/lib")
 target_link_libraries(test_fpA_intB_ppu PRIVATE cublas)  # PRIVATE to match the keyword signature the cutlass macro already used
