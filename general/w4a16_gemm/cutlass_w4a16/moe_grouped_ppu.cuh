@@ -91,7 +91,11 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     std::printf("[moe_grouped layout] m=%d n=%d k=%d L=%d gs=%d\n", m,n,k,L,group_size);
     std::printf("  StrideA="); cute::print(sA); std::printf("\n  StrideB="); cute::print(sB);
     std::printf("\n  StrideC="); cute::print(sC); std::printf("\n  StrideD="); cute::print(sD);
-    std::printf("\n  StrideScale="); cute::print(sS); std::printf("\n"); } }
+    std::printf("\n  StrideScale="); cute::print(sS);
+    // THE decisive flag: mixed-input swaps M/N in to_underlying when B is narrow. actlize's single-GEMM kernel
+    // does that swap; this grouped kernel does NOT (yet). If this prints 1, that's the L=1 bug.
+    std::printf("\n  Has_SwapAB=%d  (strides above are the ARGUMENT/host stage, pre-to_underlying/pre-swap)\n",
+                int(cutlass::gemm::detail::Has_SwapAB_v<CollectiveMainloop>)); } }
 #endif
   GroupProblemShape ps; ps.num_groups = L; ps.problem_shapes = group_shapes_dev; ps.host_problem_shapes = group_shapes_host;
   cutlass::KernelHardwareInfo hw{};   // cu_count auto-queried in to_underlying_arguments
