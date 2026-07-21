@@ -644,15 +644,14 @@ int run(Options &options)
     std::cout << "  Avg runtime: " << result.avg_runtime_ms << " ms" << std::endl;
     std::cout << "  GFLOPS: " << result.gflops << std::endl;
 
-    // Comparable line for the marlin side (bench_marlin_gguf prints us / GB/s). W4A16 prefill is weight-bound:
-    // the weight traffic is N*K int4 = N*K/2 bytes, plus N*ceil(K/g) fp16 scales. Divide by the ACHIEVABLE
-    // read bandwidth measured by bw_probe (~2200 GB/s on this box), NOT the 2766 nameplate.
+    // Comparable line for the marlin side. At a prefill M this GEMM is COMPUTE-bound, not weight-bound: at
+    // M=2048,N=K=4096 the math is 2*M*N*K = 6.9e10 FLOP (~550us at 125 TFLOP/s) while the weight read is only
+    // N*K/2 = 8.4 MB (~4us). So the right metric is MFU against the 500 TFLOP/s fp16 peak, not %HBM. (The
+    // weight-bandwidth framing only becomes the binding one at decode M~1, where the GEMV lives.)
     const double us = result.avg_runtime_ms * 1e3;
-    const double wbytes = double(options.n) * options.k / 2.0
-                        + double(options.n) * ((options.k + options.g - 1) / options.g) * sizeof(MmaType);
-    const double gbps = wbytes / (us * 1e-6) / 1e9;
-    std::printf("  [CUTLASS gs=%d] %6.2f us | %6.0f GB/s (weight) | %.1f%% of 2200\n",
-                options.g, us, gbps, 100.0 * gbps / 2200.0);
+    const double tflops = result.gflops / 1e3;
+    std::printf("  [CUTLASS gs=%d] M=%d %7.2f us | %6.1f TFLOP/s | %.1f%% of 500 (fp16 peak)\n",
+                options.g, options.m, us, tflops, 100.0 * tflops / 500.0);
   }
 
   return 0;
