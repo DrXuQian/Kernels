@@ -79,10 +79,10 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   const int scale_k = (k + group_size - 1) / group_size;
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));
   StrideB sB = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, L));
-  // C/D strides are REVERSED (n,m,L) because mixed-input swaps+transposes when B is the narrow (int4) operand
-  // -> the kernel writes D transposed as [N][M]. (example 16: "Reverse stride here due to swap and transpose".)
-  StrideD sD = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(n, m, L));
-  StrideC sC = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(n, m, L));
+  // C/D strides are NORMAL (m,n,L): the FinegrainedGs AIU mixed-input collective does NOT swap
+  // (Has_SwapAB=0, measured), unlike example 16's coop schedule. So D is row-major [M][N], no transpose.
+  StrideD sD = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, L));
+  StrideC sC = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, L));
   StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
 
 #ifdef MOEG_DEBUG

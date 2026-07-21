@@ -105,8 +105,8 @@ int main(int argc, char** argv) {
         for (int kk=0;kk<K;kk++)
           // Wdq is ROW-major [N][K] (measured: StrideB=(K,1,0)): element (n,k) at n*K + k.
           ref += hA[(size_t)(offs[e]+i)*K + kk] * (double)float(hWdq[(size_t)e*N*K + (size_t)j*K + kk]);
-        // D is TRANSPOSED [N][M] per expert (mixed-input swap+transpose): element (m,n) at e*N*Mmax + n*Mmax + m.
-        double got = (double)float(hD[(size_t)e*N*Mmax + (size_t)j*Mmax + i]);
+        // D is row-major [M][N] per expert (Has_SwapAB=0, no transpose): element (m,n) at e*Mmax*N + m*N + n.
+        double got = (double)float(hD[(size_t)e*Mmax*N + (size_t)i*N + j]);
         double rel = std::abs(got-ref)/(std::abs(ref)+1e-3);
         if (rel > max_rel) max_rel = rel;
         if (rel > 5e-2) bad++;
