@@ -77,6 +77,19 @@ TILE_M=128 TILE_N=256 WARP_M=64 WARP_N=64 STAGES=3 ./build.sh
 Sweep tile/warp/stages and read the `[CUTLASS gs=128]` MFU line. Not every combination will compile or run
 on the mixed-input AIU mainloop — keep WARP a divisor of TILE and a multiple of the 16x16 MMA atom.
 
+### Autotune: `./sweep.sh`
+
+Because the tile is compile-time, autotune is build-time (as in cutlass/vLLM): `sweep.sh` builds each
+candidate in `CONFIGS`, runs a short warmup timing, keeps the best-MFU config that PASSED, then rebuilds that
+one and runs it once at full iterations.
+
+```bash
+./sweep.sh                          # sweep at the default 2048x4096x4096, gs=128, mode=1
+M=4096 N=4096 K=4096 ./sweep.sh     # shape is fixed across the sweep, env-overridable (M N K G MODE)
+```
+
+Failed/unsupported configs are skipped (logged to a temp dir); edit `CONFIGS` to add or trim candidates.
+
 ## Entry file
 
 `bench_cutlass_w4a16.cu` is example 16 (`16_ppu_mixed_dtype_gemm`) **verbatim**, with exactly two changes,
