@@ -126,11 +126,9 @@ void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
   };
 
   Gemm gemm;
-  auto st = gemm.can_implement(args);
-  if (st != cutlass::Status::kSuccess) {
-    std::printf("[fpA_intB] can_implement failed: %s\n", cutlassGetStatusString(st)); return;
-  }
-  gemm.initialize(args, workspace, stream);
+  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return;   // silently skip; sweep flags it via >peak TFLOP/s
+  if (gemm.get_workspace_size(args) > workspace_bytes) return;         // undersized workspace -> would no-op
+  if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return;
   gemm.run(stream);
 }
 

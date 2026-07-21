@@ -21,7 +21,10 @@ int main(int argc, char** argv) {
   using half_t = cutlass::half_t;
   using int4_t = cutlass::int4b_t;
   const int scale_k = (k + g - 1) / g;
-  const size_t ws_bytes = (size_t)cutlass::ceil_div(m,128) * cutlass::ceil_div(n,64) * 7 * 4;
+  // Split-k workspace = grid_m*grid_n*sizeof(int) per the kernel, with grid largest for the SMALLEST tile
+  // (Bm=16, Bn=64) and largest split_k in the sweep. Size for the worst case so split_k configs actually run
+  // -- an undersized workspace made initialize() fail silently and the kernel no-op (garbage >peak TFLOP/s).
+  const size_t ws_bytes = (size_t)cutlass::ceil_div(m,16) * cutlass::ceil_div(n,64) * 8 /*max split_k*/ * 4;
 
   cutlass::DeviceAllocation<half_t> A((size_t)m*k), scales((size_t)n*scale_k), D((size_t)m*n);
   cutlass::DeviceAllocation<int4_t> B((size_t)n*k);       // int4b_t elements (packed by the allocator)
@@ -46,8 +49,10 @@ int main(int argc, char** argv) {
     double us = double(t.elapsed_millis()) * 1e3 / iters;                                            \
     double tf = 2.0 * m * n * k / (us * 1e-6) / 1e12;                                                \
     const char* nm = #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK;                     \
-    std::printf("%-32s %-10.1f %.1f%%\n", nm, tf, 100.0*tf/500.0);                                    \
-    if (tf > best_tf) { best_tf = tf; std::snprintf(best_name, sizeof(best_name), "%s", nm); }        \
+    bool ran = tf <= 500.0;  /* faster-than-peak == kernel no-op (init/can_implement bailed) */       \
+    if (ran) std::printf("%-32s %-10.1f %.1f%%\n", nm, tf, 100.0*tf/500.0);                            \
+    else     std::printf("%-32s %-10s %s\n", nm, "-", "FAIL (no-op: init/can_implement)");            \
+    if (ran && tf > best_tf) { best_tf = tf; std::snprintf(best_name, sizeof(best_name), "%s", nm); }  \
   } while (0)
 
   // EXPANDED SEARCH SPACE. tactic+sweep (not the official LUT): we measure every config and keep the best.
