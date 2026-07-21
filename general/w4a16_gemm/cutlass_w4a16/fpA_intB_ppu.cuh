@@ -25,6 +25,9 @@
 //   [F4] the splitk kernel may want ClusterShape rather than WarpShape in the epilogue builder.
 #pragma once
 
+#include <cstdio>
+#include <type_traits>
+
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
@@ -42,9 +45,16 @@
 namespace fpa_intb_ppu {
 using namespace cute;
 
+// actlize v1.0.0 does NOT expose cutlass::WeightOnlyQuantOp / isFinegrained / hasZero (those are acext-private).
+// The format axis is instead carried by the schedule (FinegrainedGs* vs PerCol) plus whether the ElementBInfo
+// tuple has a zero. This local enum + the two constexpr helpers reproduce the official QuantOp axis.
+enum class QuantMode { PerColScaleOnly, FinegrainedScaleOnly, FinegrainedScaleZero };
+constexpr bool is_finegrained(QuantMode q) { return q != QuantMode::PerColScaleOnly; }
+constexpr bool has_zero(QuantMode q) { return q == QuantMode::FinegrainedScaleZero; }
+
 // One instantiation: fp16 x int4, a given schedule / tile / scale-tile / stages / interleave. Mirrors the
 // official generic_mixed_gemm_kernelLauncher but pared to (A=half, B=int4, scale/zero=half, out=half).
-template <cutlass::WeightOnlyQuantOp QuantOp, class KernelSchedule,
+template <QuantMode QuantOp, class KernelSchedule,
           class TileShape, class ScaleTileShape, class WarpShape, int Stages, bool AiuInterleaved>
 void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
                       const cutlass::half_t* scales, const cutlass::half_t* zeros, cutlass::half_t* D,
@@ -63,7 +73,7 @@ void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
   using ElementZero  = cutlass::half_t;
   using PackedScale     = cute::tuple<ElementB, ElementScale>;
   using PackedScaleZero = cute::tuple<ElementB, ElementScale, ElementZero>;
-  using ElementBInfo = std::conditional_t<cutlass::hasZero(QuantOp), PackedScaleZero, PackedScale>;
+  using ElementBInfo = std::conditional_t<has_zero(QuantOp), PackedScaleZero, PackedScale>;
 
   using ElementC = cutlass::half_t;                     // [F2] could be void when no bias
   using LayoutC  = cutlass::layout::RowMajor;
@@ -125,7 +135,7 @@ void generic_launcher(const cutlass::half_t* A, const cutlass::int4b_t* B,
 }
 
 // group_size -> compile-time schedule + ScaleTileShape, with the official block_k >= group_size gate.
-template <cutlass::WeightOnlyQuantOp QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages, bool AiuInterleaved>
+template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages, bool AiuInterleaved>
 void dispatch_gs(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
                  const cutlass::half_t* zeros, cutlass::half_t* D, int m, int n, int k, int group_size,
                  int split_k, char* ws, size_t ws_bytes, cudaStream_t stream) {
@@ -133,7 +143,7 @@ void dispatch_gs(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutl
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   if (k % 64 || n % 64) { std::printf("[fpA_intB] n,k must be multiples of 64\n"); return; }
 
-  if constexpr (cutlass::isFinegrained(QuantOp)) {
+  if constexpr (is_finegrained(QuantOp)) {
     if (TK < group_size) {   // official validity gate
       std::printf("[fpA_intB] block_k(%d) < group_size(%d): finegrained needs block_k >= gs\n", TK, group_size);
       return;
@@ -161,7 +171,7 @@ void dispatch_gs(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutl
 }
 
 // AiuInterleaved from shape divisibility (official filter_and_run_mixed_gemm).
-template <cutlass::WeightOnlyQuantOp QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages>
+template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages>
 void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
                     const cutlass::half_t* zeros, cutlass::half_t* D, int m, int n, int k, int group_size,
                     int split_k, char* ws, size_t ws_bytes, cudaStream_t stream) {
