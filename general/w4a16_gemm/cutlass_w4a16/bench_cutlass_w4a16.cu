@@ -75,6 +75,13 @@
 #include "ppu_include.hpp"
 #include "cutlass/gemm/collective/builders/ppu_mma_builder.inl"
 
+#ifdef MOEG_XCHECK
+// Cross-check hook: pull in the grouped mixed-input launcher so we can run it (L=1) on THIS file's own
+// verified data. Guarded so the stock bench target is byte-identical. ppu_mma_builder.inl is #pragma once, so
+// re-inclusion via moe_grouped_ppu.cuh is safe.
+#include "moe_grouped_ppu.cuh"
+#endif
+
 using namespace cute;
 
 
@@ -795,6 +802,59 @@ void save_tactic(std::string const& path, Options const& o, std::string const& n
   out << key << "|config=" << name << ",tflops=" << tflops << "\n";
 }
 
+#ifdef MOEG_XCHECK
+// ================================ GROUPED KERNEL CROSS-CHECK (L=1) ================================
+// The decisive root-cause test. Reuses this file's initialize()-produced data VERBATIM:
+//   block_A         -- the same A the verified mixed kernel uses,
+//   block_B_buff    -- B already shuffled by the TRUSTED preprocess_weights_for_mixed_gemm (interleave-256),
+//   block_scale     -- the same scales, same stride convention,
+//   block_ref_D     -- the VERIFIED reference (dequantize_weight -> fp16 GemmRef), filled by verify().
+// It runs the grouped kernel as a single expert (group_shape = {m,n,k}, no ragged offset) and compares its D
+// against block_ref_D. NO hand-rolled dequant/packing/orientation here -- that is exactly the thing under
+// suspicion in test_moe_grouped_verify. Outcome interpretation:
+//   MATCH    -> grouped kernel + strides are correct; the earlier MISMATCH was my hand-rolled verify setup.
+//   MISMATCH -> the grouped no-swap stride convention (esp. StrideB from the interleaved LayoutB) is wrong;
+//               compare vs block_D (the mixed kernel's own output) to localize.
+void xcheck_grouped(Options const& options) {
+  using GS = moe_grouped_ppu::GroupShape;
+  int const L = 1, m = options.m, n = options.n, k = options.k, g = options.g;
+
+  std::vector<GS> host_shapes(L, cute::make_shape(m, n, k));
+  cutlass::DeviceAllocation<GS> dev_shapes(L); dev_shapes.copy_from_host(host_shapes.data());
+  cutlass::DeviceAllocation<cutlass::half_t> Dgrp((size_t)m * n);
+  size_t const ws_bytes = (size_t)cutlass::ceil_div(m, 16) * cutlass::ceil_div(n, 64) * L * 64;
+  cutlass::DeviceAllocation<char> ws(ws_bytes);
+
+  // FinegrainedGs128 needs TK >= gs(=128 default); tile 64x64x128/s3 (result is tile-independent).
+  moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
+      block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr, Dgrp.get(),
+      m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
+      ws.get(), ws_bytes, /*stream=*/nullptr);
+  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+
+  bool const ok = cutlass::reference::device::BlockCompareRelativelyEqual(
+      block_ref_D.get(), Dgrp.get(), (size_t)m * n, ElementD(1e-2f), ElementD(1e-4f));
+
+  std::vector<ElementD> hr((size_t)m * n), hg((size_t)m * n);
+  block_ref_D.copy_to_host(hr.data()); Dgrp.copy_to_host(hg.data());
+  double maxrel = 0; int bad = 0;
+  for (size_t i = 0; i < (size_t)m * n; ++i) {
+    double r = float(hr[i]), gt = float(hg[i]);
+    double rel = std::abs(gt - r) / (std::abs(r) + 1e-3);
+    if (rel > maxrel) maxrel = rel;
+    if (rel > 5e-2) ++bad;
+  }
+  std::printf("\n[xcheck grouped L=1] m=%d n=%d k=%d g=%d  BlockCompare=%s  max_rel=%.3e  bad=%d/%zu -> %s\n",
+              m, n, k, g, ok ? "PASS" : "FAIL", maxrel, bad, (size_t)m * n, bad == 0 ? "MATCH" : "MISMATCH");
+  std::printf("  ref_D[0..5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hr[i]));
+  std::printf("\n  grp_D[0..5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[i]));
+  // Also dump the second row start (index n) to check for a transpose/stride error signature.
+  std::printf("\n  ref_D[n..n+5]="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hr[n + i]));
+  std::printf("\n  grp_D[n..n+5]="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[n + i]));
+  std::printf("\n");
+}
+#endif
+
 int main(int argc, char const **args) {
   hggcDeviceProp props;
   int current_device_id;
@@ -834,6 +894,18 @@ int main(int argc, char const **args) {
     return 0;
   }
   std::cout << (options.g == options.k ? "PPU1.0 per-column scale mode.\n" : "PPU1.0 group scale mode.\n");
+
+#ifdef MOEG_XCHECK
+  // Root-cause cross-check: run the VERIFIED mixed kernel once (fills block_ref_D + the shuffled block_B_buff),
+  // then run the grouped kernel L=1 on that exact data and compare. Bypasses the tactic path entirely.
+  {
+    std::cout << "[xcheck] verified mixed kernel -> reference, then grouped L=1 on the SAME data\n";
+    Options o = options; o.iterations = 0;   // correctness only, skip timing
+    run<GemmScaleOnly>(o);                    // fills block_A / block_B_buff / block_scale / block_ref_D
+    xcheck_grouped(o);
+    return 0;
+  }
+#endif
 
   // --search_configs: time every compiled config (in-process, no recompile), keep the best that PASSED,
   // print a table, optionally persist to a tactic cache, then run the winner once.
