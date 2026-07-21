@@ -26,30 +26,36 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<int4_t> B((size_t)n*k);       // int4b_t elements (packed by the allocator)
   cutlass::DeviceAllocation<char>   ws(ws_bytes);
 
-  std::printf("fpA_intB official path sweep: m=%d n=%d k=%d gs=%d (FinegrainedGs128, scale-only, TK>=gs=128)\n", m,n,k,g);
+  std::printf("fpA_intB official path sweep: m=%d n=%d k=%d gs=%d (FinegrainedGs128, scale-only)\n", m,n,k,g);
   std::printf("%-24s %-10s %s\n", "TILE(MxNxK)/WARP/ST", "TFLOP/s", "MFU");
 
   // GEMM timing is data-independent, so uninitialized buffers give a valid perf number (correctness checked
-  // separately via the bench harness). Each TIME(...) is a distinct compiled instantiation; block_k is pinned
-  // to 128 because the official finegrained path requires block_k >= group_size (gs=128 here).
+  // separately via the bench harness). Each TIME(...) is a distinct compiled instantiation. block_k (TK) is
+  // now swept too: TK=128 satisfies the official block_k>=gs gate; TK=64 probes the relaxed gate (does the
+  // FinegrainedGs128 kernel accept a group spanning 2 k-tiles?).
   const int warmup = 20, iters = 100;
-#define TIME(TM,TN,WM,WN,ST) do {                                                                    \
+#define TIME(TM,TN,TK,WM,WN,ST) do {                                                                 \
     auto launch = [&]{ fpa_intb_ppu::filter_and_run<fpa_intb_ppu::QuantMode::FinegrainedScaleOnly,   \
-        TM, TN, 128, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, D.get(), m, n, k, g,       \
+        TM, TN, TK, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, D.get(), m, n, k, g,        \
         1, ws.get(), ws_bytes, nullptr); };                                                          \
     launch();                                                                                        \
     for (int i = 0; i < warmup; i++) launch();                                                       \
     PpuTimer t; t.start(); for (int i = 0; i < iters; i++) launch(); t.stop();                       \
     double us = double(t.elapsed_millis()) * 1e3 / iters;                                            \
     double tf = 2.0 * m * n * k / (us * 1e-6) / 1e12;                                                \
-    std::printf("%-24s %-10.1f %.1f%%\n", #TM "x" #TN "x128/" #WM "x" #WN "/s" #ST, tf, 100.0*tf/500.0); \
+    std::printf("%-24s %-10.1f %.1f%%\n", #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST, tf, 100.0*tf/500.0); \
   } while (0)
 
-  TIME(64,  64,  32, 32, 3);
-  TIME(64,  64,  32, 32, 4);
-  TIME(128, 64,  64, 32, 3);
-  TIME(64,  128, 32, 64, 3);
-  TIME(128, 128, 64, 64, 3);   // the 12.9% config from the first run
+  // K=64 (probes the relaxed block_k>=gs gate -- matches the generic path's winning K)
+  TIME(64,  64,  64, 32, 32, 3);
+  TIME(64,  64,  64, 32, 32, 4);
+  TIME(128, 64,  64, 64, 32, 3);
+  // K=128 (official-legal for gs=128)
+  TIME(64,  64,  128, 32, 32, 3);
+  TIME(64,  64,  128, 32, 32, 4);
+  TIME(128, 64,  128, 64, 32, 3);
+  TIME(64,  128, 128, 32, 64, 3);
+  TIME(128, 128, 128, 64, 64, 3);
 #undef TIME
   return 0;
 }
