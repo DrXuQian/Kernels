@@ -34,28 +34,32 @@ int main(int argc, char** argv) {
   // now swept too: TK=128 satisfies the official block_k>=gs gate; TK=64 probes the relaxed gate (does the
   // FinegrainedGs128 kernel accept a group spanning 2 k-tiles?).
   const int warmup = 20, iters = 100;
-#define TIME(TM,TN,TK,WM,WN,ST) do {                                                                 \
+#define TIME(TM,TN,TK,WM,WN,ST,SPLITK) do {                                                          \
     auto launch = [&]{ fpa_intb_ppu::filter_and_run<fpa_intb_ppu::QuantMode::FinegrainedScaleOnly,   \
         TM, TN, TK, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, D.get(), m, n, k, g,        \
-        1, ws.get(), ws_bytes, nullptr); };                                                          \
+        SPLITK, ws.get(), ws_bytes, nullptr); };                                                     \
     launch();                                                                                        \
     for (int i = 0; i < warmup; i++) launch();                                                       \
     PpuTimer t; t.start(); for (int i = 0; i < iters; i++) launch(); t.stop();                       \
     double us = double(t.elapsed_millis()) * 1e3 / iters;                                            \
     double tf = 2.0 * m * n * k / (us * 1e-6) / 1e12;                                                \
-    std::printf("%-24s %-10.1f %.1f%%\n", #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST, tf, 100.0*tf/500.0); \
+    std::printf("%-30s %-10.1f %.1f%%\n",                                                            \
+        #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK, tf, 100.0*tf/500.0);            \
   } while (0)
 
-  // K=64 (probes the relaxed block_k>=gs gate -- matches the generic path's winning K)
-  TIME(64,  64,  64, 32, 32, 3);
-  TIME(64,  64,  64, 32, 32, 4);
-  TIME(128, 64,  64, 64, 32, 3);
-  // K=128 (official-legal for gs=128)
-  TIME(64,  64,  128, 32, 32, 3);
-  TIME(64,  64,  128, 32, 32, 4);
-  TIME(128, 64,  128, 64, 32, 3);
-  TIME(64,  128, 128, 32, 64, 3);
-  TIME(128, 128, 128, 64, 64, 3);
+  // The OFFICIAL heuristic configs (Bk=256, Bn=64, stage=2, split_k) -- the regime I had missed.
+  // Indexed by m in the official table; run this at m=1/32/64/128 to compare against the heuristic's intent,
+  // and at m=2048 for the prefill point.
+  TIME(16, 64, 256, 16, 16, 2, 2);   // official m in 1..32
+  TIME(32, 64, 256, 32, 16, 2, 2);   // official m=64
+  TIME(32, 64, 256, 32, 16, 2, 1);   // official m=128
+  // neighbours of the official configs (split_k and stage variations)
+  TIME(16, 64, 256, 16, 16, 2, 4);
+  TIME(32, 64, 256, 32, 16, 3, 2);
+  TIME(64, 64, 256, 32, 32, 2, 1);
+  // my earlier prefill configs, for reference
+  TIME(64,  64,  64,  32, 32, 4, 1);
+  TIME(64,  64,  128, 32, 32, 3, 1);
 #undef TIME
   return 0;
 }
