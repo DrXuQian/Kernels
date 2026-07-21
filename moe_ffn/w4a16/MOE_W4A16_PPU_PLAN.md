@@ -135,3 +135,14 @@ tactic/config-selection layer we built for dense.
 - Reuse the existing routing in `gemv_w4a16_ppu.cu` vs porting trtllm's `custom_moe_routing.cu` (more complete:
   handles renormalization, expert bias). Port trtllm's for completeness.
 - Activation: qwen uses SiLU-GLU (gate*silu(up) or up*silu(gate)); confirm the exact GLU order against ggml.
+
+## STATUS (ppu001)
+- Step 1 (batched uniform-m mixed-input): DONE, 55.6% MFU @ m=2048 FC1.
+- Step 2a (grouped via GroupScheduler, uniform): DONE, compiles+runs, 20.0% MFU (grouped path 2.4x slower
+  than batched -- a tuning gap, not correctness).
+- Step 2b (RAGGED, variable tokens/expert): RUNS. actlize_moe_ragged.patch gives the mixed-input collective a
+  per-expert A base (ptr_A + group_row_offsets[l_coord]*K); ragged case (tokens 64/128/192/256) launches, no
+  OOB, 87.3 TFLOP/s scaled to the ragged total. This is the cutlass mixed-precision RAGGED grouped GEMM asked
+  for. REMAINING: (a) CPU-reference correctness verify (timing can't prove ragged reads the right rows);
+  (b) D contiguous [sum_tokens][N] via an epilogue offset (2c; 2b uses padded [L][M_max][N]); (c) the grouped
+  MFU/tuning gap (17-20% vs batched 49-55%).
