@@ -35,12 +35,10 @@ git submodule update --init third_party/actlize
 ./build.sh
 ```
 
-`build.sh` (1) auto-detects the SDK's arch naming: it applies `actlize_ppu001.patch` (retargeting shipped
-`ppu0010` / `-arch=ppu_10` to `ppu001` / `-arch=ppu001`, library arch `80a`) only if it applies cleanly, and
-skips it for an SDK whose naming already matches shipped — `ARCH` follows (`ppu001` when patched, `ppu0010`
-otherwise; override with `PPU_ARCHS=`); (2) overlays `bench_cutlass_w4a16.cu` into actlize's `examples/` as a
-new example; (3) builds just that target through actlize's proven example machinery; (4) restores the
-submodule (patch, example list, overlay) on exit, so the pinned submodule content stays clean.
+`build.sh` (1) overlays `bench_cutlass_w4a16.cu` into actlize's `examples/` as a new example; (2) builds just
+that target through actlize's proven example machinery (`CUTLASS_PPU_ARCHS=ppu0010`, override with
+`PPU_ARCHS=`); (3) restores the submodule (example list, overlay) on exit, so the pinned submodule content
+stays clean.
 
 ## Run the comparison
 
