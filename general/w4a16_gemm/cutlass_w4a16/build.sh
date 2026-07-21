@@ -40,7 +40,11 @@ echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
-cp "$HERE"/*.cu "$HERE"/*.cpp "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*.h "$HERE/CMakeLists.txt" "$EX_DIR/"
+# nullglob so patterns that match nothing (e.g. no *.cpp right now) vanish instead of aborting under set -e.
+shopt -s nullglob
+_overlay_files=("$HERE"/*.cu "$HERE"/*.cpp "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*.h "$HERE/CMakeLists.txt")
+shopt -u nullglob
+cp "${_overlay_files[@]}" "$EX_DIR/"
 
 # register it in the foreach list (idempotent: only if absent)
 if ! grep -q "$EX_NAME" "$EX_LIST"; then
