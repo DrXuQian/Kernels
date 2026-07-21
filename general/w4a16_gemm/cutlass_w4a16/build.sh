@@ -27,7 +27,8 @@ EX_LIST="$ACTLIZE/examples/CMakeLists.txt"
 # pass the name through (ppu0010 -> -arch=ppu0010); the ppu0010 -> library arch 80a mapping was already right.
 # Applied to the submodule before the build and reverted after, so the pinned submodule content is unchanged.
 ARCH="${PPU_ARCHS:-ppu0010}"
-PPU_SDK_ROOT="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
+# Default to this box's SDK location; override with PPU_SDK=<path> (or PPU_HOME) if it moves.
+PPU_SDK_ROOT="${PPU_SDK:-${PPU_HOME:-/sim/eec/shared/junfu.qx/PPU_SDK}}"
 PATCH="$HERE/actlize_ppu001.patch"
 
 if [ ! -x "$PPU_SDK_ROOT/bin/hgcc" ]; then

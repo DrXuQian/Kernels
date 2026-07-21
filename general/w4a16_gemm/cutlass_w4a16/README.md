@@ -31,7 +31,7 @@ actlize builds with the PPU toolchain — `hgcc` device compiler + the `hggc` ru
 
 ```bash
 git submodule update --init third_party/actlize
-# PPU_SDK defaults to /usr/local/PPU_SDK (where bin/hgcc lives on this box); set it only if elsewhere.
+# PPU_SDK defaults to /sim/eec/shared/junfu.qx/PPU_SDK (this box); set it only if elsewhere.
 ./build.sh
 ```
 
