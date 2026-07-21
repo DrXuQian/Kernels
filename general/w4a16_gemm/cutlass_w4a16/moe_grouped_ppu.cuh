@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <type_traits>
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -111,6 +112,9 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     { {ElementAccumulator(1.f), ElementAccumulator(0.f)}, (ElementC*)nullptr, sC, D, sD },
     hw
   };
+  // DEBUG: MOEG_PROBE=1 turns the kernel into a routing probe (writes expert+1 instead of the GEMM); lets a
+  // caller decode which D-plane each expert's tiles land in without touching signatures. 0/unset = normal.
+  if (const char* e = std::getenv("MOEG_PROBE")) args.probe = std::atoi(e);
 
   Gemm gemm;
   auto st = gemm.can_implement(args);

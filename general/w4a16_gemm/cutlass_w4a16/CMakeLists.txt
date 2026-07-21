@@ -57,9 +57,17 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_moe_grouped_ppu PRIVATE -w)
 
-# STEP 2b correctness gate: ragged grouped mixed-input vs CPU reference. TARGET=test_moe_grouped_verify ./build.sh
+# STEP 2b correctness gate: multi-expert/ragged grouping vs grouped-L=1 oracle. TARGET=test_moe_grouped_verify ./build.sh
 cutlass_example_add_executable(
   test_moe_grouped_verify
   test_moe_grouped_verify.cu
 )
 target_compile_options(test_moe_grouped_verify PRIVATE -w)
+
+# ROUTING PROBE: MOEG_PROBE=1 makes the grouped kernel write (expert+1) instead of the GEMM, to decode which
+# D-plane each expert's tiles land in. TARGET=test_moe_grouped_probe ./build.sh ; run: MOEG_PROBE=1 <bin>
+cutlass_example_add_executable(
+  test_moe_grouped_probe
+  test_moe_grouped_probe.cu
+)
+target_compile_options(test_moe_grouped_probe PRIVATE -w)

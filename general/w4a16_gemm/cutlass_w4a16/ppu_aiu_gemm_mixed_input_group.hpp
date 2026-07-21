@@ -95,6 +95,7 @@ public:
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
+    int probe = 0;   // debug: 0=normal; 1=ROUTING probe (skip GEMM, write expert+1 to every output element)
   };
   struct Params {
     GemmUniversalMode mode;
@@ -104,6 +105,7 @@ public:
     KernelHardwareInfo hw_info;
     TileSchedulerParams scheduler;
     void* workspace;
+    int probe = 0;
   };
 
   static Params
@@ -133,7 +135,7 @@ public:
       problem_shapes,
       CollectiveMainloop::to_underlying_arguments(rep_mnkl, args.mainloop, /*workspace=*/nullptr),
       CollectiveEpilogue::to_underlying_arguments(rep_mnkl, args.epilogue, /*workspace=*/nullptr),
-      hw_info, scheduler, workspace
+      hw_info, scheduler, workspace, args.probe
     };
   }
 
@@ -207,7 +209,16 @@ public:
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
-      collective_mainloop(params.mainloop, load_inputs, accumulators, k_tile_iter, k_tile_count, thread_idx, smem_buf);
+      if (params.probe == 1) {
+        // ROUTING PROBE: skip the GEMM entirely and tag every output element of THIS tile with (expert+1).
+        // Read back D afterwards: plane e should be uniformly (e+1) iff the scheduler issued expert e's tiles
+        // AND the epilogue wrote them to D-plane e. All-zero plane => never written (scheduler/L_idx miss);
+        // mixed tags in one plane => epilogue L-slice wrong. This decodes scheduler+epilogue routing directly,
+        // independent of B/scale slicing or the mma. (load_init already ran, so residue_mnk/gA/gB are valid.)
+        cute::fill(accumulators, ElementCompute(expert + 1));
+      } else {
+        collective_mainloop(params.mainloop, load_inputs, accumulators, k_tile_iter, k_tile_count, thread_idx, smem_buf);
+      }
 
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.tensors.epilogue};
       epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators, tiled_mma, residue_mnk,
