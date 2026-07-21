@@ -71,3 +71,11 @@ cutlass_example_add_executable(
   test_moe_grouped_probe.cu
 )
 target_compile_options(test_moe_grouped_probe PRIVATE -w)
+
+# DATA-SLICE probe: controlled per-expert data (B/scale/A each varied in turn) to pin WHICH input the collective
+# fails to slice by l_coord. TARGET=test_moe_grouped_dataslice ./build.sh ; run: <bin> (MOEG_PROBE unset)
+cutlass_example_add_executable(
+  test_moe_grouped_dataslice
+  test_moe_grouped_dataslice.cu
+)
+target_compile_options(test_moe_grouped_dataslice PRIVATE -w)
