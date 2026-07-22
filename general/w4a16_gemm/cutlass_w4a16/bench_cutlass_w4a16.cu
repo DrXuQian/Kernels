@@ -836,7 +836,31 @@ void xcheck_grouped(Options const& options) {
   // gs=32 CONFIG SWEEP (removed): confirmed gs=32 UNSUPPORTED -- all TK=64/128 configs gave zeros (GroupK=gs/16=2
   // < required 4), TK=32 won't compile. gs<64 needs dequant->bf16, not the fused path. Only g>=64 below.
 
-  // single config (TK=128 for g>=128, TK=64 for g=64) + (A)/(B) compare below.
+  // [DIAGNOSTIC] Scale_TileK (STK) = ceil(TK/gs) is the #scale-groups per K-tile. All previously-VALIDATED
+  // configs had STK=1 (gs=64/TK=64, gs=128/TK=128). The intra-tile multi-scale path (STK>=2, i.e. gs<TK) was
+  // only ever exercised by gs=32, and via the oracle (0==0 blind). This runs gs=64 at BOTH TK=64 (STK=1) and
+  // TK=128 (STK=2) vs the dequant golden. gs=64 uses the SHIPPED Gs64 tag (no gs32 patch), so if TK=128 breaks
+  // the STK>=2 path is broken in the stock collective -- patch-independent. (Set PROBE_STK=0 to restore normal.)
+  bool const probe_stk = (g == 64) && (std::getenv("PROBE_STK") == nullptr || std::atoi(std::getenv("PROBE_STK")) != 0);
+  auto run_cfg_g64_tk128 = [&]{
+    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
+        block_A.get(), block_B_buff.device_data(), block_scale.get(), nullptr, pd.get(), sd.get(), gm.get(),
+        m, n, k, L, g, dev_shapes.get(), host_shapes.data(), nullptr, ws.get(), ws_bytes, nullptr);
+  };
+  if (probe_stk) {
+    // First run TK=128 (STK=2) into Dgrp, report it, then fall through to the normal TK=64 (STK=1) run below.
+    run_cfg_g64_tk128();
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    std::vector<ElementD> h128((size_t)m * n); Dgrp.copy_to_host(h128.data());
+    double mr = 0; int bad = 0;
+    for (size_t i = 0; i < (size_t)m * n; ++i) { double r = float(hr[i]), gt = float(h128[i]);
+      double rel = std::abs(gt - r) / (std::abs(r) + 1e-3); if (rel > mr) mr = rel; if (rel > 5e-2) ++bad; }
+    std::printf("\n[PROBE STK=2] gs=64 TK=128 (Scale_TileK=2) vs dequant golden: max_rel=%.3e bad=%d/%zu -> %s"
+                "  grp[0..2]=%.3f %.3f %.3f\n", mr, bad, (size_t)m * n, bad == 0 ? "MATCH" : "MISMATCH",
+                float(h128[0]), float(h128[1]), float(h128[2]));
+  }
+
+  // single config (TK=128 for g>=128, TK=64 for g<=64) + (A)/(B) compare below. (For g=64 this is STK=1.)
   if (g >= 128)
     moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
         block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
