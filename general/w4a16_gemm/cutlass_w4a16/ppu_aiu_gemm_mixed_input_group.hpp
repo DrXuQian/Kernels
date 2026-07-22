@@ -96,7 +96,8 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
     int probe = 0;   // debug: 0=normal; 1=ROUTING probe (skip GEMM, write expert+1 to every output element)
-    int const* group_M = nullptr;   // device [L] per-expert M_e; cheap O(L) decode of blockIdx.x -> (expert,m_tile)
+    int const* group_M = nullptr;   // device [L] per-expert M_e; O(L) decode of blockIdx.x -> (expert,m_tile)
+    int mtiles_uniform = 0;         // >0: all experts have this many m-tiles -> O(1) decode; 0: ragged, scan group_M
   };
   struct Params {
     GemmUniversalMode mode;
@@ -108,6 +109,7 @@ public:
     void* workspace;
     int probe = 0;
     int const* group_M = nullptr;
+    int mtiles_uniform = 0;
   };
 
   static Params
@@ -137,7 +139,7 @@ public:
       problem_shapes,
       CollectiveMainloop::to_underlying_arguments(rep_mnkl, args.mainloop, /*workspace=*/nullptr),
       CollectiveEpilogue::to_underlying_arguments(rep_mnkl, args.epilogue, /*workspace=*/nullptr),
-      hw_info, scheduler, workspace, args.probe, args.group_M
+      hw_info, scheduler, workspace, args.probe, args.group_M, args.mtiles_uniform
     };
   }
 
@@ -197,14 +199,19 @@ public:
     int const TM = int(size<0>(blk_shape));
     int flat = int(blockIdx.x), n_idx = int(blockIdx.y);
     int expert = -1, m_idx = 0;
-    // A (O(L) cheap decode): scan the tiny cached group_M[] int array (M_e per expert) instead of reading the
-    // full (M,N,K) problem-shape struct L times per block. Find (expert, local m-tile).
-    for (int e = 0; e < num_groups; ++e) {
-      int const mt = int(cute::ceil_div(params.group_M[e], TM));
-      if (flat < mt) { expert = e; m_idx = flat; break; }
-      flat -= mt;
+    if (params.mtiles_uniform > 0) {
+      // A (O(1) fast path): all experts have the same #m-tiles -> pure division, no scan (recovers the ~5%
+      // the O(L) scan cost the uniform case vs the old blockIdx.z decode).
+      expert = flat / params.mtiles_uniform;  m_idx = flat % params.mtiles_uniform;
+    } else {
+      // A (O(L) ragged fallback): scan the tiny cached group_M[] (M_e per expert) for (expert, local m-tile).
+      for (int e = 0; e < num_groups; ++e) {
+        int const mt = int(cute::ceil_div(params.group_M[e], TM));
+        if (flat < mt) { expert = e; m_idx = flat; break; }
+        flat -= mt;
+      }
     }
-    if (expert < 0) return;                                    // guard (grid.x is exactly SUM_e mtiles_e)
+    if (expert < 0 || expert >= num_groups) return;            // guard (grid.x is exactly SUM_e mtiles_e)
     auto pe = append<4>(params.problem_shape.get_problem_shape(expert), Int<1>{});  // ONE struct read for N,K
     int const M = int(get<0>(pe)), N = int(get<1>(pe)), K = int(get<2>(pe));
     if (n_idx * int(size<1>(blk_shape)) >= N) return;          // N uniform, guard anyway

@@ -118,6 +118,13 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     hw
   };
   args.group_M = group_M;
+  // O(1) decode hint: if every expert has the SAME #m-tiles (ceil(M_e/TM)), the kernel skips the O(L) scan.
+  { int const TMv = int(cute::size<0>(TileShape{}));
+    int const mt0 = int(cute::ceil_div(int(cute::get<0>(group_shapes_host[0])), TMv));
+    bool uni = true;
+    for (int e = 1; e < L; ++e)
+      if (int(cute::ceil_div(int(cute::get<0>(group_shapes_host[e])), TMv)) != mt0) { uni = false; break; }
+    args.mtiles_uniform = uni ? mt0 : 0; }
   if (const char* e = std::getenv("MOEG_PROBE")) args.probe = std::atoi(e);   // routing probe (test_moe_grouped_probe)
 
   Gemm gemm;
