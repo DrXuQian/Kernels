@@ -210,12 +210,13 @@ public:
       // Same grid/raster as the old fast path; recovers the ~5% the flat grid lost on the balanced case.
       expert = int(blockIdx.z);  m_idx = flat;
     } else {
-      // A (O(L) ragged fallback): scan the tiny cached group_M[] (M_e per expert) for (expert, local m-tile).
-      for (int e = 0; e < num_groups; ++e) {
-        int const mt = int(cute::ceil_div(params.group_M[e], TM));
-        if (flat < mt) { expert = e; m_idx = flat; break; }
-        flat -= mt;
-      }
+      // A (O(log L) ragged): binary-search the m-tile prefix [L+1] (written by launch into the scheduler-unused
+      // workspace) for the largest e with prefix[e] <= flat. Replaces the O(L) linear scan (the ~5% the flat
+      // grid lost at high expert count -- avg ~64 iters at L=128 -> now ~7).
+      int const* pfx = reinterpret_cast<int const*>(params.workspace);
+      int lo = 0, hi = num_groups;
+      while (lo + 1 < hi) { int const mid = (lo + hi) >> 1; if (pfx[mid] <= flat) lo = mid; else hi = mid; }
+      expert = lo;  m_idx = flat - pfx[lo];
     }
     if (expert < 0 || expert >= num_groups) return;            // guard (grid.x is exactly SUM_e mtiles_e)
     auto pe = append<4>(params.problem_shape.get_problem_shape(expert), Int<1>{});  // ONE struct read for N,K

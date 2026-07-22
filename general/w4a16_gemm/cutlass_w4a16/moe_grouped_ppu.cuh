@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 #include <type_traits>
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -139,6 +140,15 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   size_t need = gemm.get_workspace_size(args);
   if (need > workspace_bytes) { std::printf("[moe_grouped] workspace %zu > %zu\n", need, workspace_bytes); return; }
   if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) { std::printf("[moe_grouped] init failed\n"); return; }
+  // Ragged O(log L) decode: write the m-tile prefix [L+1] into the workspace (the non-persistent kernel does
+  // NOT use the scheduler workspace, so it's free). AFTER initialize (no clobber), BEFORE run. Uniform path
+  // (mtiles_uniform>0) uses blockIdx.z and ignores this. Blocking copy -> ordered before run; L+1 ints, tiny.
+  if (args.mtiles_uniform == 0 && workspace != nullptr) {
+    std::vector<int> pfx(L + 1); pfx[0] = 0;
+    int const TMv = int(cute::size<0>(TileShape{}));
+    for (int e = 0; e < L; ++e) pfx[e + 1] = pfx[e] + int(cute::ceil_div(int(cute::get<0>(group_shapes_host[e])), TMv));
+    hggcMemcpy(workspace, pfx.data(), sizeof(int) * (L + 1), hggcMemcpyHostToDevice);
+  }
   gemm.run(stream);
 }
 
