@@ -105,8 +105,10 @@ class Gguf:
         n_elems = 1
         for d in dims:
             n_elems *= d
-        if ttype == GGML_Q4_K:
-            nbytes = n_elems // 256 * 144
+        # (elems_per_block, bytes_per_block) per ggml type
+        BLK = {8: (32, 34), 10: (256, 84), 11: (256, 110), 12: (256, 144), 13: (256, 176), 14: (256, 210)}
+        if ttype in BLK:
+            epb, bpb = BLK[ttype]; nbytes = n_elems // epb * bpb
         elif ttype == 1:   # F16
             nbytes = n_elems * 2
         elif ttype == 0:   # F32
@@ -204,13 +206,14 @@ def golden_and_pack(q_signed, scale, zero, gs, M, seed=1234):
     return A, golden
 
 
-def write_bin(path, L, M, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gold_list):
+def write_bin(path, L, M, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gold_list, bits=4):
     # q is computed/held as [K][N] (q[k][n]=weight(in k,out n)); the grouped kernel reads the raw B buffer as
     # [N][K] (q_buf[n*K+k] -> W(out n,in k)), so DUMP q TRANSPOSED to [N][K]. scale stays [scale_k][N]; golden
     # stays true physics. (Localized via the driver's 4-way host-golden probe: G3 q-transposed matched.)
+    # bits: 4 -> q_signed in [-8,7] (W4A16, int4 slot); 8 -> [-128,127] (W8A16, int8 slot). q dumped int8 either way.
     with open(path, "wb") as f:
         f.write(b"RWMOE\0\0\0")
-        f.write(struct.pack("<6i", L, M, N, K, gs, mode))
+        f.write(struct.pack("<7i", L, M, N, K, gs, mode, bits))
         for A in A_list:   f.write(np.ascontiguousarray(A, dtype=np.float16).tobytes())
         for q in qs_list:  f.write(np.ascontiguousarray(q.T, dtype=np.int8).tobytes())   # [K][N] -> [N][K]
         for s in sc_list:  f.write(np.ascontiguousarray(s, dtype=np.float16).tobytes())
@@ -247,32 +250,33 @@ def main():
     ap.add_argument("--k", type=int, default=2048)
     ap.add_argument("--gs", type=int, default=128)
     ap.add_argument("--mode", type=int, default=0, choices=[0, 1])
+    ap.add_argument("--bits", type=int, default=4, choices=[4, 8])  # synth: int4 (W4A16) or int8 (W8A16) slot
     args = ap.parse_args()
     experts = parse_experts(args.experts) if "-" in args.experts or "," in args.experts else list(range(int(args.experts)))
 
     if args.kind == "synth":
         # random q_signed[K][N] in [-8,7] + random scale[scale_k][N] (+zero if mode==1) + native golden.
         # Exercises the driver + golden orientation with NO real-weight extraction, to isolate harness vs kernel.
-        N, K, gs, mode = args.n, args.k, args.gs, args.mode
+        N, K, gs, mode, bits = args.n, args.k, args.gs, args.mode, args.bits
         sk = (K + gs - 1) // gs
+        qlo, qhi = (-8, 8) if bits == 4 else (-128, 128)
         rng = np.random.default_rng(2024)
         qs_list, sc_list, zr_list, A_list, gold_list = [], [], [], [], []
         L = len(experts)
         for e in range(L):
-            q = rng.integers(-8, 8, size=(K, N)).astype(np.int8)
+            q = rng.integers(qlo, qhi, size=(K, N)).astype(np.int8)
             sc = (0.02 + rng.integers(0, 8, size=(sk, N)) * 0.01).astype(np.float16)
             zr = ((rng.random((sk, N)).astype(np.float32) - 0.5) * 0.2).astype(np.float16) if mode == 1 else None
             A, gold = golden_and_pack(q, sc, zr, gs, args.m, seed=1000 + e)
             qs_list.append(q); sc_list.append(sc); A_list.append(A); gold_list.append(gold)
             if mode == 1: zr_list.append(zr)
-        out = args.out or f"synth_gs{gs}_mode{mode}.bin"
-        write_bin(out, L, args.m, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gold_list)
+        out = args.out or f"synth_gs{gs}_mode{mode}_int{bits}.bin"
+        write_bin(out, L, args.m, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gold_list, bits=bits)
         return
 
     if args.kind == "gguf":
+        import gguf_dequant as gq
         g = Gguf(args.path)
-        arch = g.kv.get("general.architecture", "?")
-        # find ffn expert tensor name for this proj. llama.cpp MoE naming: blk.{L}.ffn_{gate,up,down}_exps.weight
         cand = [f"blk.{args.layer}.ffn_{args.proj}_exps.weight",
                 f"blk.{args.layer}.ffn_{args.proj}_exps.{args.proj}.weight"]
         tname = next((c for c in cand if c in g.tensors), None)
@@ -284,27 +288,37 @@ def main():
                     print("        ", k, g.tensors[k][0], "type", g.tensors[k][1])
             sys.exit(1)
         dims, ttype, raw = g.raw(tname)
-        print(f"[gguf] {tname} dims(fast-first)={dims} ggml_type={ttype} (Q4_K={GGML_Q4_K})")
-        assert ttype == GGML_Q4_K, f"expected Q4_K, got type {ttype}"
-        # dims for a 3D expert tensor: [K, N, n_expert] fastest-first -> K=dims[0], N=dims[1], E=dims[2]
-        K, N, E = dims[0], dims[1], dims[2]
-        per_expert_bytes = (K * N) // 256 * 144
-        print(f"[gguf] K(in)={K} N(out)={N} n_expert={E} per_expert_bytes={per_expert_bytes} gs=32")
-        gs = 32
+        fmt = gq.GGML_TYPE.get(ttype, f"type{ttype}")
+        K, N, E = dims[0], dims[1], dims[2]                      # [K(in), N(out), n_expert] fastest-first
+        epb = 32 if fmt == "q8_0" else 256
+        per_expert_bytes = (K * N) // epb * gq.BLOCK_BYTES.get(fmt, 0)
+        print(f"[gguf] {tname} dims={dims} ggml_type={ttype} ({fmt})  K(in)={K} N(out)={N} n_expert={E}")
+
+        def unpack(rawe):   # dispatch: Q4_K -> this file's int4 unpacker; others -> gguf_dequant
+            if ttype == GGML_Q4_K:
+                q, sc, zr = unpack_q4k_expert(rawe, N, K); return q, sc, zr, 32, 4
+            if fmt not in gq.UNPACK:
+                print(f"[gguf] unsupported ggml_type {ttype} ({fmt})"); sys.exit(1)
+            return gq.UNPACK[fmt](rawe, N, K)
+
+        q0, sc0, zr0, gs, bits = unpack(raw[:per_expert_bytes])
+        mode = 0 if zr0 is None else 1
+        print(f"[gguf] fmt={fmt} gs={gs} slot=int{bits} mode={mode} per_expert_bytes={per_expert_bytes}")
         if args.selfcheck:
-            q, sc, zr = unpack_q4k_expert(raw[:per_expert_bytes], N, K)
-            Wf = sc.astype(np.float32)[(np.arange(K)//gs), :] * q.astype(np.float32) + zr.astype(np.float32)[(np.arange(K)//gs), :]
-            print(f"[selfcheck] expert0 {args.proj}: q_signed range [{q.min()},{q.max()}] "
-                  f"scale[min,max]=[{sc.astype(np.float32).min():.4g},{sc.astype(np.float32).max():.4g}] "
+            Wf = sc0.astype(np.float32)[(np.arange(K) // gs), :] * q0.astype(np.float32)
+            if zr0 is not None: Wf += zr0.astype(np.float32)[(np.arange(K) // gs), :]
+            print(f"[selfcheck] expert0 {args.proj} {fmt}: q_signed range [{q0.min()},{q0.max()}] "
+                  f"scale[min,max]=[{sc0.astype(np.float32).min():.4g},{sc0.astype(np.float32).max():.4g}] "
                   f"W[min,max,mean,std]=[{Wf.min():.4g},{Wf.max():.4g},{Wf.mean():.4g},{Wf.std():.4g}]")
             return
         qs_list, sc_list, zr_list, A_list, gold_list = [], [], [], [], []
         for e in experts:
-            q, sc, zr = unpack_q4k_expert(raw[e * per_expert_bytes:(e + 1) * per_expert_bytes], N, K)
+            q, sc, zr, _, _ = unpack(raw[e * per_expert_bytes:(e + 1) * per_expert_bytes])
             A, gold = golden_and_pack(q, sc, zr, gs, args.m, seed=1000 + e)
-            qs_list.append(q); sc_list.append(sc); zr_list.append(zr); A_list.append(A); gold_list.append(gold)
-        out = args.out or f"real_gguf_{args.proj}_L{args.layer}.bin"
-        write_bin(out, len(experts), args.m, N, K, gs, 1, A_list, qs_list, sc_list, zr_list, gold_list)
+            qs_list.append(q); sc_list.append(sc); A_list.append(A); gold_list.append(gold)
+            if mode == 1: zr_list.append(zr)
+        out = args.out or f"real_{fmt}_{args.proj}_L{args.layer}.bin"
+        write_bin(out, len(experts), args.m, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gold_list, bits=bits)
 
     else:  # gptq
         # config.json / index.json may live in --path OR a parent dir (safetensors can be in a subdir like ow7_224_ca).
