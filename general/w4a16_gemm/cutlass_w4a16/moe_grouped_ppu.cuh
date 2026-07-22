@@ -30,9 +30,11 @@
 namespace moe_grouped_ppu {
 using namespace cute;
 
-// Public per-expert output-stride element type (RowMajor D). Callers build a DeviceAllocation<DStride> of L
-// entries (one make_cute_packed_stride({M_e,N,1}) each) for the ptr-array (contiguous) epilogue.
-using DStride = cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>;
+// Public per-expert output-stride element type for the ptr-array (contiguous) epilogue. RowMajor D, and the
+// BATCH stride is static _0 (the epilogue indexes ptr_D[l] per expert, so the batch/L stride is unused) --
+// this must match CollectiveEpilogue::StrideD's element exactly (Stride<long,_1,_0>). Callers build a
+// DeviceAllocation<DStride> of L entries, one make_cute_packed_stride(DStride{}, {M_e,N,1}) each.
+using DStride = cute::Stride<int64_t, cute::Int<1>, cute::Int<0>>;
 
 enum class QuantMode { PerColScaleOnly, FinegrainedScaleOnly, FinegrainedScaleZero };
 constexpr bool is_finegrained(QuantMode q) { return q != QuantMode::PerColScaleOnly; }
@@ -110,7 +112,9 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     cutlass::gemm::GemmUniversalMode::kGrouped,
     ps,
     { A, sA, B, sB, scales, sS, group_size, zeros, group_row_offsets },
-    { {ElementAccumulator(1.f), ElementAccumulator(0.f)}, (ElementC const**)nullptr, StrideC{}, ptr_D, stride_D },
+    // EVT ptr-array epilogue Arguments = { fusion_args, ptr_C, dC, ptr_D, dD }. Default fusion_args {} =
+    // alpha=1, beta=0 (all ptrs null) -> scale-only, no C. (ptr-array always routes EVT: builder use_evt, 306.)
+    { {}, (ElementC const**)nullptr, StrideC{}, ptr_D, stride_D },
     hw
   };
   args.group_M = group_M;
