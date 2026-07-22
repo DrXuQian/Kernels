@@ -114,19 +114,57 @@ int main(int argc, char** argv) {
 
   std::vector<half_t> hD((size_t)total * N); dD.copy_to_host(hD.data());
 
-  // compare each expert vs the Python native golden
-  double max_rel = 0; int bad = 0, worst_e = -1;
+  auto cmp = [&](const char* name, std::vector<std::vector<double>> const& G) {
+    double mr = 0; int bad = 0, we = -1;
+    for (int e = 0; e < L; ++e)
+      for (size_t i = 0; i < (size_t)M * N; ++i) {
+        double g = G[e][i], got = float(hD[(size_t)e * M * N + i]);
+        double rel = std::abs(got - g) / (std::abs(g) + 1e-3);
+        if (rel > mr) { mr = rel; we = e; }
+        if (rel > 5e-2) ++bad;
+      }
+    std::printf("  grp vs %-28s max_rel=%.3e (worst e=%d) bad=%d/%zu -> %s\n",
+                name, mr, we, bad, (size_t)L * M * N, bad == 0 ? "MATCH" : "MISMATCH");
+    return bad == 0;
+  };
+
+  // Candidate host goldens to localize the orientation. q buf is [K*N], scale buf is [scale_k*N] (G1's layout).
+  //  G1 = Python golden (scale[sk][n]=scale_buf[sk*N+n], q[k][n]=q_buf[k*N+n]).
+  //  G2 = scale read n-major: scale_buf[n*scale_k+sk].
+  //  G3 = q read transposed (as [N][K]): q_buf[n*K+k].
+  //  G4 = both transposed (q [N][K] + scale n-major).
+  std::vector<std::vector<double>> Gpy(L), G2(L), G3(L), G4(L);
+  for (int e = 0; e < L; ++e) {
+    Gpy[e].assign((size_t)M * N, 0); G2[e].assign((size_t)M * N, 0);
+    G3[e].assign((size_t)M * N, 0);  G4[e].assign((size_t)M * N, 0);
+    for (size_t i = 0; i < (size_t)M * N; ++i) Gpy[e][i] = float(gold[e][i]);
+  }
   for (int e = 0; e < L; ++e)
-    for (size_t i = 0; i < (size_t)M * N; ++i) {
-      double g = float(gold[e][i]), got = float(hD[(size_t)e * M * N + i]);
-      double rel = std::abs(got - g) / (std::abs(g) + 1e-3);
-      if (rel > max_rel) { max_rel = rel; worst_e = e; }
-      if (rel > 5e-2) ++bad;
-    }
-  std::printf("  grp vs native golden (real weights): max_rel=%.3e (worst e=%d) bad=%d/%zu -> %s\n",
-              max_rel, worst_e, bad, (size_t)L * M * N, bad == 0 ? "MATCH" : "MISMATCH");
+    for (int m = 0; m < M; ++m)
+      for (int n = 0; n < N; ++n) {
+        double a2 = 0, a3 = 0, a4 = 0;
+        for (int k = 0; k < K; ++k) {
+          int sk = k / gs;
+          double sc_sk_n = float(scl[e][(size_t)sk * N + n]);   // scale[sk][n]
+          double sc_n_sk = float(scl[e][(size_t)n * scale_k + sk]); // scale[n][sk]
+          double q_k_n = (double)qs[e][(size_t)k * N + n];       // q[k][n]
+          double q_n_k = (double)qs[e][(size_t)n * K + k];       // q as [N][K]
+          double z_sk_n = mode == 1 ? (double)float(zro[e][(size_t)sk * N + n]) : 0.0;
+          double z_n_sk = mode == 1 ? (double)float(zro[e][(size_t)n * scale_k + sk]) : 0.0;
+          double a = (double)float(A[e][(size_t)m * K + k]);
+          a2 += a * (sc_n_sk * q_k_n + z_n_sk);
+          a3 += a * (sc_sk_n * q_n_k + z_sk_n);
+          a4 += a * (sc_n_sk * q_n_k + z_n_sk);
+        }
+        G2[e][(size_t)m * N + n] = a2; G3[e][(size_t)m * N + n] = a3; G4[e][(size_t)m * N + n] = a4;
+      }
+
+  bool ok = cmp("G1 python (scale[sk][n],q[k][n])", Gpy);
+  cmp("G2 scale[n][sk]                ", G2);
+  cmp("G3 q[n][k] transposed          ", G3);
+  cmp("G4 both transposed             ", G4);
   std::printf("  gold[e0][0..5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(gold[0][i]));
   std::printf("\n  grp [e0][0..5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hD[i]));
   std::printf("\n");
-  return bad == 0 ? 0 : 1;
+  return ok ? 0 : 1;
 }
