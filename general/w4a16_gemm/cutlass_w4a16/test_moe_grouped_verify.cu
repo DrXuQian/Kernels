@@ -25,9 +25,13 @@ static void run_grouped(const half_t* A, const int4_t* B, const half_t* scales,
                         half_t** ptr_D, DStride* stride_D, int const* group_M,
                         int Mmax, int N, int K, int L, int gs,
                         GS* gsd, GS const* gsh, int const* offsets, char* ws, size_t wsb) {
-  moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
-      A, B, scales, /*zeros=*/nullptr, ptr_D, stride_D, group_M, Mmax, N, K, L, gs, gsd, gsh, offsets, ws, wsb,
-      /*stream=*/nullptr);
+  // TK must satisfy gs<=TK<=2*gs (SK=ceil(TK/gs)<=2; SK>=4 is broken). gs=128->TK=128, gs=32/64->TK=64.
+  if (gs >= 128)
+    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
+        A, B, scales, nullptr, ptr_D, stride_D, group_M, Mmax, N, K, L, gs, gsd, gsh, offsets, ws, wsb, nullptr);
+  else
+    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 64, 32, 32, 3>(
+        A, B, scales, nullptr, ptr_D, stride_D, group_M, Mmax, N, K, L, gs, gsd, gsh, offsets, ws, wsb, nullptr);
 }
 
 int main(int argc, char** argv) {
