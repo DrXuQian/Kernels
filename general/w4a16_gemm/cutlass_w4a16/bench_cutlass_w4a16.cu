@@ -845,39 +845,35 @@ void xcheck_grouped(Options const& options) {
       ws.get(), ws_bytes, /*stream=*/nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
-  // Two independent comparisons, both zero-new-math:
-  //   (A) grp vs block_ref_D  -- the fp16 dequant->GemmRef reference (algorithm-independent golden).
-  //   (B) grp vs block_D      -- the VERIFIED mixed kernel's OWN output (same collective, same shuffled B).
-  //       (B) is the sharpest: grouped just wraps the same collective, so on identical data it should be
-  //       near-bit-identical to block_D. A big (B) delta localizes the bug to the group wrapper itself.
-  bool const okR = cutlass::reference::device::BlockCompareRelativelyEqual(
-      block_ref_D.get(), Dgrp.get(), (size_t)m * n, ElementD(1e-2f), ElementD(1e-4f));
-  bool const okK = cutlass::reference::device::BlockCompareRelativelyEqual(
-      block_D.get(), Dgrp.get(), (size_t)m * n, ElementD(1e-2f), ElementD(1e-4f));
-
+  // (A) grp vs block_ref_D -- the fp16 dequant->GemmRef reference (algorithm-independent golden). This is the
+  //     TRUTH and is always reported.
+  // (B) grp vs block_D -- the stock (non-grouped) mixed example's own output. Only a VALID cross-check when the
+  //     stock example itself is correct, i.e. gs>=64. For gs<64 the stock non-grouped path mis-handles the scale
+  //     grouping (it predates the per-mma-atom FINE fix, which only the grouped collective carries), so block_D is
+  //     wrong there and (B) would MISMATCH spuriously -- skip it and rely on (A).
+  bool const bValid = (g >= 64);
   std::vector<ElementD> hk((size_t)m * n), hg((size_t)m * n);   // hr (dequant golden) already copied above
   block_D.copy_to_host(hk.data()); Dgrp.copy_to_host(hg.data());
   double maxrelR = 0, maxrelK = 0; int badR = 0, badK = 0;
   for (size_t i = 0; i < (size_t)m * n; ++i) {
-    double r = float(hr[i]), kk = float(hk[i]), gt = float(hg[i]);
+    double r = float(hr[i]), gt = float(hg[i]);
     double relR = std::abs(gt - r) / (std::abs(r) + 1e-3);
-    double relK = std::abs(gt - kk) / (std::abs(kk) + 1e-3);
     if (relR > maxrelR) maxrelR = relR;  if (relR > 5e-2) ++badR;
-    if (relK > maxrelK) maxrelK = relK;  if (relK > 5e-2) ++badK;
+    if (bValid) { double kk = float(hk[i]); double relK = std::abs(gt - kk) / (std::abs(kk) + 1e-3);
+                  if (relK > maxrelK) maxrelK = relK;  if (relK > 5e-2) ++badK; }
   }
   std::printf("\n[xcheck grouped L=1] m=%d n=%d k=%d g=%d\n", m, n, k, g);
   std::printf("  (A) grp vs ref_D (dequant golden): max_rel=%.3e bad=%d/%zu -> %s\n",
               maxrelR, badR, (size_t)m * n, badR == 0 ? "MATCH" : "MISMATCH");
-  std::printf("  (B) grp vs block_D (verified kernel): max_rel=%.3e bad=%d/%zu -> %s\n",
-              maxrelK, badK, (size_t)m * n, badK == 0 ? "MATCH" : "MISMATCH");
+  if (bValid)
+    std::printf("  (B) grp vs block_D (stock non-grouped kernel): max_rel=%.3e bad=%d/%zu -> %s\n",
+                maxrelK, badK, (size_t)m * n, badK == 0 ? "MATCH" : "MISMATCH");
+  else
+    std::printf("  (B) grp vs block_D: SKIPPED (gs<64: stock non-grouped example mis-handles gs<64; (A) is the truth)\n");
   std::printf("  ref_D[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hr[i]));
-  std::printf("\n  blkD[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[i]));
   std::printf("\n  grp_D[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[i]));
-  // Second row start (index n): a transpose/stride bug shows as grp reading a different row/col here.
-  std::printf("\n  grp_D[n..n+5]="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[n + i]));
-  std::printf("\n  blkD[n..n+5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[n + i]));
+  if (bValid) { std::printf("\n  blkD[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[i])); }
   std::printf("\n");
-  (void)okR; (void)okK;
 }
 
 int main(int argc, char const **args) {
