@@ -33,7 +33,13 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
   cutlass::DeviceAllocation<char> ws(ws_bytes);
 
   std::printf("\n=== %s: experts=%d total_tokens=%d n=%d k=%d gs=%d Mmax=%d ===\n", label, L, total, n, k, g, Mmax);
-  const double wbytes = (double)L*n*k/2.0 + (double)L*n*scale_k*2.0;
+  // COMPULSORY HBM traffic (each read/written once): A activations + B int4 weights + scales + D output.
+  // (Earlier this counted ONLY B -> 4-5x undercount, since A and D dominate at these shapes. This is the ideal
+  // lower bound with perfect reuse; actual is higher when M_e/TM>1 re-reads B per m-tile.)
+  const double abytes = (double)total * k * 2.0;                                  // A fp16 [total][K]
+  const double bbytes = (double)L * n * k / 2.0 + (double)L * n * scale_k * 2.0;  // B int4 + fp16 scales
+  const double dbytes = (double)total * n * 2.0;                                  // D fp16 [total][N]
+  const double wbytes = abytes + bbytes + dbytes;
   std::printf("%-26s %-9s %-6s %-9s %s\n", "TILE(MxNxK)/WARP/ST", "TFLOP/s", "MFU", "GB/s", "%HBM");
 
   const int warmup = 10, iters = 50;
