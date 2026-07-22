@@ -164,18 +164,19 @@ void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const c
   const bool il = (n % 256 == 0 && k % 256 == 0);
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL>( \
       A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream)
-  // COLLECTIVE CONSTRAINTS (measured vs dequant golden):
-  //  * GroupK = gs/16 must be >= 4  => gs >= 64. gs=32 (GroupK=2) silently reads scale=0 -> ZERO output for
-  //    EVERY tile (TK=32 also won't compile). So gs<64 is UNSUPPORTED on the fused path -> use dequant->bf16.
-  //  * SK = ceil(TK/gs) must be <= 2 => TK <= 2*gs (SK>=4 also reads scale=0).
+  // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
+  //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
+  //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K
+  //   (e.g. gs=32) now works -- the old "gs>=64 / SK<=2" limit is gone. gs=32/TK=64 (SK=2) validated vs the
+  //   dequant golden; larger SK is structurally supported. TK=32 still won't compile (AIU needs TK>=64).
   #define MOEG_FG(SCH, SK) do { \
-      if constexpr ((SK) <= 2) { if (il) MOEG_CALL(SCH, cute::Int<SK>, true); else MOEG_CALL(SCH, cute::Int<SK>, false); } \
-      else std::printf("[moe_grouped] gs=%d + TK=%d -> SK=%d>2 UNSUPPORTED (collective scale path); use TK<=2*gs\n", group_size, TK, (SK)); \
+      if constexpr ((SK) <= (TK/16)) { if (il) MOEG_CALL(SCH, cute::Int<SK>, true); else MOEG_CALL(SCH, cute::Int<SK>, false); } \
+      else std::printf("[moe_grouped] gs=%d + TK=%d -> SK=%d > TK/16=%d UNSUPPORTED (gs<16); use dequant->bf16\n", group_size, TK, (SK), TK/16); \
     } while (0)
   if constexpr (is_finegrained(QuantOp)) {
     if (group_size == 128)     { constexpr int SK=(TK+127)/128; MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs128, SK); }
     else if (group_size == 64) { constexpr int SK=(TK+63)/64;   MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs64,  SK); }
-    else if (group_size == 32) { constexpr int SK=(TK+31)/32;    MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32,  SK); }  // UNDER INVESTIGATION (GroupK=2)
+    else if (group_size == 32) { constexpr int SK=(TK+31)/32;    MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32,  SK); }  // FIXED (per-mma-atom FINE scale)
     else std::printf("[moe_grouped] gs %d unsupported\n", group_size);
   } else {
     if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputPerCol, cute::_1, true);

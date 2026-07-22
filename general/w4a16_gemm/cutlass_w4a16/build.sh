@@ -59,15 +59,13 @@ grep -q "$EX_NAME" "$EX_LIST" || { echo "ERROR: failed to register example in $E
 
 # --- tile/warp/stages tuning: forward from the environment (defaults match the stock example) ---
 TILE_M="${TILE_M:-32}"; TILE_N="${TILE_N:-32}"; WARP_M="${WARP_M:-16}"; WARP_N="${WARP_N:-16}"; STAGES="${STAGES:-3}"
-SCALE_DBG="${SCALE_DBG:-0}"   # 1 => -DPPU_SCALE_DBG (gs=32 intra-tile scale-reload log)
-echo "[build.sh] TILE=${TILE_M}x${TILE_N} WARP=${WARP_M}x${WARP_N} STAGES=${STAGES} SCALE_DBG=${SCALE_DBG}"
+echo "[build.sh] TILE=${TILE_M}x${TILE_N} WARP=${WARP_M}x${WARP_N} STAGES=${STAGES}"
 
 # --- configure & build just our target ---
 BUILD="$ACTLIZE/build_w4a16_compare"
 rm -rf "$BUILD" && mkdir -p "$BUILD" && cd "$BUILD"
 cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" \
   -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" \
-  -DSCALE_DBG="$SCALE_DBG" \
   >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
 TARGET="${TARGET:-bench_cutlass_w4a16}"
 make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log

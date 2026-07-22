@@ -815,18 +815,6 @@ void save_tactic(std::string const& path, Options const& o, std::string const& n
 //   MATCH    -> grouped kernel + strides are correct; the earlier MISMATCH was my hand-rolled verify setup.
 //   MISMATCH -> the grouped no-swap stride convention (esp. StrideB from the interleaved LayoutB) is wrong;
 //               compare vs block_D (the mixed kernel's own output) to localize.
-#if defined(PPU_SCALE_DBG)
-// Read the collective's block0/thread0 scale-reload log back to host. buf laid out [i*4 + {k_block, scale_k_idx,
-// smem_src, reg_dest}], cnt = #entries (<=16). Runs after an xcheck GEMM so buf is populated.
-__global__ void ppu_scale_dbg_read(float* out, int* c, float* meta) {
-  if (threadIdx.x == 0) {
-    for (int i = 0; i < 64; ++i) out[i] = cutlass_ppu_scale_dbg::buf[i];
-    for (int i = 0; i < 8; ++i) meta[i] = cutlass_ppu_scale_dbg::meta[i];
-    *c = cutlass_ppu_scale_dbg::cnt;
-  }
-}
-#endif
-
 void xcheck_grouped(Options const& options) {
   using GS = moe_grouped_ppu::GroupShape;
   int const L = 1, m = options.m, n = options.n, k = options.k, g = options.g;
@@ -845,34 +833,10 @@ void xcheck_grouped(Options const& options) {
   cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
   cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
   std::vector<ElementD> hr((size_t)m * n); block_ref_D.copy_to_host(hr.data());   // dequant golden
-  // gs=32 CONFIG SWEEP (removed): confirmed gs=32 UNSUPPORTED -- all TK=64/128 configs gave zeros (GroupK=gs/16=2
-  // < required 4), TK=32 won't compile. gs<64 needs dequant->bf16, not the fused path. Only g>=64 below.
 
-  // [DIAGNOSTIC] Scale_TileK (STK) = ceil(TK/gs) is the #scale-groups per K-tile. All previously-VALIDATED
-  // configs had STK=1 (gs=64/TK=64, gs=128/TK=128). The intra-tile multi-scale path (STK>=2, i.e. gs<TK) was
-  // only ever exercised by gs=32, and via the oracle (0==0 blind). This runs gs=64 at BOTH TK=64 (STK=1) and
-  // TK=128 (STK=2) vs the dequant golden. gs=64 uses the SHIPPED Gs64 tag (no gs32 patch), so if TK=128 breaks
-  // the STK>=2 path is broken in the stock collective -- patch-independent. (Set PROBE_STK=0 to restore normal.)
-  bool const probe_stk = (g == 64) && (std::getenv("PROBE_STK") == nullptr || std::atoi(std::getenv("PROBE_STK")) != 0);
-  auto run_cfg_g64_tk128 = [&]{
-    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
-        block_A.get(), block_B_buff.device_data(), block_scale.get(), nullptr, pd.get(), sd.get(), gm.get(),
-        m, n, k, L, g, dev_shapes.get(), host_shapes.data(), nullptr, ws.get(), ws_bytes, nullptr);
-  };
-  if (probe_stk) {
-    // First run TK=128 (STK=2) into Dgrp, report it, then fall through to the normal TK=64 (STK=1) run below.
-    run_cfg_g64_tk128();
-    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-    std::vector<ElementD> h128((size_t)m * n); Dgrp.copy_to_host(h128.data());
-    double mr = 0; int bad = 0;
-    for (size_t i = 0; i < (size_t)m * n; ++i) { double r = float(hr[i]), gt = float(h128[i]);
-      double rel = std::abs(gt - r) / (std::abs(r) + 1e-3); if (rel > mr) mr = rel; if (rel > 5e-2) ++bad; }
-    std::printf("\n[PROBE STK=2] gs=64 TK=128 (Scale_TileK=2) vs dequant golden: max_rel=%.3e bad=%d/%zu -> %s"
-                "  grp[0..2]=%.3f %.3f %.3f\n", mr, bad, (size_t)m * n, bad == 0 ? "MATCH" : "MISMATCH",
-                float(h128[0]), float(h128[1]), float(h128[2]));
-  }
-
-  // single config (TK=128 for g>=128, TK=64 for g<=64) + (A)/(B) compare below. (For g=64 this is STK=1.)
+  // TK=128 for g>=128, else TK=64. gs=32 (< the 64-K B copy step) is now correct via the collective's per-mma-atom
+  // FINE scale path; SK=ceil(TK/gs) can exceed 2 (handled). (A)/(B) compare below. gs<64: block_D (stock example,
+  // non-grouped) is itself wrong for gs<64, so only (A) grp-vs-dequant-golden is meaningful there.
   if (g >= 128)
     moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
         block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
@@ -920,22 +884,6 @@ void xcheck_grouped(Options const& options) {
   std::printf("\n  blkD[n..n+5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[n + i]));
   std::printf("\n");
   (void)okR; (void)okK;
-
-#if defined(PPU_SCALE_DBG)
-  // Dump the collective's per-reload scale log (block0/thread0). Distinguishes load-vs-apply for the gs=32 zero.
-  cutlass::DeviceAllocation<float> dbg(64), dmeta(8); cutlass::DeviceAllocation<int> dcnt(1);
-  ppu_scale_dbg_read<<<1, 32>>>(dbg.get(), dcnt.get(), dmeta.get());
-  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-  std::vector<float> hb(64), hm(8); int hc = 0; dbg.copy_to_host(hb.data()); dmeta.copy_to_host(hm.data()); dcnt.copy_to_host(&hc);
-  std::printf("\n[SCALE_DBG] gs=%d: Scale_TileK=%.0f K_BLOCK_MAX=%.0f mma_K_atoms=%.0f K_ATOM_PER_COPY=%.0f\n",
-              g, hm[0], hm[1], hm[2], hm[3]);
-  std::printf("           accum(0)=%.5f  accum_frag_size=%.0f  accum_sum=%.5f  (block0/thread0 after mainloop)\n",
-              hm[4], hm[5], hm[6]);
-  std::printf("           %d intra-tile scale reloads logged:\n", hc);
-  std::printf("   idx | k_block scale_k_idx | smem_src   reg_dest\n");
-  for (int i = 0; i < hc && i < 16; ++i)
-    std::printf("   %3d |   %5.0f     %6.0f    | %8.5f  %8.5f\n", i, hb[i*4+0], hb[i*4+1], hb[i*4+2], hb[i*4+3]);
-#endif
 }
 
 int main(int argc, char const **args) {
