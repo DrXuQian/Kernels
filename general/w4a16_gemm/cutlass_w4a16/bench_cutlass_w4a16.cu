@@ -834,21 +834,15 @@ void xcheck_grouped(Options const& options) {
   cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
   std::vector<ElementD> hr((size_t)m * n); block_ref_D.copy_to_host(hr.data());   // dequant golden
 
-  // TK=128 for g>=128, else TK=64. gs=32 (< the 64-K B copy step) is now correct via the collective's per-mma-atom
-  // FINE scale path; SK=ceil(TK/gs) can exceed 2 (handled). (A)/(B) compare below. gs<64: block_D (stock example,
-  // non-grouped) is itself wrong for gs<64, so only (A) grp-vs-dequant-golden is meaningful there.
-  if (g >= 128)
-    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
-        block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
-        pd.get(), sd.get(), gm.get(),
-        m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
-        ws.get(), ws_bytes, /*stream=*/nullptr);
-  else
-    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 64, 32, 32, 3>(
-        block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
-        pd.get(), sd.get(), gm.get(),
-        m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
-        ws.get(), ws_bytes, /*stream=*/nullptr);
+  // Fixed TK=128 (matches the perf-sweep configs in test_moe_grouped_ppu, so this gate validates the SAME shape
+  // the perf run uses). gs=32 -> SK=ceil(128/32)=4 -> FINE per-mma-atom scale (Scale_TileK=4 > K_BLOCK_MAX=2);
+  // gs=64 -> SK=2; gs=128 -> SK=1. (A) vs dequant golden is the truth. gs<64: block_D (stock non-grouped example)
+  // is itself wrong for gs<64, so its (B) mismatch is expected -- only (A) matters there.
+  moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
+      block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
+      pd.get(), sd.get(), gm.get(),
+      m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
+      ws.get(), ws_bytes, /*stream=*/nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
   // Two independent comparisons, both zero-new-math:
