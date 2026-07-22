@@ -76,10 +76,13 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
   TIME(64,  64,  128, 32, 32, 3);   // current baseline winner
   TIME(64,  64,  128, 32, 32, 4);
   // REUSE axis: bigger BM/BN/BK -> fewer B re-reads (helps larger M_e / prefill).
-  TIME(64,  128, 128, 32, 64, 3);
+  TIME(64,  128, 128, 32, 64, 3);   // ragged winner (s3)
+  TIME(64,  128, 128, 32, 64, 2);   // NEW: winner's s2 -> less shared (more blocks/CU) + fewer regs (kill spill?)
   TIME(128, 64,  128, 64, 32, 3);
+  TIME(128, 64,  128, 64, 32, 2);   // NEW: bigger TM (halve B re-reads) + s2 (occupancy)
   TIME(128, 64,  128, 64, 32, 4);
   TIME(128, 128, 128, 64, 64, 3);   // if this fails to compile (shared budget), comment it out & rebuild
+  TIME(128, 128, 128, 64, 64, 2);   // NEW: bigger TM + s2
   TIME(64,  64,  256, 32, 32, 2);
   TIME(32,  64,  256, 32, 16, 2);
   TIME(64,  128, 256, 32, 64, 2);   // bigger TK on 64x128; comment out if compile fails
