@@ -833,12 +833,19 @@ void xcheck_grouped(Options const& options) {
   cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
   cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
 
-  // FinegrainedGs128 needs TK >= gs(=128 default); tile 64x64x128/s3 (result is tile-independent).
-  moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
-      block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
-      pd.get(), sd.get(), gm.get(),
-      m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
-      ws.get(), ws_bytes, /*stream=*/nullptr);
+  // TK must satisfy gs<=TK<=2*gs (SK=ceil(TK/gs)<=2; SK>=4 broken -> zeros). gs=128->TK=128, gs=32/64->TK=64.
+  if (g >= 128)
+    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
+        block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
+        pd.get(), sd.get(), gm.get(),
+        m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
+        ws.get(), ws_bytes, /*stream=*/nullptr);
+  else
+    moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 64, 32, 32, 3>(
+        block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
+        pd.get(), sd.get(), gm.get(),
+        m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
+        ws.get(), ws_bytes, /*stream=*/nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
   // Two independent comparisons, both zero-new-math:
