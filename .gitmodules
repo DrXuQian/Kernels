@@ -3,5 +3,5 @@
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "third_party/actlize"]
 	path = third_party/actlize
-	url = https://github.com/t-head/actlize
-	branch = v1.0.0
+	url = git@github.com:DrXuQian/actlize.git
+	branch = ppu-w4a16-dev
