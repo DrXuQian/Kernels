@@ -164,9 +164,10 @@ void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const c
   const bool il = (n % 256 == 0 && k % 256 == 0);
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL>( \
       A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream)
-  // CONSTRAINT: the collective's scale path only works for SK = ceil(TK/gs) <= 2 (SK>=4 silently reads scale=0
-  // -> zero output; VERIFIED: gs=128/TK=128 SK=1 ok, gs=64/TK=128 SK=2 ok, gs=32/TK=128 SK=4 BROKEN). So each
-  // finegrained gs REQUIRES gs <= TK <= 2*gs. gs=32 must use TK<=64.
+  // COLLECTIVE CONSTRAINTS (measured vs dequant golden):
+  //  * GroupK = gs/16 must be >= 4  => gs >= 64. gs=32 (GroupK=2) silently reads scale=0 -> ZERO output for
+  //    EVERY tile (TK=32 also won't compile). So gs<64 is UNSUPPORTED on the fused path -> use dequant->bf16.
+  //  * SK = ceil(TK/gs) must be <= 2 => TK <= 2*gs (SK>=4 also reads scale=0).
   #define MOEG_FG(SCH, SK) do { \
       if constexpr ((SK) <= 2) { if (il) MOEG_CALL(SCH, cute::Int<SK>, true); else MOEG_CALL(SCH, cute::Int<SK>, false); } \
       else std::printf("[moe_grouped] gs=%d + TK=%d -> SK=%d>2 UNSUPPORTED (collective scale path); use TK<=2*gs\n", group_size, TK, (SK)); \
@@ -174,7 +175,7 @@ void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const c
   if constexpr (is_finegrained(QuantOp)) {
     if (group_size == 128)     { constexpr int SK=(TK+127)/128; MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs128, SK); }
     else if (group_size == 64) { constexpr int SK=(TK+63)/64;   MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs64,  SK); }
-    else if (group_size == 32) { constexpr int SK=(TK+31)/32;   MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32,  SK); }  // needs actlize_gs32.patch; TK<=64
+    else if (group_size == 32)  std::printf("[moe_grouped] gs=32 UNSUPPORTED (collective GroupK=gs/16 must be >=4 -> gs>=64; use dequant->bf16 for Q4_0/Q4_1/Q4_K)\n");
     else std::printf("[moe_grouped] gs %d unsupported\n", group_size);
   } else {
     if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputPerCol, cute::_1, true);

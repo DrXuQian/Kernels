@@ -833,40 +833,10 @@ void xcheck_grouped(Options const& options) {
   cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
   cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
   std::vector<ElementD> hr((size_t)m * n); block_ref_D.copy_to_host(hr.data());   // dequant golden
+  // gs=32 CONFIG SWEEP (removed): confirmed gs=32 UNSUPPORTED -- all TK=64/128 configs gave zeros (GroupK=gs/16=2
+  // < required 4), TK=32 won't compile. gs<64 needs dequant->bf16, not the fused path. Only g>=64 below.
 
-  // g==32 CONFIG SWEEP: SK<=2 was empirical but tile-dependent (gs=32/TK=64 SK=2 still failed while gs=64/TK=128
-  // SK=2 worked). Find which tile config gives CORRECT gs=32 vs the dequant golden. Calls launch<> directly
-  // (bypasses filter_and_run's SK<=2 guard) so SK=1(TK=32)/2(TK=64)/4(TK=128) all run.
-  if (g == 32) {
-    std::printf("\n[xcheck g=32 CONFIG SWEEP] m=%d n=%d k=%d (grp-L1 vs dequant golden ref_D)\n", m, n, k);
-    #define TRY32(TM,TN,TK,WM,WN,ST) do { \
-        constexpr int SK=((TK)+31)/32; \
-        cutlass::DeviceAllocation<cutlass::half_t> Dg((size_t)m*n); \
-        std::vector<cutlass::half_t*> ph{Dg.get()}; cutlass::DeviceAllocation<cutlass::half_t*> pdx(1); pdx.copy_from_host(ph.data()); \
-        moe_grouped_ppu::launch<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, \
-            cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32, \
-            cute::Shape<cute::Int<TM>,cute::Int<TN>,cute::Int<TK>>, cute::Shape<cute::Int<TN>,cute::Int<SK>>, \
-            cute::Shape<cute::Int<WM>,cute::Int<WN>,cute::Int<TK>>, ST, true>( \
-            block_A.get(), block_B_buff.device_data(), block_scale.get(), nullptr, pdx.get(), sd.get(), gm.get(), \
-            m, n, k, L, g, dev_shapes.get(), host_shapes.data(), nullptr, ws.get(), ws_bytes, nullptr); \
-        CUTLASS_PPU_CHECK(hggcDeviceSynchronize()); \
-        std::vector<ElementD> hg((size_t)m*n); Dg.copy_to_host(hg.data()); \
-        double mr=0; int bad=0; for(size_t i=0;i<(size_t)m*n;i++){double r=float(hr[i]),gt=float(hg[i]); \
-          double rel=std::abs(gt-r)/(std::abs(r)+1e-3); if(rel>mr)mr=rel; if(rel>5e-2)++bad;} \
-        std::printf("  %-22s SK=%d  max_rel=%.3e bad=%d/%zu %s  grp[0..2]=%.2f %.2f %.2f\n", \
-            #TM"x"#TN"x"#TK"/"#WM"x"#WN"/s"#ST, SK, mr, bad, (size_t)m*n, bad==0?"MATCH":"MISMATCH", \
-            float(hg[0]),float(hg[1]),float(hg[2])); \
-      } while(0)
-    // NOTE: TK=32 (SK=1) is REJECTED by the collective builder (CollectiveOp=int -> undefined GemmUniversal;
-    // AIU multistage needs TK>=64), so gs=32 can't get the proven SK=1 path. Only TK=64/128 (SK=2/4) below.
-    TRY32(64,64,64,32,32,3);  TRY32(64,64,64,32,32,2);  TRY32(32,64,64,32,32,3);   // SK=2 (TK=64)
-    TRY32(128,64,64,64,32,3); TRY32(64,128,64,32,64,3);
-    TRY32(64,64,128,32,32,3); TRY32(32,64,128,32,32,3); TRY32(128,64,128,64,32,3); // SK=4 (TK=128)
-    #undef TRY32
-    return;
-  }
-
-  // g!=32: single config (TK=128 for g>=128, TK=64 for g=64) + (A)/(B) compare below.
+  // single config (TK=128 for g>=128, TK=64 for g=64) + (A)/(B) compare below.
   if (g >= 128)
     moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
         block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
