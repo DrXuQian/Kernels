@@ -31,24 +31,16 @@ fi
 export PATH="$PPU_SDK_ROOT/bin:$PATH"
 
 cleanup() {
-  # Restore the example list + any patched submodule files, and remove the overlay, so the pinned submodule
-  # content stays clean.
-  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt \
-    include/cutlass/gemm/kernel/ppu_aiu_gemm_mixed_input.hpp \
-    include/cutlass/gemm/collective/ppu_mma_aiu_multistage_mixed_input.hpp 2>/dev/null || true
+  # Restore ONLY the example-list registration + remove the overlay. The actlize W4A16 changes now live as real
+  # commits on the DrXuQian/actlize fork (submodule branch ppu-w4a16-dev), NOT as build-time patches, so we must
+  # NOT `git checkout --` the include/ files here (that would wipe uncommitted collective WIP during iteration).
+  git -C "$ACTLIZE" checkout -- examples/CMakeLists.txt 2>/dev/null || true
   rm -rf "$EX_DIR"
 }
 trap cleanup EXIT
 echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 
-# --- apply the MoE disambiguation patch(es) so the grouped mixed-input specialization is unambiguous ---
-shopt -s nullglob
-for p in "$HERE"/*.patch; do
-  if git -C "$ACTLIZE" apply --reverse --check "$p" 2>/dev/null; then echo "[build.sh] $(basename "$p") already applied";
-  elif git -C "$ACTLIZE" apply --check "$p" 2>/dev/null; then git -C "$ACTLIZE" apply "$p"; echo "[build.sh] applied $(basename "$p")";
-  else echo "ERROR: $(basename "$p") does not apply to the submodule" >&2; exit 1; fi
-done
-shopt -u nullglob
+# NOTE: the former MoE/gs32 *.patch files are now baked into the submodule (fork ppu-w4a16-dev). No patch step.
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
