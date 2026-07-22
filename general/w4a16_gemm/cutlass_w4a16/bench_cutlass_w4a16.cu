@@ -824,10 +824,19 @@ void xcheck_grouped(Options const& options) {
   cutlass::DeviceAllocation<cutlass::half_t> Dgrp((size_t)m * n);
   size_t const ws_bytes = (size_t)cutlass::ceil_div(m, 16) * cutlass::ceil_div(n, 64) * L * 64;
   cutlass::DeviceAllocation<char> ws(ws_bytes);
+  // ptr-array (contiguous) output; L=1 so plane 0 is the whole [m][n].
+  using DStride = moe_grouped_ppu::DStride;
+  std::vector<cutlass::half_t*> pdh{Dgrp.get()};
+  std::vector<DStride> sdh{cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(m, n, 1))};
+  std::vector<int> gmh{m};
+  cutlass::DeviceAllocation<cutlass::half_t*> pd(L); pd.copy_from_host(pdh.data());
+  cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
+  cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
 
   // FinegrainedGs128 needs TK >= gs(=128 default); tile 64x64x128/s3 (result is tile-independent).
   moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
-      block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr, Dgrp.get(),
+      block_A.get(), block_B_buff.device_data(), block_scale.get(), /*zeros=*/nullptr,
+      pd.get(), sd.get(), gm.get(),
       m, n, k, L, g, dev_shapes.get(), host_shapes.data(), /*group_row_offsets=*/nullptr,
       ws.get(), ws_bytes, /*stream=*/nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());

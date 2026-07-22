@@ -17,13 +17,15 @@
 #include <vector>
 #include <algorithm>
 #include "cutlass/util/device_memory.h"
+#include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "unfused_weight_dequantize.hpp"
 #include "moe_grouped_ppu.cuh"
 
 using half_t = cutlass::half_t;
 using int4_t = cutlass::int4b_t;
-using GS     = moe_grouped_ppu::GroupShape;
+using GS      = moe_grouped_ppu::GroupShape;
+using DStride = moe_grouped_ppu::DStride;
 
 int main(int argc, char** argv) {
   const int L  = argc > 1 ? atoi(argv[1]) : 4;
@@ -56,9 +58,15 @@ int main(int argc, char** argv) {
     { std::vector<half_t> t(hA.size());  for(size_t i=0;i<hA.size();i++)  t[i]=half_t(hA[i]);  A.copy_from_host(t.data()); }
     { std::vector<half_t> t(hSc.size()); for(size_t i=0;i<hSc.size();i++) t[i]=half_t(hSc[i]); scales.copy_from_host(t.data()); }
     B.copy_from_host(reinterpret_cast<int4_t const*>(Bbuf.data()));
+    // contiguous ptr-array output (uniform M -> plane e at e*M*N)
+    std::vector<half_t*> pdh(L); std::vector<DStride> sdh(L); std::vector<int> gmh(L);
+    for (int e=0;e<L;e++){ pdh[e]=D.get()+(size_t)e*M*N; sdh[e]=cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(M,N,1)); gmh[e]=M; }
+    cutlass::DeviceAllocation<half_t*> pd(L); pd.copy_from_host(pdh.data());
+    cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
+    cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
 
     moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64,64,128, 32,32, 3>(
-        A.get(), B.get(), scales.get(), nullptr, D.get(), M, N, K, L, gs,
+        A.get(), B.get(), scales.get(), nullptr, pd.get(), sd.get(), gm.get(), M, N, K, L, gs,
         shpd.get(), shp.data(), nullptr, wsr.get(), ws, nullptr);
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
     std::vector<half_t> hD((size_t)L*M*N); D.copy_to_host(hD.data());

@@ -10,11 +10,13 @@
 #include <vector>
 #include <algorithm>
 #include "cutlass/util/device_memory.h"
+#include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "moe_grouped_ppu.cuh"
 
 using half_t = cutlass::half_t; using int4_t = cutlass::int4b_t;
-using GS = moe_grouped_ppu::GroupShape;
+using GS      = moe_grouped_ppu::GroupShape;
+using DStride = moe_grouped_ppu::DStride;
 static const double TF_PEAK = 500.0, HBM_PEAK = 2766.0;   // ppu001
 
 // Sweep the candidate-tile set on one workload (per-expert token counts `me`), rank by MFU.
@@ -24,13 +26,19 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
   std::vector<int> offs(L); int total = 0, Mmax = 0;
   for (int e = 0; e < L; ++e) { offs[e] = total; total += me[e]; Mmax = std::max(Mmax, me[e]); }
 
-  cutlass::DeviceAllocation<half_t> A((size_t)total*k), scales((size_t)L*n*scale_k), D((size_t)L*Mmax*n);
+  cutlass::DeviceAllocation<half_t> A((size_t)total*k), scales((size_t)L*n*scale_k), D((size_t)total*n);  // contiguous
   cutlass::DeviceAllocation<int4_t> B((size_t)L*n*k);
   std::vector<GS> shp(L); for (int e=0;e<L;e++) shp[e]=cute::make_shape(me[e],n,k);
   cutlass::DeviceAllocation<GS> shpd(L); shpd.copy_from_host(shp.data());
   cutlass::DeviceAllocation<int> offdev(L); offdev.copy_from_host(offs.data());
-  const size_t ws_bytes = (size_t)cutlass::ceil_div(Mmax,16)*cutlass::ceil_div(n,64)*L*64;
+  const size_t ws_bytes = (size_t)cutlass::ceil_div(Mmax,16)*cutlass::ceil_div(n,64)*(size_t)L*64;
   cutlass::DeviceAllocation<char> ws(ws_bytes);
+  // ptr-array outputs (TM-independent -> built once, reused across the config sweep): contiguous ptr_D[e]=D+offs[e]*n
+  std::vector<half_t*> pdh(L); std::vector<DStride> sdh(L); std::vector<int> gmh(L);
+  for (int e=0;e<L;e++){ pdh[e]=D.get()+(size_t)offs[e]*n; sdh[e]=cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(me[e],n,1)); gmh[e]=me[e]; }
+  cutlass::DeviceAllocation<half_t*> pd(L); pd.copy_from_host(pdh.data());
+  cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
+  cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
 
   std::printf("\n=== %s: experts=%d total_tokens=%d n=%d k=%d gs=%d Mmax=%d ===\n", label, L, total, n, k, g, Mmax);
   // COMPULSORY HBM traffic (each read/written once): A activations + B int4 weights + scales + D output.
@@ -46,8 +54,8 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
   char best_name[64] = ""; double best_mfu = 0.0;
 #define TIME(TM,TN,TK,WM,WN,ST) do {                                                                    \
     auto launch = [&]{ moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly,\
-        TM, TN, TK, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, D.get(), Mmax, n, k, L, g,     \
-        shpd.get(), shp.data(), offdev.get(), ws.get(), ws_bytes, nullptr); };                          \
+        TM, TN, TK, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, pd.get(), sd.get(), gm.get(), \
+        Mmax, n, k, L, g, shpd.get(), shp.data(), offdev.get(), ws.get(), ws_bytes, nullptr); };        \
     launch(); for (int i=0;i<warmup;i++) launch();                                                      \
     PpuTimer t; t.start(); for (int i=0;i<iters;i++) launch(); t.stop();                                \
     double us = double(t.elapsed_millis())*1e3/iters;                                                   \
@@ -83,17 +91,22 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
 // capture (acu -c 1). Enable with env MOEG_ONE=1.
 static void one_launch(int L, int Mb, int n, int k, int g) {
   const int scale_k = (k + g - 1) / g;
-  cutlass::DeviceAllocation<half_t> A((size_t)L*Mb*k), scales((size_t)L*n*scale_k), D((size_t)L*Mb*n);
+  cutlass::DeviceAllocation<half_t> A((size_t)L*Mb*k), scales((size_t)L*n*scale_k), D((size_t)L*Mb*n);  // contiguous
   cutlass::DeviceAllocation<int4_t> B((size_t)L*n*k);
   std::vector<GS> shp(L, cute::make_shape(Mb, n, k));
   cutlass::DeviceAllocation<GS> shpd(L); shpd.copy_from_host(shp.data());
   std::vector<int> offs(L); for (int e=0;e<L;e++) offs[e]=e*Mb;
   cutlass::DeviceAllocation<int> offdev(L); offdev.copy_from_host(offs.data());
+  std::vector<half_t*> pdh(L); std::vector<DStride> sdh(L); std::vector<int> gmh(L);
+  for (int e=0;e<L;e++){ pdh[e]=D.get()+(size_t)e*Mb*n; sdh[e]=cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(Mb,n,1)); gmh[e]=Mb; }
+  cutlass::DeviceAllocation<half_t*> pd(L); pd.copy_from_host(pdh.data());
+  cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
+  cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
   const size_t ws = (size_t)cutlass::ceil_div(Mb,16)*cutlass::ceil_div(n,64)*(size_t)L*64;
   cutlass::DeviceAllocation<char> wsr(ws);
   std::printf("[MOEG_ONE] single launch 64x64x128/32x32/s3 uniform L=%d m=%d n=%d k=%d gs=%d\n", L,Mb,n,k,g);
   moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64,64,128, 32,32, 3>(
-      A.get(), B.get(), scales.get(), nullptr, D.get(), Mb, n, k, L, g,
+      A.get(), B.get(), scales.get(), nullptr, pd.get(), sd.get(), gm.get(), Mb, n, k, L, g,
       shpd.get(), shp.data(), offdev.get(), wsr.get(), ws, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 }
