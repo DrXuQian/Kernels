@@ -24,8 +24,15 @@
 #include "cutlass/epilogue/collective/builders/ppu_builder.inl"
 #include "ppu_aiu_gemm_mixed_input_group.hpp"   // the new grouped mixed-input GemmUniversal specialization
 
+#include "cutlass/epilogue/fusion/operations.hpp"
+#include "cutlass/detail/layout.hpp"
+
 namespace moe_grouped_ppu {
 using namespace cute;
+
+// Public per-expert output-stride element type (RowMajor D). Callers build a DeviceAllocation<DStride> of L
+// entries (one make_cute_packed_stride({M_e,N,1}) each) for the ptr-array (contiguous) epilogue.
+using DStride = cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>;
 
 enum class QuantMode { PerColScaleOnly, FinegrainedScaleOnly, FinegrainedScaleZero };
 constexpr bool is_finegrained(QuantMode q) { return q != QuantMode::PerColScaleOnly; }
@@ -38,7 +45,10 @@ using GroupProblemShape = cutlass::gemm::GroupProblemShape<GroupShape>;
 template <QuantMode QuantOp, class KernelSchedule,
           class TileShape, class ScaleTileShape, class WarpShape, int Stages, bool AiuInterleaved>
 void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
-            const cutlass::half_t* zeros, cutlass::half_t* D,
+            const cutlass::half_t* zeros,
+            cutlass::half_t** ptr_D,        // device [L] per-expert output base pointers (contiguous: D+offs[e]*N)
+            DStride* stride_D,              // device [L] per-expert output strides ({M_e,N,1} row-major)
+            int const* group_M,             // device [L] per-expert M_e (cheap decode of blockIdx.x)
             int m, int n, int k, int L, int group_size,
             GroupShape* group_shapes_dev, GroupShape const* group_shapes_host,
             int const* group_row_offsets,   // ragged: per-expert cumulative A row start; null=uniform
@@ -57,13 +67,19 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
   using ElementAccumulator = float;  using OperatorClass = cutlass::arch::OpClassTensorOp;
   using ClusterShape = WarpShape;
-  using EpilogueSchedule = cutlass::epilogue::EpilogueSimtVectorizedWithoutEvt;
+  // Ptr-array (grouped) epilogue -> per-expert output pointers ptr_D[l], contiguous by construction (like
+  // example 11 / DeepGemm). POINTER layouts (LayoutC*/LayoutD*) signal grouped to the builder. Scalar alpha/beta
+  // (array epilogue supports scalar: ThreadEpilogueOp(params.thread, l_coord), collective:221-224).
+  using EpilogueSchedule = cutlass::epilogue::EpiloguePtrArraySimtVectorized;
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::PPU0010, OperatorClass, TileShape, ClusterShape, EpilogueTileType,
-      ElementAccumulator, ElementAccumulator, ElementC, LayoutC, AlignmentC,
-      ElementD, LayoutD, AlignmentD, EpilogueSchedule>::CollectiveOp;
+      ElementAccumulator, ElementAccumulator,
+      ElementC, LayoutC*, AlignmentC,
+      ElementD, LayoutD*, AlignmentD,
+      EpilogueSchedule,
+      cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>>::CollectiveOp;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::PPU0010, OperatorClass, ElementA, LayoutA, AlignmentA,
       ElementBInfo, LayoutB, AlignmentB, ElementAccumulator,
@@ -77,31 +93,16 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
   using StrideC = typename CollectiveEpilogue::StrideC;  using StrideD = typename CollectiveEpilogue::StrideD;
   using StrideS = typename CollectiveMainloop::StrideScale;
 
-  const int scale_k = (k + group_size - 1) / group_size;
-  StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));
-  StrideB sB = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, L));
-  // C/D strides are NORMAL (m,n,L). GROUND TRUTH (actlize builder ppu_mma_builder.inl:420-455): example 16's
-  // KernelTmaWarpSpecializedCooperativeMixedInput and our AIU schedules route through the SAME collective
-  // (ppu_mma_aiu_multistage_mixed_input.hpp); SwapAB is toggled ONLY by whether the quantized tuple sits in the
-  // A or B slot (SwapAB = IsATransformed, collective:112/166). We (and example 16) put int4 in B -> SwapAB=0 ->
-  // no M/N swap, strides bound as-is. Example 16's reversed (n,m,L) stride_C/stride_D are DEAD CODE (never
-  // referenced; its live args use the normal stride_*_ref). So D is row-major [M][N], no transpose. Confirmed.
-  StrideD sD = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, L));
-  StrideC sC = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, L));
-  StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
+  // Grouped ptr-array epilogue: StrideD/StrideC are POINTER types (per-expert stride arrays from the caller).
+  static_assert(std::is_same_v<DStride, cute::remove_pointer_t<StrideD>>,
+                "caller DStride must match CollectiveEpilogue::StrideD element type");
 
-#ifdef MOEG_DEBUG
-  // GET THE LAYOUT, don't guess: print the actual strides the kernel uses for A/B/C/D/scale + the swap flag.
-  { static bool once = true; if (once) { once = false;
-    std::printf("[moe_grouped layout] m=%d n=%d k=%d L=%d gs=%d\n", m,n,k,L,group_size);
-    std::printf("  StrideA="); cute::print(sA); std::printf("\n  StrideB="); cute::print(sB);
-    std::printf("\n  StrideC="); cute::print(sC); std::printf("\n  StrideD="); cute::print(sD);
-    std::printf("\n  StrideScale="); cute::print(sS);
-    // Has_SwapAB is 0 here BY DESIGN (int4 tuple in B slot). This is the SAME collective example 16 uses and
-    // example 16 is also SwapAB=0 -- so a 0 here is CORRECT, not the bug. (Prints the ARGUMENT-stage strides.)
-    std::printf("\n  Has_SwapAB=%d  (strides above are the ARGUMENT/host stage, pre-to_underlying)\n",
-                int(cutlass::gemm::kernel::detail::Has_SwapAB_v<CollectiveMainloop>)); } }
-#endif
+  const int scale_k = (k + group_size - 1) / group_size;
+  StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));   // mainloop: single L-strided base
+  StrideB sB = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, L));
+  StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
+  // C/D strides now come from the caller (per-expert ptr_D + stride_D arrays) -> contiguous output.
+
   GroupProblemShape ps; ps.num_groups = L; ps.problem_shapes = group_shapes_dev; ps.host_problem_shapes = group_shapes_host;
   cutlass::KernelHardwareInfo hw{};   // cu_count auto-queried in to_underlying_arguments
 
@@ -109,12 +110,11 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     cutlass::gemm::GemmUniversalMode::kGrouped,
     ps,
     { A, sA, B, sB, scales, sS, group_size, zeros, group_row_offsets },
-    { {ElementAccumulator(1.f), ElementAccumulator(0.f)}, (ElementC*)nullptr, sC, D, sD },
+    { {ElementAccumulator(1.f), ElementAccumulator(0.f)}, (ElementC const**)nullptr, StrideC{}, ptr_D, stride_D },
     hw
   };
-  // DEBUG: MOEG_PROBE=1 turns the kernel into a routing probe (writes expert+1 instead of the GEMM); lets a
-  // caller decode which D-plane each expert's tiles land in without touching signatures. 0/unset = normal.
-  if (const char* e = std::getenv("MOEG_PROBE")) args.probe = std::atoi(e);
+  args.group_M = group_M;
+  if (const char* e = std::getenv("MOEG_PROBE")) args.probe = std::atoi(e);   // routing probe (test_moe_grouped_probe)
 
   Gemm gemm;
   auto st = gemm.can_implement(args);
@@ -127,14 +127,16 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
 
 template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages>
 void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
-                    const cutlass::half_t* zeros, cutlass::half_t* D, int m, int n, int k, int L, int group_size,
+                    const cutlass::half_t* zeros,
+                    cutlass::half_t** ptr_D, DStride* stride_D, int const* group_M,
+                    int m, int n, int k, int L, int group_size,
                     GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
                     char* ws, size_t ws_bytes, hggcStream_t stream) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL>( \
-      A,B,scales,zeros,D,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream)
+      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream)
   if constexpr (is_finegrained(QuantOp)) {
     if (group_size == 128) { constexpr int SK=(TK+127)/128;
       if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs128, cute::Int<SK>, true);

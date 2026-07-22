@@ -96,6 +96,7 @@ public:
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
     int probe = 0;   // debug: 0=normal; 1=ROUTING probe (skip GEMM, write expert+1 to every output element)
+    int const* group_M = nullptr;   // device [L] per-expert M_e; cheap O(L) decode of blockIdx.x -> (expert,m_tile)
   };
   struct Params {
     GemmUniversalMode mode;
@@ -106,6 +107,7 @@ public:
     TileSchedulerParams scheduler;
     void* workspace;
     int probe = 0;
+    int const* group_M = nullptr;
   };
 
   static Params
@@ -135,7 +137,7 @@ public:
       problem_shapes,
       CollectiveMainloop::to_underlying_arguments(rep_mnkl, args.mainloop, /*workspace=*/nullptr),
       CollectiveEpilogue::to_underlying_arguments(rep_mnkl, args.epilogue, /*workspace=*/nullptr),
-      hw_info, scheduler, workspace, args.probe
+      hw_info, scheduler, workspace, args.probe, args.group_M
     };
   }
 
@@ -194,15 +196,17 @@ public:
     // Mmax-sized (.,.,L) grid). l_coord = expert selects this expert's A/B/scale/zero plane in the collective.
     int const TM = int(size<0>(blk_shape));
     int flat = int(blockIdx.x), n_idx = int(blockIdx.y);
-    int expert = -1, m_idx = 0, M = 0, N = 0, K = 0;
+    int expert = -1, m_idx = 0;
+    // A (O(L) cheap decode): scan the tiny cached group_M[] int array (M_e per expert) instead of reading the
+    // full (M,N,K) problem-shape struct L times per block. Find (expert, local m-tile).
     for (int e = 0; e < num_groups; ++e) {
-      auto pe = append<4>(params.problem_shape.get_problem_shape(e), Int<1>{});
-      int const Me = int(get<0>(pe));
-      int const mt = int(cute::ceil_div(Me, TM));
-      if (flat < mt) { expert = e; m_idx = flat; M = Me; N = int(get<1>(pe)); K = int(get<2>(pe)); break; }
+      int const mt = int(cute::ceil_div(params.group_M[e], TM));
+      if (flat < mt) { expert = e; m_idx = flat; break; }
       flat -= mt;
     }
     if (expert < 0) return;                                    // guard (grid.x is exactly SUM_e mtiles_e)
+    auto pe = append<4>(params.problem_shape.get_problem_shape(expert), Int<1>{});  // ONE struct read for N,K
+    int const M = int(get<0>(pe)), N = int(get<1>(pe)), K = int(get<2>(pe));
     if (n_idx * int(size<1>(blk_shape)) >= N) return;          // N uniform, guard anyway
 
     auto problem_shape_MNKL = make_shape(M, N, K, num_groups);
