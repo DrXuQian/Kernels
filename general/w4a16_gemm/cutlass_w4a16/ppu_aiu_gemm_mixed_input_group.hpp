@@ -157,17 +157,20 @@ public:
   // blocks and ran tiles serially -> acu measured 2 active warps/CU, 3.1% achieved occupancy, 16% CU throughput.
   // Thousands of blocks let the HW hide per-tile load/epilogue latency across blocks. X uses Mmax over experts;
   // experts with fewer M-tiles early-exit in-kernel. (N uniform across experts.)
+  // FLAT non-persistent grid: gridDim.x = SUM_e ceil(M_e/TM) (NOT Mmax*L) -> no per-expert padding, so ragged
+  // experts launch ZERO idle blocks. gridDim.y = N-tiles. blockIdx.x is decoded to (expert, local m_tile) in
+  // operator() by a per-expert m-tile prefix scan (L is small). (Earlier grid was (ceil(Mmax/TM), N/TN, L),
+  // which over-launched idle blocks for small experts.)
   static dim3 get_grid_shape(Params const& params) {
     int const L = params.problem_shape.groups();
-    int Mmax = 0, N = 1;
+    int const TM = cute::size<0>(TileShape{}), TN = cute::size<1>(TileShape{});
+    int total_m_tiles = 0, N = 1;
     for (int e = 0; e < L; ++e) {
       auto ps = params.problem_shape.get_host_problem_shape(e);
-      int Me = int(cute::get<0>(ps));
-      if (Me > Mmax) Mmax = Me;
+      total_m_tiles += int(cute::ceil_div(int(cute::get<0>(ps)), TM));
       N = int(cute::get<1>(ps));
     }
-    int const TM = cute::size<0>(TileShape{}), TN = cute::size<1>(TileShape{});
-    return dim3(int(cute::ceil_div(Mmax, TM)), int(cute::ceil_div(N, TN)), L);
+    return dim3(total_m_tiles, int(cute::ceil_div(N, TN)), 1);
   }
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
 
@@ -186,15 +189,21 @@ public:
     auto blk_shape = TileShape{};
     int const num_groups = params.problem_shape.groups();   // L extent for the collective's B/S/Z slice
 
-    // NON-PERSISTENT: this block owns exactly one (m_tile, n_tile, expert), coords from blockIdx (like the
-    // standard mixed-input kernel). No while-loop -> no serial per-tile latency. Experts with fewer M-tiles than
-    // the Mmax-sized grid early-exit. l_coord = expert selects this expert's A/B/scale/zero plane in the collective.
-    int const expert = int(blockIdx.z);
-    if (expert >= num_groups) return;
-    auto ps = append<4>(params.problem_shape.get_problem_shape(expert), Int<1>{});   // per-expert [M_e,N,K,1]
-    int const M = int(get<0>(ps)), N = int(get<1>(ps)), K = int(get<2>(ps));
-    int const m_idx = int(blockIdx.x), n_idx = int(blockIdx.y);
-    if (m_idx * size<0>(blk_shape) >= M || n_idx * size<1>(blk_shape) >= N) return;   // beyond this expert's tiles
+    // FLAT non-persistent: decode blockIdx.x -> (expert, local m_idx) via a per-expert m-tile prefix scan
+    // (num_groups is small). Every block maps to a REAL tile of some expert -> no idle blocks (vs the old
+    // Mmax-sized (.,.,L) grid). l_coord = expert selects this expert's A/B/scale/zero plane in the collective.
+    int const TM = int(size<0>(blk_shape));
+    int flat = int(blockIdx.x), n_idx = int(blockIdx.y);
+    int expert = -1, m_idx = 0, M = 0, N = 0, K = 0;
+    for (int e = 0; e < num_groups; ++e) {
+      auto pe = append<4>(params.problem_shape.get_problem_shape(e), Int<1>{});
+      int const Me = int(get<0>(pe));
+      int const mt = int(cute::ceil_div(Me, TM));
+      if (flat < mt) { expert = e; m_idx = flat; M = Me; N = int(get<1>(pe)); K = int(get<2>(pe)); break; }
+      flat -= mt;
+    }
+    if (expert < 0) return;                                    // guard (grid.x is exactly SUM_e mtiles_e)
+    if (n_idx * int(size<1>(blk_shape)) >= N) return;          // N uniform, guard anyway
 
     auto problem_shape_MNKL = make_shape(M, N, K, num_groups);
     auto blk_coord_mnkl = make_coord(m_idx, n_idx, _, expert);

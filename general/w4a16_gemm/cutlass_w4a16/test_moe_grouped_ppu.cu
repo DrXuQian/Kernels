@@ -70,12 +70,32 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
   std::printf("  WINNER %s: %s at %.1f%% MFU\n", label, best_name, best_mfu);
 }
 
+// Single clean launch of the winner config (64x64x128/32x32/s3) on a UNIFORM workload, for a 1-kernel acu
+// capture (acu -c 1). Enable with env MOEG_ONE=1.
+static void one_launch(int L, int Mb, int n, int k, int g) {
+  const int scale_k = (k + g - 1) / g;
+  cutlass::DeviceAllocation<half_t> A((size_t)L*Mb*k), scales((size_t)L*n*scale_k), D((size_t)L*Mb*n);
+  cutlass::DeviceAllocation<int4_t> B((size_t)L*n*k);
+  std::vector<GS> shp(L, cute::make_shape(Mb, n, k));
+  cutlass::DeviceAllocation<GS> shpd(L); shpd.copy_from_host(shp.data());
+  std::vector<int> offs(L); for (int e=0;e<L;e++) offs[e]=e*Mb;
+  cutlass::DeviceAllocation<int> offdev(L); offdev.copy_from_host(offs.data());
+  const size_t ws = (size_t)cutlass::ceil_div(Mb,16)*cutlass::ceil_div(n,64)*(size_t)L*64;
+  cutlass::DeviceAllocation<char> wsr(ws);
+  std::printf("[MOEG_ONE] single launch 64x64x128/32x32/s3 uniform L=%d m=%d n=%d k=%d gs=%d\n", L,Mb,n,k,g);
+  moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64,64,128, 32,32, 3>(
+      A.get(), B.get(), scales.get(), nullptr, D.get(), Mb, n, k, L, g,
+      shpd.get(), shp.data(), offdev.get(), wsr.get(), ws, nullptr);
+  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+}
+
 int main(int argc, char** argv) {
   int L  = argc > 1 ? atoi(argv[1]) : 8;
   int Mb = argc > 2 ? atoi(argv[2]) : 512;
   int n  = argc > 3 ? atoi(argv[3]) : 1024;
   int k  = argc > 4 ? atoi(argv[4]) : 2048;
   int g  = argc > 5 ? atoi(argv[5]) : 128;
+  if (std::getenv("MOEG_ONE")) { one_launch(L, Mb, n, k, g); return 0; }
 
   // UNIFORM: every expert has Mb tokens (Mmax==Mb, no padding, no imbalance) -> isolates grouped-scheduler cost
   // vs the batched kernel (test_moe_gemm_ppu, ~49% MFU) at the same per-expert shape.
