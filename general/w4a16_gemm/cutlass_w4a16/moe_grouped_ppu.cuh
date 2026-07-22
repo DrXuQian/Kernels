@@ -175,7 +175,7 @@ void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const c
   if constexpr (is_finegrained(QuantOp)) {
     if (group_size == 128)     { constexpr int SK=(TK+127)/128; MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs128, SK); }
     else if (group_size == 64) { constexpr int SK=(TK+63)/64;   MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs64,  SK); }
-    else if (group_size == 32)  std::printf("[moe_grouped] gs=32 UNSUPPORTED (collective GroupK=gs/16 must be >=4 -> gs>=64; use dequant->bf16 for Q4_0/Q4_1/Q4_K)\n");
+    else if (group_size == 32) { constexpr int SK=(TK+31)/32;    MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32,  SK); }  // UNDER INVESTIGATION (GroupK=2)
     else std::printf("[moe_grouped] gs %d unsupported\n", group_size);
   } else {
     if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputPerCol, cute::_1, true);
