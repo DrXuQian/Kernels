@@ -168,13 +168,18 @@ public:
   static dim3 get_grid_shape(Params const& params) {
     int const L = params.problem_shape.groups();
     int const TM = cute::size<0>(TileShape{}), TN = cute::size<1>(TileShape{});
-    int total_m_tiles = 0, N = 1;
+    int total_m_tiles = 0, N = 1, mt0 = -1; bool uni = true;
     for (int e = 0; e < L; ++e) {
       auto ps = params.problem_shape.get_host_problem_shape(e);
-      total_m_tiles += int(cute::ceil_div(int(cute::get<0>(ps)), TM));
-      N = int(cute::get<1>(ps));
+      int const mte = int(cute::ceil_div(int(cute::get<0>(ps)), TM));
+      total_m_tiles += mte;  N = int(cute::get<1>(ps));
+      if (mt0 < 0) mt0 = mte; else if (mte != mt0) uni = false;
     }
-    return dim3(total_m_tiles, int(cute::ceil_div(N, TN)), 1);
+    int const Nt = int(cute::ceil_div(N, TN));
+    // UNIFORM: 3D grid (mt0, N_tiles, L) with blockIdx.z=expert -> same raster/L2 locality as the old grid
+    // (recovers ~5% the flat (total,N,1) grid loses on the balanced case). RAGGED: flat grid, no idle blocks.
+    if (uni) return dim3(mt0, Nt, L);
+    return dim3(total_m_tiles, Nt, 1);
   }
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
 
@@ -200,9 +205,9 @@ public:
     int flat = int(blockIdx.x), n_idx = int(blockIdx.y);
     int expert = -1, m_idx = 0;
     if (params.mtiles_uniform > 0) {
-      // A (O(1) fast path): all experts have the same #m-tiles -> pure division, no scan (recovers the ~5%
-      // the O(L) scan cost the uniform case vs the old blockIdx.z decode).
-      expert = flat / params.mtiles_uniform;  m_idx = flat % params.mtiles_uniform;
+      // UNIFORM: 3D grid (mt0, N_tiles, L) -> expert = blockIdx.z (O(1)), m_idx = blockIdx.x (local m-tile).
+      // Same grid/raster as the old fast path; recovers the ~5% the flat grid lost on the balanced case.
+      expert = int(blockIdx.z);  m_idx = flat;
     } else {
       // A (O(L) ragged fallback): scan the tiny cached group_M[] (M_e per expert) for (expert, local m-tile).
       for (int e = 0; e < num_groups; ++e) {
