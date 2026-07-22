@@ -34,7 +34,8 @@ int main(int argc, char** argv) {
   const int  L      = argc > 1 ? atoi(argv[1]) : 4;
   const int  Mb     = argc > 2 ? atoi(argv[2]) : 128;
   const bool ragged = argc > 3;
-  const int  N = 1024, K = 2048, gs = 128;   // %256==0 -> interleaved-256 (xcheck-proven), gs=128
+  const int  gs     = argc > 4 ? atoi(argv[4]) : 128;   // 128/64/32 (gs=32 needs actlize_gs32.patch)
+  const int  N = 1024, K = 2048;              // %256==0 -> interleaved-256
   const int  scale_k = K / gs;
 
   std::vector<int> me(L), offs(L);

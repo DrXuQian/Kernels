@@ -171,6 +171,9 @@ void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const c
     else if (group_size == 64) { constexpr int SK=(TK+63)/64;
       if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs64, cute::Int<SK>, true);
       else    MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs64, cute::Int<SK>, false); }
+    else if (group_size == 32) { constexpr int SK=(TK+31)/32;   // Q4_0/Q4_1/Q4_K-as-AWQ; needs actlize_gs32.patch
+      if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32, cute::Int<SK>, true);
+      else    MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32, cute::Int<SK>, false); }
     else std::printf("[moe_grouped] gs %d unsupported\n", group_size);
   } else {
     if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputPerCol, cute::_1, true);
