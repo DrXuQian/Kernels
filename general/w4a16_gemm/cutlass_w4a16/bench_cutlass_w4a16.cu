@@ -815,6 +815,14 @@ void save_tactic(std::string const& path, Options const& o, std::string const& n
 //   MATCH    -> grouped kernel + strides are correct; the earlier MISMATCH was my hand-rolled verify setup.
 //   MISMATCH -> the grouped no-swap stride convention (esp. StrideB from the interleaved LayoutB) is wrong;
 //               compare vs block_D (the mixed kernel's own output) to localize.
+#if defined(PPU_SCALE_DBG)
+// Read the collective's block0/thread0 scale-reload log back to host. buf laid out [i*4 + {k_block, scale_k_idx,
+// smem_src, reg_dest}], cnt = #entries (<=16). Runs after an xcheck GEMM so buf is populated.
+__global__ void ppu_scale_dbg_read(float* out, int* c) {
+  if (threadIdx.x == 0) { for (int i = 0; i < 64; ++i) out[i] = cutlass_ppu_scale_dbg::buf[i]; *c = cutlass_ppu_scale_dbg::cnt; }
+}
+#endif
+
 void xcheck_grouped(Options const& options) {
   using GS = moe_grouped_ppu::GroupShape;
   int const L = 1, m = options.m, n = options.n, k = options.k, g = options.g;
@@ -908,6 +916,18 @@ void xcheck_grouped(Options const& options) {
   std::printf("\n  blkD[n..n+5] ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[n + i]));
   std::printf("\n");
   (void)okR; (void)okK;
+
+#if defined(PPU_SCALE_DBG)
+  // Dump the collective's per-reload scale log (block0/thread0). Distinguishes load-vs-apply for the gs=32 zero.
+  cutlass::DeviceAllocation<float> dbg(64); cutlass::DeviceAllocation<int> dcnt(1);
+  ppu_scale_dbg_read<<<1, 32>>>(dbg.get(), dcnt.get());
+  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+  std::vector<float> hb(64); int hc = 0; dbg.copy_to_host(hb.data()); dcnt.copy_to_host(&hc);
+  std::printf("\n[SCALE_DBG] gs=%d: %d intra-tile scale reloads logged (block0/thread0)\n", g, hc);
+  std::printf("   idx | k_block scale_k_idx | smem_src   reg_dest\n");
+  for (int i = 0; i < hc && i < 16; ++i)
+    std::printf("   %3d |   %5.0f     %6.0f    | %8.5f  %8.5f\n", i, hb[i*4+0], hb[i*4+1], hb[i*4+2], hb[i*4+3]);
+#endif
 }
 
 int main(int argc, char const **args) {

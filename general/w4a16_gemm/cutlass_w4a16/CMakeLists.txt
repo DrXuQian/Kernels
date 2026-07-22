@@ -14,9 +14,13 @@ set(TILE_N  "64" CACHE STRING "threadblock tile N")
 set(WARP_M  "32" CACHE STRING "warp tile M")
 set(WARP_N  "32" CACHE STRING "warp tile N")
 set(STAGES  "4"  CACHE STRING "pipeline stages")
+set(SCALE_DBG "0" CACHE STRING "1 = enable PPU_SCALE_DBG intra-tile scale-reload log (gs=32 debug)")
 
 set(_W4A16_DEFS
   -DTILE_M=${TILE_M} -DTILE_N=${TILE_N} -DWARP_M=${WARP_M} -DWARP_N=${WARP_N} -DSTAGES=${STAGES})
+if(SCALE_DBG)
+  list(APPEND _W4A16_DEFS -DPPU_SCALE_DBG=1)
+endif()
 
 cutlass_example_add_executable(
   bench_cutlass_w4a16
@@ -25,7 +29,8 @@ cutlass_example_add_executable(
 )
 
 target_compile_definitions(bench_cutlass_w4a16 PRIVATE
-  TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES})
+  TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES}
+  $<$<BOOL:${SCALE_DBG}>:PPU_SCALE_DBG=1>)
 target_compile_options(bench_cutlass_w4a16 PRIVATE -w)
 # Root-cause cross-check is now a RUNTIME flag on this same binary (--xcheck): it runs the grouped kernel (L=1)
 # on the verified bench data (block_A / shuffled block_B_buff / block_scale) and compares vs block_ref_D and the
