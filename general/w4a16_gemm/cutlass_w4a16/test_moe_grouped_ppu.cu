@@ -91,22 +91,28 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
 // capture (acu -c 1). Enable with env MOEG_ONE=1.
 static void one_launch(int L, int Mb, int n, int k, int g) {
   const int scale_k = (k + g - 1) / g;
-  cutlass::DeviceAllocation<half_t> A((size_t)L*Mb*k), scales((size_t)L*n*scale_k), D((size_t)L*Mb*n);  // contiguous
+  // RAGGED single launch (same 1:2:3:4 skew, total=L*Mb) with the RAGGED winner config, for a clean acu -c 1
+  // capture of the production (dropless) path. flat grid + O(log L) binary decode.
+  std::vector<int> me(L), offs(L);
+  { long wsum=0; for (int e=0;e<L;e++) wsum += (e%4+1);
+    long target=(long)L*Mb, acc=0;
+    for (int e=0;e<L;e++){ me[e]=(int)(target*(e%4+1)/wsum); acc+=me[e]; } me[L-1]+=(int)(target-acc); }
+  int total=0, Mmax=0; for (int e=0;e<L;e++){ offs[e]=total; total+=me[e]; Mmax=std::max(Mmax,me[e]); }
+  cutlass::DeviceAllocation<half_t> A((size_t)total*k), scales((size_t)L*n*scale_k), D((size_t)total*n);
   cutlass::DeviceAllocation<int4_t> B((size_t)L*n*k);
-  std::vector<GS> shp(L, cute::make_shape(Mb, n, k));
+  std::vector<GS> shp(L); for (int e=0;e<L;e++) shp[e]=cute::make_shape(me[e],n,k);
   cutlass::DeviceAllocation<GS> shpd(L); shpd.copy_from_host(shp.data());
-  std::vector<int> offs(L); for (int e=0;e<L;e++) offs[e]=e*Mb;
   cutlass::DeviceAllocation<int> offdev(L); offdev.copy_from_host(offs.data());
   std::vector<half_t*> pdh(L); std::vector<DStride> sdh(L); std::vector<int> gmh(L);
-  for (int e=0;e<L;e++){ pdh[e]=D.get()+(size_t)e*Mb*n; sdh[e]=cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(Mb,n,1)); gmh[e]=Mb; }
+  for (int e=0;e<L;e++){ pdh[e]=D.get()+(size_t)offs[e]*n; sdh[e]=cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(me[e],n,1)); gmh[e]=me[e]; }
   cutlass::DeviceAllocation<half_t*> pd(L); pd.copy_from_host(pdh.data());
   cutlass::DeviceAllocation<DStride> sd(L); sd.copy_from_host(sdh.data());
   cutlass::DeviceAllocation<int>     gm(L); gm.copy_from_host(gmh.data());
-  const size_t ws = (size_t)cutlass::ceil_div(Mb,16)*cutlass::ceil_div(n,64)*(size_t)L*64;
+  const size_t ws = (size_t)cutlass::ceil_div(Mmax,16)*cutlass::ceil_div(n,64)*(size_t)L*64;
   cutlass::DeviceAllocation<char> wsr(ws);
-  std::printf("[MOEG_ONE] single launch 64x64x128/32x32/s3 uniform L=%d m=%d n=%d k=%d gs=%d\n", L,Mb,n,k,g);
-  moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64,64,128, 32,32, 3>(
-      A.get(), B.get(), scales.get(), nullptr, pd.get(), sd.get(), gm.get(), Mb, n, k, L, g,
+  std::printf("[MOEG_ONE] single RAGGED launch 64x128x128/32x64/s3 L=%d Mb=%d total=%d n=%d k=%d gs=%d Mmax=%d\n", L,Mb,total,n,k,g,Mmax);
+  moe_grouped_ppu::filter_and_run<moe_grouped_ppu::QuantMode::FinegrainedScaleOnly, 64,128,128, 32,64, 3>(
+      A.get(), B.get(), scales.get(), nullptr, pd.get(), sd.get(), gm.get(), Mmax, n, k, L, g,
       shpd.get(), shp.data(), offdev.get(), wsr.get(), ws, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 }
