@@ -152,13 +152,22 @@ public:
     return Status::kSuccess;
   }
 
+  // NON-PERSISTENT grid: one block per (m_tile, n_tile, expert), like the standard mixed-input kernel
+  // (ppu_aiu_gemm_mixed_input.hpp, ~49% MFU). The persistent GroupScheduler launched only grid=(72,1,1) = #CU
+  // blocks and ran tiles serially -> acu measured 2 active warps/CU, 3.1% achieved occupancy, 16% CU throughput.
+  // Thousands of blocks let the HW hide per-tile load/epilogue latency across blocks. X uses Mmax over experts;
+  // experts with fewer M-tiles early-exit in-kernel. (N uniform across experts.)
   static dim3 get_grid_shape(Params const& params) {
-    TileSchedulerArguments args{};
-    if constexpr (!std::is_const_v<decltype(args.max_swizzle_size)>)
-      args.max_swizzle_size = 1 << params.scheduler.log_swizzle_size_;
-    args.raster_order = params.scheduler.raster_order_ == TileScheduler::RasterOrder::AlongN
-                      ? TileScheduler::RasterOrderOptions::AlongN : TileScheduler::RasterOrderOptions::AlongM;
-    return TileScheduler::get_grid_shape(params.scheduler, params.problem_shape, TileShape{}, ClusterShape{}, params.hw_info, args);
+    int const L = params.problem_shape.groups();
+    int Mmax = 0, N = 1;
+    for (int e = 0; e < L; ++e) {
+      auto ps = params.problem_shape.get_host_problem_shape(e);
+      int Me = int(cute::get<0>(ps));
+      if (Me > Mmax) Mmax = Me;
+      N = int(cute::get<1>(ps));
+    }
+    int const TM = cute::size<0>(TileShape{}), TN = cute::size<1>(TileShape{});
+    return dim3(int(cute::ceil_div(Mmax, TM)), int(cute::ceil_div(N, TN)), L);
   }
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
 
@@ -175,57 +184,47 @@ public:
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{};
-    int const num_groups = params.problem_shape.groups();   // [Q2] L extent for the collective's B/S/Z slice
+    int const num_groups = params.problem_shape.groups();   // L extent for the collective's B/S/Z slice
 
-    TileScheduler scheduler{params.scheduler};
-    auto work_tile_info = scheduler.get_current_work();
+    // NON-PERSISTENT: this block owns exactly one (m_tile, n_tile, expert), coords from blockIdx (like the
+    // standard mixed-input kernel). No while-loop -> no serial per-tile latency. Experts with fewer M-tiles than
+    // the Mmax-sized grid early-exit. l_coord = expert selects this expert's A/B/scale/zero plane in the collective.
+    int const expert = int(blockIdx.z);
+    if (expert >= num_groups) return;
+    auto ps = append<4>(params.problem_shape.get_problem_shape(expert), Int<1>{});   // per-expert [M_e,N,K,1]
+    int const M = int(get<0>(ps)), N = int(get<1>(ps)), K = int(get<2>(ps));
+    int const m_idx = int(blockIdx.x), n_idx = int(blockIdx.y);
+    if (m_idx * size<0>(blk_shape) >= M || n_idx * size<1>(blk_shape) >= N) return;   // beyond this expert's tiles
 
-    while (work_tile_info.is_valid()) {
-      if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
-        work_tile_info = fetch_next_work(work_tile_info, scheduler);
-        continue;
-      }
-      int expert = work_tile_info.L_idx;
-      auto ps = append<4>(params.problem_shape.get_problem_shape(expert), Int<1>{});   // per-expert [M_e,N,K,1]
-      auto M = get<0>(ps); auto N = get<1>(ps); auto K = get<2>(ps);
-      // Drive the mixed-input collective with L = num_groups so its B/scale/zero L-slice spans all experts and
-      // l_coord = expert selects this expert's plane. (Uniform-M for step 2a; A is sliced by l_coord too.)
-      auto problem_shape_MNKL = make_shape(int(M), int(N), int(K), num_groups);   // [Q3] uniform-M assumption
-      auto blk_coord_mnkl = make_coord(work_tile_info.M_idx, work_tile_info.N_idx, _, expert);
+    auto problem_shape_MNKL = make_shape(M, N, K, num_groups);
+    auto blk_coord_mnkl = make_coord(m_idx, n_idx, _, expert);
 
-      CollectiveMainloop collective_mainloop;
-      auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop);
-      Tensor gA = get<0>(load_inputs);
-      Tensor gB = get<1>(load_inputs);
+    CollectiveMainloop collective_mainloop;
+    auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop);
+    Tensor gA = get<0>(load_inputs);
+    Tensor gB = get<1>(load_inputs);
 
-      auto m_max = M - size<0>(gA) * work_tile_info.M_idx;
-      auto n_max = N - size<0>(gB) * work_tile_info.N_idx;
-      auto k_res = K - size<1>(gA) * size<2>(gA);
-      auto residue_mnk = make_tuple(m_max, n_max, k_res);
+    auto m_max = M - size<0>(gA) * m_idx;
+    auto n_max = N - size<0>(gB) * n_idx;
+    auto k_res = K - size<1>(gA) * size<2>(gA);
+    auto residue_mnk = make_tuple(m_max, n_max, k_res);
 
-      TiledMma tiled_mma;
-      Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
-      clear(accumulators);
-      auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
-      int  k_tile_count = size<2>(gA);
+    TiledMma tiled_mma;
+    Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
+    clear(accumulators);
+    auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
+    int  k_tile_count = size<2>(gA);
 
-      if (params.probe == 1) {
-        // ROUTING PROBE: skip the GEMM entirely and tag every output element of THIS tile with (expert+1).
-        // Read back D afterwards: plane e should be uniformly (e+1) iff the scheduler issued expert e's tiles
-        // AND the epilogue wrote them to D-plane e. All-zero plane => never written (scheduler/L_idx miss);
-        // mixed tags in one plane => epilogue L-slice wrong. This decodes scheduler+epilogue routing directly,
-        // independent of B/scale slicing or the mma. (load_init already ran, so residue_mnk/gA/gB are valid.)
-        cute::fill(accumulators, ElementCompute(expert + 1));
-      } else {
-        collective_mainloop(params.mainloop, load_inputs, accumulators, k_tile_iter, k_tile_count, thread_idx, smem_buf);
-      }
-
-      CollectiveEpilogue epilogue{params.epilogue, shared_storage.tensors.epilogue};
-      epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators, tiled_mma, residue_mnk,
-               thread_idx, (char*)&shared_storage.tensors.epilogue);   // [Q4] epilogue must write to this expert's D plane (L-strided by l_coord)
-
-      work_tile_info = fetch_next_work(work_tile_info, scheduler);
+    if (params.probe == 1) {
+      // ROUTING PROBE: skip the GEMM, tag every output element with (expert+1). See test_moe_grouped_probe.
+      cute::fill(accumulators, ElementCompute(expert + 1));
+    } else {
+      collective_mainloop(params.mainloop, load_inputs, accumulators, k_tile_iter, k_tile_count, thread_idx, smem_buf);
     }
+
+    CollectiveEpilogue epilogue{params.epilogue, shared_storage.tensors.epilogue};
+    epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators, tiled_mma, residue_mnk,
+             thread_idx, (char*)&shared_storage.tensors.epilogue);   // writes this expert's D plane (L-strided)
   }
 };
 
