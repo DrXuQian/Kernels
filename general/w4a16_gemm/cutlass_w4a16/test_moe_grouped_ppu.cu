@@ -58,14 +58,23 @@ static void sweep(const char* label, const std::vector<int>& me, int n, int k, i
     else     std::printf("%-26s %-9s %-6s %-9s %s\n", nm, "-","-","-","FAIL (no-op)");                   \
     if (ran && mfu > best_mfu) { best_mfu = mfu; std::snprintf(best_name,sizeof(best_name),"%s",nm); }   \
   } while (0)
+  // OCCUPANCY axis: smaller BM / fewer stages -> less shared -> more blocks/CU (acu said theoretical occ was
+  // shared-limited to 21.9%; this axis IS the occupancy/shared search -- no separate "tuning" step).
+  TIME(32,  64,  128, 32, 32, 2);
   TIME(32,  64,  128, 32, 32, 3);
+  TIME(32,  64,  128, 32, 32, 4);
   TIME(32,  128, 128, 32, 64, 3);
-  TIME(32,  64,  256, 32, 16, 2);
-  TIME(64,  64,  128, 32, 32, 3);
+  TIME(64,  64,  128, 32, 32, 2);
+  TIME(64,  64,  128, 32, 32, 3);   // current baseline winner
   TIME(64,  64,  128, 32, 32, 4);
+  // REUSE axis: bigger BM/BN/BK -> fewer B re-reads (helps larger M_e / prefill).
   TIME(64,  128, 128, 32, 64, 3);
   TIME(128, 64,  128, 64, 32, 3);
+  TIME(128, 64,  128, 64, 32, 4);
+  TIME(128, 128, 128, 64, 64, 3);   // if this fails to compile (shared budget), comment it out & rebuild
   TIME(64,  64,  256, 32, 32, 2);
+  TIME(32,  64,  256, 32, 16, 2);
+  TIME(64,  128, 256, 32, 64, 2);   // bigger TK on 64x128; comment out if compile fails
 #undef TIME
   std::printf("  WINNER %s: %s at %.1f%% MFU\n", label, best_name, best_mfu);
 }
