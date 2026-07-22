@@ -119,13 +119,18 @@ int main(int argc, char** argv) {
   int g  = argc > 5 ? atoi(argv[5]) : 128;
   if (std::getenv("MOEG_ONE")) { one_launch(L, Mb, n, k, g); return 0; }
 
-  // UNIFORM: every expert has Mb tokens (Mmax==Mb, no padding, no imbalance) -> isolates grouped-scheduler cost
-  // vs the batched kernel (test_moe_gemm_ppu, ~49% MFU) at the same per-expert shape.
+  // UNIFORM: every expert has Mb tokens. total = L*Mb.
   std::vector<int> uni(L, Mb);
-  sweep("UNIFORM (m=Mb, no padding/imbalance)", uni, n, k, g);
+  sweep("UNIFORM (m=Mb)", uni, n, k, g);
 
-  // RAGGED: me = Mb*(e%4+1) -> adds load-imbalance + padded-D over the uniform case at higher total work.
-  std::vector<int> rag(L); for (int e=0;e<L;e++) rag[e] = Mb * (e % 4 + 1);
-  sweep("RAGGED (m=Mb*(e%4+1))", rag, n, k, g);
+  // RAGGED at the SAME total (L*Mb) as uniform, so the comparison isolates LOAD-IMBALANCE from work amount
+  // (the old ragged used Mb*(e%4+1) -> 2.5x more tokens, which alone raised MFU -- an unfair comparison).
+  // Keep the 1:2:3:4 skew shape but normalize the sum to L*Mb.
+  std::vector<int> rag(L);
+  { long wsum = 0; for (int e = 0; e < L; ++e) wsum += (e % 4 + 1);
+    long target = (long)L * Mb, acc = 0;
+    for (int e = 0; e < L; ++e) { rag[e] = (int)(target * (e % 4 + 1) / wsum); acc += rag[e]; }
+    rag[L - 1] += (int)(target - acc); }                          // fix rounding: exact sum == L*Mb
+  sweep("RAGGED (1:2:3:4 skew, SAME total=L*Mb)", rag, n, k, g);
   return 0;
 }
