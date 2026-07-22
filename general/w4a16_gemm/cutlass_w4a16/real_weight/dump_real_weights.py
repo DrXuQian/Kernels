@@ -273,14 +273,31 @@ def main():
         write_bin(out, len(experts), args.m, N, K, gs, 1, A_list, qs_list, sc_list, zr_list, gold_list)
 
     else:  # gptq
-        # config / quant config
-        cfg = json.load(open(os.path.join(args.path, "config.json")))
+        # config.json / index.json may live in --path OR a parent dir (safetensors can be in a subdir like ow7_224_ca).
+        def find_up(start, name, levels=4):
+            d = os.path.abspath(start)
+            for _ in range(levels):
+                p = os.path.join(d, name)
+                if os.path.exists(p):
+                    return p
+                nd = os.path.dirname(d)
+                if nd == d:
+                    break
+                d = nd
+            return None
+        cfg_path = find_up(args.path, "config.json")
+        idx_path = find_up(args.path, "model.safetensors.index.json")
+        assert cfg_path, f"config.json not found at/above {args.path}"
+        assert idx_path, f"model.safetensors.index.json not found at/above {args.path}"
+        shard_dir = os.path.dirname(idx_path)   # shards live next to the index
+        print(f"[gptq] config={cfg_path}\n[gptq] index={idx_path}\n[gptq] shard_dir={shard_dir}")
+        cfg = json.load(open(cfg_path))
         qc = cfg.get("quantization_config", {})
         bits = qc.get("bits", 4); gs = qc.get("group_size", 128); sym = qc.get("sym", True)
         desc_act = qc.get("desc_act", False)
         print(f"[gptq] bits={bits} gs={gs} sym={sym} desc_act={desc_act}")
         assert bits == 4 and sym and not desc_act, "this path assumes bits=4, sym, desc_act=false"
-        idx = json.load(open(os.path.join(args.path, "model.safetensors.index.json")))["weight_map"]
+        idx = json.load(open(idx_path))["weight_map"]
         # resolve prefix (model.language_model.layers.{L}.mlp.experts.{E}.{proj}_proj)
         def key(e, sfx):
             return f"model.language_model.layers.{args.layer}.mlp.experts.{e}.{args.proj}_proj.{sfx}"
@@ -290,7 +307,7 @@ def main():
             k = key(e, sfx)
             shard = idx[k]
             if shard not in open_shards:
-                open_shards[shard] = st_open(os.path.join(args.path, shard))
+                open_shards[shard] = st_open(os.path.join(shard_dir, shard))
             f, hdr, ds = open_shards[shard]
             return st_get(f, hdr, ds, k)
         qs_list, sc_list, A_list, gold_list = [], [], [], []
