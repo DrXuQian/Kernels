@@ -818,8 +818,12 @@ void save_tactic(std::string const& path, Options const& o, std::string const& n
 #if defined(PPU_SCALE_DBG)
 // Read the collective's block0/thread0 scale-reload log back to host. buf laid out [i*4 + {k_block, scale_k_idx,
 // smem_src, reg_dest}], cnt = #entries (<=16). Runs after an xcheck GEMM so buf is populated.
-__global__ void ppu_scale_dbg_read(float* out, int* c) {
-  if (threadIdx.x == 0) { for (int i = 0; i < 64; ++i) out[i] = cutlass_ppu_scale_dbg::buf[i]; *c = cutlass_ppu_scale_dbg::cnt; }
+__global__ void ppu_scale_dbg_read(float* out, int* c, float* meta) {
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < 64; ++i) out[i] = cutlass_ppu_scale_dbg::buf[i];
+    for (int i = 0; i < 8; ++i) meta[i] = cutlass_ppu_scale_dbg::meta[i];
+    *c = cutlass_ppu_scale_dbg::cnt;
+  }
 }
 #endif
 
@@ -919,11 +923,15 @@ void xcheck_grouped(Options const& options) {
 
 #if defined(PPU_SCALE_DBG)
   // Dump the collective's per-reload scale log (block0/thread0). Distinguishes load-vs-apply for the gs=32 zero.
-  cutlass::DeviceAllocation<float> dbg(64); cutlass::DeviceAllocation<int> dcnt(1);
-  ppu_scale_dbg_read<<<1, 32>>>(dbg.get(), dcnt.get());
+  cutlass::DeviceAllocation<float> dbg(64), dmeta(8); cutlass::DeviceAllocation<int> dcnt(1);
+  ppu_scale_dbg_read<<<1, 32>>>(dbg.get(), dcnt.get(), dmeta.get());
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-  std::vector<float> hb(64); int hc = 0; dbg.copy_to_host(hb.data()); dcnt.copy_to_host(&hc);
-  std::printf("\n[SCALE_DBG] gs=%d: %d intra-tile scale reloads logged (block0/thread0)\n", g, hc);
+  std::vector<float> hb(64), hm(8); int hc = 0; dbg.copy_to_host(hb.data()); dmeta.copy_to_host(hm.data()); dcnt.copy_to_host(&hc);
+  std::printf("\n[SCALE_DBG] gs=%d: Scale_TileK=%.0f K_BLOCK_MAX=%.0f mma_K_atoms=%.0f K_ATOM_PER_COPY=%.0f\n",
+              g, hm[0], hm[1], hm[2], hm[3]);
+  std::printf("           accum(0)=%.5f  accum_frag_size=%.0f  accum_sum=%.5f  (block0/thread0 after mainloop)\n",
+              hm[4], hm[5], hm[6]);
+  std::printf("           %d intra-tile scale reloads logged:\n", hc);
   std::printf("   idx | k_block scale_k_idx | smem_src   reg_dest\n");
   for (int i = 0; i < hc && i < 16; ++i)
     std::printf("   %3d |   %5.0f     %6.0f    | %8.5f  %8.5f\n", i, hb[i*4+0], hb[i*4+1], hb[i*4+2], hb[i*4+3]);
