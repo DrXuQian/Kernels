@@ -79,3 +79,12 @@ cutlass_example_add_executable(
   test_moe_grouped_dataslice.cu
 )
 target_compile_options(test_moe_grouped_dataslice PRIVATE -w)
+
+# REAL-WEIGHT gate: loads a .bin (real Qwen3.5 GPTQ / Q4_K expert weights from real_weight/dump_real_weights.py),
+# runs the grouped kernel, compares vs the Python native golden. TARGET=test_moe_grouped_real ./build.sh
+#   run: <bin> real_weight/real_gptq_gate_L0.bin   (or the Q4_K .bin)
+cutlass_example_add_executable(
+  test_moe_grouped_real
+  test_moe_grouped_real.cu
+)
+target_compile_options(test_moe_grouped_real PRIVATE -w)
