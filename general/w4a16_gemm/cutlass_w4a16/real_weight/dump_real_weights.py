@@ -192,7 +192,9 @@ def golden_and_pack(q_signed, scale, zero, gs, M, seed=1234):
     """q_signed[K,N], scale[scale_k,N], zero or None. Returns A[M,K] f16, golden[M,N] f16."""
     K, N = q_signed.shape
     rng = np.random.default_rng(seed)
-    A = (rng.integers(-3, 4, size=(M, K)).astype(np.float32) * 0.25).astype(np.float16)
+    # Larger A (integers +-7, std ~4) so D = A@W is O(1) for real (small-magnitude) weights -- keeps the match well
+    # above the driver's 1e-2 abs floor, i.e. non-trivial (not a mostly-zero 0==0 pass).
+    A = rng.integers(-7, 8, size=(M, K)).astype(np.float16)
     # dequant W[k,n] = scale[k//gs,n]*q_signed + (zero[k//gs,n] or 0)
     g = (np.arange(K) // gs)
     W = scale.astype(np.float32)[g, :] * q_signed.astype(np.float32)
@@ -215,7 +217,12 @@ def write_bin(path, L, M, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gol
         if mode == 1:
             for z in zr_list: f.write(np.ascontiguousarray(z, dtype=np.float16).tobytes())
         for g in gold_list: f.write(np.ascontiguousarray(g, dtype=np.float16).tobytes())
+    # golden magnitude stats -> guard against a trivial (mostly-zero) MATCH
+    gall = np.concatenate([np.asarray(g, np.float32).ravel() for g in gold_list])
+    a = np.abs(gall)
     print(f"[dump] wrote {path}: L={L} M={M} N={N} K={K} gs={gs} mode={mode}")
+    print(f"[dump] golden stats: mean|.|={a.mean():.4g} max|.|={a.max():.4g} "
+          f"nonzero(|.|>1e-2)={100.0*(a>1e-2).mean():.1f}%  (low nonzero%% => MATCH would be near-trivial)")
 
 
 def parse_experts(s):
