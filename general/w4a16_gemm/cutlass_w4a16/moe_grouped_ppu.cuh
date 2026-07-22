@@ -118,13 +118,19 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
     hw
   };
   args.group_M = group_M;
-  // O(1) decode hint: if every expert has the SAME #m-tiles (ceil(M_e/TM)), the kernel skips the O(L) scan.
+  // O(1) decode hint: if every expert has the SAME #m-tiles (ceil(M_e/TM)), the kernel uses blockIdx.z (no scan).
+  // MOEG_FORCE3D (diagnostic): force the 3D Mmax grid + blockIdx.z decode even for ragged (small experts idle)
+  // to isolate whether the ragged gap is the O(L) scan (jumps -> yes) or load-imbalance (unchanged -> no).
   { int const TMv = int(cute::size<0>(TileShape{}));
     int const mt0 = int(cute::ceil_div(int(cute::get<0>(group_shapes_host[0])), TMv));
-    bool uni = true;
-    for (int e = 1; e < L; ++e)
-      if (int(cute::ceil_div(int(cute::get<0>(group_shapes_host[e])), TMv)) != mt0) { uni = false; break; }
-    args.mtiles_uniform = uni ? mt0 : 0; }
+    int mt_max = mt0; bool uni = true;
+    for (int e = 1; e < L; ++e) {
+      int const m = int(cute::ceil_div(int(cute::get<0>(group_shapes_host[e])), TMv));
+      if (m > mt_max) mt_max = m;
+      if (m != mt0) uni = false;
+    }
+    bool const force3d = std::getenv("MOEG_FORCE3D") != nullptr;
+    args.mtiles_uniform = uni ? mt0 : (force3d ? mt_max : 0); }
   if (const char* e = std::getenv("MOEG_PROBE")) args.probe = std::atoi(e);   // routing probe (test_moe_grouped_probe)
 
   Gemm gemm;

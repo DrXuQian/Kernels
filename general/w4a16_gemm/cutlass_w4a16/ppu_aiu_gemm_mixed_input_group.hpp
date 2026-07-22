@@ -168,17 +168,18 @@ public:
   static dim3 get_grid_shape(Params const& params) {
     int const L = params.problem_shape.groups();
     int const TM = cute::size<0>(TileShape{}), TN = cute::size<1>(TileShape{});
-    int total_m_tiles = 0, N = 1, mt0 = -1; bool uni = true;
+    int total_m_tiles = 0, N = 1, mt0 = -1, mt_max = 0; bool uni = true;
     for (int e = 0; e < L; ++e) {
       auto ps = params.problem_shape.get_host_problem_shape(e);
       int const mte = int(cute::ceil_div(int(cute::get<0>(ps)), TM));
-      total_m_tiles += mte;  N = int(cute::get<1>(ps));
+      total_m_tiles += mte;  N = int(cute::get<1>(ps));  mt_max = mte > mt_max ? mte : mt_max;
       if (mt0 < 0) mt0 = mte; else if (mte != mt0) uni = false;
     }
     int const Nt = int(cute::ceil_div(N, TN));
-    // UNIFORM: 3D grid (mt0, N_tiles, L) with blockIdx.z=expert -> same raster/L2 locality as the old grid
-    // (recovers ~5% the flat (total,N,1) grid loses on the balanced case). RAGGED: flat grid, no idle blocks.
-    if (uni) return dim3(mt0, Nt, L);
+    bool const force3d = std::getenv("MOEG_FORCE3D") != nullptr;   // diagnostic: force 3D Mmax grid for ragged
+    // UNIFORM (or forced): 3D grid (mt_max, N_tiles, L), blockIdx.z=expert, O(1) decode. small experts' extra
+    // m-tiles early-exit (idle). RAGGED default: flat grid (total,N,1), no idle blocks but O(L) decode scan.
+    if (uni || force3d) return dim3(uni ? mt0 : mt_max, Nt, L);
     return dim3(total_m_tiles, Nt, 1);
   }
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
@@ -219,6 +220,7 @@ public:
     if (expert < 0 || expert >= num_groups) return;            // guard (grid.x is exactly SUM_e mtiles_e)
     auto pe = append<4>(params.problem_shape.get_problem_shape(expert), Int<1>{});  // ONE struct read for N,K
     int const M = int(get<0>(pe)), N = int(get<1>(pe)), K = int(get<2>(pe));
+    if (m_idx * TM >= M) return;                               // idle m-tile (3D Mmax grid: small experts); no-op for flat
     if (n_idx * int(size<1>(blk_shape)) >= N) return;          // N uniform, guard anyway
 
     auto problem_shape_MNKL = make_shape(M, N, K, num_groups);
