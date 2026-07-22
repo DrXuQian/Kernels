@@ -203,11 +203,14 @@ def golden_and_pack(q_signed, scale, zero, gs, M, seed=1234):
 
 
 def write_bin(path, L, M, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gold_list):
+    # q is computed/held as [K][N] (q[k][n]=weight(in k,out n)); the grouped kernel reads the raw B buffer as
+    # [N][K] (q_buf[n*K+k] -> W(out n,in k)), so DUMP q TRANSPOSED to [N][K]. scale stays [scale_k][N]; golden
+    # stays true physics. (Localized via the driver's 4-way host-golden probe: G3 q-transposed matched.)
     with open(path, "wb") as f:
         f.write(b"RWMOE\0\0\0")
         f.write(struct.pack("<6i", L, M, N, K, gs, mode))
         for A in A_list:   f.write(np.ascontiguousarray(A, dtype=np.float16).tobytes())
-        for q in qs_list:  f.write(np.ascontiguousarray(q, dtype=np.int8).tobytes())
+        for q in qs_list:  f.write(np.ascontiguousarray(q.T, dtype=np.int8).tobytes())   # [K][N] -> [N][K]
         for s in sc_list:  f.write(np.ascontiguousarray(s, dtype=np.float16).tobytes())
         if mode == 1:
             for z in zr_list: f.write(np.ascontiguousarray(z, dtype=np.float16).tobytes())

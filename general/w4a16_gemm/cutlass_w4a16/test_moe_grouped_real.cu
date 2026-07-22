@@ -119,9 +119,9 @@ int main(int argc, char** argv) {
     for (int e = 0; e < L; ++e)
       for (size_t i = 0; i < (size_t)M * N; ++i) {
         double g = G[e][i], got = float(hD[(size_t)e * M * N + i]);
-        double rel = std::abs(got - g) / (std::abs(g) + 1e-3);
+        double ad = std::abs(got - g), rel = ad / (std::abs(g) + 1e-3);
         if (rel > mr) { mr = rel; we = e; }
-        if (rel > 5e-2) ++bad;
+        if (ad > 1e-2 + 5e-2 * std::abs(g)) ++bad;   // abs floor tolerates near-zero fp16 noise
       }
     std::printf("  grp vs %-28s max_rel=%.3e (worst e=%d) bad=%d/%zu -> %s\n",
                 name, mr, we, bad, (size_t)L * M * N, bad == 0 ? "MATCH" : "MISMATCH");
