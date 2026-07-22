@@ -224,16 +224,40 @@ def parse_experts(s):
 # =========================================================== main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["gptq", "gguf"])
-    ap.add_argument("path")
+    ap.add_argument("kind", choices=["gptq", "gguf", "synth"])
+    ap.add_argument("path", nargs="?", default="")
     ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--experts", default="0-7")
     ap.add_argument("--proj", default="gate", choices=["gate", "up", "down"])
     ap.add_argument("--m", type=int, default=128)
     ap.add_argument("--out", default=None)
     ap.add_argument("--selfcheck", action="store_true")
+    # synth-only shape overrides
+    ap.add_argument("--n", type=int, default=512)
+    ap.add_argument("--k", type=int, default=2048)
+    ap.add_argument("--gs", type=int, default=128)
+    ap.add_argument("--mode", type=int, default=0, choices=[0, 1])
     args = ap.parse_args()
-    experts = parse_experts(args.experts)
+    experts = parse_experts(args.experts) if "-" in args.experts or "," in args.experts else list(range(int(args.experts)))
+
+    if args.kind == "synth":
+        # random q_signed[K][N] in [-8,7] + random scale[scale_k][N] (+zero if mode==1) + native golden.
+        # Exercises the driver + golden orientation with NO real-weight extraction, to isolate harness vs kernel.
+        N, K, gs, mode = args.n, args.k, args.gs, args.mode
+        sk = (K + gs - 1) // gs
+        rng = np.random.default_rng(2024)
+        qs_list, sc_list, zr_list, A_list, gold_list = [], [], [], [], []
+        L = len(experts)
+        for e in range(L):
+            q = rng.integers(-8, 8, size=(K, N)).astype(np.int8)
+            sc = (0.02 + rng.integers(0, 8, size=(sk, N)) * 0.01).astype(np.float16)
+            zr = ((rng.random((sk, N)).astype(np.float32) - 0.5) * 0.2).astype(np.float16) if mode == 1 else None
+            A, gold = golden_and_pack(q, sc, zr, gs, args.m, seed=1000 + e)
+            qs_list.append(q); sc_list.append(sc); A_list.append(A); gold_list.append(gold)
+            if mode == 1: zr_list.append(zr)
+        out = args.out or f"synth_gs{gs}_mode{mode}.bin"
+        write_bin(out, L, args.m, N, K, gs, mode, A_list, qs_list, sc_list, zr_list, gold_list)
+        return
 
     if args.kind == "gguf":
         g = Gguf(args.path)
