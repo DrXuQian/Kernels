@@ -857,10 +857,11 @@ void xcheck_grouped(Options const& options) {
             #TM"x"#TN"x"#TK"/"#WM"x"#WN"/s"#ST, SK, mr, bad, (size_t)m*n, bad==0?"MATCH":"MISMATCH", \
             float(hg[0]),float(hg[1]),float(hg[2])); \
       } while(0)
-    TRY32(64,64,32,32,32,3);  TRY32(64,64,32,32,32,2);  TRY32(32,64,32,32,32,3);   // SK=1 (TK=32)
+    // NOTE: TK=32 (SK=1) is REJECTED by the collective builder (CollectiveOp=int -> undefined GemmUniversal;
+    // AIU multistage needs TK>=64), so gs=32 can't get the proven SK=1 path. Only TK=64/128 (SK=2/4) below.
     TRY32(64,64,64,32,32,3);  TRY32(64,64,64,32,32,2);  TRY32(32,64,64,32,32,3);   // SK=2 (TK=64)
     TRY32(128,64,64,64,32,3); TRY32(64,128,64,32,64,3);
-    TRY32(64,64,128,32,32,3); TRY32(32,64,128,32,32,3);                            // SK=4 (TK=128)
+    TRY32(64,64,128,32,32,3); TRY32(32,64,128,32,32,3); TRY32(128,64,128,64,32,3); // SK=4 (TK=128)
     #undef TRY32
     return;
   }
