@@ -58,7 +58,7 @@ void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::
             char* workspace, size_t workspace_bytes, hggcStream_t stream) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-  using ElementB = cutlass::int4b_t;   // W4A16 only (int8/W8A16 path dropped)
+  using ElementB = cutlass::int4b_t;
   using LayoutB  = std::conditional_t<AiuInterleaved, cutlass::layout::ColumnMajorInterleaved<256>, cutlass::layout::ColumnMajor>;
   constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
   using ElementScale = cutlass::half_t;  using ElementZero = cutlass::half_t;
@@ -177,9 +177,6 @@ void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const c
     if (group_size == 128)     { constexpr int SK=(TK+127)/128; MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs128, SK); }
     else if (group_size == 64) { constexpr int SK=(TK+63)/64;   MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs64,  SK); }
     else if (group_size == 32) { constexpr int SK=(TK+31)/32;    MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32,  SK); }  // FIXED (per-mma-atom FINE scale)
-    // gs=16 (Q6_K/Q2_K/Q3_K): gs<=TK => load-side reload_factor=1 for ANY StaticGroupSize, so reuse the Gs32 tag;
-    // the actual 16-grouping comes from Scale_TileK=SK=ceil(TK/16) (launcher) + the FINE per-mma-atom apply.
-    else if (group_size == 16) { constexpr int SK=(TK+15)/16;    MOEG_FG(cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32,  SK); }
     else std::printf("[moe_grouped] gs %d unsupported\n", group_size);
   } else {
     if (il) MOEG_CALL(cutlass::gemm::KernelAiuMultistageMixedInputPerCol, cute::_1, true);
