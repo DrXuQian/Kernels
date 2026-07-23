@@ -30,7 +30,8 @@ namespace cutlass_kernels
 {
 enum class QuantType {
     INT8_WEIGHT_ONLY,
-    PACKED_INT4_WEIGHT_ONLY
+    PACKED_INT4_WEIGHT_ONLY,
+    PACKED_INT2_WEIGHT_ONLY   // W2A16 (4 uint2/byte); mirrors PACKED_INT4 with ELTS_PER_BYTE=4
 };
 int get_bits_in_quant_type(QuantType quant_type);
 

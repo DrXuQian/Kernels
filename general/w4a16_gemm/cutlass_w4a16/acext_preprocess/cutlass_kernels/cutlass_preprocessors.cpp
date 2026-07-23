@@ -32,6 +32,8 @@ int get_bits_in_quant_type(QuantType quant_type)
             return 8;
         case QuantType::PACKED_INT4_WEIGHT_ONLY:
             return 4;
+        case QuantType::PACKED_INT2_WEIGHT_ONLY:
+            return 2;
         default:
             FT_CHECK_WITH_INFO(false, "Invalid quant_type");
             return -1;
@@ -110,6 +112,11 @@ LayoutDetails getLayoutDetailsForArch(QuantType quant_type)
     else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY) {
         details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::uint4b_t>();
     }
+    else if (quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY) {
+        // box-verify: needs cutlass LayoutDetailsB<uint2b_t>. If unspecialized, the interleaved path won't
+        // compile -> use the NON-interleaved (ColumnMajor) driver path first (n,k not %256 -> il=false).
+        details = getLayoutDetailsForArchAndQuantType<cutlassArch, cutlass::uint2b_t>();
+    }
     else {
         FT_CHECK_WITH_INFO(false, "Unsupported quantization type");
     }
@@ -150,7 +157,7 @@ void permute_B_rows_for_mixed_gemm(int8_t*                    permuted_quantized
 {
 
     // We only want to run this step for weight only quant.
-    FT_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY);
+    FT_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY || quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY);
 
     FT_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
@@ -233,8 +240,10 @@ void subbyte_transpose_impl(int8_t*                    transposed_quantized_tens
     const uint8_t* input_byte_ptr  = reinterpret_cast<const uint8_t*>(quantized_tensor);
     uint8_t*       output_byte_ptr = reinterpret_cast<uint8_t*>(transposed_quantized_tensor);
 
-    static_assert(quant_type == QuantType::INT8_WEIGHT_ONLY || quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY, "");
-    static constexpr int ELTS_PER_BYTE = quant_type == QuantType::INT8_WEIGHT_ONLY ? 1 : 2;
+    static_assert(quant_type == QuantType::INT8_WEIGHT_ONLY || quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY
+                  || quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY, "");
+    static constexpr int ELTS_PER_BYTE = quant_type == QuantType::INT8_WEIGHT_ONLY ? 1
+                                       : (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY ? 2 : 4);
 
     static constexpr int M_TILE_L1 = 64;
     static constexpr int N_TILE_L1 = M_TILE_L1 / ELTS_PER_BYTE;
@@ -310,6 +319,24 @@ void subbyte_transpose_impl(int8_t*                    transposed_quantized_tens
                         }
                     }
                 }
+                else if (quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY) {
+                    // 2-bit crumb transpose: mirror of the int4 nibble path with ELTS_PER_BYTE=4 (>>2*off, mask 0x3).
+                    // box-verify (subbyte transpose of 4 crumbs/byte).
+                    for (int ii = 0; ii < M_TILE_L1; ++ii) {
+                        for (int jj = ii + 1; jj < M_TILE_L1; ++jj) {
+                            const int ii_byte       = ii / ELTS_PER_BYTE;
+                            const int ii_bit_offset = ii % ELTS_PER_BYTE;
+                            const int jj_byte       = jj / ELTS_PER_BYTE;
+                            const int jj_bit_offset = jj % ELTS_PER_BYTE;
+                            uint8_t src_elt = 0x3 & (cache_buf[ii][jj_byte] >> (2 * jj_bit_offset));
+                            uint8_t tgt_elt = 0x3 & (cache_buf[jj][ii_byte] >> (2 * ii_bit_offset));
+                            cache_buf[ii][jj_byte] &= uint8_t(~(0x3 << (2 * jj_bit_offset)));
+                            cache_buf[jj][ii_byte] &= uint8_t(~(0x3 << (2 * ii_bit_offset)));
+                            cache_buf[ii][jj_byte] |= (tgt_elt << (2 * jj_bit_offset));
+                            cache_buf[jj][ii_byte] |= (src_elt << (2 * ii_bit_offset));
+                        }
+                    }
+                }
                 else {
                     FT_CHECK_WITH_INFO(false, "Unsupported quantization type.");
                 }
@@ -350,6 +377,10 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
     }
     else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY) {
         subbyte_transpose_impl<QuantType::PACKED_INT4_WEIGHT_ONLY>(
+            transposed_quantized_tensor, quantized_tensor, shape);
+    }
+    else if (quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY) {
+        subbyte_transpose_impl<QuantType::PACKED_INT2_WEIGHT_ONLY>(
             transposed_quantized_tensor, quantized_tensor, shape);
     }
     else {
@@ -430,6 +461,16 @@ void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const siz
     }
 }
 
+void add_bias_and_interleave_int2s_inplace(int8_t* packed_int2_tensor, const size_t num_elts)
+{
+    // W2A16 / uint2b_t: values are already unsigned [0,3] (the fp16 converter reads raw uint2 and the per-group
+    // affine 'zero' absorbs the offset) -> NO +bias step (unlike int4's +8). Register relayout kept IDENTITY to
+    // match the SEQUENTIAL base-16 converter (bits[2i:2i+2]). This within-register order must match the fp16 mma
+    // B-fragment; if the box shows a STRUCTURED permutation, add the analog of int4's [7,5,3,1,6,4,2,0] relayout
+    // HERE and the matching mask order in MixGemmNumericArrayConverter<half_t,uint2b_t,16>. No-op first cut.
+    (void)packed_int2_tensor; (void)num_elts;
+}
+
 void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size_t num_elts, QuantType quant_type)
 {
     if (quant_type == QuantType::INT8_WEIGHT_ONLY) {
@@ -437,6 +478,9 @@ void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size
     }
     else if (quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY) {
         add_bias_and_interleave_int4s_inplace(tensor, num_elts);
+    }
+    else if (quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY) {
+        add_bias_and_interleave_int2s_inplace(tensor, num_elts);
     }
     else {
         FT_CHECK_WITH_INFO(false, "Invalid quantization type for interleaving.");
@@ -451,7 +495,7 @@ void interleave_column_major_tensor(int8_t*                    interleaved_quant
 {
 
     // We only want to run this step for weight only quant.
-    FT_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY);
+    FT_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY || quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY);
 
     FT_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
@@ -510,7 +554,7 @@ void interleave_column_major_tensor_aiu(int8_t*                    interleaved_q
 {
 
     // We only want to run this step for weight only quant.
-    FT_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY);
+    FT_CHECK(quant_type == QuantType::PACKED_INT4_WEIGHT_ONLY || quant_type == QuantType::INT8_WEIGHT_ONLY || quant_type == QuantType::PACKED_INT2_WEIGHT_ONLY);
 
     FT_CHECK_WITH_INFO(shape.size() == 2 || shape.size() == 3, "Shape must be 2-D or 3-D");
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
