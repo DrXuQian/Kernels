@@ -1,0 +1,5 @@
+# compiled probe/driver binaries (build artifacts)
+w2a16_smoke
+w2a16_swzl_probe
+test_w2a16_grouped
+*.o
