@@ -1,9 +1,6 @@
-// W2A16 q2 N-PERMUTATION READOUT [box-only]. zero-N is correct (prior probe) but q2's N-map is untested (q2 was
-// n-independent). q2 is 2-bit so we bit-slice n into q2 selected by k%4: q2[k][n] = (n >> (2*(k%4))) & 3.
-// identity A, scale=1, zero=0 -> D[m][n] = q2[m][n] = (n' >> (2*(m%4))) & 3 where n' = sigma_n(n) is the column
-// the kernel actually read. Reconstruct n' = D[0][n] | D[1][n]<<2 | D[2][n]<<4 | D[3][n]<<6 (m=0..3 give k%4=0..3;
-// robust to any within-%4 K permutation since the layout diag proved k%4 is preserved). n' vs n reveals sigma_n.
-//
+// W2A16 DEQUANT-isolation diag [box-only]. A=identity (M=K) so D[m][n]=W[m][n] -> isolates dequant/layout from
+// the K-contraction. Random q2/scale/zero (sensitive to the N/within-reg permutation). Reports bad + the first
+// mismatches with context so the residual permutation (if any) is visible.
 //   TARGET=test_w2a16_diag ./build.sh ; ./<bin>
 #include <cstdio>
 #include <cstdlib>
@@ -22,22 +19,32 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  const int L = 1, M = 256, N = 256, K = 256, gs = 32;   // TK=256 test: int2 needs 64B K-contiguous (like int4
-  const int scale_k = (K + gs - 1) / gs;                 // @TK=128=64B); TK=256 -> AiuContByteSize=64, CUBE_W=64
-  std::printf("[w2a16-diag q2-N TK=256] q2[k][n]=(n>>(2*(k%%4)))&3; reconstruct sigma_n(n); expect n\n");
+  const int L = 1, M = 256, N = 256, K = 256, gs = 32;
+  const int scale_k = (K + gs - 1) / gs;
+  std::srand(4321);
+  std::printf("[w2a16-diag DEQUANT] identity A, RANDOM q2/scale/zero; D[m][n] should = W[m][n]\n");
 
   std::vector<int>   q2((size_t)K * N);
-  std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
-  for (int k=0;k<K;++k) for (int n=0;n<N;++n) q2[(size_t)k*N+n] = (n >> 3) & 1;   // bit-3 of n -> byte=((n>>3)&1)*0x55
-  for (int m=0;m<M;++m) hA[(size_t)m*K + m] = 1.f;                          // identity A
+  std::vector<float> hsc((size_t)scale_k * N), hzr((size_t)scale_k * N), hA((size_t)M * K, 0.f);
+  for (auto& q : q2)  q = std::rand() % 4;
+  for (auto& s : hsc) s = 0.01f + (std::rand() % 8) * 0.01f;
+  for (auto& z : hzr) z = (std::rand() % 9 - 4) * 0.01f;
+  for (int m = 0; m < M; ++m) hA[(size_t)m*K + m] = 1.f;                    // identity A
 
+  std::vector<double> gD((size_t)M * N, 0.0);
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
+    int g = m / gs;
+    gD[(size_t)m*N+n] = (double)hsc[(size_t)g*N+n]*q2[(size_t)m*N+n] + hzr[(size_t)g*N+n];   // W[m][n]
+  }
+
+  // transpose q [K][N]->[N][K] + pack 4 uint2/byte + preprocess PACKED_INT2
   std::vector<int> qT((size_t)K * N);
-  for (int k=0;k<K;++k) for (int n=0;n<N;++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
+  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
   std::vector<int8_t> packed((size_t)K * N / 4, 0);
-  for (size_t i=0;i<(size_t)K*N/4;++i)
+  for (size_t i = 0; i < (size_t)K * N / 4; ++i)
     packed[i] = int8_t((qT[4*i]&3) | ((qT[4*i+1]&3)<<2) | ((qT[4*i+2]&3)<<4) | ((qT[4*i+3]&3)<<6));
   std::vector<int8_t> Bbuf((size_t)K * N / 4);
-  preprocess_weights_for_mixed_gemm<false, 256>(   // il=true (N,K%256==0)
+  preprocess_weights_for_mixed_gemm<false, 256>(
       Bbuf.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
 
   std::vector<half_t> hA16(hA.size()), hSc16(hsc.size()), hZr16(hzr.size());
@@ -67,9 +74,18 @@ int main() {
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
 
-  // D[0][n] should = (n>>3)&1  (0 for n%16<8, 1 for n%16>=8). All 0 => N bit-3 aliased (sigma=n&~8).
-  std::printf("  D[0][n] n=0..31 (expect (n>>3)&1 = 0*8,1*8,0*8,1*8):\n   ");
-  for (int n=0;n<32;++n) std::printf(" %d", (int)std::lround((double)float(hD[(size_t)0*N+n])));
-  std::printf("\n");
+  int bad = 0, shown = 0;
+  for (size_t i=0;i<(size_t)M*N;++i) if (std::abs((double)float(hD[i])-gD[i]) > 1e-2 + 5e-2*std::abs(gD[i])) ++bad;
+  std::printf("  bad=%d/%d %s\n", bad, M*N, bad==0?"MATCH":"MISMATCH");
+  std::printf("  mismatches (m,n,g | q2 sc zr | got exp):\n");
+  for (int m=0; m<M && shown<12; ++m) for (int n=0; n<N && shown<12; ++n) {
+    double got=(double)float(hD[(size_t)m*N+n]), exp=gD[(size_t)m*N+n];
+    if (std::abs(got-exp) > 1e-2 + 5e-2*std::abs(exp)) {
+      int g=m/gs;
+      std::printf("    m=%3d n=%3d g=%d | q2=%d sc=%.2f zr=%.2f | got=%.3f exp=%.3f\n",
+                  m,n,g, q2[(size_t)m*N+n], hsc[(size_t)g*N+n], hzr[(size_t)g*N+n], got, exp);
+      ++shown;
+    }
+  }
   return 0;
 }
