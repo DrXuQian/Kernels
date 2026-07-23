@@ -1,7 +1,9 @@
-// W2A16 SCALE-GROUP DIAGNOSTIC [box-only]. The layout diag (q2/zero, scale=1) MATCHed, but the random-A/
-// random-scale test (test_w2a16_grouped) MISMATCHes -> scale=1 there masked a per-group SCALE bug. This isolates
-// it: A = identity (M=K), q2=1, zero=0, scale[g][n]=g+1 (g=k/gs) -> W[k][n]=(k/gs)+1 -> D[m][n]=(m/gs)+1. So
-// D reveals whether the FINE per-group scale is applied to the correct k-range (group boundaries at m=gs,2gs,...).
+// W2A16 DEQUANT-ISOLATION DIAGNOSTIC [box-only]. Layout ✓ and scale-per-group ✓ (prior diags), but random-A/
+// random-scale MISMATCHes. Untested axes: scale-per-n, zero-per-group, and the scale*q2 pairing (each prior
+// probe held one factor constant). This runs the FULL random config (q2/scale/zero per (g,n), like the grouped
+// test) but with A = IDENTITY (M=K) so D[m][n] = W[m][n] exactly -> isolates DEQUANT from the K-contraction.
+// If bad=0 -> dequant is correct, the grouped MISMATCH is the random-A contraction. If bad>0 -> dequant bug;
+// the per-mismatch dump (group, n, q2, scale, zero, got, exp) shows which axis is off.
 //
 //   TARGET=test_w2a16_diag ./build.sh ; ./<bin>
 #include <cstdio>
@@ -21,19 +23,25 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  const int L = 1, M = 256, N = 256, K = 256, gs = 32;   // M=K for identity A; scale_k=8 groups
+  const int L = 1, M = 256, N = 256, K = 256, gs = 32;   // M=K -> identity A isolates dequant
   const int scale_k = (K + gs - 1) / gs;
-  std::printf("[w2a16-diag SCALE] identity A, q2=1, zero=0, scale[g]=g+1 (g=k/gs=%d groups); D[m][n] should=(m/gs)+1\n", scale_k);
+  std::srand(4321);
+  std::printf("[w2a16-diag DEQUANT] identity A, RANDOM q2/scale/zero per (g,n); D[m][n] should = W[m][n]\n");
 
-  std::vector<int>   q2((size_t)K * N, 1);                                  // q2 = 1 -> isolate scale
-  std::vector<float> hsc((size_t)scale_k * N), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
-  for (int g = 0; g < scale_k; ++g) for (int n = 0; n < N; ++n) hsc[(size_t)g*N+n] = (float)(g + 1);  // scale = group+1
+  std::vector<int>   q2((size_t)K * N);
+  std::vector<float> hsc((size_t)scale_k * N), hzr((size_t)scale_k * N), hA((size_t)M * K, 0.f);
+  for (auto& q : q2)  q = std::rand() % 4;
+  for (auto& s : hsc) s = 0.01f + (std::rand() % 8) * 0.01f;
+  for (auto& z : hzr) z = (std::rand() % 9 - 4) * 0.01f;
   for (int m = 0; m < M; ++m) hA[(size_t)m*K + m] = 1.f;                    // identity A
 
   std::vector<double> gD((size_t)M * N, 0.0);
-  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) gD[(size_t)m*N+n] = (m / gs) + 1;   // W[m][n]=(m/gs)+1
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
+    int g = m / gs;
+    gD[(size_t)m*N+n] = (double)hsc[(size_t)g*N+n]*q2[(size_t)m*N+n] + hzr[(size_t)g*N+n];   // W[m][n]
+  }
 
-  // TRANSPOSE q [K][N]->[N][K] before packing (dumper writes q.T) + pack 4 uint2/byte + preprocess PACKED_INT2
+  // TRANSPOSE q [K][N]->[N][K] + pack 4 uint2/byte + preprocess PACKED_INT2
   std::vector<int> qT((size_t)K * N);
   for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
   std::vector<int8_t> packed((size_t)K * N / 4, 0);
@@ -68,17 +76,19 @@ int main() {
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
 
-  int bad = 0; for (size_t i=0;i<(size_t)M*N;++i) if (std::abs((double)float(hD[i])-gD[i])>0.5) ++bad;
+  int bad = 0, shown = 0;
+  for (size_t i=0;i<(size_t)M*N;++i) if (std::abs((double)float(hD[i])-gD[i]) > 1e-2 + 5e-2*std::abs(gD[i])) ++bad;
   std::printf("  bad=%d/%d %s\n", bad, M*N, bad==0?"MATCH":"MISMATCH");
-  // per-group: D[g*gs][0] should be g+1  (reveals if scale-group index is right)
-  std::printf("  D[g*gs][0] (should be g+1):");
-  for (int g=0; g<scale_k; ++g) std::printf(" g%d:%.1f", g, (double)float(hD[(size_t)(g*gs)*N + 0]));
-  std::printf("\n");
-  // D[m][0] around the first 3 group boundaries (m=gs,2gs,3gs) -> where does the scale step?
-  for (int b = 1; b <= 3; ++b) {
-    std::printf("  D[m][0] m=%d..%d (boundary %d):", b*gs-2, b*gs+2, b*gs);
-    for (int m = b*gs-2; m <= b*gs+2; ++m) std::printf(" m%d:%.1f", m, (double)float(hD[(size_t)m*N + 0]));
-    std::printf("\n");
+  // per-mismatch context: m,n,group,q2,scale,zero,got,exp  -> which axis is off
+  std::printf("  mismatches (m,n,g=m/gs | q2 scale zero | got exp):\n");
+  for (int m=0; m<M && shown<12; ++m) for (int n=0; n<N && shown<12; ++n) {
+    double got=(double)float(hD[(size_t)m*N+n]), exp=gD[(size_t)m*N+n];
+    if (std::abs(got-exp) > 1e-2 + 5e-2*std::abs(exp)) {
+      int g=m/gs;
+      std::printf("    m=%3d n=%3d g=%d | q2=%d sc=%.2f zr=%.2f | got=%.3f exp=%.3f\n",
+                  m,n,g, q2[(size_t)m*N+n], hsc[(size_t)g*N+n], hzr[(size_t)g*N+n], got, exp);
+      ++shown;
+    }
   }
   return 0;
 }
