@@ -1,9 +1,8 @@
-// W2A16 DEQUANT-ISOLATION DIAGNOSTIC [box-only]. Layout ✓ and scale-per-group ✓ (prior diags), but random-A/
-// random-scale MISMATCHes. Untested axes: scale-per-n, zero-per-group, and the scale*q2 pairing (each prior
-// probe held one factor constant). This runs the FULL random config (q2/scale/zero per (g,n), like the grouped
-// test) but with A = IDENTITY (M=K) so D[m][n] = W[m][n] exactly -> isolates DEQUANT from the K-contraction.
-// If bad=0 -> dequant is correct, the grouped MISMATCH is the random-A contraction. If bad>0 -> dequant bug;
-// the per-mismatch dump (group, n, q2, scale, zero, got, exp) shows which axis is off.
+// W2A16 N-PERMUTATION READOUT [box-only]. The dequant probe (random per-(g,n)) MISMATCHed with a structured
+// N-side permutation that PRESERVES n%4 (so the earlier n%4-only probes missed it). This reads the exact column
+// map: A=identity (M=K), q2[k][n]=k%4 (encodes k%4), scale=1, zero[g][n]=1000+4*n (encodes n). Then
+//   D[m][n] = W[m][n] = (m%4) + 1000 + 4*n   ->   n_read = (round(D)-1000)/4 ,  k4_read = (round(D)-1000)%4.
+// n_read vs n reveals the N permutation sigma(n); k4_read vs m%4 reveals any K(mod4) permutation.
 //
 //   TARGET=test_w2a16_diag ./build.sh ; ./<bin>
 #include <cstdio>
@@ -23,29 +22,23 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  const int L = 1, M = 256, N = 256, K = 256, gs = 32;   // M=K -> identity A isolates dequant
+  const int L = 1, M = 256, N = 256, K = 256, gs = 32;
   const int scale_k = (K + gs - 1) / gs;
-  std::srand(4321);
-  std::printf("[w2a16-diag DEQUANT] identity A, RANDOM q2/scale/zero per (g,n); D[m][n] should = W[m][n]\n");
+  std::printf("[w2a16-diag N-READOUT] W[k][n]=(k%%4)+1000+4*n; decode n_read=(D-1000)/4, k4_read=(D-1000)%%4\n");
 
   std::vector<int>   q2((size_t)K * N);
-  std::vector<float> hsc((size_t)scale_k * N), hzr((size_t)scale_k * N), hA((size_t)M * K, 0.f);
-  for (auto& q : q2)  q = std::rand() % 4;
-  for (auto& s : hsc) s = 0.01f + (std::rand() % 8) * 0.01f;
-  for (auto& z : hzr) z = (std::rand() % 9 - 4) * 0.01f;
-  for (int m = 0; m < M; ++m) hA[(size_t)m*K + m] = 1.f;                    // identity A
+  std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N), hA((size_t)M * K, 0.f);
+  for (int k=0;k<K;++k) for (int n=0;n<N;++n) q2[(size_t)k*N+n] = k % 4;
+  for (int g=0;g<scale_k;++g) for (int n=0;n<N;++n) hzr[(size_t)g*N+n] = 1000.f + 4.f*n;
+  for (int m=0;m<M;++m) hA[(size_t)m*K + m] = 1.f;                          // identity A
 
   std::vector<double> gD((size_t)M * N, 0.0);
-  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
-    int g = m / gs;
-    gD[(size_t)m*N+n] = (double)hsc[(size_t)g*N+n]*q2[(size_t)m*N+n] + hzr[(size_t)g*N+n];   // W[m][n]
-  }
+  for (int m=0;m<M;++m) for (int n=0;n<N;++n) gD[(size_t)m*N+n] = (m%4) + 1000.0 + 4.0*n;
 
-  // TRANSPOSE q [K][N]->[N][K] + pack 4 uint2/byte + preprocess PACKED_INT2
   std::vector<int> qT((size_t)K * N);
-  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
+  for (int k=0;k<K;++k) for (int n=0;n<N;++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
   std::vector<int8_t> packed((size_t)K * N / 4, 0);
-  for (size_t i = 0; i < (size_t)K * N / 4; ++i)
+  for (size_t i=0;i<(size_t)K*N/4;++i)
     packed[i] = int8_t((qT[4*i]&3) | ((qT[4*i+1]&3)<<2) | ((qT[4*i+2]&3)<<4) | ((qT[4*i+3]&3)<<6));
   std::vector<int8_t> Bbuf((size_t)K * N / 4);
   preprocess_weights_for_mixed_gemm<false, 256>(
@@ -76,19 +69,14 @@ int main() {
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
 
-  int bad = 0, shown = 0;
-  for (size_t i=0;i<(size_t)M*N;++i) if (std::abs((double)float(hD[i])-gD[i]) > 1e-2 + 5e-2*std::abs(gD[i])) ++bad;
-  std::printf("  bad=%d/%d %s\n", bad, M*N, bad==0?"MATCH":"MISMATCH");
-  // per-mismatch context: m,n,group,q2,scale,zero,got,exp  -> which axis is off
-  std::printf("  mismatches (m,n,g=m/gs | q2 scale zero | got exp):\n");
-  for (int m=0; m<M && shown<12; ++m) for (int n=0; n<N && shown<12; ++n) {
-    double got=(double)float(hD[(size_t)m*N+n]), exp=gD[(size_t)m*N+n];
-    if (std::abs(got-exp) > 1e-2 + 5e-2*std::abs(exp)) {
-      int g=m/gs;
-      std::printf("    m=%3d n=%3d g=%d | q2=%d sc=%.2f zr=%.2f | got=%.3f exp=%.3f\n",
-                  m,n,g, q2[(size_t)m*N+n], hsc[(size_t)g*N+n], hzr[(size_t)g*N+n], got, exp);
-      ++shown;
-    }
-  }
+  auto dec = [&](int m,int n,int& nr,int& kr){ int v=(int)std::lround((double)float(hD[(size_t)m*N+n]))-1000; nr=v/4; kr=((v%4)+4)%4; };
+  // row m=0: read sigma(n) for n=0..31  (n_read should == n)
+  std::printf("  m=0  n : n_read (exp n)  [* if n_read!=n]\n   ");
+  for (int n=0;n<32;++n){ int nr,kr; dec(0,n,nr,kr); std::printf(" %d:%d%s", n, nr, nr!=n?"*":""); }
+  std::printf("\n");
+  // k4 check across m=0..7 at n=0 (k4_read should == m%4)
+  std::printf("  n=0  m : k4_read (exp m%%4):");
+  for (int m=0;m<8;++m){ int nr,kr; dec(m,0,nr,kr); std::printf(" m%d:%d(%d)", m, kr, m%4); }
+  std::printf("\n");
   return 0;
 }
