@@ -28,7 +28,7 @@ int main() {
 
   std::vector<int>   q2((size_t)K * N);
   std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
-  for (int k=0;k<K;++k) for (int n=0;n<N;++n) q2[(size_t)k*N+n] = (n >> (2*(k%4))) & 3;
+  for (int k=0;k<K;++k) for (int n=0;n<N;++n) q2[(size_t)k*N+n] = (n >> 3) & 1;   // bit-3 of n -> byte=((n>>3)&1)*0x55
   for (int m=0;m<M;++m) hA[(size_t)m*K + m] = 1.f;                          // identity A
 
   std::vector<int> qT((size_t)K * N);
@@ -67,14 +67,9 @@ int main() {
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
 
-  auto q = [&](int m,int n){ return ((int)std::lround((double)float(hD[(size_t)m*N+n]))) & 3; };
-  std::printf("  n : sigma_n(n)   [* if != n]\n   ");
-  int bad = 0;
-  for (int n=0;n<64;++n){
-    int np = q(0,n) | (q(1,n)<<2) | (q(2,n)<<4) | (q(3,n)<<6);
-    if (np!=n) ++bad;
-    std::printf(" %d:%d%s", n, np, np!=n?"*":"");
-  }
-  std::printf("\n  (%d of first 64 permuted)\n", bad);
+  // D[0][n] should = (n>>3)&1  (0 for n%16<8, 1 for n%16>=8). All 0 => N bit-3 aliased (sigma=n&~8).
+  std::printf("  D[0][n] n=0..31 (expect (n>>3)&1 = 0*8,1*8,0*8,1*8):\n   ");
+  for (int n=0;n<32;++n) std::printf(" %d", (int)std::lround((double)float(hD[(size_t)0*N+n])));
+  std::printf("\n");
   return 0;
 }
