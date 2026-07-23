@@ -1,5 +1,4 @@
-# compiled probe/driver binaries (build artifacts)
+# compiled probe binaries (build artifacts; bare-nvcc, built in place)
 w2a16_smoke
 w2a16_swzl_probe
-test_w2a16_grouped
 *.o

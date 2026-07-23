@@ -88,3 +88,11 @@ cutlass_example_add_executable(
   test_moe_grouped_real.cu
 )
 target_compile_options(test_moe_grouped_real PRIVATE -w)
+
+# W2A16 (uint2b_t) single-expert correctness driver: synthetic Q2 -> pack 4 uint2/byte -> preprocess PACKED_INT2
+# -> filter_and_run<...,uint2b_t> vs host dequant golden. Build: TARGET=test_w2a16_grouped ./build.sh
+cutlass_example_add_executable(
+  test_w2a16_grouped
+  test_w2a16_grouped.cu
+)
+target_compile_options(test_w2a16_grouped PRIVATE -w)
