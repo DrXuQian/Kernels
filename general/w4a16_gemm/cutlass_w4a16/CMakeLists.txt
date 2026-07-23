@@ -112,3 +112,11 @@ cutlass_example_add_executable(
   swzl_ldmatrix_probe.cu
 )
 target_compile_options(swzl_ldmatrix_probe PRIVATE -w)
+
+# INT4 REFERENCE diag: same params as test_w2a16_diag but int4b_t, so the W2DBG cute-layout print for the
+# KNOWN-GOOD int4 path can be compared line-by-line vs int2. Build: TARGET=test_w4a16_diag ./build.sh
+cutlass_example_add_executable(
+  test_w4a16_diag
+  test_w4a16_diag.cu
+)
+target_compile_options(test_w4a16_diag PRIVATE -w)
