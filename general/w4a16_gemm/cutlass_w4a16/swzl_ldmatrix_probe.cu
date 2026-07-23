@@ -33,6 +33,6 @@ __global__ void probe(int coord_h) {
 
 int main() {
   printf("[swzl-probe] CUBE_H=64; word[i]=i; dump (lane,reg)->smem b16-word index. Compare coord_h=0 vs 8.\n");
-  for (int ch : {0, 8}) { probe<64><<<1, 32>>>(ch); cudaDeviceSynchronize(); printf("----\n"); }
+  for (int ch : {0, 8}) { probe<64><<<1, 32>>>(ch); hggcDeviceSynchronize(); printf("----\n"); }
   return 0;
 }
