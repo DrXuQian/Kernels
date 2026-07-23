@@ -330,22 +330,9 @@ void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size
         add_bias_and_interleave_int4s_inplace(tensor, num_elts);
     }
     else if (quant_type == QuantTypeClass::PACKED_INT2_WEIGHT_ONLY) {
-        // W2A16 / uint2b_t: no +bias (unsigned [0,3]; affine zero absorbs). Register relayout = analog of int4's
-        // even/odd stride-2 deinterleave, extended to 16 uint2 per 32-bit reg: dest[i<8]=src[2i],
-        // dest[i>=8]=src[2(i-8)+1] (evens -> low half [0..7], odds -> high half [8..15]). Pairs with the SEQUENTIAL
-        // base-16 converter. HYPOTHESIS (box-verify vs dequant probe); iterate if the permutation persists.
-        const size_t num_bytes = num_elts / 4;          // 4 uint2/byte
-        const size_t num_regs  = num_bytes / 4;         // 4 bytes/reg
-        uint32_t* rp = reinterpret_cast<uint32_t*>(tensor);
-        for (size_t r = 0; r < num_regs; ++r) {
-            const uint32_t in = rp[r];
-            uint32_t out = 0;
-            for (int d = 0; d < 16; ++d) {
-                const int s = (d < 8) ? (2 * d) : (2 * (d - 8) + 1);
-                out |= (((in >> (2 * s)) & 0x3u) << (2 * d));
-            }
-            rp[r] = out;
-        }
+        // W2A16 / uint2b_t: identity. (A per-reg relayout only reorders the 16 K of ONE N-row, so it can't affect
+        // the N-half permutation; the even/odd deinterleave candidate made it worse. The N issue is elsewhere.)
+        (void)tensor; (void)num_elts;
     }
     else {
         // FT_CHECK_WITH_INFO(false, "Invalid quantization type for interleaving.");
