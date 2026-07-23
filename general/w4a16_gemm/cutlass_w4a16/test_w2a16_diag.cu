@@ -1,8 +1,8 @@
-// W2A16 N-PERMUTATION READOUT [box-only]. The dequant probe (random per-(g,n)) MISMATCHed with a structured
-// N-side permutation that PRESERVES n%4 (so the earlier n%4-only probes missed it). This reads the exact column
-// map: A=identity (M=K), q2[k][n]=k%4 (encodes k%4), scale=1, zero[g][n]=1000+4*n (encodes n). Then
-//   D[m][n] = W[m][n] = (m%4) + 1000 + 4*n   ->   n_read = (round(D)-1000)/4 ,  k4_read = (round(D)-1000)%4.
-// n_read vs n reveals the N permutation sigma(n); k4_read vs m%4 reveals any K(mod4) permutation.
+// W2A16 q2 N-PERMUTATION READOUT [box-only]. zero-N is correct (prior probe) but q2's N-map is untested (q2 was
+// n-independent). q2 is 2-bit so we bit-slice n into q2 selected by k%4: q2[k][n] = (n >> (2*(k%4))) & 3.
+// identity A, scale=1, zero=0 -> D[m][n] = q2[m][n] = (n' >> (2*(m%4))) & 3 where n' = sigma_n(n) is the column
+// the kernel actually read. Reconstruct n' = D[0][n] | D[1][n]<<2 | D[2][n]<<4 | D[3][n]<<6 (m=0..3 give k%4=0..3;
+// robust to any within-%4 K permutation since the layout diag proved k%4 is preserved). n' vs n reveals sigma_n.
 //
 //   TARGET=test_w2a16_diag ./build.sh ; ./<bin>
 #include <cstdio>
@@ -24,16 +24,12 @@ using QM      = moe_grouped_ppu::QuantMode;
 int main() {
   const int L = 1, M = 256, N = 256, K = 256, gs = 32;
   const int scale_k = (K + gs - 1) / gs;
-  std::printf("[w2a16-diag N-READOUT] W[k][n]=(k%%4)+1000+4*n; decode n_read=(D-1000)/4, k4_read=(D-1000)%%4\n");
+  std::printf("[w2a16-diag q2-N] q2[k][n]=(n>>(2*(k%%4)))&3; reconstruct n' from D[0..3][n] -> sigma_n(n)\n");
 
   std::vector<int>   q2((size_t)K * N);
-  std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N), hA((size_t)M * K, 0.f);
-  for (int k=0;k<K;++k) for (int n=0;n<N;++n) q2[(size_t)k*N+n] = k % 4;
-  for (int g=0;g<scale_k;++g) for (int n=0;n<N;++n) hzr[(size_t)g*N+n] = 1000.f + 4.f*n;
+  std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
+  for (int k=0;k<K;++k) for (int n=0;n<N;++n) q2[(size_t)k*N+n] = (n >> (2*(k%4))) & 3;
   for (int m=0;m<M;++m) hA[(size_t)m*K + m] = 1.f;                          // identity A
-
-  std::vector<double> gD((size_t)M * N, 0.0);
-  for (int m=0;m<M;++m) for (int n=0;n<N;++n) gD[(size_t)m*N+n] = (m%4) + 1000.0 + 4.0*n;
 
   std::vector<int> qT((size_t)K * N);
   for (int k=0;k<K;++k) for (int n=0;n<N;++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
@@ -44,8 +40,10 @@ int main() {
   preprocess_weights_for_mixed_gemm<false, 256>(
       Bbuf.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
 
-  auto to_h = [](std::vector<float> const& f){ std::vector<half_t> h(f.size()); for (size_t i=0;i<f.size();++i) h[i]=half_t(f[i]); return h; };
-  auto hA16 = to_h(hA), hSc16 = to_h(hsc), hZr16 = to_h(hzr);
+  std::vector<half_t> hA16(hA.size()), hSc16(hsc.size()), hZr16(hzr.size());
+  for (size_t i=0;i<hA.size();++i)  hA16[i]  = half_t(hA[i]);
+  for (size_t i=0;i<hsc.size();++i) hSc16[i] = half_t(hsc[i]);
+  for (size_t i=0;i<hzr.size();++i) hZr16[i] = half_t(hzr[i]);
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dScale((size_t)scale_k*N), dZero((size_t)scale_k*N), dD((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> dB((size_t)K*N);
   dA.copy_from_host(hA16.data()); dScale.copy_from_host(hSc16.data()); dZero.copy_from_host(hZr16.data());
@@ -69,14 +67,14 @@ int main() {
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
 
-  auto dec = [&](int m,int n,int& nr,int& kr){ int v=(int)std::lround((double)float(hD[(size_t)m*N+n]))-1000; nr=v/4; kr=((v%4)+4)%4; };
-  // row m=0: read sigma(n) for n=0..31  (n_read should == n)
-  std::printf("  m=0  n : n_read (exp n)  [* if n_read!=n]\n   ");
-  for (int n=0;n<32;++n){ int nr,kr; dec(0,n,nr,kr); std::printf(" %d:%d%s", n, nr, nr!=n?"*":""); }
-  std::printf("\n");
-  // k4 check across m=0..7 at n=0 (k4_read should == m%4)
-  std::printf("  n=0  m : k4_read (exp m%%4):");
-  for (int m=0;m<8;++m){ int nr,kr; dec(m,0,nr,kr); std::printf(" m%d:%d(%d)", m, kr, m%4); }
-  std::printf("\n");
+  auto q = [&](int m,int n){ return ((int)std::lround((double)float(hD[(size_t)m*N+n]))) & 3; };
+  std::printf("  n : sigma_n(n)   [* if != n]\n   ");
+  int bad = 0;
+  for (int n=0;n<64;++n){
+    int np = q(0,n) | (q(1,n)<<2) | (q(2,n)<<4) | (q(3,n)<<6);
+    if (np!=n) ++bad;
+    std::printf(" %d:%d%s", n, np, np!=n?"*":"");
+  }
+  std::printf("\n  (%d of first 64 permuted)\n", bad);
   return 0;
 }
