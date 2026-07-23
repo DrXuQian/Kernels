@@ -59,9 +59,12 @@ int main() {
 
   // pack 4 uint2/byte over the [K][N] row-major flattening (mirror int4's "2 nibbles/byte" but crumbs), then
   // preprocess PACKED_INT2, shape {K,N}. Packed B = K*N/4 bytes.
+  // TRANSPOSE q [K][N] -> [N][K] before packing (the dumper writes q.T; collective reads B as [N][K]).
+  std::vector<int> qT((size_t)K * N);
+  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
   std::vector<int8_t> packed((size_t)K * N / 4, 0);
   for (size_t i = 0; i < (size_t)K * N / 4; ++i)
-    packed[i] = int8_t((q2[4*i] & 3) | ((q2[4*i+1] & 3) << 2) | ((q2[4*i+2] & 3) << 4) | ((q2[4*i+3] & 3) << 6));
+    packed[i] = int8_t((qT[4*i] & 3) | ((qT[4*i+1] & 3) << 2) | ((qT[4*i+2] & 3) << 4) | ((qT[4*i+3] & 3) << 6));
   std::vector<int8_t> Bbuf((size_t)K * N / 4);
   preprocess_weights_for_mixed_gemm<false, 256>(
       Bbuf.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
