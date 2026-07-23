@@ -22,9 +22,9 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  const int L = 1, M = 256, N = 256, K = 256, gs = 32;
-  const int scale_k = (K + gs - 1) / gs;
-  std::printf("[w2a16-diag q2-N] q2[k][n]=(n>>(2*(k%%4)))&3; reconstruct n' from D[0..3][n] -> sigma_n(n)\n");
+  const int L = 1, M = 128, N = 128, K = 128, gs = 32;   // N,K NOT %256 -> il=false (non-interleaved) to isolate
+  const int scale_k = (K + gs - 1) / gs;                 // whether the N-alias is the interleave or the swzl/load
+  std::printf("[w2a16-diag q2-N il=FALSE] q2[k][n]=(n>>(2*(k%%4)))&3; reconstruct sigma_n(n); expect n\n");
 
   std::vector<int>   q2((size_t)K * N);
   std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
@@ -37,7 +37,7 @@ int main() {
   for (size_t i=0;i<(size_t)K*N/4;++i)
     packed[i] = int8_t((qT[4*i]&3) | ((qT[4*i+1]&3)<<2) | ((qT[4*i+2]&3)<<4) | ((qT[4*i+3]&3)<<6));
   std::vector<int8_t> Bbuf((size_t)K * N / 4);
-  preprocess_weights_for_mixed_gemm<false, 256>(
+  preprocess_weights_for_mixed_gemm<false, -1>(   // RowsPerTile=-1 -> NO 256-interleave (il=false path)
       Bbuf.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
 
   std::vector<half_t> hA16(hA.size()), hSc16(hsc.size()), hZr16(hzr.size());
