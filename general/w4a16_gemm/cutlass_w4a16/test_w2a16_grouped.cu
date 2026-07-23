@@ -89,8 +89,10 @@ int main() {
   const size_t wsb = (size_t)cutlass::ceil_div(M, 16) * cutlass::ceil_div(N, 64) * (size_t)L * 64;
   cutlass::DeviceAllocation<char> ws(wsb);
 
-  // TK=64 (gs=32 -> gs<128 path). ElementB = uint2b_t (the W2A16 template arg).
-  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, cutlass::uint2b_t>(
+  // TK=128 (REQUIRED for int2: Block_K=TK, and the AIU needs >=32B contiguous per copy-step; int2 at TK=128 =
+  // 128*2/8 = 32B, whereas TK=64 = 16B fails the operand static_assert). TK is independent of gs (SK=ceil(TK/gs)
+  // =4 here, <= TK/16=8, OK). ElementB = uint2b_t (the W2A16 template arg).
+  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, cutlass::uint2b_t>(
       dA.get(), dB.get(), dScale.get(), dZero.get(), pd.get(), sd.get(), gm.get(),
       M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
