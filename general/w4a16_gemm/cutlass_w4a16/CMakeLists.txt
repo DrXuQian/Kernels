@@ -104,3 +104,11 @@ cutlass_example_add_executable(
   test_w2a16_diag.cu
 )
 target_compile_options(test_w2a16_diag PRIVATE -w)
+
+# Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
+# the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
+cutlass_example_add_executable(
+  swzl_ldmatrix_probe
+  swzl_ldmatrix_probe.cu
+)
+target_compile_options(swzl_ldmatrix_probe PRIVATE -w)
