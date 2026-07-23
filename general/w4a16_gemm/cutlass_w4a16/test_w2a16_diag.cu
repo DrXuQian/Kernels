@@ -22,9 +22,9 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  const int L = 1, M = 128, N = 128, K = 128, gs = 32;   // N,K NOT %256 -> il=false (non-interleaved) to isolate
-  const int scale_k = (K + gs - 1) / gs;                 // whether the N-alias is the interleave or the swzl/load
-  std::printf("[w2a16-diag q2-N il=FALSE] q2[k][n]=(n>>(2*(k%%4)))&3; reconstruct sigma_n(n); expect n\n");
+  const int L = 1, M = 256, N = 256, K = 256, gs = 32;   // TK=256 test: int2 needs 64B K-contiguous (like int4
+  const int scale_k = (K + gs - 1) / gs;                 // @TK=128=64B); TK=256 -> AiuContByteSize=64, CUBE_W=64
+  std::printf("[w2a16-diag q2-N TK=256] q2[k][n]=(n>>(2*(k%%4)))&3; reconstruct sigma_n(n); expect n\n");
 
   std::vector<int>   q2((size_t)K * N);
   std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
@@ -37,7 +37,7 @@ int main() {
   for (size_t i=0;i<(size_t)K*N/4;++i)
     packed[i] = int8_t((qT[4*i]&3) | ((qT[4*i+1]&3)<<2) | ((qT[4*i+2]&3)<<4) | ((qT[4*i+3]&3)<<6));
   std::vector<int8_t> Bbuf((size_t)K * N / 4);
-  preprocess_weights_for_mixed_gemm<false, -1>(   // RowsPerTile=-1 -> NO 256-interleave (il=false path)
+  preprocess_weights_for_mixed_gemm<false, 256>(   // il=true (N,K%256==0)
       Bbuf.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
 
   std::vector<half_t> hA16(hA.size()), hSc16(hsc.size()), hZr16(hzr.size());
@@ -61,7 +61,7 @@ int main() {
   const size_t wsb = (size_t)cutlass::ceil_div(M,16)*cutlass::ceil_div(N,64)*(size_t)L*64;
   cutlass::DeviceAllocation<char> ws(wsb);
 
-  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, cutlass::uint2b_t>(
+  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3, cutlass::uint2b_t>(
       dA.get(), dB.get(), dScale.get(), dZero.get(), pd.get(), sd.get(), gm.get(),
       M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
