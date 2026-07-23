@@ -96,3 +96,11 @@ cutlass_example_add_executable(
   test_w2a16_grouped.cu
 )
 target_compile_options(test_w2a16_grouped PRIVATE -w)
+
+# W2A16 LAYOUT DIAGNOSTIC: identity A + decodable W=(k%4)+10*(n%4) to read the int2 layout permutation (mod 4)
+# on a MISMATCH. Build: TARGET=test_w2a16_diag ./build.sh
+cutlass_example_add_executable(
+  test_w2a16_diag
+  test_w2a16_diag.cu
+)
+target_compile_options(test_w2a16_diag PRIVATE -w)
