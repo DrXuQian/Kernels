@@ -250,7 +250,7 @@ def main():
     ap.add_argument("--k", type=int, default=2048)
     ap.add_argument("--gs", type=int, default=128)
     ap.add_argument("--mode", type=int, default=0, choices=[0, 1])
-    ap.add_argument("--bits", type=int, default=4, choices=[4, 8])  # synth: int4 (W4A16) or int8 (W8A16) slot
+    ap.add_argument("--bits", type=int, default=4, choices=[4])  # int8/W8A16 dropped; int4 slot only
     args = ap.parse_args()
     experts = parse_experts(args.experts) if "-" in args.experts or "," in args.experts else list(range(int(args.experts)))
 

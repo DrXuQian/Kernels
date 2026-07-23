@@ -46,64 +46,6 @@ def get_scale_min_k4(scbytes12):  # [.,.,12] uint8 -> (sc[.,.,8], mn[.,.,8]) int
     return sc, mn
 
 
-# ----------------------------------------------------------------------------- Q8_0 (32/block, gs=32, sym)
-def unpack_q8_0(raw, N, K):
-    gs = 32; nblk = K // 32
-    b = np.frombuffer(raw, np.uint8).reshape(N, nblk, 34)
-    d = _half(b[:, :, 0:2])[:, :, 0]                       # [N,nblk]
-    qs = b[:, :, 2:34].view(np.int8).astype(np.int8)       # [N,nblk,32]
-    q_signed = _place_KN(qs.astype(np.int8), N, K, 32)     # [K][N]
-    scale = (d[:, :, None] * np.ones((1, 1, 1), np.float32)).astype(np.float16)  # [N,nblk,1]
-    scale = _place_KN(np.broadcast_to(d[:, :, None], (N, nblk, 1)).astype(np.float16), N, K // gs, 1)  # [K//gs][N]
-    return q_signed, scale, None, gs, 8
-
-
-# ----------------------------------------------------------------------------- Q6_K (256/block, gs=16, sym)
-def unpack_q6k(raw, N, K):
-    gs = 16; nblk = K // 256
-    b = np.frombuffer(raw, np.uint8).reshape(N, nblk, 210)
-    ql = b[:, :, 0:128].astype(np.int32)                   # [N,nblk,128]
-    qh = b[:, :, 128:192].astype(np.int32)                 # [N,nblk,64]
-    sc = b[:, :, 192:208].view(np.int8).astype(np.float32) # [N,nblk,16] int8 scales
-    d = _half(b[:, :, 208:210])[:, :, 0]                   # [N,nblk]
-    q6 = np.zeros((N, nblk, 256), np.int32)
-    l = np.arange(32)
-    for g in range(2):
-        qlg = ql[:, :, g * 64:(g + 1) * 64]
-        qhg = qh[:, :, g * 32:(g + 1) * 32]
-        q6[:, :, g * 128 + 0 * 32 + l] = (qlg[:, :, l] & 0xF) | ((qhg[:, :, l] & 3) << 4)
-        q6[:, :, g * 128 + 1 * 32 + l] = (qlg[:, :, l + 32] & 0xF) | (((qhg[:, :, l] >> 2) & 3) << 4)
-        q6[:, :, g * 128 + 2 * 32 + l] = (qlg[:, :, l] >> 4) | (((qhg[:, :, l] >> 4) & 3) << 4)
-        q6[:, :, g * 128 + 3 * 32 + l] = (qlg[:, :, l + 32] >> 4) | (((qhg[:, :, l] >> 6) & 3) << 4)
-    q_signed = _place_KN((q6 - 32).astype(np.int8), N, K, 256)          # [K][N]
-    scale = _place_KN((d[:, :, None] * sc).astype(np.float16), N, K // gs, 16)  # [K//16][N]
-    return q_signed, scale, None, gs, 8
-
-
-# ----------------------------------------------------------------------------- Q5_K (256/block, gs=32, affine)
-def unpack_q5k(raw, N, K):
-    gs = 32; nblk = K // 256
-    b = np.frombuffer(raw, np.uint8).reshape(N, nblk, 176)
-    d = _half(b[:, :, 0:2])[:, :, 0]                       # [N,nblk]
-    dmin = _half(b[:, :, 2:4])[:, :, 0]
-    sc, mn = get_scale_min_k4(b[:, :, 4:16])               # [N,nblk,8]
-    qh = b[:, :, 16:48].astype(np.int32)                   # [N,nblk,32]
-    qs = b[:, :, 48:176].astype(np.int32)                  # [N,nblk,128]
-    q5 = np.zeros((N, nblk, 256), np.int32)
-    l = np.arange(32)
-    for jj in range(4):
-        qsj = qs[:, :, jj * 32:(jj + 1) * 32]              # ql advances +32 per iter
-        u1 = 1 << (2 * jj); u2 = 2 << (2 * jj)
-        q5[:, :, jj * 64 + 0 * 32 + l] = (qsj[:, :, l] & 0xF) + np.where(qh[:, :, l] & u1, 16, 0)
-        q5[:, :, jj * 64 + 1 * 32 + l] = (qsj[:, :, l] >> 4) + np.where(qh[:, :, l] & u2, 16, 0)
-    q_signed = _place_KN((q5 - 16).astype(np.int8), N, K, 256)          # [-16,15]
-    sv = (d[:, :, None] * sc)                              # [N,nblk,8]
-    zero = (-dmin[:, :, None] * mn + 16.0 * sv)            # fold the -16 centering
-    scale = _place_KN(sv.astype(np.float16), N, K // gs, 8)
-    zero = _place_KN(zero.astype(np.float16), N, K // gs, 8)
-    return q_signed, scale, zero, gs, 8
-
-
 # ----------------------------------------------------------------------------- Q2_K (256/block, gs=16, affine)
 def unpack_q2k(raw, N, K):
     gs = 16; nblk = K // 256
@@ -167,7 +109,9 @@ def unpack_q3k(raw, N, K):
     return q_signed, scale, None, gs, 4
 
 
-UNPACK = {"q8_0": unpack_q8_0, "q6_k": unpack_q6k, "q5_k": unpack_q5k, "q2_k": unpack_q2k, "q3_k": unpack_q3k}
+# int8-slot formats (Q8_0/Q6_K/Q5_K) DROPPED -- the int8/W8A16 collective path is not built. Only int4-slot
+# low-bit (Q2_K/Q3_K, stored padded into int4) is supported here (+ Q4_K in dump_real_weights.py).
+UNPACK = {"q2_k": unpack_q2k, "q3_k": unpack_q3k}
 
 
 # ================================================================= self-test: synthetic block round-trip

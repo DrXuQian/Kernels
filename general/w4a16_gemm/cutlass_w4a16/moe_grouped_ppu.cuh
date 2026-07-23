@@ -46,9 +46,8 @@ using GroupProblemShape = cutlass::gemm::GroupProblemShape<GroupShape>;
 
 // group_shapes_dev/host: L entries of [M_e,N,K]. A/B/scales single L-strided bases (2a uniform). L=num_experts.
 template <QuantMode QuantOp, class KernelSchedule,
-          class TileShape, class ScaleTileShape, class WarpShape, int Stages, bool AiuInterleaved,
-          class ElementB_ = cutlass::int4b_t>   // int4b_t (W4A16) or int8_t (W8A16); builder handles the width
-void launch(const cutlass::half_t* A, const ElementB_* B, const cutlass::half_t* scales,
+          class TileShape, class ScaleTileShape, class WarpShape, int Stages, bool AiuInterleaved>
+void launch(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
             const cutlass::half_t* zeros,
             cutlass::half_t** ptr_D,        // device [L] per-expert output base pointers (contiguous: D+offs[e]*N)
             DStride* stride_D,              // device [L] per-expert output strides ({M_e,N,1} row-major)
@@ -59,7 +58,7 @@ void launch(const cutlass::half_t* A, const ElementB_* B, const cutlass::half_t*
             char* workspace, size_t workspace_bytes, hggcStream_t stream) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-  using ElementB = ElementB_;   // W4A16: int4b_t; W8A16: int8_t. AlignmentB derives from its width below.
+  using ElementB = cutlass::int4b_t;   // W4A16 only (int8/W8A16 path dropped)
   using LayoutB  = std::conditional_t<AiuInterleaved, cutlass::layout::ColumnMajorInterleaved<256>, cutlass::layout::ColumnMajor>;
   constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
   using ElementScale = cutlass::half_t;  using ElementZero = cutlass::half_t;
@@ -153,9 +152,8 @@ void launch(const cutlass::half_t* A, const ElementB_* B, const cutlass::half_t*
   gemm.run(stream);
 }
 
-template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages,
-          class ElementB = cutlass::int4b_t>   // int4b_t (W4A16) or int8_t (W8A16)
-void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* scales,
+template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages>
+void filter_and_run(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutlass::half_t* scales,
                     const cutlass::half_t* zeros,
                     cutlass::half_t** ptr_D, DStride* stride_D, int const* group_M,
                     int m, int n, int k, int L, int group_size,
@@ -164,7 +162,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
-  #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB>( \
+  #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL>( \
       A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective

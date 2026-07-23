@@ -30,42 +30,33 @@ template <class T> static std::vector<T> rd(std::ifstream& f, size_t n) {
   std::vector<T> v(n); f.read(reinterpret_cast<char*>(v.data()), n * sizeof(T)); return v;
 }
 
-template <class ElementB>
-static void run_grouped(QM mode, const half_t* A, const ElementB* B, const half_t* scale, const half_t* zero,
+static void run_grouped(QM mode, const half_t* A, const int4_t* B, const half_t* scale, const half_t* zero,
                         half_t** ptr_D, DStride* sd, int const* gm, int Mmax, int N, int K, int L, int gs,
                         GS* gsd, GS const* gsh, int const* offs, char* ws, size_t wsb) {
   // TK=128 for gs>=128, else TK=64 (gs=16/32/64 -> FINE per-mma-atom scale). All 64x64/32x32/s3, il auto by n,k%256.
-  #define CALL(QMODE, TK) moe_grouped_ppu::filter_and_run<QMODE, 64, 64, TK, 32, 32, 3, ElementB>( \
+  #define CALL(QMODE, TK) moe_grouped_ppu::filter_and_run<QMODE, 64, 64, TK, 32, 32, 3>( \
       A, B, scale, zero, ptr_D, sd, gm, Mmax, N, K, L, gs, gsd, gsh, offs, ws, wsb, nullptr)
   if (mode == QM::FinegrainedScaleOnly) { if (gs >= 128) CALL(QM::FinegrainedScaleOnly, 128); else CALL(QM::FinegrainedScaleOnly, 64); }
   else                                   { if (gs >= 128) CALL(QM::FinegrainedScaleZero, 128); else CALL(QM::FinegrainedScaleZero, 64); }
   #undef CALL
 }
 
-// One case for a given slot type ElementB (int4b_t / int8_t). qs[e] is the dumped [N][K] int8 (transposed).
-template <class ElementB>
+// int4 (W4A16) only. qs[e] is the dumped [N][K] int8 in [-8,7] (transposed).
 static int run_case(int L, int M, int N, int K, int gs, int mode, int scale_k, QM qmode,
                     std::vector<std::vector<half_t>> const& A, std::vector<std::vector<int8_t>> const& qs,
                     std::vector<std::vector<half_t>> const& scl, std::vector<std::vector<half_t>> const& zro,
                     std::vector<std::vector<half_t>> const& gold) {
-  constexpr bool IS4 = (cutlass::sizeof_bits<ElementB>::value == 4);
-  const QuantTypeClass qt = IS4 ? QuantTypeClass::PACKED_INT4_WEIGHT_ONLY : QuantTypeClass::INT8_WEIGHT_ONLY;
-  const size_t belts = (size_t)K * N, bbytes = IS4 ? belts / 2 : belts;   // bytes per expert after packing
-
-  // pack + preprocess B per expert (SAME transform as test_moe_grouped_verify.cu, shape {K,N})
+  const size_t belts = (size_t)K * N, bbytes = belts / 2;
+  // pack 2 int4/byte + preprocess B per expert (SAME transform as test_moe_grouped_verify.cu, shape {K,N})
   std::vector<int8_t> Bbuf((size_t)L * bbytes);
   for (int e = 0; e < L; ++e) {
     std::vector<int8_t> packed(bbytes);
-    if constexpr (IS4) {
-      for (size_t i = 0; i < belts / 2; ++i) {
-        int8_t lo = qs[e][2 * i] & 0xF, hi = qs[e][2 * i + 1] & 0xF;
-        packed[i] = int8_t((hi << 4) | lo);
-      }
-    } else {
-      std::memcpy(packed.data(), qs[e].data(), belts);   // int8: 1 elt/byte, no nibble packing
+    for (size_t i = 0; i < belts / 2; ++i) {
+      int8_t lo = qs[e][2 * i] & 0xF, hi = qs[e][2 * i + 1] & 0xF;
+      packed[i] = int8_t((hi << 4) | lo);
     }
     preprocess_weights_for_mixed_gemm<false, 256>(
-        (int8_t*)&Bbuf[(size_t)e * bbytes], packed.data(), {(size_t)K, (size_t)N}, qt);
+        (int8_t*)&Bbuf[(size_t)e * bbytes], packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY);
   }
 
   const int total = L * M, Mmax = M;
@@ -77,11 +68,11 @@ static int run_case(int L, int M, int N, int K, int gs, int mode, int scale_k, Q
   }
   cutlass::DeviceAllocation<half_t> dA((size_t)total * K), dScale((size_t)L * scale_k * N),
       dZero(mode == 1 ? (size_t)L * scale_k * N : 1), dD((size_t)total * N);
-  cutlass::DeviceAllocation<ElementB> dB((size_t)belts * L);
+  cutlass::DeviceAllocation<int4_t> dB((size_t)belts * L);
   dA.copy_from_host(hAll.data());
   dScale.copy_from_host(hScAll.data());
   if (mode == 1) dZero.copy_from_host(hZrAll.data());
-  dB.copy_from_host(reinterpret_cast<ElementB const*>(Bbuf.data()));
+  dB.copy_from_host(reinterpret_cast<int4_t const*>(Bbuf.data()));
 
   std::vector<GS> shp(L); for (int e = 0; e < L; ++e) shp[e] = cute::make_shape(M, N, K);
   cutlass::DeviceAllocation<GS> shpd(L); shpd.copy_from_host(shp.data());
@@ -95,9 +86,9 @@ static int run_case(int L, int M, int N, int K, int gs, int mode, int scale_k, Q
   const size_t wsb = (size_t)cutlass::ceil_div(Mmax, 16) * cutlass::ceil_div(N, 64) * (size_t)L * 64;
   cutlass::DeviceAllocation<char> ws(wsb);
 
-  run_grouped<ElementB>(qmode, dA.get(), dB.get(), dScale.get(), mode == 1 ? dZero.get() : nullptr,
-                        pd.get(), sd.get(), gm.get(), Mmax, N, K, L, gs, shpd.get(), shp.data(),
-                        offdev.get(), ws.get(), wsb);
+  run_grouped(qmode, dA.get(), dB.get(), dScale.get(), mode == 1 ? dZero.get() : nullptr,
+              pd.get(), sd.get(), gm.get(), Mmax, N, K, L, gs, shpd.get(), shp.data(),
+              offdev.get(), ws.get(), wsb);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
   std::vector<half_t> hD((size_t)total * N); dD.copy_to_host(hD.data());
@@ -139,7 +130,8 @@ int main(int argc, char** argv) {
   if (mode == 1) for (int e = 0; e < L; ++e) zro[e] = rd<half_t>(f, (size_t)scale_k * N);
   for (int e = 0; e < L; ++e) gold[e] = rd<half_t>(f, (size_t)M * N);
 
-  int bad = (bits == 8) ? run_case<int8_t>(L, M, N, K, gs, mode, scale_k, qmode, A, qs, scl, zro, gold)
-                        : run_case<int4_t>(L, M, N, K, gs, mode, scale_k, qmode, A, qs, scl, zro, gold);
+  // int8 / W8A16 path dropped. Only int4 (W4A16: Q2_K/Q3_K/Q4_K/GPTQ; Q2/Q3 stored padded into the int4 slot).
+  if (bits != 4) { std::printf("  bits=%d (int8/W8A16) UNSUPPORTED -- dropped; only int4 slot is built\n", bits); return 2; }
+  int bad = run_case(L, M, N, K, gs, mode, scale_k, qmode, A, qs, scl, zro, gold);
   return bad == 0 ? 0 : 1;
 }
