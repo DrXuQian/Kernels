@@ -1,8 +1,7 @@
-// W2A16 LAYOUT DIAGNOSTIC [box-only]. The random-A driver (test_w2a16_grouped) MISMATCHes with in-range but
-// scrambled values -> a structured permutation somewhere in the int2 layout chain (within-b16 / permute_B_rows /
-// interleave). This isolates it: A = identity (M=K), W[k][n] = (k%4) + 10*(n%4) -> D[m][n] = W[m][n] =
-// (m%4) + 10*(n%4). So from each D[m][n]:  got_k4 = round(D)%10 (the K index mod 4 the kernel actually read),
-// got_n4 = round(D)/10 (the N index mod 4). Compare vs expected (m%4, n%4) to read the permutation mod 4.
+// W2A16 SCALE-GROUP DIAGNOSTIC [box-only]. The layout diag (q2/zero, scale=1) MATCHed, but the random-A/
+// random-scale test (test_w2a16_grouped) MISMATCHes -> scale=1 there masked a per-group SCALE bug. This isolates
+// it: A = identity (M=K), q2=1, zero=0, scale[g][n]=g+1 (g=k/gs) -> W[k][n]=(k/gs)+1 -> D[m][n]=(m/gs)+1. So
+// D reveals whether the FINE per-group scale is applied to the correct k-range (group boundaries at m=gs,2gs,...).
 //
 //   TARGET=test_w2a16_diag ./build.sh ; ./<bin>
 #include <cstdio>
@@ -22,23 +21,19 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  const int L = 1, M = 256, N = 256, K = 256, gs = 32;   // M=K for identity A; N,K%256 -> il=true
+  const int L = 1, M = 256, N = 256, K = 256, gs = 32;   // M=K for identity A; scale_k=8 groups
   const int scale_k = (K + gs - 1) / gs;
-  std::printf("[w2a16-diag] identity A, W[k][n]=(k%%4)+10*(n%%4); D[m][n] should = (m%%4)+10*(n%%4)\n");
+  std::printf("[w2a16-diag SCALE] identity A, q2=1, zero=0, scale[g]=g+1 (g=k/gs=%d groups); D[m][n] should=(m/gs)+1\n", scale_k);
 
-  // decodable weight: q2[k][n] = k%4 ; scale=1 ; zero[g][n] = 10*(n%4)  -> W[k][n] = (k%4) + 10*(n%4)
-  std::vector<int>   q2((size_t)K * N);
-  std::vector<float> hsc((size_t)scale_k * N), hzr((size_t)scale_k * N), hA((size_t)M * K, 0.f);
-  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) q2[(size_t)k*N+n] = k % 4;
-  for (auto& s : hsc) s = 1.0f;
-  for (int g = 0; g < scale_k; ++g) for (int n = 0; n < N; ++n) hzr[(size_t)g*N+n] = 10.f * (n % 4);
-  for (int m = 0; m < M; ++m) hA[(size_t)m*K + m] = 1.f;                    // identity
+  std::vector<int>   q2((size_t)K * N, 1);                                  // q2 = 1 -> isolate scale
+  std::vector<float> hsc((size_t)scale_k * N), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
+  for (int g = 0; g < scale_k; ++g) for (int n = 0; n < N; ++n) hsc[(size_t)g*N+n] = (float)(g + 1);  // scale = group+1
+  for (int m = 0; m < M; ++m) hA[(size_t)m*K + m] = 1.f;                    // identity A
 
   std::vector<double> gD((size_t)M * N, 0.0);
-  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) gD[(size_t)m*N+n] = (m % 4) + 10.0 * (n % 4);
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) gD[(size_t)m*N+n] = (m / gs) + 1;   // W[m][n]=(m/gs)+1
 
-  // TRANSPOSE q [K][N] -> [N][K] before packing (the dumper writes q.T; the collective reads B as [N][K]:
-  // q_buf[n*K+k]=W(out n,in k)). Missing this was reading q2 transposed. Then pack 4 uint2/byte + preprocess.
+  // TRANSPOSE q [K][N]->[N][K] before packing (dumper writes q.T) + pack 4 uint2/byte + preprocess PACKED_INT2
   std::vector<int> qT((size_t)K * N);
   for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n*K + k] = q2[(size_t)k*N + n];
   std::vector<int8_t> packed((size_t)K * N / 4, 0);
@@ -75,15 +70,14 @@ int main() {
 
   int bad = 0; for (size_t i=0;i<(size_t)M*N;++i) if (std::abs((double)float(hD[i])-gD[i])>0.5) ++bad;
   std::printf("  bad=%d/%d %s\n", bad, M*N, bad==0?"MATCH":"MISMATCH");
-  // decode grid: for m in 0..15, n in 0..7 print  got(k4,n4) vs exp(m%4,n%4)
-  std::printf("  m\\n :  (got_k4,got_n4 | exp_k4,exp_n4) ...\n");
-  for (int m = 0; m < 16; ++m) {
-    std::printf("  m=%2d:", m);
-    for (int n = 0; n < 8; ++n) {
-      int v = (int)std::lround((double)float(hD[(size_t)m*N+n]));
-      int gk = ((v%10)+10)%10, gn = v/10;
-      std::printf("  %d,%d|%d,%d", gk, gn, m%4, n%4);
-    }
+  // per-group: D[g*gs][0] should be g+1  (reveals if scale-group index is right)
+  std::printf("  D[g*gs][0] (should be g+1):");
+  for (int g=0; g<scale_k; ++g) std::printf(" g%d:%.1f", g, (double)float(hD[(size_t)(g*gs)*N + 0]));
+  std::printf("\n");
+  // D[m][0] around the first 3 group boundaries (m=gs,2gs,3gs) -> where does the scale step?
+  for (int b = 1; b <= 3; ++b) {
+    std::printf("  D[m][0] m=%d..%d (boundary %d):", b*gs-2, b*gs+2, b*gs);
+    for (int m = b*gs-2; m <= b*gs+2; ++m) std::printf(" m%d:%.1f", m, (double)float(hD[(size_t)m*N + 0]));
     std::printf("\n");
   }
   return 0;
