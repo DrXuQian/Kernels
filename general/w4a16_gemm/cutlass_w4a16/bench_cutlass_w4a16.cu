@@ -51,6 +51,7 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 
 #include "cutlass/cutlass.h"
@@ -792,14 +793,30 @@ Result run(Options &options, char const* label = "default")
     std::cout << "  Avg runtime: " << result.avg_runtime_ms << " ms" << std::endl;
     std::cout << "  GFLOPS: " << result.gflops << std::endl;
 
-    // Comparable line for the marlin side. At a prefill M this GEMM is COMPUTE-bound, not weight-bound: at
-    // M=2048,N=K=4096 the math is 2*M*N*K = 6.9e10 FLOP (~550us at 125 TFLOP/s) while the weight read is only
-    // N*K/2 = 8.4 MB (~4us). So the right metric is MFU against the 500 TFLOP/s fp16 peak, not %HBM. (The
-    // weight-bandwidth framing only becomes the binding one at decode M~1, where the GEMV lives.)
+    // Report BOTH utilizations -- neither alone tells you what is binding:
+    //   cmp   = achieved TFLOP/s vs the 500 TFLOP/s fp16 peak (compute utilization).
+    //   min   = the ALGORITHMIC minimum traffic (A + B + D each touched once) vs HBM peak. This is what a perfect
+    //           kernel would move from HBM; at prefill M it is tiny (few % of HBM), which is why MFU is the headline.
+    //   tile  = the TILE-LEVEL traffic actually generated: A is re-read once per N-tile (N/TileN times) and B once
+    //           per M-tile (M/TileM times). With a narrow TileN this explodes and becomes the real ceiling -- e.g.
+    //           int1 32x128 at M=2048,N=K=4096 moves 656MB in 286us = 2295 GB/s = 83% of HBM, i.e. it is
+    //           BANDWIDTH-bound on the A re-reads even though cmp is only 48%. Widening TileN is what cuts it.
     const double us = result.avg_runtime_ms * 1e3;
     const double tflops = result.gflops / 1e3;
-    std::printf("  [CUTLASS gs=%d cfg=%s] M=%d %7.2f us | %6.1f TFLOP/s | %.1f%% of 500 (fp16 peak)\n",
-                options.g, label, options.m, us, tflops, 100.0 * tflops / 500.0);
+    int tm = 0, tn = 0;
+    std::sscanf(label, "%dx%d", &tm, &tn);                       // label is "TMxTN:WMxWN:sS"
+    const double Mm = options.m, Nn = options.n, Kk = options.k;
+    const double bq = double(sizeof_bits<QuantType>::value) / 8.0;   // bytes per weight element
+    const double n_tiles = tn > 0 ? std::ceil(Nn / tn) : 1.0;
+    const double m_tiles = tm > 0 ? std::ceil(Mm / tm) : 1.0;
+    const double min_bytes  = Mm * Kk * 2.0 + Nn * Kk * bq + Mm * Nn * 2.0;
+    const double tile_bytes = Mm * Kk * 2.0 * n_tiles + Nn * Kk * bq * m_tiles + Mm * Nn * 2.0;
+    const double HBM_GBS = 2766.0;                               // ppu001 HBM peak
+    const double gbs_min  = min_bytes  / (us * 1e-6) / 1e9;
+    const double gbs_tile = tile_bytes / (us * 1e-6) / 1e9;
+    std::printf("  [CUTLASS gs=%d cfg=%s] M=%d %7.2f us | %6.1f TFLOP/s | cmp %5.1f%% | tile %6.0f GB/s (%5.1f%% HBM) | min %5.0f GB/s (%4.1f%%)\n",
+                options.g, label, options.m, us, tflops, 100.0 * tflops / 500.0,
+                gbs_tile, 100.0 * gbs_tile / HBM_GBS, gbs_min, 100.0 * gbs_min / HBM_GBS);
   }
 
   return result;
