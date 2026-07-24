@@ -168,6 +168,14 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_q3_bconcat_ablate PRIVATE -w)
 
+# Q3_K B-CONCAT vs A-CONCAT speed: synthetic large shape, interleaved same-session A/B timing (us/MFU/HBM).
+#   Build: TARGET=test_q3_bconcat_bench ./build.sh ; run: ./<bin> [M] [N] [K]
+cutlass_example_add_executable(
+  test_q3_bconcat_bench
+  test_q3_bconcat_bench.cu
+)
+target_compile_options(test_q3_bconcat_bench PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
