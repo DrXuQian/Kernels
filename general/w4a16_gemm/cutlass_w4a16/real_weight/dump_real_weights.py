@@ -57,6 +57,7 @@ _GT_FMT = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?
 _GT_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 GGML_Q4_K = 12
 GGML_Q2_K = 10   # 84 B / 256 elems: scales[16] (4b sc + 4b min per 16-elt sub-block), qs[64] (2b), d(f16), dmin(f16)
+GGML_Q3_K = 11   # 110 B / 256 elems: hmask[32] (1b/elt), qs[64] (2b/elt), scales[12] (16 x 6b), d(f16)
 
 class Gguf:
     def __init__(self, path):
@@ -110,6 +111,8 @@ class Gguf:
             nbytes = n_elems // 256 * 144
         elif ttype == GGML_Q2_K:
             nbytes = n_elems // 256 * 84
+        elif ttype == GGML_Q3_K:
+            nbytes = n_elems // 256 * 110
         elif ttype == 1:   # F16
             nbytes = n_elems * 2
         elif ttype == 0:   # F32
@@ -194,6 +197,53 @@ def unpack_q2k_expert(raw_bytes, N, K):
                             k = b * 256 + is_full * 16 + l      # logical k (dequant y-order)
                             q2[k, n] = (qbyte >> shift) & 3
     return q2, scale.astype(np.float16), zero.astype(np.float16)
+
+
+def unpack_q3k_expert(raw_bytes, N, K):
+    """Q3_K tensor bytes, logical [N][K] (K/256 blocks per row). Mirrors llama.cpp dequantize_row_q3_K.
+    Block = 110B: hmask[32] (1 bit/elt) | qs[64] (2 bit/elt) | scales[12] (16 x 6-bit) | d(f16).
+        dl = d * (sc6 - 32)   and   W[k,n] = dl * (low2 + 4*high1 - 4)      (gs = 16)
+    NOTE the llama.cpp form is `low2 - (hm_bit ? 0 : 4)`, i.e. the hmask bit ADDS 4 -- so high1 == that bit.
+
+    Returns low2[K,N] u8 in [0,3], high1[K,N] u8 in {0,1}, dl[K//16,N] f32. This IS the bit-plane
+    decomposition the concat needs:
+        int2 plane: q = low2,  scale = dl,     zero = -4*dl   (the -4 center folds into the affine zero)
+        int1 plane: q = high1, scale = 4*dl,   zero = 0
+    and D_low + D_high == A @ dequant(Q3_K) exactly."""
+    nblk = K // 256
+    blk = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(N, nblk, 110)
+    scale_k = K // 16
+    low2  = np.zeros((K, N), np.uint8)
+    high1 = np.zeros((K, N), np.uint8)
+    dl    = np.zeros((scale_k, N), np.float32)
+    for n in range(N):
+        for b in range(nblk):
+            rec   = blk[n, b]
+            hmask = rec[0:32]
+            qs    = rec[32:96]
+            s     = rec[96:108].astype(np.int32)
+            d     = np.frombuffer(rec[108:110].tobytes(), dtype=np.float16)[0].astype(np.float32)
+            # 12 bytes -> 16 six-bit scales (llama.cpp aux/kmask1,kmask2 trick, written per byte)
+            sc6 = np.zeros(16, np.int32)
+            for t in range(4):
+                sc6[0  + t] = ( s[0 + t]       & 0xF) | (((s[8 + t] >> 0) & 0x3) << 4)
+                sc6[4  + t] = ( s[4 + t]       & 0xF) | (((s[8 + t] >> 2) & 0x3) << 4)
+                sc6[8  + t] = ((s[0 + t] >> 4) & 0xF) | (((s[8 + t] >> 4) & 0x3) << 4)
+                sc6[12 + t] = ((s[4 + t] >> 4) & 0xF) | (((s[8 + t] >> 6) & 0x3) << 4)
+            # y-order: for each 128-elt half, j=0..3 (shift 2j, hmask bit half*4+j), two 16-elt sub-blocks
+            for half in range(2):                 # qs advances 32 bytes; hmask does NOT (bit index advances)
+                for j in range(4):
+                    for which in range(2):        # sub-block from byte l (which=0) or l+16 (which=1)
+                        is_full = half * 8 + j * 2 + which        # 0..15 sub-block in y-order
+                        g = b * 16 + is_full
+                        dl[g, n] = d * (sc6[is_full] - 32)
+                        for l in range(16):
+                            qb = int(qs[half * 32 + which * 16 + l])
+                            hb = int(hmask[which * 16 + l])
+                            k  = b * 256 + is_full * 16 + l
+                            low2[k, n]  = (qb >> (2 * j)) & 3
+                            high1[k, n] = (hb >> (half * 4 + j)) & 1
+    return low2, high1, dl
 
 
 # =========================================================== GPTQ unpack (sym, desc_act=false)

@@ -132,6 +132,15 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_w1a16_grouped PRIVATE -w)
 
+# Q3_K BIT-PLANE CONCAT on REAL GGUF weights: int2(low2, zero=-4dl) + int1(high1, scale=4dl) summed vs the native
+# Q3_K golden. Validates int1 AND int2 on real bits AND the A-concat at once. Bin from real_weight/dump_q3_concat.py.
+#   Build: TARGET=test_q3_concat_real ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
+cutlass_example_add_executable(
+  test_q3_concat_real
+  test_q3_concat_real.cu
+)
+target_compile_options(test_q3_concat_real PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
