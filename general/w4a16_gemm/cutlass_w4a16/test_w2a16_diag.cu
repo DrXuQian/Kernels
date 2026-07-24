@@ -19,7 +19,10 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  const int L = 1, M = 256, N = 256, K = 256, gs = 32;
+  // K=512/TK=512 (was 256): int2's AIU swzl cube must be 128B (64 b16). At TK=256 int2's cube is only 64B
+  // (32 b16) -> the fixed 128B swzl swizzle folds the adjacent N-row in -> sigma_n=n&~8. TK=512 fills it (=the
+  // recipe's "int2 reads 2x K"). See memory ppu-w2a16-aiu-cube-width-bug.
+  const int L = 1, M = 256, N = 256, K = 512, gs = 32;
   const int scale_k = (K + gs - 1) / gs;
   std::srand(4321);
   std::printf("[w2a16-diag DEQUANT] identity A, RANDOM q2/scale/zero; D[m][n] should = W[m][n]\n");
@@ -68,7 +71,7 @@ int main() {
   const size_t wsb = (size_t)cutlass::ceil_div(M,16)*cutlass::ceil_div(N,64)*(size_t)L*64;
   cutlass::DeviceAllocation<char> ws(wsb);
 
-  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3, cutlass::uint2b_t>(
+  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 512, 32, 32, 3, cutlass::uint2b_t>(  // TK=512: fill the 128B AIU swzl cube (int2)
       dA.get(), dB.get(), dScale.get(), dZero.get(), pd.get(), sd.get(), gm.get(),
       M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
