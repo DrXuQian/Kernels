@@ -124,6 +124,14 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_w1a16_diag PRIVATE -w)
 
+# W1A16 MULTI-EXPERT + RAGGED grouped gate: grouped-L vs grouped-L=1 oracle (contiguous ptr-array D), uint1b_t,
+# TK=256, int1's winner tile 32x128. Build: TARGET=test_w1a16_grouped ./build.sh ; run: ./<bin> [L] [Mb] [ragged] [gs]
+cutlass_example_add_executable(
+  test_w1a16_grouped
+  test_w1a16_grouped.cu
+)
+target_compile_options(test_w1a16_grouped PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
