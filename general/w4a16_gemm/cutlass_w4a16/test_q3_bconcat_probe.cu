@@ -172,6 +172,71 @@ static bool rung7(Ctx& c, const std::vector<uint8_t>& low, const std::vector<uin
   return bad == 0;
 }
 
+// rung 8: RECOVER the high plane the kernel actually consumed, exactly. With low=0, scale=1, zero=0 and A=identity,
+// D[m][n] == 4*high_used[m][n], so high_used is recovered as an exact integer -- no fitting, no guessing. Then the
+// map is read off by testing candidates against the recovered plane.
+// Why this and not rung2/rung7: those used rhigh = (i*13/3)%2, a SELF-SIMILAR pattern. Measured locally, it still
+// agrees 21846/32768 under a candidate permutation, so it is a weak witness and can pass while the plane is wrong --
+// which is exactly what happened (the real-weight ablation shows high=0 clean, low=0 broken). rung8 uses a strong
+// hash instead, so no permutation can hide.
+static uint32_t hbit(int k, int n) {                     // strong 1-bit hash, no self-similarity in k or n
+  uint32_t h = (uint32_t)k * 2654435761u ^ (uint32_t)n * 2246822519u;
+  h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+  return h & 1u;
+}
+static void rung8(Ctx& c) {
+  std::vector<uint8_t> low((size_t)K * N, 0), high((size_t)K * N);
+  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) high[(size_t)k * N + n] = (uint8_t)hbit(k, n);
+  std::vector<half_t> sc1((size_t)scale_k * N, half_t(1.f)), zr0((size_t)scale_k * N, half_t(0.f));
+  set_scales(c, sc1, zr0);
+  auto D = run(c, low, high);
+  // exact recovery: D == 4*high_used
+  std::vector<uint8_t> used((size_t)M * N);
+  int nonbin = 0;
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
+    double d = (double)float(D[(size_t)m * N + n]);
+    int v = (int)std::lround(d / 4.0);
+    if (std::abs(d - 4.0 * v) > 0.25 || v < 0 || v > 1) ++nonbin;
+    used[(size_t)m * N + n] = (uint8_t)(v & 1);
+  }
+  int bad = 0;
+  for (int k = 0; k < K && k < M; ++k) for (int n = 0; n < N; ++n)
+    if (used[(size_t)k * N + n] != high[(size_t)k * N + n]) ++bad;
+  std::printf("    rung8 strong-random high, recovered exactly: bad=%d/%d  (non-binary D: %d) %s\n",
+              bad, (K < M ? K : M) * N, nonbin, bad == 0 ? "MATCH" : "MISMATCH");
+  if (bad == 0) { std::printf("      => the high plane is bit-exact even under a strong witness.\n"); return; }
+  // name the map: which (k',n') does slot (k,n) actually read?
+  struct Cand { const char* name; int dk, dn; bool andmask; };
+  static const Cand cands[] = {
+    {"n^1",0,1,false},{"n^2",0,2,false},{"n^4",0,4,false},{"n^8",0,8,false},{"n^16",0,16,false},
+    {"n^32",0,32,false},{"n^64",0,64,false},{"n^128",0,128,false},
+    {"k^1",1,0,false},{"k^2",2,0,false},{"k^4",4,0,false},{"k^8",8,0,false},{"k^16",16,0,false},
+    {"k^32",32,0,false},{"k^64",64,0,false},{"k^128",128,0,false},
+    {"n&~8",0,8,true},{"n&~16",0,16,true},{"k&~8",8,0,true},{"k&~16",16,0,true},{"k&~64",64,0,true},
+  };
+  const int rows = (K < M ? K : M);
+  for (auto const& cd : cands) {
+    int hit = 0;
+    for (int k = 0; k < rows; ++k) for (int n = 0; n < N; ++n) {
+      int kk = cd.andmask ? (cd.dk ? (k & ~cd.dk) : k) : (k ^ cd.dk);
+      int nn = cd.andmask ? (cd.dn ? (n & ~cd.dn) : n) : (n ^ cd.dn);
+      if (used[(size_t)k * N + n] == high[(size_t)kk * N + nn]) ++hit;
+    }
+    if (hit > rows * N * 90 / 100)
+      std::printf("      => candidate '%-6s' explains %d/%d\n", cd.name, hit, rows * N);
+  }
+  // structure of the failures: which n and k residues are affected
+  std::printf("      bad-rate by n%%16:");
+  for (int r = 0; r < 16; ++r) { int b = 0, t = 0;
+    for (int k = 0; k < rows; ++k) for (int n = r; n < N; n += 16) { ++t; if (used[(size_t)k*N+n] != high[(size_t)k*N+n]) ++b; }
+    std::printf(" %d:%2d%%", r, 100 * b / (t ? t : 1)); }
+  std::printf("\n      bad-rate by k%%16:");
+  for (int r = 0; r < 16; ++r) { int b = 0, t = 0;
+    for (int k = r; k < rows; k += 16) for (int n = 0; n < N; ++n) { ++t; if (used[(size_t)k*N+n] != high[(size_t)k*N+n]) ++b; }
+    std::printf(" %d:%2d%%", r, 100 * b / (t ? t : 1)); }
+  std::printf("\n");
+}
+
 // rung 0-2: compare D against low + 4*high
 static bool check(const char* tag, const std::vector<half_t>& D,
                   const std::vector<uint8_t>& low, const std::vector<uint8_t>& high) {
@@ -291,6 +356,10 @@ int main(int argc, char** argv) {
     check_affine("rung5 varying scale+zero, both planes", run(c, rlow, rhigh), rlow, rhigh, sc, zr);
   }
   decode_group(c);
+
+  // rung 8: exact recovery of the consumed high plane under a STRONG witness (the headline diagnostic).
+  std::printf("  --- rung 8: recover the consumed high plane exactly (strong random) ---\n");
+  rung8(c);
 
   // rung 7: the LAST structural difference from the real test -- a dense A.
   std::printf("  --- rung 7: DENSE A (closes the identity-A blind spot) ---\n");
