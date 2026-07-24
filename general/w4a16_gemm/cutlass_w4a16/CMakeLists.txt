@@ -149,6 +149,16 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_q3_bconcat_real PRIVATE -w)
 
+# B-CONCAT CONTROLLED-INPUT PROBE: A=identity + scale=1/zero=0 + index-labelled bit planes, so D reads back WHICH
+# (n,k) each consumed bit came from. Rungs 0/1/2 separate mantissa PLACEMENT from bit PERMUTATION; rung 3 decodes
+# the permutation. Same technique that cracked the int2 sigma_n bug (sim layouts are NOT trustworthy here).
+#   Build: TARGET=test_q3_bconcat_probe ./build.sh ; run: ./<bin> [N] [K]
+cutlass_example_add_executable(
+  test_q3_bconcat_probe
+  test_q3_bconcat_probe.cu
+)
+target_compile_options(test_q3_bconcat_probe PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
