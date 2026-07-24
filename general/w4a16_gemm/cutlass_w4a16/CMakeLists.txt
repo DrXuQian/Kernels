@@ -120,3 +120,11 @@ cutlass_example_add_executable(
   test_w4a16_diag.cu
 )
 target_compile_options(test_w4a16_diag PRIVATE -w)
+
+# W2A16 REAL-WEIGHT gate: reads a real Q2_K slice .bin (real_weight/real_q2k_ffn_gate_L0.bin, from
+# dump_real_weights.py on the 3B ffn_gate) + native golden; runs W2A16 at gs=16. TARGET=test_w2a16_real ./build.sh
+cutlass_example_add_executable(
+  test_w2a16_real
+  test_w2a16_real.cu
+)
+target_compile_options(test_w2a16_real PRIVATE -w)
