@@ -141,6 +141,14 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_q3_concat_real PRIVATE -w)
 
+# Q3_K B-CONCAT: ONE GEMM with TWO B bit planes (dedicated 2-plane mainloop), vs the native Q3_K golden.
+#   Build: TARGET=test_q3_bconcat_real ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
+cutlass_example_add_executable(
+  test_q3_bconcat_real
+  test_q3_bconcat_real.cu
+)
+target_compile_options(test_q3_bconcat_real PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(

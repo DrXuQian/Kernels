@@ -47,7 +47,8 @@ using GroupProblemShape = cutlass::gemm::GroupProblemShape<GroupShape>;
 // group_shapes_dev/host: L entries of [M_e,N,K]. A/B/scales single L-strided bases (2a uniform). L=num_experts.
 template <QuantMode QuantOp, class KernelSchedule,
           class TileShape, class ScaleTileShape, class WarpShape, int Stages, bool AiuInterleaved,
-          class ElementB = cutlass::int4b_t>   // default W4A16; pass cutlass::uint2b_t for W2A16
+          class ElementB = cutlass::int4b_t,   // default W4A16; pass cutlass::uint2b_t for W2A16
+          class PlaneB2 = void>                // bit-plane concat: 2nd (high) B plane; void = single plane
 void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* scales,
             const cutlass::half_t* zeros,
             cutlass::half_t** ptr_D,        // device [L] per-expert output base pointers (contiguous: D+offs[e]*N)
@@ -56,7 +57,8 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
             int m, int n, int k, int L, int group_size,
             GroupShape* group_shapes_dev, GroupShape const* group_shapes_host,
             int const* group_row_offsets,   // ragged: per-expert cumulative A row start; null=uniform
-            char* workspace, size_t workspace_bytes, hggcStream_t stream) {
+            char* workspace, size_t workspace_bytes, hggcStream_t stream,
+            const PlaneB2* B2 = nullptr) {   // bit-plane concat: 2nd (high) plane; ignored when PlaneB2 is void
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   // ElementB is now a template param (default int4b_t; uint2b_t for W2A16). AlignmentB below auto-adjusts.
@@ -65,8 +67,10 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   using LayoutB  = std::conditional_t<AiuInterleaved, cutlass::layout::ColumnMajorInterleaved<256>, cutlass::layout::ColumnMajor>;
   constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
   using ElementScale = cutlass::half_t;  using ElementZero = cutlass::half_t;
-  using ElementBInfo = std::conditional_t<has_zero(QuantOp),
-      cute::tuple<ElementB, ElementScale, ElementZero>, cute::tuple<ElementB, ElementScale>>;
+  using ElementBInfo = std::conditional_t<!std::is_void_v<PlaneB2>,
+      cute::tuple<ElementB, ElementScale, ElementZero, PlaneB2>,
+      std::conditional_t<has_zero(QuantOp),
+          cute::tuple<ElementB, ElementScale, ElementZero>, cute::tuple<ElementB, ElementScale>>>;
   using ElementC = cutlass::half_t;  using LayoutC = cutlass::layout::RowMajor;
   using ElementD = cutlass::half_t;  using LayoutD = cutlass::layout::RowMajor;
   constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
@@ -121,6 +125,7 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
     { {}, (ElementC const**)nullptr, StrideC{}, ptr_D, stride_D },
     hw
   };
+  if constexpr (!std::is_void_v<PlaneB2>) { args.mainloop.ptr_B2 = B2; }
   args.group_M = group_M;
   // O(1) decode hint: if every expert has the SAME #m-tiles (ceil(M_e/TM)), the kernel uses blockIdx.z (no scan).
   // MOEG_FORCE3D (diagnostic): force the 3D Mmax grid + blockIdx.z decode even for ragged (small experts idle)
@@ -156,18 +161,20 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
 }
 
 template <QuantMode QuantOp, int TM, int TN, int TK, int WM, int WN, int Stages,
-          class ElementB = cutlass::int4b_t>   // default W4A16; pass cutlass::uint2b_t for W2A16
+          class ElementB = cutlass::int4b_t,   // default W4A16; pass cutlass::uint2b_t for W2A16
+          class PlaneB2 = void>                // bit-plane concat: 2nd (high) B plane; void = single plane
 void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* scales,
                     const cutlass::half_t* zeros,
                     cutlass::half_t** ptr_D, DStride* stride_D, int const* group_M,
                     int m, int n, int k, int L, int group_size,
                     GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
-                    char* ws, size_t ws_bytes, hggcStream_t stream) {
+                    char* ws, size_t ws_bytes, hggcStream_t stream,
+                    const PlaneB2* B2 = nullptr) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
-  #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB>( \
-      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream)
+  #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
+      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
   //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K
