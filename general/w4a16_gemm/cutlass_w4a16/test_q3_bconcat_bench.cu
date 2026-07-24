@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
   M = argc > 1 ? atoi(argv[1]) : 2048;
   N = argc > 2 ? atoi(argv[2]) : 4096;
   K = argc > 3 ? atoi(argv[3]) : 4096;
+  gs = argc > 4 ? atoi(argv[4]) : 16;                      // Q3_K native is gs=16; pass 128 to compare with the record
   scale_k = K / gs;
   std::printf("[q3-bconcat-bench] M=%d N=%d K=%d gs=%d  (B-concat = 1 GEMM 3-bit; A-concat = 2 GEMMs)\n", M, N, K, gs);
 
@@ -100,23 +101,27 @@ int main(int argc, char** argv) {
   };
 
   const double flops = 2.0 * M * N * K;                    // one A@W
-  const double PEAK = 197.0e12;                            // ppu001 fp16 tensor peak (approx, for MFU%)
-  auto report = [&](const char* tag, double us, double wbytes){
+  // ppu001 fp16 tensor peak, back-derived from the recorded single-plane winners (all consistent):
+  //   int4 230.0us/59.7% -> 299 TFLOP/s/0.597 = 500 ; int2 256.8us/50.8% -> 527 ; int1 285.9us/48.1% -> 500.
+  const double PEAK = 500.0e12;
+  auto report = [&](const char* tag, double us){
     double tf = flops / (us * 1e-6) / 1e12;
-    std::printf("  %-24s %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU) | weight %5.1f MB @ %6.0f GB/s\n",
-                tag, us, tf, 100.0*tf*1e12/PEAK, wbytes/1e6, wbytes/(us*1e-6)/1e9);
+    std::printf("  %-24s %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n", tag, us, tf, 100.0*tf*1e12/PEAK);
   };
-  const double wb_b = (double)K*N*3/8;                     // 3-bit
-  const double wb_a = (double)K*N*2/8 + (double)K*N*1/8;   // int2 + int1 = same 3-bit total, but 2 passes
+  // NOTE: no weight-bandwidth metric -- at M=2048 the weight is reused across M, so this is compute/latency-bound,
+  // not weight-bandwidth-bound; a "weight GB/s" figure is meaningless here.
 
   std::printf("  interleaved B,A,B,A,... (only same-session A/B is trustworthy on the shared box)\n");
+  std::printf("  CAVEAT: wall-clock event timing around a full filter_and_run (rebuilds args + can_implement +\n");
+  std::printf("  initialize each iter) inflates ABSOLUTE us via GPU idle between launches; the B/A RATIO is the\n");
+  std::printf("  robust number (both routes pay the same per-launch overhead). Cross-check absolutes with asys.\n");
   for (int r = 0; r < 4; ++r) {
     double tb = time_it(bconcat, 50);
     double ta = time_it(aconcat, 50);
     std::printf("  --- round %d ---\n", r);
-    report("B-concat (1 GEMM)", tb, wb_b);
-    report("A-concat (2 GEMMs)", ta, wb_a);
-    std::printf("  %-24s B/A = %.2fx\n", "speedup", ta / tb);
+    report("B-concat (1 GEMM)", tb);
+    report("A-concat (2 GEMMs)", ta);
+    std::printf("  %-24s B/A = %.2fx  (B-concat is 1 GEMM vs 2; same 3-bit weight footprint)\n", "speedup", ta / tb);
   }
   return 0;
 }
