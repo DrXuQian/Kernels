@@ -60,7 +60,7 @@ grep -q "$EX_NAME" "$EX_LIST" || { echo "ERROR: failed to register example in $E
 # --- tile/warp/stages tuning: forward from the environment (defaults match the stock example) ---
 TILE_M="${TILE_M:-32}"; TILE_N="${TILE_N:-32}"; WARP_M="${WARP_M:-16}"; WARP_N="${WARP_N:-16}"; STAGES="${STAGES:-3}"
 QUANT="${QUANT:-int4}"   # int4 (default) or uint2 -> bench_cutlass_w4a16's QuantType (W4A16 vs W2A16 perf)
-TSK="${TSK:-128}"        # int2 TileShapeK (128 or 256; %128==0). int2 fp16 fragment is 2x int4 -> smaller TK helps
+TSK="${TSK:-}"           # TileShapeK override (empty = per-quant default: int2->128, int4->64). Set to force, e.g. TSK=128
 echo "[build.sh] TILE=${TILE_M}x${TILE_N} WARP=${WARP_M}x${WARP_N} STAGES=${STAGES} QUANT=${QUANT} TSK=${TSK}"
 
 # --- configure & build just our target ---

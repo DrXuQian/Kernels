@@ -107,7 +107,11 @@ using QuantType = cutlass::uint2b_t;                 // W2A16 perf bench (build:
 constexpr int TileShapeK = BENCH_TSK;                // int2 needs TK>=128 (AIU 32B min: TK*2/8 % 32 == 0 -> TK%128==0); sweep 128/256 via TSK=
 #else
 using QuantType = cutlass::int4b_t;
-constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;   // 64
+#ifdef BENCH_TSK
+constexpr int TileShapeK = BENCH_TSK;                // apples-to-apples: force int4 to int2's TK (TSK=128) to isolate the tile effect
+#else
+constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;   // 64 (default: 4bit*64/8 = 32B AIU-legal)
+#endif
 #endif
 
 // A matrix configuration
