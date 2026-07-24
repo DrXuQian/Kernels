@@ -164,7 +164,8 @@ void dequantize_weight(DequantizedElement* dq_buffer,
 enum class QuantTypeClass {
     INT8_WEIGHT_ONLY,
     PACKED_INT4_WEIGHT_ONLY,
-    PACKED_INT2_WEIGHT_ONLY   // W2A16 (4 uint2/byte); mirrors PACKED_INT4 with ELTS_PER_BYTE=4
+    PACKED_INT2_WEIGHT_ONLY,  // W2A16 (4 uint2/byte); mirrors PACKED_INT4 with ELTS_PER_BYTE=4
+    PACKED_INT1_WEIGHT_ONLY   // W1A16 (8 uint1/byte); Q3/Q5 high plane; mirrors PACKED_INT2 with ELTS_PER_BYTE=8
 };
 
 int get_bits_in_quant_type(QuantTypeClass quant_type)
@@ -176,6 +177,8 @@ int get_bits_in_quant_type(QuantTypeClass quant_type)
             return 4;
         case QuantTypeClass::PACKED_INT2_WEIGHT_ONLY:
             return 2;
+        case QuantTypeClass::PACKED_INT1_WEIGHT_ONLY:
+            return 1;
         default:
             //FT_CHECK_WITH_INFO(false, "Invalid quant_type");
             return -1;
@@ -357,6 +360,11 @@ void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size
         // Stage-2: was identity; now the split-at-8 register relayout that the int2 lop3 magic converter needs.
         add_bias_and_interleave_int2s_inplace(tensor, num_elts);
     }
+    else if (quant_type == QuantTypeClass::PACKED_INT1_WEIGHT_ONLY) {
+        // W1A16: IDENTITY for now (the correctness-first magic-OR int1 converter reads bits sequentially). Add the
+        // int1 split relayout here in lockstep with the int1 lop3 converter (mirror of add_bias_and_interleave_int2s).
+        (void)tensor; (void)num_elts;
+    }
     else {
         // FT_CHECK_WITH_INFO(false, "Invalid quantization type for interleaving.");
         assert(false);
@@ -434,9 +442,10 @@ void subbyte_transpose_impl(int8_t*                    transposed_quantized_tens
     uint8_t*       output_byte_ptr = reinterpret_cast<uint8_t*>(transposed_quantized_tensor);
 
     static_assert(quant_type == QuantTypeClass::INT8_WEIGHT_ONLY || quant_type == QuantTypeClass::PACKED_INT4_WEIGHT_ONLY
-                  || quant_type == QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, "");
+                  || quant_type == QuantTypeClass::PACKED_INT2_WEIGHT_ONLY || quant_type == QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, "");
     static constexpr int ELTS_PER_BYTE = quant_type == QuantTypeClass::INT8_WEIGHT_ONLY ? 1
-                                       : (quant_type == QuantTypeClass::PACKED_INT4_WEIGHT_ONLY ? 2 : 4);
+                                       : (quant_type == QuantTypeClass::PACKED_INT4_WEIGHT_ONLY ? 2
+                                       : (quant_type == QuantTypeClass::PACKED_INT2_WEIGHT_ONLY ? 4 : 8));
 
     static constexpr int M_TILE_L1 = 64;
     static constexpr int N_TILE_L1 = M_TILE_L1 / ELTS_PER_BYTE;
@@ -528,6 +537,23 @@ void subbyte_transpose_impl(int8_t*                    transposed_quantized_tens
                         }
                     }
                 }
+                else if (quant_type == QuantTypeClass::PACKED_INT1_WEIGHT_ONLY) {
+                    // 1-bit transpose: mirror of int2, ELTS_PER_BYTE=8 (>>1*off, mask 0x1).
+                    for (int ii = 0; ii < M_TILE_L1; ++ii) {
+                        for (int jj = ii + 1; jj < M_TILE_L1; ++jj) {
+                            const int ii_byte       = ii / ELTS_PER_BYTE;
+                            const int ii_bit_offset = ii % ELTS_PER_BYTE;
+                            const int jj_byte       = jj / ELTS_PER_BYTE;
+                            const int jj_bit_offset = jj % ELTS_PER_BYTE;
+                            uint8_t src_elt = 0x1 & (cache_buf[ii][jj_byte] >> jj_bit_offset);
+                            uint8_t tgt_elt = 0x1 & (cache_buf[jj][ii_byte] >> ii_bit_offset);
+                            cache_buf[ii][jj_byte] &= uint8_t(~(0x1 << jj_bit_offset));
+                            cache_buf[jj][ii_byte] &= uint8_t(~(0x1 << ii_bit_offset));
+                            cache_buf[ii][jj_byte] |= (tgt_elt << jj_bit_offset);
+                            cache_buf[jj][ii_byte] |= (src_elt << ii_bit_offset);
+                        }
+                    }
+                }
                 else {
                     // FT_CHECK_WITH_INFO(false, "Unsupported quantization type.");
                     assert(false);
@@ -573,6 +599,10 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
     }
     else if (quant_type == QuantTypeClass::PACKED_INT2_WEIGHT_ONLY) {
         subbyte_transpose_impl<QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>(
+            transposed_quantized_tensor, quantized_tensor, shape);
+    }
+    else if (quant_type == QuantTypeClass::PACKED_INT1_WEIGHT_ONLY) {
+        subbyte_transpose_impl<QuantTypeClass::PACKED_INT1_WEIGHT_ONLY>(
             transposed_quantized_tensor, quantized_tensor, shape);
     }
     else {

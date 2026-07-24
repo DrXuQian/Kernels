@@ -115,6 +115,13 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_w2a16_diag PRIVATE -w)
 
+# W1A16 LAYOUT DIAGNOSTIC: identity A + random q1/scale/zero, uint1b_t (8/byte, PACKED_INT1). Build: TARGET=test_w1a16_diag ./build.sh
+cutlass_example_add_executable(
+  test_w1a16_diag
+  test_w1a16_diag.cu
+)
+target_compile_options(test_w1a16_diag PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
