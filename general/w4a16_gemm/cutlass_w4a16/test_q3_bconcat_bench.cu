@@ -75,6 +75,21 @@ int main(int argc, char** argv) {
   const size_t wsb = (size_t)cutlass::ceil_div(M,16)*cutlass::ceil_div(N,64)*64;
   cutlass::DeviceAllocation<char> ws(wsb);
 
+  // CONTROLS in the SAME harness (same per-iter host overhead): a KNOWN-GOOD single-plane int2 GEMM. The recorded
+  // 256us/50.8% for this kernel was measured with asys/cuda-graph, NOT comparable to this wall-clock harness -- so
+  // measure it HERE. int2_tk128 is the recorded winner shape; int2_tk256 isolates the TK=256 penalty ALONE (no 2nd
+  // plane); B-concat adds only the 2nd plane on top of int2_tk256. If int2_tk128 also reads ~1000us here, the gap is
+  // harness host-overhead, not the kernel. If int2_tk256 ~= B-concat, the 2nd swzl load is nearly free (as expected).
+  auto int2_tk128 = [&]{
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, uint2_t>(
+        dA.get(), dBlo.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
+        M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
+  };
+  auto int2_tk256 = [&]{
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3, uint2_t>(
+        dA.get(), dBlo.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
+        M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
+  };
   auto bconcat = [&]{  // ONE 2-plane GEMM
     moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3, uint2_t, uint1_t>(
         dA.get(), dBlo.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
@@ -116,12 +131,17 @@ int main(int argc, char** argv) {
   std::printf("  initialize each iter) inflates ABSOLUTE us via GPU idle between launches; the B/A RATIO is the\n");
   std::printf("  robust number (both routes pay the same per-launch overhead). Cross-check absolutes with asys.\n");
   for (int r = 0; r < 4; ++r) {
-    double tb = time_it(bconcat, 50);
-    double ta = time_it(aconcat, 50);
+    double t128 = time_it(int2_tk128, 50);
+    double t256 = time_it(int2_tk256, 50);
+    double tb   = time_it(bconcat, 50);
+    double ta   = time_it(aconcat, 50);
     std::printf("  --- round %d ---\n", r);
-    report("B-concat (1 GEMM)", tb);
-    report("A-concat (2 GEMMs)", ta);
-    std::printf("  %-24s B/A = %.2fx  (B-concat is 1 GEMM vs 2; same 3-bit weight footprint)\n", "speedup", ta / tb);
+    report("int2 single TK=128 (ref)", t128);   // recorded 256us/50.8% via asys -- compare to THIS value
+    report("int2 single TK=256      ", t256);   // + the TK penalty, still ONE plane
+    report("B-concat (1 GEMM,2plane)", tb);      // + the 2nd swzl load on top of int2_tk256
+    report("A-concat (2 GEMMs)      ", ta);
+    std::printf("  %-24s B/int2@256 = %.2fx (2nd load cost) | int2@256/int2@128 = %.2fx (TK cost) | B/A = %.2fx\n",
+                "ratios", tb / t256, t256 / t128, ta / tb);
   }
   return 0;
 }
