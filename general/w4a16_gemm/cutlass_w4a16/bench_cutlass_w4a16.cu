@@ -99,7 +99,13 @@ enum GemmMode {
 // commented alternative). Everything else in this file is example 16 verbatim -- the point is to compare
 // against KNOWN-GOOD actlize code, so deviations are kept to this one line plus the Options defaults below.
 using MmaType = cutlass::half_t;
-#ifdef BENCH_UINT2
+#ifdef BENCH_UINT1
+using QuantType = cutlass::uint1b_t;                 // W1A16 perf bench (build: QUANT=uint1 ... ./build.sh)
+#ifndef BENCH_TSK
+#define BENCH_TSK 256                                 // int1 needs TK%256==0 (AIU 32B min: TK*1/8 % 32 == 0)
+#endif
+constexpr int TileShapeK = BENCH_TSK;
+#elif defined(BENCH_UINT2)
 using QuantType = cutlass::uint2b_t;                 // W2A16 perf bench (build: QUANT=uint2 ... ./build.sh)
 #ifndef BENCH_TSK
 #define BENCH_TSK 128                                 // int2 fp16 B-fragment is 2x int4's (density) -> smaller TK helps
@@ -594,6 +600,8 @@ void initialize(Options const& options) {
     quant_type = QuantTypeClass::PACKED_INT4_WEIGHT_ONLY;
   } else if (sizeof_bits<QuantType>::value == 2) {
     quant_type = QuantTypeClass::PACKED_INT2_WEIGHT_ONLY;
+  } else if (sizeof_bits<QuantType>::value == 1) {
+    quant_type = QuantTypeClass::PACKED_INT1_WEIGHT_ONLY;
   } else {
     std::cerr << "unsupported QuantType" << std::endl;
     exit(-1);

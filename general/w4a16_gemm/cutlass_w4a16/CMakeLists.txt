@@ -20,6 +20,8 @@ set(TSK "" CACHE STRING "TileShapeK override (empty=default int2->128/int4->64; 
 set(_QUANT_DEFS)
 if(BENCH_QUANT STREQUAL "uint2")
   set(_QUANT_DEFS -DBENCH_UINT2)
+elseif(BENCH_QUANT STREQUAL "uint1")
+  set(_QUANT_DEFS -DBENCH_UINT1)
 endif()
 if(NOT TSK STREQUAL "")
   list(APPEND _QUANT_DEFS -DBENCH_TSK=${TSK})
