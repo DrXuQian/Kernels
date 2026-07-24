@@ -99,8 +99,13 @@ enum GemmMode {
 // commented alternative). Everything else in this file is example 16 verbatim -- the point is to compare
 // against KNOWN-GOOD actlize code, so deviations are kept to this one line plus the Options defaults below.
 using MmaType = cutlass::half_t;
+#ifdef BENCH_UINT2
+using QuantType = cutlass::uint2b_t;                 // W2A16 perf bench (build: QUANT=uint2 ... ./build.sh)
+constexpr int TileShapeK = 256;                      // int2 needs TK>=128 (AIU 32B min: TK*2/8 % 32 == 0 -> TK%128==0)
+#else
 using QuantType = cutlass::int4b_t;
-constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
+constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;   // 64
+#endif
 
 // A matrix configuration
 using         ElementA    = MmaType;                                        // Element type for A matrix operand

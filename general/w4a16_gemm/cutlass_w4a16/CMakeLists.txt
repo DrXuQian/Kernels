@@ -15,8 +15,14 @@ set(WARP_M  "32" CACHE STRING "warp tile M")
 set(WARP_N  "32" CACHE STRING "warp tile N")
 set(STAGES  "4"  CACHE STRING "pipeline stages")
 
+set(BENCH_QUANT "int4" CACHE STRING "bench QuantType: int4 (W4A16) or uint2 (W2A16)")
+set(_QUANT_DEFS)
+if(BENCH_QUANT STREQUAL "uint2")
+  set(_QUANT_DEFS -DBENCH_UINT2)
+endif()
+
 set(_W4A16_DEFS
-  -DTILE_M=${TILE_M} -DTILE_N=${TILE_N} -DWARP_M=${WARP_M} -DWARP_N=${WARP_N} -DSTAGES=${STAGES})
+  -DTILE_M=${TILE_M} -DTILE_N=${TILE_N} -DWARP_M=${WARP_M} -DWARP_N=${WARP_N} -DSTAGES=${STAGES} ${_QUANT_DEFS})
 
 cutlass_example_add_executable(
   bench_cutlass_w4a16
@@ -25,7 +31,7 @@ cutlass_example_add_executable(
 )
 
 target_compile_definitions(bench_cutlass_w4a16 PRIVATE
-  TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES})
+  TILE_M=${TILE_M} TILE_N=${TILE_N} WARP_M=${WARP_M} WARP_N=${WARP_N} STAGES=${STAGES} ${_QUANT_DEFS})
 target_compile_options(bench_cutlass_w4a16 PRIVATE -w)
 # Root-cause cross-check is now a RUNTIME flag on this same binary (--xcheck): it runs the grouped kernel (L=1)
 # on the verified bench data (block_A / shuffled block_B_buff / block_scale) and compares vs block_ref_D and the
