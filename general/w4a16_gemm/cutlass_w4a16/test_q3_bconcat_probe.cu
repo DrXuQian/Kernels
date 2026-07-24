@@ -88,6 +88,53 @@ static std::vector<half_t> run(Ctx& c, const std::vector<uint8_t>& low, const st
   return hD;
 }
 
+static void set_scales(Ctx& c, const std::vector<half_t>& sc, const std::vector<half_t>& zr) {
+  c.dSc.copy_from_host(sc.data()); c.dZr.copy_from_host(zr.data());
+}
+
+// rung 5: with A=identity, D[m][n] must be sc[m/gs][n]*(low+4*high) + zr[m/gs][n]. The rungs above all ran
+// scale=1/zero=0, which makes ANY scale-group misindexing invisible -- that is exactly the blind spot that let the
+// synthetic rungs pass while the real Q3_K weight (per-group dl and -4dl) still mismatched.
+static bool check_affine(const char* tag, const std::vector<half_t>& D,
+                         const std::vector<uint8_t>& low, const std::vector<uint8_t>& high,
+                         const std::vector<half_t>& sc, const std::vector<half_t>& zr) {
+  int bad = 0, shown = 0;
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
+    const int g = m / gs;
+    double q   = (double)low[(size_t)m * N + n] + 4.0 * (double)high[(size_t)m * N + n];
+    double exp = (double)float(sc[(size_t)g * N + n]) * q + (double)float(zr[(size_t)g * N + n]);
+    double got = (double)float(D[(size_t)m * N + n]);
+    if (std::abs(got - exp) > 2e-2 + 3e-2 * std::abs(exp)) {
+      ++bad;
+      if (shown < 6) { std::printf("      m=%d n=%d (g=%d) | got=%.4f exp=%.4f  sc=%.4f zr=%.4f q=%.0f\n",
+                                   m, n, g, got, exp, (double)float(sc[(size_t)g*N+n]), (double)float(zr[(size_t)g*N+n]), q); ++shown; }
+    }
+  }
+  std::printf("    %-46s bad=%d/%d %s\n", tag, bad, M * N, bad == 0 ? "MATCH" : "MISMATCH");
+  return bad == 0;
+}
+
+// rung 6: make the SCALE itself the label. low=1, high=0, zero=0, sc[g][n] = 2^g -> D = 2^g_used exactly (fp16 holds
+// 2^15), so the scale group each output row actually consumed reads straight out of D.
+static void decode_group(Ctx& c) {
+  std::vector<uint8_t> low((size_t)K * N, 1), high((size_t)K * N, 0);
+  std::vector<half_t> sc((size_t)scale_k * N), zr((size_t)scale_k * N, half_t(0.f));
+  for (int g = 0; g < scale_k; ++g) for (int n = 0; n < N; ++n) sc[(size_t)g * N + n] = half_t(float(1 << g));
+  set_scales(c, sc, zr);
+  auto D = run(c, low, high);
+  int bad = 0, shown = 0;
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
+    double d = (double)float(D[(size_t)m * N + n]);
+    int g_used = (d > 0) ? (int)std::lround(std::log2(d)) : -1;
+    const int want = m / gs;
+    if (g_used != want) {
+      ++bad;
+      if (shown < 12) { std::printf("      (m=%3d,n=%3d) g_used=%3d want=%3d  D=%.1f\n", m, n, g_used, want, d); ++shown; }
+    }
+  }
+  std::printf("    SCALE group index: bad=%d/%d %s\n", bad, M * N, bad ? "MISINDEXED" : "identity");
+}
+
 // rung 0-2: compare D against low + 4*high
 static bool check(const char* tag, const std::vector<half_t>& D,
                   const std::vector<uint8_t>& low, const std::vector<uint8_t>& high) {
@@ -190,10 +237,25 @@ int main(int argc, char** argv) {
   std::printf("  --- rung 0/1/2: is it PLACEMENT or PERMUTATION? ---\n");
   bool r0 = check("rung0 low=rand high=0     (low path+affine)", run(c, rlow, z), rlow, z);
   bool r1 = check("rung1 low=rand high=1     (the +4 placement)", run(c, rlow, ones), rlow, ones);
-  check("rung2 low=rand high=rand  (reproduces the bug)", run(c, rlow, rhigh), rlow, rhigh);
+  bool r2 = check("rung2 low=rand high=rand  (reproduces the bug)", run(c, rlow, rhigh), rlow, rhigh);
   if (!r0) std::printf("  !! rung0 failed: the fault is NOT the high plane at all -- fix the low path first.\n");
   else if (!r1) std::printf("  !! rung1 failed: the high bit's MANTISSA PLACEMENT is wrong (not a permutation).\n");
-  else std::printf("  ==> rung0+1 OK, rung2 bad => pure PERMUTATION of the high bits. Decoding it below.\n");
+  else if (!r2) std::printf("  !! rung2 failed: rungs 0+1 OK => pure PERMUTATION of the high bits (see rung3).\n");
+  else std::printf("  ==> rungs 0-2 all OK: q = low + 4*high is exact under a UNIFORM scale.\n");
+
+  // rung 5/6: the blind spot of every rung above -- a VARYING per-group scale/zero.
+  std::printf("  --- rung 5/6: per-group scale/zero (invisible to rungs 0-3) ---\n");
+  { std::vector<half_t> sc((size_t)scale_k * N), zr((size_t)scale_k * N);
+    for (int g = 0; g < scale_k; ++g) for (int n = 0; n < N; ++n) {
+      sc[(size_t)g * N + n] = half_t(0.125f * float(1 + (g * 5 + n) % 7));      // varies in BOTH g and n
+      zr[(size_t)g * N + n] = half_t(-0.5f  * float(1 + (g * 3 + n) % 5));
+    }
+    set_scales(c, sc, zr);
+    check_affine("rung5 varying scale+zero, both planes", run(c, rlow, rhigh), rlow, rhigh, sc, zr);
+  }
+  decode_group(c);
+  { std::vector<half_t> sc1((size_t)scale_k * N, half_t(1.f)), zr0((size_t)scale_k * N, half_t(0.f));
+    set_scales(c, sc1, zr0); }   // restore uniform for rung 3
 
   std::printf("  --- rung 3: decode the source index each consumed bit carried ---\n");
   decode(c, false, AXIS_K);   // low plane as CONTROL (validated standalone -> must be identity)
