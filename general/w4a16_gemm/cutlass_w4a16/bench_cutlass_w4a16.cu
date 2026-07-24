@@ -101,7 +101,10 @@ enum GemmMode {
 using MmaType = cutlass::half_t;
 #ifdef BENCH_UINT2
 using QuantType = cutlass::uint2b_t;                 // W2A16 perf bench (build: QUANT=uint2 ... ./build.sh)
-constexpr int TileShapeK = 256;                      // int2 needs TK>=128 (AIU 32B min: TK*2/8 % 32 == 0 -> TK%128==0)
+#ifndef BENCH_TSK
+#define BENCH_TSK 128                                 // int2 fp16 B-fragment is 2x int4's (density) -> smaller TK helps
+#endif
+constexpr int TileShapeK = BENCH_TSK;                // int2 needs TK>=128 (AIU 32B min: TK*2/8 % 32 == 0 -> TK%128==0); sweep 128/256 via TSK=
 #else
 using QuantType = cutlass::int4b_t;
 constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;   // 64

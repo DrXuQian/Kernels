@@ -16,9 +16,10 @@ set(WARP_N  "32" CACHE STRING "warp tile N")
 set(STAGES  "4"  CACHE STRING "pipeline stages")
 
 set(BENCH_QUANT "int4" CACHE STRING "bench QuantType: int4 (W4A16) or uint2 (W2A16)")
+set(TSK "128" CACHE STRING "int2 TileShapeK (must be %128==0: 128 or 256); ignored for int4")
 set(_QUANT_DEFS)
 if(BENCH_QUANT STREQUAL "uint2")
-  set(_QUANT_DEFS -DBENCH_UINT2)
+  set(_QUANT_DEFS -DBENCH_UINT2 -DBENCH_TSK=${TSK})
 endif()
 
 set(_W4A16_DEFS

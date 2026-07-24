@@ -60,13 +60,14 @@ grep -q "$EX_NAME" "$EX_LIST" || { echo "ERROR: failed to register example in $E
 # --- tile/warp/stages tuning: forward from the environment (defaults match the stock example) ---
 TILE_M="${TILE_M:-32}"; TILE_N="${TILE_N:-32}"; WARP_M="${WARP_M:-16}"; WARP_N="${WARP_N:-16}"; STAGES="${STAGES:-3}"
 QUANT="${QUANT:-int4}"   # int4 (default) or uint2 -> bench_cutlass_w4a16's QuantType (W4A16 vs W2A16 perf)
-echo "[build.sh] TILE=${TILE_M}x${TILE_N} WARP=${WARP_M}x${WARP_N} STAGES=${STAGES} QUANT=${QUANT}"
+TSK="${TSK:-128}"        # int2 TileShapeK (128 or 256; %128==0). int2 fp16 fragment is 2x int4 -> smaller TK helps
+echo "[build.sh] TILE=${TILE_M}x${TILE_N} WARP=${WARP_M}x${WARP_N} STAGES=${STAGES} QUANT=${QUANT} TSK=${TSK}"
 
 # --- configure & build just our target ---
 BUILD="$ACTLIZE/build_w4a16_compare"
 rm -rf "$BUILD" && mkdir -p "$BUILD" && cd "$BUILD"
 cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" \
-  -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" -DBENCH_QUANT="$QUANT" \
+  -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" -DBENCH_QUANT="$QUANT" -DTSK="$TSK" \
   >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
 TARGET="${TARGET:-bench_cutlass_w4a16}"
 make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log
