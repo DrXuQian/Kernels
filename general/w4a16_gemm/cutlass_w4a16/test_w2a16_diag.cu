@@ -19,26 +19,22 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 int main() {
-  // K=512/TK=512 (was 256): int2's AIU swzl cube must be 128B (64 b16). At TK=256 int2's cube is only 64B
-  // (32 b16) -> the fixed 128B swzl swizzle folds the adjacent N-row in -> sigma_n=n&~8. TK=512 fills it (=the
-  // recipe's "int2 reads 2x K"). See memory ppu-w2a16-aiu-cube-width-bug.
-  const int L = 1, M = 256, N = 256, K = 512, gs = 32;
+  // CONTROLLED-INPUT probe (user's half-fill idea): scale=1, zero=0 so D[m][n] == q2[m][n] directly.
+  // q2 tagged by the N-half WITHIN each 16-N mma atom: n%16<8 -> 1, n%16>=8 -> 2 (k-independent). If correct,
+  // D[0][n%16<8]=1 and D[0][n%16>=8]=2. If the upper N-half reads the lower half, D[0][n%16>=8] shows 1 ->
+  // exposes the aliasing directly (no AIU modeling needed).
+  const int L = 1, M = 256, N = 256, K = 256, gs = 32;
   const int scale_k = (K + gs - 1) / gs;
-  std::srand(4321);
-  std::printf("[w2a16-diag DEQUANT] identity A, RANDOM q2/scale/zero; D[m][n] should = W[m][n]\n");
+  std::printf("[w2a16-probe] scale=1 zero=0, q2[n]=((n%%16)<8?1:2); D[0][n] expect 1 for n%%16<8, 2 for n%%16>=8\n");
 
   std::vector<int>   q2((size_t)K * N);
-  std::vector<float> hsc((size_t)scale_k * N), hzr((size_t)scale_k * N), hA((size_t)M * K, 0.f);
-  for (auto& q : q2)  q = std::rand() % 4;
-  for (auto& s : hsc) s = 0.01f + (std::rand() % 8) * 0.01f;
-  for (auto& z : hzr) z = (std::rand() % 9 - 4) * 0.01f;
+  std::vector<float> hsc((size_t)scale_k * N, 1.f), hzr((size_t)scale_k * N, 0.f), hA((size_t)M * K, 0.f);
+  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) q2[(size_t)k*N+n] = ((n % 16) < 8) ? 1 : 2;  // half-tag
   for (int m = 0; m < M; ++m) hA[(size_t)m*K + m] = 1.f;                    // identity A
 
   std::vector<double> gD((size_t)M * N, 0.0);
-  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
-    int g = m / gs;
-    gD[(size_t)m*N+n] = (double)hsc[(size_t)g*N+n]*q2[(size_t)m*N+n] + hzr[(size_t)g*N+n];   // W[m][n]
-  }
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n)
+    gD[(size_t)m*N+n] = (double)q2[(size_t)m*N+n];   // scale=1, zero=0 -> W == q2
 
   // transpose q [K][N]->[N][K] + pack 4 uint2/byte + preprocess PACKED_INT2
   std::vector<int> qT((size_t)K * N);
@@ -71,24 +67,22 @@ int main() {
   const size_t wsb = (size_t)cutlass::ceil_div(M,16)*cutlass::ceil_div(N,64)*(size_t)L*64;
   cutlass::DeviceAllocation<char> ws(wsb);
 
-  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 512, 32, 32, 3, cutlass::uint2b_t>(  // TK=512: fill the 128B AIU swzl cube (int2)
+  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3, cutlass::uint2b_t>(
       dA.get(), dB.get(), dScale.get(), dZero.get(), pd.get(), sd.get(), gm.get(),
       M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
 
-  int bad = 0, shown = 0;
-  for (size_t i=0;i<(size_t)M*N;++i) if (std::abs((double)float(hD[i])-gD[i]) > 1e-2 + 5e-2*std::abs(gD[i])) ++bad;
+  int bad = 0;
+  for (size_t i=0;i<(size_t)M*N;++i) if (std::abs((double)float(hD[i])-gD[i]) > 0.3) ++bad;
   std::printf("  bad=%d/%d %s\n", bad, M*N, bad==0?"MATCH":"MISMATCH");
-  std::printf("  mismatches (m,n,g | q2 sc zr | got exp):\n");
-  for (int m=0; m<M && shown<12; ++m) for (int n=0; n<N && shown<12; ++n) {
-    double got=(double)float(hD[(size_t)m*N+n]), exp=gD[(size_t)m*N+n];
-    if (std::abs(got-exp) > 1e-2 + 5e-2*std::abs(exp)) {
-      int g=m/gs;
-      std::printf("    m=%3d n=%3d g=%d | q2=%d sc=%.2f zr=%.2f | got=%.3f exp=%.3f\n",
-                  m,n,g, q2[(size_t)m*N+n], hsc[(size_t)g*N+n], hzr[(size_t)g*N+n], got, exp);
-      ++shown;
-    }
-  }
+  // Direct look: D[0][n] for n=0..31. Each value = the q2 (tag) that output col n actually read.
+  //   1 = read the LOW  N-half (n%16<8)    2 = read the HIGH N-half (n%16>=8)
+  // Expect: 1 1 1 1 1 1 1 1  2 2 2 2 2 2 2 2  (repeat). Any n%16>=8 showing 1 = aliased to the low half.
+  std::printf("  D[0][0..31] (round) = ");
+  for (int n = 0; n < 32; ++n) { if (n%16==0) std::printf("| "); std::printf("%d ", (int)((double)float(hD[(size_t)0*N+n])+0.5)); }
+  std::printf("\n  D[1][0..31] (round) = ");
+  for (int n = 0; n < 32; ++n) { if (n%16==0) std::printf("| "); std::printf("%d ", (int)((double)float(hD[(size_t)1*N+n])+0.5)); }
+  std::printf("\n");
   return 0;
 }
