@@ -159,6 +159,15 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_q3_bconcat_probe PRIVATE -w)
 
+# Q3_K B-CONCAT ABLATION on the REAL .bin: runs the 2-plane kernel on the real numbers with a HOST golden recomputed
+# per ablation (real low+high / high=0 / low=0 / synthetic A) to localize a bug the synthetic probe cannot reproduce.
+#   Build: TARGET=test_q3_bconcat_ablate ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
+cutlass_example_add_executable(
+  test_q3_bconcat_ablate
+  test_q3_bconcat_ablate.cu
+)
+target_compile_options(test_q3_bconcat_ablate PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
