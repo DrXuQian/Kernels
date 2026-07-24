@@ -135,6 +135,43 @@ static void decode_group(Ctx& c) {
   std::printf("    SCALE group index: bad=%d/%d %s\n", bad, M * N, bad ? "MISINDEXED" : "identity");
 }
 
+// rung 7: DENSE A. Every rung above used A = identity, whose one-nonzero-per-row structure means each m-tile only
+// ever exercises the k values equal to its own row indices -- a dense A uses ALL k in EVERY m-tile. That is the
+// structural blind spot that let all the synthetic rungs pass while the real Q3_K GEMM (dense A) still mismatched.
+// A entries are multiples of 1/4 in [-1,1] so the fp16 products are exact; the host golden accumulates in fp32.
+static bool rung7(Ctx& c, const std::vector<uint8_t>& low, const std::vector<uint8_t>& high,
+                  const std::vector<half_t>& sc, const std::vector<half_t>& zr, const char* tag) {
+  std::vector<half_t> Ad((size_t)M * K);
+  for (int m = 0; m < M; ++m) for (int k = 0; k < K; ++k)
+    Ad[(size_t)m * K + k] = half_t(0.25f * float((int)((m * 31 + k * 17) % 9) - 4));   // {-1,-0.75,..,1}
+  c.dA.copy_from_host(Ad.data());
+  set_scales(c, sc, zr);
+  auto D = run(c, low, high);
+  int bad = 0, shown = 0; double maxrel = 0;
+  for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
+    double acc = 0;
+    for (int k = 0; k < K; ++k) {
+      const int g = k / gs;
+      double w = (double)float(sc[(size_t)g * N + n]) * ((double)low[(size_t)k * N + n] + 4.0 * (double)high[(size_t)k * N + n])
+               + (double)float(zr[(size_t)g * N + n]);
+      acc += (double)float(Ad[(size_t)m * K + k]) * w;
+    }
+    double got = (double)float(D[(size_t)m * N + n]);
+    double rel = std::abs(got - acc) / (std::abs(acc) + 1e-3);
+    if (rel > maxrel) maxrel = rel;
+    if (std::abs(got - acc) > 5e-2 + 5e-2 * std::abs(acc)) {
+      ++bad;
+      if (shown < 8) { std::printf("      m=%d n=%d | got=%.4f exp=%.4f\n", m, n, got, acc); ++shown; }
+    }
+  }
+  std::printf("    %-46s bad=%d/%d max_rel=%.2e %s\n", tag, bad, M * N, maxrel, bad == 0 ? "MATCH" : "MISMATCH");
+  // restore identity A for any later rung
+  std::vector<half_t> Ai((size_t)M * K, half_t(0.f));
+  for (int m = 0; m < M && m < K; ++m) Ai[(size_t)m * K + m] = half_t(1.f);
+  c.dA.copy_from_host(Ai.data());
+  return bad == 0;
+}
+
 // rung 0-2: compare D against low + 4*high
 static bool check(const char* tag, const std::vector<half_t>& D,
                   const std::vector<uint8_t>& low, const std::vector<uint8_t>& high) {
@@ -254,6 +291,26 @@ int main(int argc, char** argv) {
     check_affine("rung5 varying scale+zero, both planes", run(c, rlow, rhigh), rlow, rhigh, sc, zr);
   }
   decode_group(c);
+
+  // rung 7: the LAST structural difference from the real test -- a dense A.
+  std::printf("  --- rung 7: DENSE A (closes the identity-A blind spot) ---\n");
+  { std::vector<half_t> sc1((size_t)scale_k * N, half_t(1.f)), zr0((size_t)scale_k * N, half_t(0.f));
+    std::vector<half_t> scv((size_t)scale_k * N), zrv((size_t)scale_k * N);
+    for (int g = 0; g < scale_k; ++g) for (int n = 0; n < N; ++n) {
+      scv[(size_t)g * N + n] = half_t(0.125f * float(1 + (g * 5 + n) % 7));
+      zrv[(size_t)g * N + n] = half_t(-0.5f  * float(1 + (g * 3 + n) % 5));
+    }
+    std::vector<uint8_t> z2((size_t)K * N, 0);
+    bool a1 = rung7(c, rlow, z2,    sc1, zr0, "rung7a denseA, high=0,    uniform scale");
+    bool a2 = rung7(c, rlow, rhigh, sc1, zr0, "rung7b denseA, high=rand, uniform scale");
+    bool a3 = rung7(c, rlow, rhigh, scv, zrv, "rung7c denseA, high=rand, VARYING scale");
+    if (a1 && a2 && a3) std::printf("  ==> dense A is clean too: the kernel is correct on synthetic data end-to-end,\n"
+                                    "      so the real-weight MISMATCH is in the .bin/golden path, not the kernel.\n");
+    else if (a1 && !a2)  std::printf("  !! dense A + high plane fails while high=0 passes => HIGH-PLANE k coverage bug\n"
+                                    "      (only the k's on the identity diagonal were ever right).\n");
+    else if (!a1)        std::printf("  !! dense A fails even with high=0 => the fault is in the SHARED path under dense A.\n");
+    else                 std::printf("  !! only the VARYING-scale dense case fails => scale group vs k under dense A.\n");
+  }
   { std::vector<half_t> sc1((size_t)scale_k * N, half_t(1.f)), zr0((size_t)scale_k * N, half_t(0.f));
     set_scales(c, sc1, zr0); }   // restore uniform for rung 3
 
