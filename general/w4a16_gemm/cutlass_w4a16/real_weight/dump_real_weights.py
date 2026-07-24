@@ -56,6 +56,7 @@ _GT_FMT = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?
            10: "<Q", 11: "<q", 12: "<d"}
 _GT_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 GGML_Q4_K = 12
+GGML_Q2_K = 10   # 84 B / 256 elems: scales[16] (4b sc + 4b min per 16-elt sub-block), qs[64] (2b), d(f16), dmin(f16)
 
 class Gguf:
     def __init__(self, path):
@@ -107,6 +108,8 @@ class Gguf:
             n_elems *= d
         if ttype == GGML_Q4_K:
             nbytes = n_elems // 256 * 144
+        elif ttype == GGML_Q2_K:
+            nbytes = n_elems // 256 * 84
         elif ttype == 1:   # F16
             nbytes = n_elems * 2
         elif ttype == 0:   # F32
@@ -158,6 +161,39 @@ def unpack_q4k_expert(raw_bytes, N, K):
                     k = b * 256 + sub * 32 + j
                     q_signed[k, n] = int(qv) - 8
     return q_signed, scale.astype(np.float16), zero.astype(np.float16)
+
+
+def unpack_q2k_expert(raw_bytes, N, K):
+    """Q2_K tensor bytes, logical [N][K] (K/256 blocks per row). Mirrors llama.cpp dequantize_row_q2_K.
+    Returns q2[K,N] uint8 in [0,3], scale[K//16,N] f16 (=d*sc), zero[K//16,N] f16 (=-dmin*m).
+    W[k,n] = scale*q2 + zero, gs=16 (per 16-elt sub-block). NO -8 offset (q2 is unsigned, zero absorbs it)."""
+    nblk = K // 256
+    blk = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(N, nblk, 84)
+    scale_k = K // 16
+    q2    = np.zeros((K, N), np.uint8)
+    scale = np.zeros((scale_k, N), np.float32)
+    zero  = np.zeros((scale_k, N), np.float32)
+    for n in range(N):
+        for b in range(nblk):
+            rec    = blk[n, b]
+            scales = rec[0:16]
+            qs     = rec[16:80]
+            d    = np.frombuffer(rec[80:82].tobytes(), dtype=np.float16)[0].astype(np.float32)
+            dmin = np.frombuffer(rec[82:84].tobytes(), dtype=np.float16)[0].astype(np.float32)
+            for half in range(2):              # QK_K in two 128-elt halves; qs offset += 32
+                for j in range(4):             # shift = 2*j
+                    shift = 2 * j
+                    for which in range(2):     # two 16-elt sub-blocks: q[l] and q[l+16]
+                        is_full = half * 8 + j * 2 + which     # scales index 0..15
+                        sc = int(scales[is_full])
+                        dl = d * (sc & 0xF); ml = dmin * (sc >> 4)
+                        g = b * 16 + is_full                    # sub-block (gs=16)
+                        scale[g, n] = dl; zero[g, n] = -ml
+                        for l in range(16):
+                            qbyte = int(qs[half * 32 + which * 16 + l])
+                            k = b * 256 + is_full * 16 + l      # logical k (dequant y-order)
+                            q2[k, n] = (qbyte >> shift) & 3
+    return q2, scale.astype(np.float16), zero.astype(np.float16)
 
 
 # =========================================================== GPTQ unpack (sym, desc_act=false)
