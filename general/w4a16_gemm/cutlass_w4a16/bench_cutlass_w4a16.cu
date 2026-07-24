@@ -286,6 +286,10 @@ inline std::vector<TileCfg> supported_configs() {
     {"64x64:32x32:s3",   64,  64, 32, 32, 3},
     {"64x64:32x32:s5",   64,  64, 32, 32, 5},
     {"32x32:16x16:s3",   32,  32, 16, 16, 3},   // stock example default
+    {"64x32:32x16:s3",   64,  32, 32, 16, 3},   // small asymmetric (good for int1/int2: occupancy-limited by big TK)
+    {"32x64:16x32:s3",   32,  64, 16, 32, 3},
+    {"64x32:32x16:s4",   64,  32, 32, 16, 4},
+    {"32x64:16x32:s4",   32,  64, 16, 32, 4},
     {"128x64:64x32:s4", 128,  64, 64, 32, 4},
     {"64x128:32x64:s4",  64, 128, 32, 64, 4},
     {"128x128:64x64:s3",128, 128, 64, 64, 3},
@@ -304,6 +308,10 @@ inline std::vector<TileCfg> supported_configs() {
     if (_try(64,64,32,32,3))   { using G = Cfg<64,64,32,32,3>::Gemm;   _matched=true; BODY; }        \
     if (_try(64,64,32,32,5))   { using G = Cfg<64,64,32,32,5>::Gemm;   _matched=true; BODY; }        \
     if (_try(32,32,16,16,3))   { using G = Cfg<32,32,16,16,3>::Gemm;   _matched=true; BODY; }        \
+    if (_try(64,32,32,16,3))   { using G = Cfg<64,32,32,16,3>::Gemm;   _matched=true; BODY; }        \
+    if (_try(32,64,16,32,3))   { using G = Cfg<32,64,16,32,3>::Gemm;   _matched=true; BODY; }        \
+    if (_try(64,32,32,16,4))   { using G = Cfg<64,32,32,16,4>::Gemm;   _matched=true; BODY; }        \
+    if (_try(32,64,16,32,4))   { using G = Cfg<32,64,16,32,4>::Gemm;   _matched=true; BODY; }        \
     if (_try(128,64,64,32,4))  { using G = Cfg<128,64,64,32,4>::Gemm;  _matched=true; BODY; }        \
     if (_try(64,128,32,64,4))  { using G = Cfg<64,128,32,64,4>::Gemm;  _matched=true; BODY; }        \
     if (_try(128,128,64,64,3)) { using G = Cfg<128,128,64,64,3>::Gemm; _matched=true; BODY; }        \

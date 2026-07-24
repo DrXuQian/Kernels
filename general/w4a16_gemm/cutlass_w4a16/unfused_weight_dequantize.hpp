@@ -348,6 +348,26 @@ void add_bias_and_interleave_int2s_inplace(int8_t* packed_int2_tensor, const siz
     }
 }
 
+void add_bias_and_interleave_int1s_inplace(int8_t* packed_int1_tensor, const size_t num_elts)
+{
+    // W1A16: NO +bias. Register relayout for the int1 lop3 magic converter -- mirror of int2's split-at-8, here
+    // split-at-16 (32 bits / 32-bit register). dest d <- src bit (d<16 ? 2d : 2(d-16)+1); then the converter's
+    // lop3 h[t] = (bit 2t, bit 2t+1) reads the bits back as sequential adjacent pairs (the validated magic-OR order).
+    const size_t num_bytes     = num_elts / 8;   // 8 bits per byte
+    const size_t num_registers = num_bytes / 4;
+    uint32_t* register_ptr = reinterpret_cast<uint32_t*>(packed_int1_tensor);
+    for (size_t ii = 0; ii < num_registers; ++ii) {
+        const uint32_t current_register     = register_ptr[ii];
+        uint32_t       transformed_register = 0;
+        for (int dest_idx = 0; dest_idx < 32; ++dest_idx) {
+            const int      src_idx = dest_idx < 16 ? 2 * dest_idx : 2 * (dest_idx - 16) + 1;
+            const uint32_t src_bit = (current_register >> src_idx) & 0x1u;
+            transformed_register |= (src_bit << dest_idx);
+        }
+        register_ptr[ii] = transformed_register;
+    }
+}
+
 void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size_t num_elts, QuantTypeClass quant_type)
 {
     if (quant_type == QuantTypeClass::INT8_WEIGHT_ONLY) {
@@ -361,9 +381,8 @@ void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size
         add_bias_and_interleave_int2s_inplace(tensor, num_elts);
     }
     else if (quant_type == QuantTypeClass::PACKED_INT1_WEIGHT_ONLY) {
-        // W1A16: IDENTITY for now (the correctness-first magic-OR int1 converter reads bits sequentially). Add the
-        // int1 split relayout here in lockstep with the int1 lop3 converter (mirror of add_bias_and_interleave_int2s).
-        (void)tensor; (void)num_elts;
+        // W1A16 lop3: split-at-16 register relayout (mirror of the int2 split-at-8) that the int1 lop3 converter needs.
+        add_bias_and_interleave_int1s_inplace(tensor, num_elts);
     }
     else {
         // FT_CHECK_WITH_INFO(false, "Invalid quantization type for interleaving.");
