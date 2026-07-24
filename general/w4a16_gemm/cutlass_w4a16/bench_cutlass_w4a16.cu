@@ -841,7 +841,15 @@ void save_tactic(std::string const& path, Options const& o, std::string const& n
 //   MATCH    -> grouped kernel + strides are correct; the earlier MISMATCH was my hand-rolled verify setup.
 //   MISMATCH -> the grouped no-swap stride convention (esp. StrideB from the interleaved LayoutB) is wrong;
 //               compare vs block_D (the mixed kernel's own output) to localize.
+template <class QT = QuantType>
 void xcheck_grouped(Options const& options) {
+  if constexpr (sizeof_bits<QT>::value < 2) {
+    // W1A16: the grouped cross-check is hard-wired to TK=128, but int1 requires Block_K % 256 == 0 (AIU 32B min),
+    // so filter_and_run<...,uint1b_t> at TK=128 is ill-formed (BlockContSize%32 static_assert). int1's grouped
+    // path is validated by test_w1a16_diag (L=1) and test_w1a16_grouped instead. Discard this branch for int1.
+    std::printf("\n[xcheck grouped] SKIPPED for W1A16 (grouped cross-check fixed at TK=128, invalid for int1)\n");
+    (void)options;
+  } else {
   using GS = moe_grouped_ppu::GroupShape;
   int const L = 1, m = options.m, n = options.n, k = options.k, g = options.g;
 
@@ -900,6 +908,7 @@ void xcheck_grouped(Options const& options) {
   std::printf("\n  grp_D[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hg[i]));
   if (bValid) { std::printf("\n  blkD[0..5]  ="); for (int i = 0; i < 6; ++i) std::printf(" %8.3f", float(hk[i])); }
   std::printf("\n");
+  }   // end if constexpr (sizeof_bits<QT> >= 2)
 }
 
 int main(int argc, char const **args) {
