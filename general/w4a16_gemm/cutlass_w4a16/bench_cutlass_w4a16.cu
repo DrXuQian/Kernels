@@ -585,6 +585,8 @@ void initialize(Options const& options) {
     quant_type = QuantTypeClass::INT8_WEIGHT_ONLY;
   } else if (sizeof_bits<QuantType>::value == 4) {
     quant_type = QuantTypeClass::PACKED_INT4_WEIGHT_ONLY;
+  } else if (sizeof_bits<QuantType>::value == 2) {
+    quant_type = QuantTypeClass::PACKED_INT2_WEIGHT_ONLY;
   } else {
     std::cerr << "unsupported QuantType" << std::endl;
     exit(-1);
