@@ -321,6 +321,30 @@ void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const siz
     }
 }
 
+void add_bias_and_interleave_int2s_inplace(int8_t* packed_int2_tensor, const size_t num_elts)
+{
+    // W2A16 / uint2b_t: NO +bias (uint2 already [0,3]; the per-group affine 'zero' absorbs the offset). Register
+    // relayout to match the int2 lop3 magic converter (Stage 2) -- mirror of int4's split-at-4, here split-at-8
+    // (16 crumbs / 32-bit register vs int4's 8 nibbles). Rearranges one 32-bit reg (the 16 K of ONE N-row):
+    //   input : [c15 c14 ... c1 c0]  (each crumb 2 bits)
+    //   output: [c15 c13 c11 c9 c7 c5 c3 c1 | c14 c12 c10 c8 c6 c4 c2 c0]
+    //   dest d <- src crumb (d<8 ? 2d : 2(d-8)+1). Then the converter's lop3 h[t] = (crumb 2t, crumb 2t+1) reads
+    //   the crumbs back in sequential order 0..15 (each lop3 pairs a crumb with the one 16 bits = 8 crumbs away).
+    const size_t num_bytes     = num_elts / 4;   // 4 crumbs per byte
+    const size_t num_registers = num_bytes / 4;
+    uint32_t* register_ptr = reinterpret_cast<uint32_t*>(packed_int2_tensor);
+    for (size_t ii = 0; ii < num_registers; ++ii) {
+        const uint32_t current_register     = register_ptr[ii];
+        uint32_t       transformed_register = 0;
+        for (int dest_idx = 0; dest_idx < 16; ++dest_idx) {
+            const int      src_idx   = dest_idx < 8 ? 2 * dest_idx : 2 * (dest_idx - 8) + 1;
+            const uint32_t src_crumb = (current_register >> (2 * src_idx)) & 0x3u;
+            transformed_register |= (src_crumb << (2 * dest_idx));
+        }
+        register_ptr[ii] = transformed_register;
+    }
+}
+
 void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size_t num_elts, QuantTypeClass quant_type)
 {
     if (quant_type == QuantTypeClass::INT8_WEIGHT_ONLY) {
@@ -330,9 +354,8 @@ void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size
         add_bias_and_interleave_int4s_inplace(tensor, num_elts);
     }
     else if (quant_type == QuantTypeClass::PACKED_INT2_WEIGHT_ONLY) {
-        // W2A16 / uint2b_t: identity. (A per-reg relayout only reorders the 16 K of ONE N-row, so it can't affect
-        // the N-half permutation; the even/odd deinterleave candidate made it worse. The N issue is elsewhere.)
-        (void)tensor; (void)num_elts;
+        // Stage-2: was identity; now the split-at-8 register relayout that the int2 lop3 magic converter needs.
+        add_bias_and_interleave_int2s_inplace(tensor, num_elts);
     }
     else {
         // FT_CHECK_WITH_INFO(false, "Invalid quantization type for interleaving.");
