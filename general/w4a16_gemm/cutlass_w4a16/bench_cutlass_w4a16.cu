@@ -290,6 +290,13 @@ inline std::vector<TileCfg> supported_configs() {
     {"32x64:16x32:s3",   32,  64, 16, 32, 3},
     {"64x32:32x16:s4",   64,  32, 32, 16, 4},
     {"32x64:16x32:s4",   32,  64, 16, 32, 4},
+    // small-M + WIDE-N (for the sub-byte formats whose forced big TK makes A-smem = TileM*TK the limiter):
+    // A-smem depends only on TileM, total A traffic ~ (N/TileN), total B convert ~ (M/TileM). So shrink M for
+    // smem/occupancy, widen N for free (B is 1-2 bit). All 4 warps (1 x 4).
+    {"32x128:32x32:s3",  32, 128, 32, 32, 3},
+    {"32x256:32x64:s3",  32, 256, 32, 64, 3},
+    {"16x128:16x32:s3",  16, 128, 16, 32, 3},
+    {"16x256:16x64:s3",  16, 256, 16, 64, 3},
     {"128x64:64x32:s4", 128,  64, 64, 32, 4},
     {"64x128:32x64:s4",  64, 128, 32, 64, 4},
     {"128x128:64x64:s3",128, 128, 64, 64, 3},
@@ -312,6 +319,10 @@ inline std::vector<TileCfg> supported_configs() {
     if (_try(32,64,16,32,3))   { using G = Cfg<32,64,16,32,3>::Gemm;   _matched=true; BODY; }        \
     if (_try(64,32,32,16,4))   { using G = Cfg<64,32,32,16,4>::Gemm;   _matched=true; BODY; }        \
     if (_try(32,64,16,32,4))   { using G = Cfg<32,64,16,32,4>::Gemm;   _matched=true; BODY; }        \
+    if (_try(32,128,32,32,3))  { using G = Cfg<32,128,32,32,3>::Gemm;  _matched=true; BODY; }        \
+    if (_try(32,256,32,64,3))  { using G = Cfg<32,256,32,64,3>::Gemm;  _matched=true; BODY; }        \
+    if (_try(16,128,16,32,3))  { using G = Cfg<16,128,16,32,3>::Gemm;  _matched=true; BODY; }        \
+    if (_try(16,256,16,64,3))  { using G = Cfg<16,256,16,64,3>::Gemm;  _matched=true; BODY; }        \
     if (_try(128,64,64,32,4))  { using G = Cfg<128,64,64,32,4>::Gemm;  _matched=true; BODY; }        \
     if (_try(64,128,32,64,4))  { using G = Cfg<64,128,32,64,4>::Gemm;  _matched=true; BODY; }        \
     if (_try(128,128,64,64,3)) { using G = Cfg<128,128,64,64,3>::Gemm; _matched=true; BODY; }        \
