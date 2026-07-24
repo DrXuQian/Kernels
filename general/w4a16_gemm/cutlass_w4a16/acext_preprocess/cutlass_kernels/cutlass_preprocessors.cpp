@@ -464,11 +464,28 @@ void add_bias_and_interleave_int4s_inplace(int8_t* packed_int4_tensor, const siz
 void add_bias_and_interleave_int2s_inplace(int8_t* packed_int2_tensor, const size_t num_elts)
 {
     // W2A16 / uint2b_t: values are already unsigned [0,3] (the fp16 converter reads raw uint2 and the per-group
-    // affine 'zero' absorbs the offset) -> NO +bias step (unlike int4's +8). Register relayout kept IDENTITY to
-    // match the SEQUENTIAL base-16 converter (bits[2i:2i+2]). This within-register order must match the fp16 mma
-    // B-fragment; if the box shows a STRUCTURED permutation, add the analog of int4's [7,5,3,1,6,4,2,0] relayout
-    // HERE and the matching mask order in MixGemmNumericArrayConverter<half_t,uint2b_t,16>. No-op first cut.
-    (void)packed_int2_tensor; (void)num_elts;
+    // affine 'zero' absorbs the offset) -> NO +bias step (unlike int4's +8).
+    //
+    // STAGE-2 register relayout (was identity): mirror of add_bias_and_interleave_int4s_inplace, split at 8 (int2
+    // has 16 crumbs / 32-bit register vs int4's 8 nibbles). The int2 lop3 magic converter reads register crumb
+    // positions in the order [0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15] (each lop3 pairs a crumb with the one 16 bits
+    // = 8 crumbs away). We place logical crumb c at the position lop3 reads it so lop3 recovers crumbs 0..15
+    // sequentially, i.e. dest position d gets src crumb (d<8 ? 2d : 2(d-8)+1). After this, lop3 h[t] = (crumb 2t,
+    // crumb 2t+1) = exactly the SEQUENTIAL adjacent pairs the (validated Stage-1) N-half interleave expects.
+    const size_t num_bytes = num_elts / 4;   // 4 crumbs per byte
+    FT_CHECK_WITH_INFO(num_bytes % 4 == 0, "int2 tensor must be a multiple of 16 elts for register relayout");
+    const size_t num_registers = num_bytes / 4;
+    uint32_t* register_ptr = reinterpret_cast<uint32_t*>(packed_int2_tensor);
+    for (size_t ii = 0; ii < num_registers; ++ii) {
+        const uint32_t current_register     = register_ptr[ii];
+        uint32_t       transformed_register = 0;
+        for (int dest_idx = 0; dest_idx < 16; ++dest_idx) {
+            const int      src_idx   = dest_idx < 8 ? 2 * dest_idx : 2 * (dest_idx - 8) + 1;
+            const uint32_t src_crumb = (current_register >> (2 * src_idx)) & 0x3u;
+            transformed_register |= (src_crumb << (2 * dest_idx));
+        }
+        register_ptr[ii] = transformed_register;
+    }
 }
 
 void add_bias_and_interleave_quantized_tensor_inplace(int8_t* tensor, const size_t num_elts, QuantType quant_type)
