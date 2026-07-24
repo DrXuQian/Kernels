@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
     dBlo.copy_from_host(reinterpret_cast<uint2_t const*>(Blo.data()));
     dBhi.copy_from_host(reinterpret_cast<uint1_t const*>(Bhi.data()));
     moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3,
-                                    cutlass::uint2_t, cutlass::uint1_t>(
+                                    cutlass::uint2b_t, cutlass::uint1b_t>(
         dA.get(), dBlo.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
         M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr, dBhi.get());
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
