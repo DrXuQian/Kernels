@@ -814,8 +814,10 @@ Result run(Options &options, char const* label = "default")
     const double HBM_GBS = 2766.0;                               // ppu001 HBM peak
     const double gbs_min  = min_bytes  / (us * 1e-6) / 1e9;
     const double gbs_tile = tile_bytes / (us * 1e-6) / 1e9;
-    std::printf("  [CUTLASS gs=%d cfg=%s] M=%d %7.2f us | %6.1f TFLOP/s | cmp %5.1f%% | tile %6.0f GB/s (%5.1f%% HBM) | min %5.0f GB/s (%4.1f%%)\n",
-                options.g, label, options.m, us, tflops, 100.0 * tflops / 500.0,
+    // NOTE: the w%d tag (w4/w2/w1) is essential -- the cfg label alone is identical across quant builds and the
+    // numbers are easy to mix up between them (int4/int2/int1 all have a "64x64:32x32:s3").
+    std::printf("  [CUTLASS w%d gs=%d cfg=%s] M=%d %7.2f us | %6.1f TFLOP/s | cmp %5.1f%% | tile %6.0f GB/s (%5.1f%% HBM) | min %5.0f GB/s (%4.1f%%)\n",
+                int(sizeof_bits<QuantType>::value), options.g, label, options.m, us, tflops, 100.0 * tflops / 500.0,
                 gbs_tile, 100.0 * gbs_tile / HBM_GBS, gbs_min, 100.0 * gbs_min / HBM_GBS);
   }
 
