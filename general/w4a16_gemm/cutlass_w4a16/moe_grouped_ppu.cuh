@@ -173,7 +173,16 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
-  #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, SCH, TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
+  // N-FOLD auto-selection: the AIU needs a >=32B CONTIGUOUS-K run, i.e. TK*bits/8 >= 32. When the requested TK is
+  // below that (e.g. int2 at TK=64 -> 16B), fold FoldNeed adjacent N-columns into the run so the load stays legal
+  // while TileShape.K (and hence A-smem = TileM*TK*2) stays small. FoldNeed==1 -> no fold, schedule unchanged (all
+  // existing callers unaffected). Requires the weight to have been preprocessed with the matching FoldTK=TK.
+  static constexpr int MOEG_BITS     = cutlass::sizeof_bits<ElementB>::value;
+  static constexpr int MOEG_RUN_B    = TK * MOEG_BITS / 8;                       // contiguous bytes at this TK
+  static constexpr int MOEG_FOLD     = MOEG_RUN_B >= 32 ? 1 : (32 / MOEG_RUN_B); // fold factor needed
+  #define MOEG_SCHED(SCH) std::conditional_t<(MOEG_FOLD > 1), \
+      cutlass::gemm::KernelAiuFold<(MOEG_FOLD > 1 ? MOEG_FOLD : 2), SCH>, SCH>
+  #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, MOEG_SCHED(SCH), TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
       A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective

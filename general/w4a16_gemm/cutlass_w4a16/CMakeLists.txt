@@ -185,6 +185,16 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_grouped_int1_perf PRIVATE -w)
 
+# N-FOLD first box run: single-plane int2 folded to TileShape.K=64 (FoldF=2 -> operand run 128 elems = 32B, reusing
+# the validated int2@TK128 swzl/converter). Target geometry is int4@TK64 (measured 55.8% gs=32 / 53.1% gs=16) vs
+# int2@TK128's 37.1%/30.9%. A=identity/scale=1/zero=0 so D == the weight code (controlled-input check).
+#   Build: TARGET=test_fold_int2 ./build.sh ; run: ./<bin> [N] [K] [gs]
+cutlass_example_add_executable(
+  test_fold_int2
+  test_fold_int2.cu
+)
+target_compile_options(test_fold_int2 PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
