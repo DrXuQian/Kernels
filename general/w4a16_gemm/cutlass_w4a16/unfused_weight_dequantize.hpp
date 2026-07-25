@@ -638,6 +638,63 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
 // 32B run. The two folded N-columns land in the lower vs upper mma-K atom blocks (cute_nfold2.cu: 0/64 cross-contam),
 // so the mainloop consumes them as 2 output-N groups reusing one A -- no reduce, no converter change.
 // Placement VERIFIED bijective and consistent with the fragment split in scratchpad/nfold_p11.cpp.
+// N-FOLD offline placement, DERIVED (not probed). Replaces the whole standard relayout for a folded config: it maps
+// each logical (n,k) of a (TileShape.N x TileShape.K) tile straight to the physical (uint32 word, crumb) the kernel
+// will read, by composing three maps that were each verified locally:
+//   1. logical (n,k) -> (warp-half, lane, vreg, crumb)   [scratchpad/derive3.cu + derive4.cu, from cute's B-fragment]
+//        n = lane/4 + 16*warp_half + 8*(vreg>=2) + 32*((crumb>>1)&1)
+//        k = 2*(lane%4) + 8*(crumb&1) + 16*((crumb>>2)&1) + ((crumb>>3)&1) + 32*(vreg&1)
+//   2. (lane, vreg) -> uint32 word offset                [ppu_tsm_ld_swzl_sim, SWAP=true]
+//   3. crumb -> bit position within the uint32           (2 bits per int2 code)
+// Self-consistency verified locally: all 4096 logical (n,k) of a 64x64 tile land on 4096 DISTINCT physical positions,
+// zero collisions, zero misses.
+// KNOWN RESIDUAL RISK (one degree of freedom): the sim is recorded as unfaithful in the vreg->N-half pairing (the
+// hardware delivers [low N 32 | high N 32], i.e. src0,1 = low half / src2,3 = high half, not the sim's v-parity -- see
+// the ppu-w2a16-aiu-cube-width-bug memory). If that bites, the symptom is a systematic vreg swap and the fix is to
+// exchange the vreg>=2 test below; NFOLD_VREG_SWAP flips it.
+inline void nfold_place_derived_int2(int8_t* out, const int8_t* in,
+                                     const std::vector<size_t>& shape, int fold_tn, int fold_tk)
+{
+    const size_t K = shape.size() == 2 ? shape[0] : shape[1];
+    const size_t N = shape.size() == 2 ? shape[1] : shape[2];
+    const int    TN = fold_tn, TK = fold_tk;          // tile shape the kernel uses (e.g. 64 x 64)
+    const int    Ng = TN / 2;                         // FoldF = 2 for int2 at TK=64
+    const size_t bytes_per_tile = (size_t)Ng * (2 * TK) * 2 / 8;   // Ng rows x (F*TK) codes x 2 bit
+    std::fill(out, out + (size_t)K * N * 2 / 8, 0);
+    // walk logical (n,k) within each tile and scatter to the derived physical slot
+    for (size_t k0 = 0; k0 + TK <= K; k0 += TK)
+      for (size_t n0 = 0; n0 + TN <= N; n0 += TN) {
+        const size_t tile_idx  = (k0 / TK) * (N / TN) + (n0 / TN);
+        int8_t*      tile_base = out + tile_idx * bytes_per_tile;
+        for (int n = 0; n < TN; ++n)
+          for (int k = 0; k < TK; ++k) {
+            // invert map 1: find (warp_half, lane, vreg, crumb) for this (n,k)
+            const int warp_half = (n % 32) / 16;      // n in [16,32) or [48,64) -> upper warp pair
+            const int nn        = n % 16;             // within the warp-half's 16 rows... (see derivation)
+            const int vhi       = (nn >= 8) ? 1 : 0;  // vreg >= 2
+            const int nhalf     = (n >= 32) ? 1 : 0;  // crumb bit 1
+            const int lane      = 4 * (nn % 8) + (k % 8) / 2;
+            const int vlo       = (k >= 32) ? 1 : 0;  // vreg & 1
+            const int vreg      = 2 * vhi + vlo;
+            const int kk        = k % 32;
+            const int crumb     = ((kk / 8) % 2) | (nhalf << 1) | (((kk / 16) & 1) << 2) | ((kk & 1) << 3);
+            // map 2: swzl word offset for (lane, vreg), SWAP=true, slice 0
+            const int lane_row = lane / 4, lane_col = lane % 4;
+            const int vreg_row = (vreg / 2) * 8 + lane_row;
+            const int vreg_line = vreg_row / 4;
+            const int vreg_vec  = (vreg_row % 4) * 2 + (vreg % 2);
+            const int swz2 = (vreg_vec ^ (vreg_line % 2)) % 8;
+            const int word = vreg_line * 32 + swz2 * 4 + lane_col;
+            // map 3: crumb -> 2-bit field; read the source code from the row-major [K][N] input
+            const size_t src_i = (k0 + k) * N + (n0 + n);
+            const int    code  = (in[src_i / 4] >> (2 * (src_i % 4))) & 0x3;
+            const size_t dst_bit = ((size_t)warp_half * (bytes_per_tile * 4) + (size_t)word * 32 + crumb * 2);
+            int8_t*      dst_byte = tile_base + dst_bit / 8;
+            *dst_byte |= (int8_t)(code << (dst_bit % 8));
+          }
+      }
+}
+
 inline void nfold_column_pairs_ppu(int8_t*                    out,
                                    const int8_t*              in,
                                    const std::vector<size_t>& shape,
