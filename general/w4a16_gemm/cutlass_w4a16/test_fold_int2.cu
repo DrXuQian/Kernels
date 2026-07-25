@@ -66,11 +66,15 @@ int main(int argc, char** argv) {
   // 64x64 tile straight to the physical (word, crumb) the folded kernel reads. Verified locally: 4096 logical
   // positions -> 4096 distinct physical positions, no collisions/misses. Set NFOLD_STD=1 to fall back to the standard
   // relayout for an A/B (that baseline gave n=0..31 correct at k=0, everything else wrong).
-  if (getenv("NFOLD_STD"))
-    preprocess_weights_for_mixed_gemm<false, 256, 0>(
-        Bp.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
-  else
-    nfold_place_derived_int2(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64);
+  // Standard preprocess FIRST (all 5 steps), then the fold is a WORD-LEVEL regroup on its output that preserves the
+  // pipeline's own crumb order -- see nfold_regroup_words_int2. NFOLD_STD=1 skips the regroup (baseline A/B).
+  preprocess_weights_for_mixed_gemm<false, 256, 0>(
+      Bp.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
+  if (!getenv("NFOLD_STD")) {
+    std::vector<int8_t> tmp(Bp.size());
+    nfold_regroup_words_int2(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64);
+    Bp.swap(tmp);
+  }
 
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> dB((size_t)K*N);

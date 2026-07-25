@@ -638,67 +638,42 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
 // 32B run. The two folded N-columns land in the lower vs upper mma-K atom blocks (cute_nfold2.cu: 0/64 cross-contam),
 // so the mainloop consumes them as 2 output-N groups reusing one A -- no reduce, no converter change.
 // Placement VERIFIED bijective and consistent with the fragment split in scratchpad/nfold_p11.cpp.
-// N-FOLD offline placement, DERIVED (not probed). Replaces the whole standard relayout for a folded config: it maps
-// each logical (n,k) of a (TileShape.N x TileShape.K) tile straight to the physical (uint32 word, crumb) the kernel
-// will read, by composing three maps that were each verified locally:
-//   1. logical (n,k) -> (warp-half, lane, vreg, crumb)   [scratchpad/derive3.cu + derive4.cu, from cute's B-fragment]
-//        n = lane/4 + 16*warp_half + 8*(vreg>=2) + 32*((crumb>>1)&1)
-//        k = 2*(lane%4) + 8*(crumb&1) + 16*((crumb>>2)&1) + ((crumb>>3)&1) + 32*(vreg&1)
-//   2. (lane, vreg) -> uint32 word offset                [ppu_tsm_ld_swzl_sim, SWAP=true]
-//   3. crumb -> bit position within the uint32           (2 bits per int2 code)
-// Self-consistency verified locally: all 4096 logical (n,k) of a 64x64 tile land on 4096 DISTINCT physical positions,
-// zero collisions, zero misses.
-// KNOWN RESIDUAL RISK (one degree of freedom): the sim is recorded as unfaithful in the vreg->N-half pairing (the
-// hardware delivers [low N 32 | high N 32], i.e. src0,1 = low half / src2,3 = high half, not the sim's v-parity -- see
-// the ppu-w2a16-aiu-cube-width-bug memory). If that bites, the symptom is a systematic vreg swap and the fix is to
-// exchange the vreg>=2 test below; NFOLD_VREG_SWAP flips it.
-inline void nfold_place_derived_int2(int8_t* out, const int8_t* in,
+// N-FOLD offline placement, built from the GROUND TRUTH of the existing pipeline (scratchpad/pipe_truth.py, which
+// re-implements all 5 relayout steps and extracts the logical->physical map of the hardware-validated int2 path).
+//
+// GROUND TRUTH (this corrected a wrong assumption that cost many rounds): one uint32 holds codes of a SINGLE n --
+//     word  = n * (K/16) + k_block          (n-major; 16 codes per word)
+//     crumb d -> k = 8*(d%8) + (d>>3)  within that word's 64-k block
+// My earlier "target table" claimed a uint32 held both n and n+32 (from composing cute's fragment map with the
+// converter order). That was wrong -- it assumed a fragment slot ordering that does not hold -- which is why the
+// resulting placement measured ~72% wrong, i.e. essentially random.
+//
+// Consequently the fold is a WORD-LEVEL regroup that PRESERVES the pipeline's own crumb order: the folded physical row
+// r must carry n=r's k-tile words followed by n=(r+Ng)'s, so that one 32B run holds two logical N columns:
+//     folded_row r  =  [ n=r's (TK/16) words ] [ n=r+Ng's (TK/16) words ]
+// Run this on the OUTPUT of the standard preprocess (so all 5 steps, including split-at-8, already applied).
+inline void nfold_regroup_words_int2(int8_t* out, const int8_t* in_std,
                                      const std::vector<size_t>& shape, int fold_tn, int fold_tk)
 {
     const size_t K = shape.size() == 2 ? shape[0] : shape[1];
     const size_t N = shape.size() == 2 ? shape[1] : shape[2];
-    const int    TN = fold_tn, TK = fold_tk;          // tile shape the kernel uses (e.g. 64 x 64)
-    const int    Ng = TN / 2;                         // FoldF = 2 for int2 at TK=64
-    const size_t bytes_per_tile = (size_t)Ng * (2 * TK) * 2 / 8;   // Ng rows x (F*TK) codes x 2 bit
-    std::fill(out, out + (size_t)K * N * 2 / 8, 0);
-    // walk logical (n,k) within each tile and scatter to the derived physical slot
-    for (size_t k0 = 0; k0 + TK <= K; k0 += TK)
-      for (size_t n0 = 0; n0 + TN <= N; n0 += TN) {
-        const size_t tile_idx  = (k0 / TK) * (N / TN) + (n0 / TN);
-        int8_t*      tile_base = out + tile_idx * bytes_per_tile;
-        for (int n = 0; n < TN; ++n)
-          for (int k = 0; k < TK; ++k) {
-            // invert map 1: find (warp_half, lane, vreg, crumb) for this (n,k)
-            const int warp_half = (n % 32) / 16;      // n in [16,32) or [48,64) -> upper warp pair
-            const int nn        = n % 16;             // within the warp-half's 16 rows... (see derivation)
-            const int vhi       = (nn >= 8) ? 1 : 0;  // vreg >= 2
-            const int nhalf     = (n >= 32) ? 1 : 0;  // crumb bit 1
-            const int lane      = 4 * (nn % 8) + (k % 8) / 2;
-            const int vlo       = (k >= 32) ? 1 : 0;  // vreg & 1
-            const int vreg      = 2 * vhi + vlo;
-            const int kk        = k % 32;
-            const int crumb     = ((kk / 8) % 2) | (nhalf << 1) | (((kk / 16) & 1) << 2) | ((kk & 1) << 3);
-            // map 2: swzl word offset for (lane, vreg), SWAP=true, slice 0
-            // coord_h carries warp_half: lane/4 only spans 8 rows, but the folded tile has Ng=32 physical rows, so
-            // rows 8..31 are reached via the copy's coord_h. (My first version instead added a bogus BIT offset
-            // warp_half*(bytes_per_tile*4), which pushed addresses outside the tile -- that was the ~73%-wrong bug.
-            // With coord_h = 16*warp_half the words land exactly in [0,255] = 32 rows x 32B, verified locally.)
-            const int lane_row = lane / 4 + 16 * warp_half, lane_col = lane % 4;
-            const int vreg_row = (vreg / 2) * 8 + lane_row;
-            const int vreg_line = vreg_row / 4;
-            const int vreg_vec  = (vreg_row % 4) * 2 + (vreg % 2);
-            const int swz2 = (vreg_vec ^ (vreg_line % 2)) % 8;
-            const int word = vreg_line * 32 + swz2 * 4 + lane_col;
-            // map 3: crumb -> 2-bit field; read the source code from the row-major [K][N] input
-            // SOURCE ORDER: the caller packs the weight as [N][K] (4 codes per byte along K) -- see the qT build in
-            // test_fold_int2.cu -- so index it that way. Reading it as [K][N] (the first version) fetched the wrong
-            // code for every element, which alone makes the whole tile wrong regardless of the address derivation.
-            const size_t src_i = (n0 + n) * K + (k0 + k);
-            const int    code  = (in[src_i / 4] >> (2 * (src_i % 4))) & 0x3;
-            const size_t dst_bit = ((size_t)word * 32 + crumb * 2);   // warp_half is in coord_h above, not here
-            int8_t*      dst_byte = tile_base + dst_bit / 8;
-            *dst_byte |= (int8_t)(code << (dst_bit % 8));
-          }
+    const int    F = 2;                                  // int2 at TK=64 -> FoldF = 2
+    const int    Ng = fold_tn / F;                       // physical rows per tile
+    const int    WPK = fold_tk / 16;                     // uint32 words per (n, K-tile): 64 codes / 16
+    const int    WPN = (int)(K / 16);                     // words per n in the standard layout
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(in_std);
+    uint32_t*       dst = reinterpret_cast<uint32_t*>(out);
+    for (size_t k0 = 0; k0 + fold_tk <= K; k0 += fold_tk)
+      for (size_t n0 = 0; n0 + fold_tn <= N; n0 += fold_tn) {
+        const size_t tile = (k0 / fold_tk) * (N / fold_tn) + (n0 / fold_tn);
+        uint32_t* tbase = dst + tile * (size_t)Ng * F * WPK;
+        for (int r = 0; r < Ng; ++r)
+          for (int f = 0; f < F; ++f)
+            for (int w = 0; w < WPK; ++w) {
+              const size_t n_src = n0 + r + (size_t)f * Ng;         // partner column is n + Ng (in-tile)
+              const size_t src_w = n_src * WPN + (k0 / 16) + w;     // standard layout: n-major, 16 codes/word
+              tbase[(size_t)r * F * WPK + (size_t)f * WPK + w] = src[src_w];
+            }
       }
 }
 
