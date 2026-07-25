@@ -642,7 +642,8 @@ inline void nfold_column_pairs_ppu(int8_t*                    out,
                                    const int8_t*              in,
                                    const std::vector<size_t>& shape,
                                    QuantTypeClass             quant_type,
-                                   const int                  fold_tk)   // TileShape.K in ELEMENTS (e.g. 64)
+                                   const int                  fold_tk,   // TileShape.K in ELEMENTS (e.g. 64)
+                                   const int                  fold_tn = 64)  // TileShape.N -- the fold group PERIOD
 {
     const int    bits        = get_bits_in_quant_type(quant_type);
     const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
@@ -670,7 +671,14 @@ inline void nfold_column_pairs_ppu(int8_t*                    out,
                             // wants (n, k=16j+..) from swzl atom j and (n + Ng, same k) from swzl atom j+F/..., i.e.
                             // the SECOND half of the folded run must carry the column Ng away, not the neighbour.
                             // Adjacent pairing (n = g*F + f) is what produced the measured n_used = n & ~1.
-                            const size_t n     = f * (N / F) + g;
+                            // TILE-PERIODIC grouping (not global): the kernel iterates B in TileShape.N-wide tiles, so a
+                            // column may only be folded with a partner INSIDE its own tile -- pairing n with n+N/F
+                            // (global halves) puts the partner in a different tile, which the block never loads. The
+                            // fold group must therefore repeat with period fold_tn: within each tile of fold_tn
+                            // columns, physical row g takes logical columns g and g + fold_tn/F.
+                            const size_t tile   = g / (fold_tn / F);            // which TileShape.N-wide tile
+                            const size_t g_in   = g % (fold_tn / F);            // physical row inside the tile
+                            const size_t n      = tile * fold_tn + f * (fold_tn / F) + g_in;
                             const int    i     = ci * TKv + j;                          // tile_idx within super-tile
                             const size_t o_off = (size_t)T * VRPT * N + g * F * VRPT
                                                + (size_t)ci * F * TKv + (size_t)f * TKv + j;
