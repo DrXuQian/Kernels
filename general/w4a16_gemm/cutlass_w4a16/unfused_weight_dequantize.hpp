@@ -630,7 +630,53 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
     }
 }
 
-template<bool is_rowmajor, int RowsPerTile>
+// N-FOLD (P1.1): frees a sparse format's TileShape.K from the AIU 32-byte-contiguous-K floor. After
+// interleave_column_major_tensor_ppu has laid each column's K into 256-K super-tiles of VRPT uint32-vecs, this
+// interleaves ADJACENT N-column groups (of F = 32B-elems/FoldTK columns) at FoldTK-vec granularity, so each AIU
+// contiguous run (still 32B, i.e. 256 elems for the sparse plane) is [n_a's FoldTK-K][n_b's FoldTK-K][...]. That lets
+// the kernel run at TileShape.K = FoldTK (A-smem = TileM*FoldTK*2, halved/quartered) while the AIU still reads a legal
+// 32B run. The two folded N-columns land in the lower vs upper mma-K atom blocks (cute_nfold2.cu: 0/64 cross-contam),
+// so the mainloop consumes them as 2 output-N groups reusing one A -- no reduce, no converter change.
+// Placement VERIFIED bijective and consistent with the fragment split in scratchpad/nfold_p11.cpp.
+inline void nfold_column_pairs_ppu(int8_t*                    out,
+                                   const int8_t*              in,
+                                   const std::vector<size_t>& shape,
+                                   QuantTypeClass             quant_type,
+                                   const int                  fold_tk)   // TileShape.K in ELEMENTS (e.g. 64)
+{
+    const int    bits        = get_bits_in_quant_type(quant_type);
+    const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
+    const size_t K           = shape.size() == 2 ? shape[0] : shape[1];   // rows
+    const size_t N           = shape.size() == 2 ? shape[1] : shape[2];   // cols
+    const int    EPV  = 32 / bits;              // elements per uint32 vec
+    const int    VRPT = 256 / EPV;              // uint32-vecs per 256-K super-tile (matches interleave RowsPerTile=256)
+    const int    TKv  = fold_tk / EPV;          // uint32-vecs per FoldTK
+    const int    F    = (32 * 8 / bits) / fold_tk;   // fold factor: how many N columns fill one 32B run
+    const int    nsuper = int(K) / 256;
+    const int    chunks = VRPT / TKv;
+    assert(F >= 2 && "nfold: FoldTK too large (single column already >= 32B, no fold needed)");
+    assert(int(N) % F == 0 && VRPT % TKv == 0 && int(K) % 256 == 0 && "nfold: shape not fold-divisible");
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(in);
+    uint32_t*       dst = reinterpret_cast<uint32_t*>(out);
+    for (size_t e = 0; e < num_experts; ++e) {
+        const size_t moff = e * (N * K / EPV);
+        for (int T = 0; T < nsuper; ++T)
+            for (size_t g = 0; g < N / F; ++g)
+                for (int ci = 0; ci < chunks; ++ci)
+                    for (int f = 0; f < F; ++f)
+                        for (int j = 0; j < TKv; ++j) {
+                            const size_t n     = g * F + f;
+                            const int    i     = ci * TKv + j;                          // tile_idx within super-tile
+                            const size_t o_off = (size_t)T * VRPT * N + g * F * VRPT
+                                               + (size_t)ci * F * TKv + (size_t)f * TKv + j;
+                            const size_t i_off = (size_t)T * VRPT * N + n * VRPT + i;
+                            dst[moff + o_off] = src[moff + i_off];
+                        }
+    }
+}
+
+// FoldTK: 0 = no N-fold (default; existing callers byte-identical). >0 = TileShape.K in ELEMENTS to fold to.
+template<bool is_rowmajor, int RowsPerTile, int FoldTK = 0>
 void preprocess_weights_for_mixed_gemm(int8_t*                    preprocessed_quantized_weight,
                                        const int8_t*              row_major_quantized_weight,
                                        const std::vector<size_t>& shape,
@@ -664,6 +710,12 @@ void preprocess_weights_for_mixed_gemm(int8_t*                    preprocessed_q
     if constexpr (RowsPerTile != -1) {
         // column major -> column interleaved 256 major
         interleave_column_major_tensor_ppu(dst_buf.data(), src_buf.data(), shape, quant_type, RowsPerTile);
+        src_buf.swap(dst_buf);
+    }
+    if constexpr (FoldTK > 0) {
+        // N-fold: interleave adjacent N-column groups at FoldTK-vec granularity (after interleave-256, before split).
+        // Operates on whole uint32-vecs so it commutes with the per-uint32 split below. Off by default (FoldTK=0).
+        nfold_column_pairs_ppu(dst_buf.data(), src_buf.data(), shape, quant_type, FoldTK);
         src_buf.swap(dst_buf);
     }
     add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
