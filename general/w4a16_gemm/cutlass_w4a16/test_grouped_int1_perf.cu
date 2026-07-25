@@ -72,11 +72,11 @@ int main(int argc, char** argv) {
   auto B1 = pack_plane<8, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY>(q1);
   auto B2 = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>(q2);
 
-  cutlass::DeviceAllocation<half_t> A((size_t)M*K), Sc((size_t)scale_k*N), D((size_t)M*N);
+  cutlass::DeviceAllocation<half_t> A((size_t)M*K), Sc((size_t)scale_k*N), Zr((size_t)scale_k*N), D((size_t)M*N);
   cutlass::DeviceAllocation<uint1_t> dB1((size_t)K*N);
   cutlass::DeviceAllocation<uint2_t> dB2((size_t)K*N);
-  { std::vector<half_t> a((size_t)M*K, half_t(0.01f)), s((size_t)scale_k*N, half_t(0.05f));
-    A.copy_from_host(a.data()); Sc.copy_from_host(s.data()); }
+  { std::vector<half_t> a((size_t)M*K, half_t(0.01f)), s((size_t)scale_k*N, half_t(0.05f)), z((size_t)scale_k*N, half_t(-0.2f));
+    A.copy_from_host(a.data()); Sc.copy_from_host(s.data()); Zr.copy_from_host(z.data()); }
   dB1.copy_from_host(reinterpret_cast<uint1_t const*>(B1.data()));
   dB2.copy_from_host(reinterpret_cast<uint2_t const*>(B2.data()));
 
@@ -97,17 +97,30 @@ int main(int argc, char** argv) {
     std::printf("  %-30s %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n", tag, us, tf, 100.0*tf*1e12/500.0e12);
   };
 
+  // ScaleOnly (zeros=nullptr) vs ScaleZero (per-group zeros): the sweep bench used ScaleZero and got int1=3052us,
+  // this harness with ScaleOnly got 417us -- SAME config/shape/gs. So the suspect is the zero-loading path for
+  // int1 specifically (int2+ScaleZero was fine at ~251us). These four measurements pin it.
   if (which != 2) {
-    double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 32,128,256, 32,32, 3, uint1_t>(
+    double u0 = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 32,128,256, 32,32, 3, uint1_t>(
         A.get(), dB1.get(), Sc.get(), nullptr, pd.get(), sd.get(), gm.get(),
         M,N,K,1,gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr); }, 30);
-    rep("int1 grouped 32x128:256 s3", u);
+    rep("int1 32x128:256 s3  ScaleOnly", u0);
+    double uz = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 32,128,256, 32,32, 3, uint1_t>(
+        A.get(), dB1.get(), Sc.get(), Zr.get(), pd.get(), sd.get(), gm.get(),
+        M,N,K,1,gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr); }, 30);
+    rep("int1 32x128:256 s3  ScaleZero", uz);
+    std::printf("    -> int1 zero penalty = %.2fx\n", uz / u0);
   }
   if (which != 1) {
-    double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64,64,128, 32,32, 3, uint2_t>(
+    double u0 = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64,64,128, 32,32, 3, uint2_t>(
         A.get(), dB2.get(), Sc.get(), nullptr, pd.get(), sd.get(), gm.get(),
         M,N,K,1,gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr); }, 30);
-    rep("int2 grouped 64x64:128  s3 (ref)", u);
+    rep("int2 64x64:128  s3  ScaleOnly (ref)", u0);
+    double uz = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64,64,128, 32,32, 3, uint2_t>(
+        A.get(), dB2.get(), Sc.get(), Zr.get(), pd.get(), sd.get(), gm.get(),
+        M,N,K,1,gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr); }, 30);
+    rep("int2 64x64:128  s3  ScaleZero (ref)", uz);
+    std::printf("    -> int2 zero penalty = %.2fx\n", uz / u0);
   }
   return 0;
 }
