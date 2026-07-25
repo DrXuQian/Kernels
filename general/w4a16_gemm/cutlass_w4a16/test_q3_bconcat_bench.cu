@@ -146,6 +146,8 @@ int main(int argc, char** argv) {
   BC(32,32,256,32,32,3);   // smallest A tile
   BC(32,128,256,32,32,3);  // wide N (int1's own winner shape)
   BC(16,128,256,16,32,3);  // very small M
+  BC(16,64,256,16,32,3);   // TileM=16 min, keep A-smem floor
+  BC(16,256,256,16,32,3);  // TileM=16 + widest N: tiny A-smem, big tile area (best occ/reuse trade)
 
   std::printf("  --- int2 single-plane sweep (TK may be 128) ---\n");
   I2(64,64,128,32,32,3);
@@ -160,6 +162,8 @@ int main(int argc, char** argv) {
   I1(32,64,256,32,32,3);
   I1(32,32,256,32,32,3);
   I1(16,128,256,16,32,3);
+  I1(16,64,256,16,32,3);    // TileM=16 min
+  I1(16,256,256,16,32,3);   // TileM=16 + widest N
 
   std::printf("  ================= VERDICT =================\n");
   std::printf("  B-concat  best: %-16s %8.2f us\n", bBC.tag, bBC.us);
