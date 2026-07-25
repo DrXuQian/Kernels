@@ -97,6 +97,25 @@ int main(int argc, char** argv) {
     std::printf("  %-30s %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n", tag, us, tf, 100.0*tf*1e12/500.0e12);
   };
 
+  // PROFILE MODE (argv[6]): emit EXACTLY ONE kernel launch (no warmup, no timing loop) so `acu --set full` gets a
+  // single clean kernel to profile instead of dozens. 1=int1 ScaleOnly, 2=int1 ScaleZero, 3=int2 ScaleZero.
+  //   acu --set full ./<bin> 2048 4096 4096 128 1 2   # profile int1 ScaleZero alone
+  int prof = argc > 6 ? atoi(argv[6]) : 0;
+  if (prof) {
+    if (prof == 1) moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 32,128,256, 32,32, 3, uint1_t>(
+        A.get(), dB1.get(), Sc.get(), nullptr, pd.get(), sd.get(), gm.get(),
+        M,N,K,1,gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
+    else if (prof == 2) moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 32,128,256, 32,32, 3, uint1_t>(
+        A.get(), dB1.get(), Sc.get(), Zr.get(), pd.get(), sd.get(), gm.get(),
+        M,N,K,1,gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
+    else moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64,64,128, 32,32, 3, uint2_t>(
+        A.get(), dB2.get(), Sc.get(), Zr.get(), pd.get(), sd.get(), gm.get(),
+        M,N,K,1,gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    std::printf("[profile] emitted ONE kernel (prof=%d) -- for acu\n", prof);
+    return 0;
+  }
+
   // ScaleOnly (zeros=nullptr) vs ScaleZero (per-group zeros): the sweep bench used ScaleZero and got int1=3052us,
   // this harness with ScaleOnly got 417us -- SAME config/shape/gs. So the suspect is the zero-loading path for
   // int1 specifically (int2+ScaleZero was fine at ~251us). These four measurements pin it.
