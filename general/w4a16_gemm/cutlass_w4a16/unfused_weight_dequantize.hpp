@@ -679,7 +679,11 @@ inline void nfold_place_derived_int2(int8_t* out, const int8_t* in,
             const int kk        = k % 32;
             const int crumb     = ((kk / 8) % 2) | (nhalf << 1) | (((kk / 16) & 1) << 2) | ((kk & 1) << 3);
             // map 2: swzl word offset for (lane, vreg), SWAP=true, slice 0
-            const int lane_row = lane / 4, lane_col = lane % 4;
+            // coord_h carries warp_half: lane/4 only spans 8 rows, but the folded tile has Ng=32 physical rows, so
+            // rows 8..31 are reached via the copy's coord_h. (My first version instead added a bogus BIT offset
+            // warp_half*(bytes_per_tile*4), which pushed addresses outside the tile -- that was the ~73%-wrong bug.
+            // With coord_h = 16*warp_half the words land exactly in [0,255] = 32 rows x 32B, verified locally.)
+            const int lane_row = lane / 4 + 16 * warp_half, lane_col = lane % 4;
             const int vreg_row = (vreg / 2) * 8 + lane_row;
             const int vreg_line = vreg_row / 4;
             const int vreg_vec  = (vreg_row % 4) * 2 + (vreg % 2);
@@ -688,7 +692,7 @@ inline void nfold_place_derived_int2(int8_t* out, const int8_t* in,
             // map 3: crumb -> 2-bit field; read the source code from the row-major [K][N] input
             const size_t src_i = (k0 + k) * N + (n0 + n);
             const int    code  = (in[src_i / 4] >> (2 * (src_i % 4))) & 0x3;
-            const size_t dst_bit = ((size_t)warp_half * (bytes_per_tile * 4) + (size_t)word * 32 + crumb * 2);
+            const size_t dst_bit = ((size_t)word * 32 + crumb * 2);   // warp_half is in coord_h above, not here
             int8_t*      dst_byte = tile_base + dst_bit / 8;
             *dst_byte |= (int8_t)(code << (dst_bit % 8));
           }
