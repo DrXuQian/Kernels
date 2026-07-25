@@ -676,9 +676,17 @@ inline void nfold_column_pairs_ppu(int8_t*                    out,
                             // (global halves) puts the partner in a different tile, which the block never loads. The
                             // fold group must therefore repeat with period fold_tn: within each tile of fold_tn
                             // columns, physical row g takes logical columns g and g + fold_tn/F.
-                            const size_t tile   = g / (fold_tn / F);            // which TileShape.N-wide tile
-                            const size_t g_in   = g % (fold_tn / F);            // physical row inside the tile
-                            const size_t n      = tile * fold_tn + f * (fold_tn / F) + g_in;
+                            // Two candidate placements exist for which logical column each half of a physical row
+                            // carries; the in-tile-half one measured n_used = n//2 (i.e. output n read the wrong
+                            // half), so switch to ADJACENT: physical row r carries logical columns F*r + f.
+                            // MOEG_FOLD_CROSSHALF=1 restores the other candidate for A/B comparison.
+                            const size_t tile   = g / (fold_tn / F);
+                            const size_t g_in   = g % (fold_tn / F);
+#if defined(MOEG_FOLD_CROSSHALF)
+                            const size_t n      = tile * fold_tn + f * (fold_tn / F) + g_in;   // in-tile half pairing
+#else
+                            const size_t n      = tile * fold_tn + g_in * F + f;               // ADJACENT pairing
+#endif
                             const int    i     = ci * TKv + j;                          // tile_idx within super-tile
                             const size_t o_off = (size_t)T * VRPT * N + g * F * VRPT
                                                + (size_t)ci * F * TKv + (size_t)f * TKv + j;
