@@ -690,7 +690,10 @@ inline void nfold_place_derived_int2(int8_t* out, const int8_t* in,
             const int swz2 = (vreg_vec ^ (vreg_line % 2)) % 8;
             const int word = vreg_line * 32 + swz2 * 4 + lane_col;
             // map 3: crumb -> 2-bit field; read the source code from the row-major [K][N] input
-            const size_t src_i = (k0 + k) * N + (n0 + n);
+            // SOURCE ORDER: the caller packs the weight as [N][K] (4 codes per byte along K) -- see the qT build in
+            // test_fold_int2.cu -- so index it that way. Reading it as [K][N] (the first version) fetched the wrong
+            // code for every element, which alone makes the whole tile wrong regardless of the address derivation.
+            const size_t src_i = (n0 + n) * K + (k0 + k);
             const int    code  = (in[src_i / 4] >> (2 * (src_i % 4))) & 0x3;
             const size_t dst_bit = ((size_t)word * 32 + crumb * 2);   // warp_half is in coord_h above, not here
             int8_t*      dst_byte = tile_base + dst_bit / 8;
