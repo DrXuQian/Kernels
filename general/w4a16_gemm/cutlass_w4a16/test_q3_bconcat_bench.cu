@@ -19,6 +19,7 @@
 
 using half_t  = cutlass::half_t;
 using uint2_t = cutlass::uint2b_t;
+using int4_t  = cutlass::int4b_t;   // ceiling reference: int4@TK64 IS the geometry int2/int1-fold target
 using uint1_t = cutlass::uint1b_t;
 using GS      = moe_grouped_ppu::GroupShape;
 using DStride = moe_grouped_ppu::DStride;
@@ -45,6 +46,7 @@ static std::vector<int8_t> pack_plane(const std::vector<uint8_t>& q) {
 // globals filled in main, so the sweep macros stay short
 static cutlass::DeviceAllocation<half_t>  *dA, *dSc, *dZr, *dD, *dDhi;
 static cutlass::DeviceAllocation<uint2_t> *dBlo;
+static cutlass::DeviceAllocation<int4_t>  *dB4;
 static cutlass::DeviceAllocation<uint1_t> *dBhi;
 static cutlass::DeviceAllocation<GS>       *shpd;
 static cutlass::DeviceAllocation<half_t*>  *pd, *pd2;
@@ -90,6 +92,15 @@ static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; st
 // A-concat's int1 plane has zero == 0 (the Q3_K -4 center folds entirely into the LOW/int2 plane), so it runs
 // ScaleOnly -- NOT ScaleZero. The earlier sweep wrongly forced ScaleZero here, dragging int1 onto the 7x
 // FINE-per-atom-zero path (3052us) and making A-concat look 6x worse than it is. Real A-concat int1 is ScaleOnly.
+// int4 CEILING reference (ScaleOnly). int4@TK64 is exactly the A-smem/occupancy/tile geometry that int2-fold@TK64
+// and int1-fold@TK64 are engineered to reach (TM64, TK64, A-smem 8KB, ~50% occ, full MMA reuse). Also shows int4's
+// own TK sensitivity (TK64 vs TK128) => whether folding int4 further would even help.
+#define I4(TM,TN,TK,WM,WN,S) do { \
+  double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly,TM,TN,TK,WM,WN,S,int4_t>( \
+      dA->get(), dB4->get(), dSc->get(), nullptr, pd->get(), sd->get(), gm->get(), \
+      M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr); }, 30); \
+  report("i4 " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S, u); upd(bI4, #TM "x" #TN ":" #TK " s" #S, u); } while (0)
+
 #define I1(TM,TN,TK,WM,WN,S) do { \
   double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly,TM,TN,TK,WM,WN,S,uint1_t>( \
       dA->get(), dBhi->get(), dSc->get(), nullptr, pd2->get(), sd->get(), gm->get(), \
@@ -114,6 +125,9 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<half_t> A_((size_t)M*K), S_((size_t)scale_k*N), Z_((size_t)scale_k*N),
                                     D_((size_t)M*N), Dh_((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> Blo_((size_t)K*N);
+  std::vector<uint8_t> q4((size_t)K*N); for (size_t i=0;i<q4.size();++i) q4[i]=(uint8_t)(i%16);
+  auto B4 = pack_plane<2, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY>(q4);
+  cutlass::DeviceAllocation<int4_t> B4_((size_t)K*N); B4_.copy_from_host(reinterpret_cast<int4_t const*>(B4.data()));
   cutlass::DeviceAllocation<uint1_t> Bhi_((size_t)K*N);
   { std::vector<half_t> a((size_t)M*K, half_t(0.01f)), s((size_t)scale_k*N, half_t(0.05f)), z((size_t)scale_k*N, half_t(-0.2f));
     A_.copy_from_host(a.data()); S_.copy_from_host(s.data()); Z_.copy_from_host(z.data()); }
@@ -133,10 +147,10 @@ int main(int argc, char** argv) {
   wsb = (size_t)cutlass::ceil_div(M,16)*cutlass::ceil_div(N,64)*64;
   cutlass::DeviceAllocation<char> ws_(wsb);
 
-  dA=&A_; dSc=&S_; dZr=&Z_; dD=&D_; dDhi=&Dh_; dBlo=&Blo_; dBhi=&Bhi_; shpd=&shpd_;
+  dA=&A_; dSc=&S_; dZr=&Z_; dD=&D_; dDhi=&Dh_; dBlo=&Blo_; dBhi=&Bhi_; dB4=&B4_; shpd=&shpd_;
   pd=&pd_; pd2=&pd2_; sd=&sd_; gm=&gm_; offdev=&off_; ws=&ws_; shpv=&shp;
 
-  Best bBC{"",1e18}, bI2{"",1e18}, bI1{"",1e18};
+  Best bBC{"",1e18}, bI2{"",1e18}, bI1{"",1e18}, bI4{"",1e18};
 
   std::printf("  --- B-concat sweep (TK locked 256; smaller TileM / fewer stages cut A-smem to lift occupancy) ---\n");
   BC(64,64,256,32,32,3);   // baseline (acu: 12.5% occ, shared-limited)
@@ -156,6 +170,13 @@ int main(int argc, char** argv) {
   I2(64,128,128,32,64,3);
   I2(32,128,128,32,32,3);
 
+  std::printf("  --- int4 CEILING ref (TK64 = fold's target geometry; TK128 = int4's own TK sensitivity) ---\n");
+  I4(64,64,64,32,32,3);    // int4 native winner: TM64 TK64, A-smem 8KB, ~50% occ -- the ceiling
+  I4(32,64,64,32,32,3);
+  I4(64,128,64,32,64,3);
+  I4(64,64,128,32,32,3);   // int4 @ TK128 (bigger A-smem) -> if slower, small TK helps int4 too
+  I4(64,64,64,32,32,4);
+
   std::printf("  --- int1 single-plane sweep (TK must be 256) ---\n");
   I1(32,128,256,32,32,3);
   I1(64,64,256,32,32,3);
@@ -169,6 +190,7 @@ int main(int argc, char** argv) {
   std::printf("  B-concat  best: %-16s %8.2f us\n", bBC.tag, bBC.us);
   std::printf("  int2      best: %-16s %8.2f us\n", bI2.tag, bI2.us);
   std::printf("  int1      best: %-16s %8.2f us\n", bI1.tag, bI1.us);
+  std::printf("  int4 CEIL best: %-16s %8.2f us  <- fold target; int2/int1-fold ceiling\n", bI4.tag, bI4.us);
   double A = bI2.us + bI1.us;
   std::printf("  A-concat (best int2 + best int1, the honest sum): %8.2f us\n", A);
   std::printf("  => B-concat / A-concat = %.2fx  (%s)\n", bBC.us / A,
