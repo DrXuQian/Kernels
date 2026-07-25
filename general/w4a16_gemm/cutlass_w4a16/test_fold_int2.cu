@@ -37,8 +37,21 @@ int main(int argc, char** argv) {
               M, N, gs);
 
   // q2 codes, transposed to [N][K] and packed 4/byte, then the OFFLINE FOLD (FoldTK=64) in preprocess.
+  // LABELLED input (argv[4]): make the weight code SPELL OUT its own source index, so a wrong fold reads back as a
+  // decodable (k,n) instead of a value we have to guess-match. int2 holds only 4 values, so label one 2-bit field at
+  // a time: mode 1 -> q = (n >> shift) & 3, mode 2 -> q = (k >> shift) & 3 (shift from argv[5]).
+  //   run: <bin> N K gs 1 0   # decodes n bits 0-1 that the kernel actually consumed
+  const int label_mode  = argc > 4 ? atoi(argv[4]) : 0;
+  const int label_shift = argc > 5 ? atoi(argv[5]) : 0;
   std::vector<uint8_t> q((size_t)K * N);
-  for (size_t i = 0; i < q.size(); ++i) q[i] = (uint8_t)((i * 7 + i / 13) % 4);
+  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) {
+    size_t i = (size_t)k * N + n;
+    q[i] = label_mode == 1 ? (uint8_t)((n >> label_shift) & 3)
+         : label_mode == 2 ? (uint8_t)((k >> label_shift) & 3)
+                           : (uint8_t)((i * 7 + i / 13) % 4);
+  }
+  if (label_mode) std::printf("  LABEL mode=%d shift=%d: q encodes %s bits %d-%d\n", label_mode, label_shift,
+                              label_mode == 1 ? "n" : "k", label_shift, label_shift + 1);
   std::vector<int> qT((size_t)K * N);
   for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n * K + k] = q[(size_t)k * N + n];
   std::vector<int8_t> packed((size_t)K * N / 4, 0);
@@ -88,7 +101,9 @@ int main(int argc, char** argv) {
     double exp = (double)q[(size_t)m*N + n];          // scale=1, zero=0 => D == code
     if (std::abs(got - exp) > 0.25) {
       ++bad;
-      if (shown < 8) { std::printf("    m=%d n=%d | got=%.2f exp=%.2f\n", m, n, got, exp); ++shown; }
+      if (shown < 16) { std::printf("    m=%d n=%d | got=%.2f exp=%.2f%s\n", m, n, got, exp,
+          label_mode == 1 ? "   (got = the n-field the kernel actually read)" :
+          label_mode == 2 ? "   (got = the k-field the kernel actually read)" : ""); ++shown; }
     }
   }
   std::printf("  fold int2 TK=64 vs host codes: bad=%d/%d %s\n", bad, M*N, bad == 0 ? "MATCH" : "MISMATCH");
