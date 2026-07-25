@@ -62,11 +62,15 @@ int main(int argc, char** argv) {
   }
   std::vector<int8_t> Bp(packed.size());
   // FoldTK=64: the N-fold step (nfold_column_pairs_ppu) runs after interleave-256.
-  // FoldTK=0: the separate fold step is abandoned (it scrambled the pipeline's own crumb interleave). This test now
-  // exercises the folded KERNEL geometry (TileShape.K=64, FoldF=2) against the STANDARD relayout, which is the
-  // baseline the derived requirement must be reached from.
-  preprocess_weights_for_mixed_gemm<false, 256, 0>(
-      Bp.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
+  // DERIVED placement (nfold_place_derived_int2) INSTEAD of the standard relayout: it maps each logical (n,k) of a
+  // 64x64 tile straight to the physical (word, crumb) the folded kernel reads. Verified locally: 4096 logical
+  // positions -> 4096 distinct physical positions, no collisions/misses. Set NFOLD_STD=1 to fall back to the standard
+  // relayout for an A/B (that baseline gave n=0..31 correct at k=0, everything else wrong).
+  if (getenv("NFOLD_STD"))
+    preprocess_weights_for_mixed_gemm<false, 256, 0>(
+        Bp.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
+  else
+    nfold_place_derived_int2(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64);
 
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> dB((size_t)K*N);
