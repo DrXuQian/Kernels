@@ -87,11 +87,14 @@ static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; st
       M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr); }, 30); \
   report("i2 " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S, u); upd(bI2, #TM "x" #TN ":" #TK " s" #S, u); } while (0)
 
+// A-concat's int1 plane has zero == 0 (the Q3_K -4 center folds entirely into the LOW/int2 plane), so it runs
+// ScaleOnly -- NOT ScaleZero. The earlier sweep wrongly forced ScaleZero here, dragging int1 onto the 7x
+// FINE-per-atom-zero path (3052us) and making A-concat look 6x worse than it is. Real A-concat int1 is ScaleOnly.
 #define I1(TM,TN,TK,WM,WN,S) do { \
-  double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,uint1_t>( \
-      dA->get(), dBhi->get(), dSc->get(), dZr->get(), pd2->get(), sd->get(), gm->get(), \
+  double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly,TM,TN,TK,WM,WN,S,uint1_t>( \
+      dA->get(), dBhi->get(), dSc->get(), nullptr, pd2->get(), sd->get(), gm->get(), \
       M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr); }, 30); \
-  report("i1 " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S, u); upd(bI1, #TM "x" #TN ":" #TK " s" #S, u); } while (0)
+  report("i1 " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " (ScaleOnly)", u); upd(bI1, #TM "x" #TN ":" #TK " s" #S, u); } while (0)
 
 int main(int argc, char** argv) {
   M = argc > 1 ? atoi(argv[1]) : 2048;
