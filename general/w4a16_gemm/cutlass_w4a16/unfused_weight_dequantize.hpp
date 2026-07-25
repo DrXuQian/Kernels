@@ -632,7 +632,7 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
 
 // N-FOLD (P1.1): frees a sparse format's TileShape.K from the AIU 32-byte-contiguous-K floor. After
 // interleave_column_major_tensor_ppu has laid each column's K into 256-K super-tiles of VRPT uint32-vecs, this
-// interleaves ADJACENT N-column groups (of F = 32B-elems/FoldTK columns) at FoldTK-vec granularity, so each AIU
+// interleaves N-column groups PAIRED ACROSS HALVES (column g with g + N/F, ...) at FoldTK-vec granularity, so each AIU
 // contiguous run (still 32B, i.e. 256 elems for the sparse plane) is [n_a's FoldTK-K][n_b's FoldTK-K][...]. That lets
 // the kernel run at TileShape.K = FoldTK (A-smem = TileM*FoldTK*2, halved/quartered) while the AIU still reads a legal
 // 32B run. The two folded N-columns land in the lower vs upper mma-K atom blocks (cute_nfold2.cu: 0/64 cross-contam),
@@ -665,7 +665,12 @@ inline void nfold_column_pairs_ppu(int8_t*                    out,
                 for (int ci = 0; ci < chunks; ++ci)
                     for (int f = 0; f < F; ++f)
                         for (int j = 0; j < TKv; ++j) {
-                            const size_t n     = g * F + f;
+                            // CROSS-HALF pairing: the MMA pairs logical column n with n + N/F (not n with n+1).
+                            // Derived from the fragment slot maps (scratchpad/cute_nfold7.cu): at mma K-atom j the MMA
+                            // wants (n, k=16j+..) from swzl atom j and (n + Ng, same k) from swzl atom j+F/..., i.e.
+                            // the SECOND half of the folded run must carry the column Ng away, not the neighbour.
+                            // Adjacent pairing (n = g*F + f) is what produced the measured n_used = n & ~1.
+                            const size_t n     = f * (N / F) + g;
                             const int    i     = ci * TKv + j;                          // tile_idx within super-tile
                             const size_t o_off = (size_t)T * VRPT * N + g * F * VRPT
                                                + (size_t)ci * F * TKv + (size_t)f * TKv + j;
