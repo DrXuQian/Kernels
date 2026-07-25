@@ -676,17 +676,18 @@ inline void nfold_column_pairs_ppu(int8_t*                    out,
                             // (global halves) puts the partner in a different tile, which the block never loads. The
                             // fold group must therefore repeat with period fold_tn: within each tile of fold_tn
                             // columns, physical row g takes logical columns g and g + fold_tn/F.
-                            // Two candidate placements exist for which logical column each half of a physical row
-                            // carries; the in-tile-half one measured n_used = n//2 (i.e. output n read the wrong
-                            // half), so switch to ADJACENT: physical row r carries logical columns F*r + f.
-                            // MOEG_FOLD_CROSSHALF=1 restores the other candidate for A/B comparison.
+                            // DERIVED placement (scratchpad/derive2.cu, no probing): composing the converter's
+                            // fixed emission order sigma with cute's B-fragment slot->(n,k) map gives, per vreg,
+                            //   (crumb>>1)&1 == 0  ->  logical column n
+                            //   (crumb>>1)&1 == 1  ->  logical column n + TN/F
+                            // i.e. the folded partner is n + TN/F (in-tile), interleaved at a granularity of TWO
+                            // crumbs -- NOT the run's first/second half. Placing the partner at the half-run boundary
+                            // (my earlier attempts, adjacent or cross-half) mis-registers every 2 crumbs, which is
+                            // exactly the measured n_used = n//2. Calibration: the same composition reproduces the
+                            // validated split-at-8 for int2@TK128 (converter pair (t,t+8) == adjacent logical k).
                             const size_t tile   = g / (fold_tn / F);
                             const size_t g_in   = g % (fold_tn / F);
-#if defined(MOEG_FOLD_CROSSHALF)
-                            const size_t n      = tile * fold_tn + f * (fold_tn / F) + g_in;   // in-tile half pairing
-#else
-                            const size_t n      = tile * fold_tn + g_in * F + f;               // ADJACENT pairing
-#endif
+                            const size_t n      = tile * fold_tn + g_in + f * (fold_tn / F);
                             const int    i     = ci * TKv + j;                          // tile_idx within super-tile
                             const size_t o_off = (size_t)T * VRPT * N + g * F * VRPT
                                                + (size_t)ci * F * TKv + (size_t)f * TKv + j;
@@ -733,12 +734,17 @@ void preprocess_weights_for_mixed_gemm(int8_t*                    preprocessed_q
         interleave_column_major_tensor_ppu(dst_buf.data(), src_buf.data(), shape, quant_type, RowsPerTile);
         src_buf.swap(dst_buf);
     }
-    if constexpr (FoldTK > 0) {
-        // N-fold: interleave adjacent N-column groups at FoldTK-vec granularity (after interleave-256, before split).
-        // Operates on whole uint32-vecs so it commutes with the per-uint32 split below. Off by default (FoldTK=0).
-        nfold_column_pairs_ppu(dst_buf.data(), src_buf.data(), shape, quant_type, FoldTK);
-        src_buf.swap(dst_buf);
-    }
+    // N-FOLD: intentionally NOT a separate step any more. Derived locally (scratchpad/derive*.cu) and recorded in
+    // memory: the EXISTING pipeline (permute_B_rows_for_mixed_gemm + the two transposes + interleave-256) already
+    // interleaves several N columns into one 32B contiguous run AT CRUMB LEVEL -- proven from the validated
+    // int2@TK128 config, where cute maps vreg0/crumb0 -> (n0,k0) but vreg0/crumb2 -> (n32,k0), and one vreg is 16
+    // contiguous crumbs of ONE smem row. Appending a whole-uint32 vector permutation after interleave-256 therefore
+    // SCRAMBLES an interleave that was already correct -- which is exactly why the probe kept measuring
+    // n_used = n&~1 / n//2. The fold must instead come from parameterising the existing steps for the folded
+    // (TN, TK/F) shape; `nfold_column_pairs_ppu` is kept below only as a record of the abandoned approach.
+    static_assert(FoldTK == 0,
+        "N-fold via a separate post-interleave step is abandoned (it scrambles the pipeline's own crumb interleave); "
+        "parameterise the existing steps for the folded shape instead -- see ppu-aiu-n-contiguous-load memory");
     add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }

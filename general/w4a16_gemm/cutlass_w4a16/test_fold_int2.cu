@@ -62,7 +62,10 @@ int main(int argc, char** argv) {
   }
   std::vector<int8_t> Bp(packed.size());
   // FoldTK=64: the N-fold step (nfold_column_pairs_ppu) runs after interleave-256.
-  preprocess_weights_for_mixed_gemm<false, 256, 64>(
+  // FoldTK=0: the separate fold step is abandoned (it scrambled the pipeline's own crumb interleave). This test now
+  // exercises the folded KERNEL geometry (TileShape.K=64, FoldF=2) against the STANDARD relayout, which is the
+  // baseline the derived requirement must be reached from.
+  preprocess_weights_for_mixed_gemm<false, 256, 0>(
       Bp.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
 
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);
