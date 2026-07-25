@@ -176,6 +176,15 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_q3_bconcat_bench PRIVATE -w)
 
+# GROUPED int1 (vs int2 ref) single-plane PERF verification: matches the validated test_w1a16_grouped call
+# (FinegrainedScaleOnly, PACKED_INT1, 32x128:256:s3) but timed + acu-able. Isolates whether grouped int1 is genuinely
+# ~10x the dense record or a harness artifact.  Build: TARGET=test_grouped_int1_perf ./build.sh
+cutlass_example_add_executable(
+  test_grouped_int1_perf
+  test_grouped_int1_perf.cu
+)
+target_compile_options(test_grouped_int1_perf PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(
