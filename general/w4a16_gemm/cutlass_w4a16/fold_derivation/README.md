@@ -63,3 +63,28 @@ converter only relabels registers inside one thread.
 The practical consequence is that int1 is pinned at TK=128, so at gs=16 it carries `SK=8` where int2 and int4
 carry `SK=4`. That is the entire int1 gs=16 gap (ScaleOnly 54.3% at gs=32 against 45.3% at gs=16, while int2 is
 flat across the two). Closing it means working on the scale path, not the fold.
+
+## Knock-on: which TK each two-plane (B-concat) format may use
+
+Both planes of a B-concat share one `TileShape.K`, so the predicate has to hold for the **narrower** plane too.
+That fixes the choice with no search:
+
+| format | planes | TK=32 | TK=64 | TK=128 | verdict |
+|---|---|---|---|---|---|
+| Q6_K | int4 + int2 | int2 8 B ✗ | int4 F=1, int2 **F=2** ✓ | int2 F=1 (no fold) | **TK=64** — and the int2 plane does fold |
+| Q3_K | int2 + int1 | ✗ | int1 8 B ✗ | int2 F=1, int1 **F=2** ✓ | **TK=128** |
+| Q5_K | int4 + int1 | ✗ | int1 8 B ✗ | int4 F=1 (64 B col), int1 **F=2** ✓ | **TK=128** |
+
+So Q6 gets what it needed — its int2 plane folds at TK=64, which is the 53%-class geometry. Q3 and Q5 are pinned
+at TK=128 by their int1 plane, and at gs=16 that means `SK=8`.
+
+## Open question this leaves, and the cheap way to settle it
+
+int1 loses 9.0 points going gs=32 → gs=16 at a fixed tile (ScaleOnly 54.3 → 45.3, `SK` 4 → 8) while int2 loses
+0.1 at its fixed tile (`SK` 2 → 4). The natural reading is that `SK=8` is where the FINE scale reload starts to
+hurt, but that is an inference from two formats, not a measurement.
+
+One box run settles it without touching the fold: **int4 at TK=128, gs=32 vs gs=16.** Same tile, same occupancy,
+same converter — only `SK` moves 4 → 8. If int4 also drops ~9 points there, the cost is `SK`-driven and
+format-independent, and the scale path is the next thing to work on. If it stays flat, something int1-specific
+is going on and the 9 points are elsewhere.
