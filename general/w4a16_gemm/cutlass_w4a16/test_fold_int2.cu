@@ -34,9 +34,16 @@ int main(int argc, char** argv) {
   gs = argc > 3 ? atoi(argv[3]) : 32;
   M = K;                                   // identity A
   const int scale_k = K / gs;
-  const int fbits = getenv("FOLD_BITS") ? atoi(getenv("FOLD_BITS")) : 2;   // 1 = int1 (F=4), 2 = int2 (F=2)
-  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  FOLD: TileShape.K=64, FoldF=%d (32B run)\n",
-              M, N, gs, fbits, (32 * 8 / fbits) / 64);
+  const int fbits = getenv("FOLD_BITS") ? atoi(getenv("FOLD_BITS")) : 2;   // 1 = int1, 2 = int2
+  // FOLD_TK: the fold's TileShape.K. NOT free -- a swzl delivery is a fixed 16 B/thread, so it carries
+  // (16*8/bits) codes, while the mma fragment has 8*(TN/32)*(TK/16) slots. They must be EQUAL or the converter
+  // produces data with nowhere to go. int2 balances at TK=64 (64 codes = 64 slots); int1 packs twice as densely and
+  // balances at TK=128 (128 = 128). At int1/TK=64 it would be 128 codes into 64 slots -- every shape assert still
+  // passes (B MMA_N=2 matches accum, MMA_K=4 matches A), so it compiles and silently drops half the data, which is
+  // exactly the 44.9%-random result measured for int1 fold at TK=64.
+  const int ftk = getenv("FOLD_TK") ? atoi(getenv("FOLD_TK")) : (fbits == 1 ? 128 : 64);
+  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  FOLD: TileShape.K=%d, FoldF=%d (32B run)\n",
+              M, N, gs, fbits, ftk, (32 * 8 / fbits) / ftk);
 
   // q2 codes, transposed to [N][K] and packed 4/byte, then the OFFLINE FOLD (FoldTK=64) in preprocess.
   // LABELLED input (argv[4]): make the weight code SPELL OUT its own source index, so a wrong fold reads back as a
@@ -83,7 +90,7 @@ int main(int argc, char** argv) {
   preprocess_weights_for_mixed_gemm<false, 256, 0>(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, qtc);
   if (!getenv("NFOLD_STD")) {
     std::vector<int8_t> tmp(Bp.size());
-    nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64, fbits);
+    nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, ftk, fbits);
     Bp.swap(tmp);
   }
 
@@ -114,7 +121,7 @@ int main(int argc, char** argv) {
   // we go through filter_and_run with TK=64 -- which for plain int2 would be ILLEGAL (16B run) and is exactly what
   // the fold makes legal.
   if (fbits == 1)
-    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint1_t>(
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, uint1_t>(
         dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
         M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   else
@@ -161,6 +168,7 @@ int main(int argc, char** argv) {
     // B format differs, so an acu A/B isolates why int2-fold is more gs-sensitive (42.0 vs 53.1 at gs=16, while at
     // gs=32 it is 52.2 vs 55.8).
     cutlass::DeviceAllocation<cutlass::int4b_t> pB4((size_t)PK*PN);
+    cutlass::DeviceAllocation<uint1_t> pB1((size_t)PK*PN);
     const bool use_i4 = getenv("FOLD_INT4") != nullptr;
     // FOLD_SCALEONLY=1 -> FinegrainedScaleOnly (zeros=nullptr). CRITICAL for fair comparison: the recorded int4
     // "ceiling" numbers (55.8% gs=32 / 53.1% gs=16) came from the bench's I4 macro, which uses ScaleOnly, while the
@@ -176,6 +184,10 @@ int main(int argc, char** argv) {
       else if (use_i4)
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, cutlass::int4b_t>(
             pA.get(), pB4.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (fbits == 1)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, uint1_t>(
+            pA.get(), pB1.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else if (scale_only)
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 64, 32, 32, 3, uint2_t>(
