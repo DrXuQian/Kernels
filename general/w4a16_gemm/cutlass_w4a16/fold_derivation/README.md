@@ -11,7 +11,13 @@ g++ -O2 -std=c++17 ft_check.cpp       -o ftchk && ./ftchk
 g++ -O2 -std=c++17 sweep_shapes.cpp   -o sweep && ./sweep
 nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l2l3_layouts.cu -o l2l3 && ./l2l3
 nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include leg5_perthread.cu -o leg5 && ./leg5
+nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l5_slots.cu -o l5s && ./l5s
 ```
+
+`l5_slots.cu` is the load-bearing one — it is the only probe that builds the builder's **real** `TiledMma` shape
+rather than a stub, and correcting that is what settled the question twice over. `leg2`/`leg4`/`leg5` all use the
+stub layout, which corresponds to `WN=64`; their layout algebra is fine but their per-thread numbers describe a
+warp shape the fold tests do not use.
 
 `sweep_shapes.cpp` is the "will this break the build" check. The kernel-side guard depends on nothing but
 `(Bits, TileShape.K)`, so enumerating the distinct pairs the tree uses is exhaustive — section 1 does that, and
