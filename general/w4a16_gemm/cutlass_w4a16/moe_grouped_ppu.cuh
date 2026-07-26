@@ -107,9 +107,18 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   static_assert(std::is_same_v<DStride, cute::remove_pointer_t<StrideD>>,
                 "caller DStride must match CollectiveEpilogue::StrideD element type");
 
+  // same fold factor rule as filter_and_run (AIU needs a >=32B contiguous-K run: TK*bits/8 >= 32)
+  static constexpr int MOEG_BITS  = cutlass::sizeof_bits<ElementB>::value;
+  static constexpr int MOEG_RUN_B = cute::size<2>(TileShape{}) * MOEG_BITS / 8;
+  static constexpr int MOEG_FOLD  = MOEG_RUN_B >= 32 ? 1 : (32 / MOEG_RUN_B);
   const int scale_k = (k + group_size - 1) / group_size;
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));   // mainloop: single L-strided base
-  StrideB sB = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, L));
+  // N-FOLD: a folded weight buffer is physically (N/FoldF) rows x (FoldF*K) codes -- one physical row carries TWO
+  // logical N columns -- so its ROW PITCH is FoldF*K, not K. Computing the stride from (n,k) makes the kernel walk
+  // gmem with the unfolded pitch and read scrambled bytes no matter how the offline placed them (this is why three
+  // structurally different placements all measured ~72% = random).
+  StrideB sB = cutlass::make_cute_packed_stride(
+      StrideB{}, cute::make_shape(n / MOEG_FOLD, k * MOEG_FOLD, L));
   StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
   // C/D strides now come from the caller (per-expert ptr_D + stride_D arrays) -> contiguous output.
 
