@@ -177,12 +177,28 @@ int main(int argc, char** argv) {
     // "int2-fold 42.0 vs int4 53.1" gap was measuring.
     const bool scale_only = getenv("FOLD_SCALEONLY") != nullptr;
     auto run = [&]{
-      if (use_i4 && scale_only)
+      if (use_i4 && ftk == 64 && scale_only)
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 64, 32, 32, 3, cutlass::int4b_t>(
             pA.get(), pB4.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
-      else if (use_i4)
+      else if (use_i4 && ftk == 64)
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, cutlass::int4b_t>(
+            pA.get(), pB4.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (!use_i4 && fbits == 2 && ftk == 128 && scale_only)   // int2 @TK=128 (unfolded) -- same-TK control
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3, uint2_t>(
+            pA.get(), pB.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (!use_i4 && fbits == 2 && ftk == 128)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, uint2_t>(
+            pA.get(), pB.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (use_i4 && ftk == 128 && scale_only)                  // int4 @TK=128 -- same-TK control
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3, cutlass::int4b_t>(
+            pA.get(), pB4.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (use_i4 && ftk == 128)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, cutlass::int4b_t>(
             pA.get(), pB4.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else if (fbits == 1 && scale_only)
@@ -204,7 +220,8 @@ int main(int argc, char** argv) {
     if (getenv("FOLD_ONCE")) {                 // acu: emit exactly ONE kernel launch
       run(); CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
       std::printf("  [acu] one launch: %s %s gs=%d\n",
-                  use_i4 ? "int4@TK64" : (fbits == 1 ? "int1f@TK128" : "int2f@TK64"),
+                  use_i4 ? (ftk == 128 ? "int4@TK128" : "int4@TK64")
+                       : (fbits == 1 ? "int1f@TK128" : (ftk == 128 ? "int2@TK128" : "int2f@TK64")),
                   scale_only ? "ScaleOnly" : "ScaleZero", gs);
       return 0;
     }
@@ -216,7 +233,8 @@ int main(int argc, char** argv) {
     float ms = 0; hggcEventElapsedTime(&ms, e0, e1);
     const double us = (double)ms * 1e3 / 30, tf = 2.0*PM*PN*PK / (us*1e-6) / 1e12;
     std::printf("  [fold perf] %-9s %-9s M=%d N=%d K=%d gs=%d : %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n",
-                use_i4 ? "int4@TK64" : (fbits == 1 ? "int1f@TK128" : "int2f@TK64"),
+                use_i4 ? (ftk == 128 ? "int4@TK128" : "int4@TK64")
+                       : (fbits == 1 ? "int1f@TK128" : (ftk == 128 ? "int2@TK128" : "int2f@TK64")),
                 scale_only ? "ScaleOnly" : "ScaleZero",
                 PM, PN, PK, gs, us, tf, 100.0*tf*1e12/500.0e12);
     std::printf("     compare: int2@TK128 = 37.1%% (gs=32) / 30.9%% (gs=16) ; int4@TK64 = 55.8%% / 53.1%%\n");
