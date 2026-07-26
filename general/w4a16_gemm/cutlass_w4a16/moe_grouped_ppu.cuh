@@ -117,14 +117,10 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // forbidden (64,128,64) with nothing to stop it. Sub-byte B only: fp16/int8 B never folds. A bare alias would
   // NOT do: naming a specialization as a template argument does not instantiate it, so the asserts would stay
   // asleep. fold::Check<> below reads a member, which requires completeness and therefore fires them.
-  // The one fold constraint that is real AND verified against cute: a thread cannot use more codes than its
-  // fragment has slots, because the surplus is never fetched. `slots` below was checked against
-  // partition_B for the default 32x32 warp tile only, so the guard is scoped to that -- the Q3 B-concat sweep
-  // runs 16x32 warps, where this TiledMMA (and hence the slot count) is a different shape.
-  //
-  // NOT asserted here, deliberately: an earlier version of this guard also demanded TK*Bits >= 128 ("a folded
-  // column cannot be narrower than a half-run"). That was WRONG -- see fold_derivation/. It assumed one logical
-  // column per 32-bit word, which is a limitation of the offline packer, not of the hardware.
+  // The one fold constraint that is real AND measured against cute: a thread cannot use more codes than its mma
+  // fragment has slots, because the surplus is never fetched. slots = WN*TK/32, validated on the builder's real
+  // TiledMma across twelve configs (fold_derivation/l5_slots.cu) -- it does NOT depend on TN, since B is split
+  // across the warps in N. Over-delivery alone separates all nine ppu001 reference points.
   static_assert(fold::CheckDelivery<MOEG_BITS, cute::size<1>(TileShape{}), cute::size<2>(TileShape{}),
                                     cute::size<0>(WarpShape{}), cute::size<1>(WarpShape{})>::ok,
                 "B plane: swzl over-delivers -- the fragment has fewer slots than one delivery carries");

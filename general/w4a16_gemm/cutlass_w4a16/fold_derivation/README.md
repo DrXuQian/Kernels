@@ -43,61 +43,94 @@ else reaches a run-word (checked over all 128 `(lane, v)` pairs).
 demands. The answer, for every tile shape tried: **N depends on `lane/4` and the value bits only.** `lane%4`
 moves K at stride 2 and never touches N.
 
-## The theorem
+## The one hard limit
 
-The four lanes of a `lane/4` group demand the *same* N, and they receive the four *different* words of a half.
-So every word of a half must carry the same logical column — a folded column can never be narrower than a
-half-run:
+Both legs above are sound measurements, but the conclusion I first drew from them was not, and the fix came from
+a third measurement: **`l5_slots.cu` builds the builder's real `TiledMma`** — `WarpOnN = TN/WN`,
+`PermN = WarpOnN*16` — instead of the stub warp layout the earlier probes used. With that, the per-thread B
+fragment is
 
 ```
-TK * Bits >= 128        (and F <= 2 follows, since F = 256 / (TK*Bits))
+slots = WN * TK / 32        measured over 12 configs; note it does NOT contain TN
 ```
 
-One-sided on purpose. A column *wider* than a run is fine; it just spans several 32 B slices, which is the
-ordinary unfolded case (int4 at TK=128 is 64 B per column).
+`slots` being independent of `TN` is the crux, and it is why widening the tile never bought anything: B is split
+across the warps in N, so a wider tile is more work per block, not a bigger fragment per thread.
 
-Smallest legal TK: **int1 → 128, int2 → 64, int4 → 32.**
+One predicate then separates all nine ppu001 reference points, **9/9**:
 
-**leg3** checks the predicate against all nine ppu001 reference points — seven that ran correctly and two that
-returned garbage. Zero mismatches. **ft_check** does the same through `FoldTraits` itself, so the header's
-`static_assert`s are what is being tested, not a restatement of them.
+```
+delivery <= slots        i.e.   WN * TK * Bits >= 4096
+```
+
+Over-delivery is unrecoverable — a thread cannot use more codes than its fragment has slots, and the surplus is
+never fetched. At the `WM=WN=32` every fold test passes, this reduces to `TK*Bits >= 128`.
+
+## Two wrong turns, and what each got right
+
+| version | claim | verdict |
+|---|---|---|
+| v1 | `TK*Bits >= 128`, therefore `F <= 2`, therefore int1 can never use TK=64 | right inequality, **wrong reason**, and the "never" was wrong |
+| v2 | that bound is not real; the offline packer is what fails | right that int1@TK=64 is reachable, **wrong** that the bound is not real |
+
+v1's error: LEG 2 shows the four lanes of a `lane/4` group demand the same *set* of N, and I read it as the same
+*single* N, then concluded a folded column must fill a half-run. A thread demands many columns, so nothing forces
+that. v2's error: it also used the stub warp layout, so its `cols_per_word` came out 2 for a config where the
+real layout gives 1 — at `WN=32` the packer was never the binding constraint.
+
+**Where the escape actually is:** `slots` scales with `WN`. Same int1 at TK=64 —
+
+| WN | slots | delivery | verdict | cols/word |
+|---|---|---|---|---|
+| 32 | 64 | 128 | over-delivery — impossible | 1 |
+| 64 | 128 | 128 | tight — **feasible** | 2 |
+| 128 | 256 | 128 | under — feasible, with headroom | 4 |
+
+The price is the thing v2 found, which is real but only bites once `WN > 32`:
+
+```
+cols_per_word = WN / 32     how many logical columns must share one 32-bit word
+```
+
+`nfold_regroup_gmem` moves whole `uint32`s (`dst[dst_w] = src[src_w]`), so it can only ever do 1. **int1 at TK=64
+needs both a higher WN and a bit-granular packer** — the two constraints pincer it, and neither alone suffices.
+
+Smallest legal TK:
+
+| | WN=32 | WN=64 | WN=128 |
+|---|---|---|---|
+| int4 | 32 | 16 | 16 |
+| int2 | 64 | 32 | 16 |
+| int1 | **128** | **64** | 32 |
 
 ## What this rules out
 
-`F=4` is **not** a converter limitation. The converter's bases `{0,32,2,34}` look like a two-way N split, and
-the obvious fix is a four-way variant with `{0,16,32,48}`. It cannot work: at `F=4` a column is 8 B, so
-`f = 2*(v%2) + (lane%4)/2`, and the third and fourth columns of a run are delivered to **different lanes**. A
-converter only relabels registers inside one thread.
-
-The practical consequence is that int1 is pinned at TK=128, so at gs=16 it carries `SK=8` where int2 and int4
-carry `SK=4`. That lines up with int1's gs=16 gap (ScaleOnly 54.3% at gs=32 against 45.3% at gs=16, while int2 is
-flat across the two), which points at the scale path rather than the fold — see the last section for the run
-that would actually confirm it.
+`F=4` is not a converter limitation. The converter's bases `{0,32,2,34}` look like a two-way N split, and the
+obvious fix is a four-way variant with `{0,16,32,48}`. It would not have helped: at `WN=32` the config is
+over-delivering, so the data does not arrive at all, and a converter only relabels registers inside one thread.
 
 ## Knock-on: which TK each two-plane (B-concat) format may use
 
-Both planes share one `TileShape.K`, and the hard limit (`delivery <= slots`) has to hold for the narrower one.
-The packer limit binds separately, and it is the one that moves:
+Both planes share one `TileShape.K` and one warp shape, so the bound has to hold for the **narrower** plane:
 
-| format | planes | with today's whole-word packer | once the packer is bit-granular |
+| format | planes | at WN=32 | at WN=64 (needs the bit-granular packer) |
 |---|---|---|---|
-| Q6_K | int4 + int2 | **TK=64** — int4 F=1, int2 F=2, both `cols/word <= 1` | unchanged |
-| Q3_K | int2 + int1 | **TK=128** — int1 would need `cols/word = 2` at TK=64 | **TK=64**, at TN >= 128 |
-| Q5_K | int4 + int1 | **TK=128** — same reason | **TK=64**, at TN >= 128 |
+| Q6_K | int4 + int2 | **TK=64** — int2 is the binding plane | TK=32 |
+| Q3_K | int2 + int1 | **TK=128** — int1 is binding | **TK=64** |
+| Q5_K | int4 + int1 | **TK=128** — int1 is binding | **TK=64** |
 
-Q6 needs nothing new: its int2 plane already folds at TK=64. Q3 and Q5 are held at TK=128 only by the packer, so
-the bit-granular offline unblocks them too — which matters, because at gs=16 TK=128 means `SK=8`.
+Q6 needs nothing new: its int2 plane already folds at TK=64. Q3 and Q5 sit at TK=128, and at gs=16 that means
+`SK=8`, so the WN=64 route matters to them as much as to standalone int1.
 
-## Open question this leaves, and the cheap way to settle it
+## Open question, and the cheap way to settle it
 
-int1 loses 9.0 points going gs=32 → gs=16 at a fixed tile (ScaleOnly 54.3 → 45.3, `SK` 4 → 8) while int2 loses
-0.1 at its fixed tile (`SK` 2 → 4). The natural reading is that `SK=8` is where the FINE scale reload starts to
-hurt, but that is an inference from two formats, not a measurement.
+int1 loses 9.0 points from gs=32 to gs=16 at a fixed tile (ScaleOnly 54.3 → 45.3, `SK` 4 → 8) while int2 loses
+0.1 at its own fixed tile (`SK` 2 → 4). The natural reading is that `SK=8` is where the FINE scale reload starts
+to hurt — but those int1 numbers are themselves unverified (the harness measured a different tile than it
+checked), so this needs re-measuring before it means anything.
 
-One box run settles it without touching the fold: **int4 at TK=128, gs=32 vs gs=16.** Same tile, same occupancy,
-same converter — only `SK` moves 4 → 8. If int4 also drops ~9 points there, the cost is `SK`-driven and
-format-independent, and the scale path is the next thing to work on. If it stays flat, something int1-specific
-is going on and the 9 points are elsewhere.
+One box run isolates the mechanism regardless: **int4 at TK=128, gs=32 vs gs=16.** Same tile, same occupancy,
+same converter — only `SK` moves 4 → 8.
 
 
 ## The index chains, as cute Layouts (`l2l3_layouts.cu`)

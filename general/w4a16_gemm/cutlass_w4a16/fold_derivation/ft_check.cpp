@@ -4,8 +4,8 @@
 #include <cstdio>
 using namespace fold;
 template<class T> void show(const char* tag){
-  printf("  %-18s F=%d Ng=%3d colw=%d deliv=%3d slots=%3d | smem=%6d B warps=%d blocks=%d\n",
-         tag, T::F, T::Ng, T::col_words, T::delivery, T::slots, T::smem, T::warps, T::blocks);
+  printf("  %-18s F=%d Ng=%3d deliv=%3d slots=%3d cols/wd=%d | smem=%6d B warps=%d blocks=%d\n",
+         tag, T::F, T::Ng, T::delivery, T::slots, T::cols_per_word, T::smem, T::warps, T::blocks);
 }
 int main(){
   printf("FoldTraits -- the 7 validated box configs must all instantiate:\n");

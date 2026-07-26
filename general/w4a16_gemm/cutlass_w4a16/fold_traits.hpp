@@ -57,8 +57,9 @@ struct FoldTraits {
 
   // ---- the two quantities that must agree ----
   static constexpr int delivery = 16 * 8 / Bits;                  // one swzl instruction hands a thread 16 BYTES
-  static constexpr int slots    = 8 * (TN / 32) * (TK / 16);      // fp16 B-fragment slots per thread
-  static constexpr int col_words = TK * Bits / 32;                // uint32 words one folded column occupies
+  // MEASURED against partition_B on the builder's real TiledMma over 12 configs (fold_derivation/l5_slots.cu).
+  // Independent of TN: B is split across the warps in N, so a wider tile is more work, not a bigger fragment.
+  static constexpr int slots    = WN * TK / 32;                   // fp16 B-fragment slots per thread
 
   // ---- occupancy ----
   static constexpr int a_smem   = TM * TK * 2;                    // fp16 A tile per stage
@@ -84,43 +85,53 @@ struct FoldTraits {
   // DERIVED, not asserted: how many logical columns the offline must fit into ONE 32-bit word. 1 means the
   // simple whole-word packer works; >1 means it must interleave columns at bit granularity. int1 at TK=64
   // needs 2, and that -- not any hardware limit -- is what the current packer cannot do.
-  // Straight from cute's partition_B (leg5_perthread.cu, four shapes predicted and measured): one thread demands
-  //     TN/16 columns  x  TK/4 k each,  and receives  TN*TK*Bits/2048  words of 32/Bits codes.
-  // Dividing gives how many logical columns must share ONE 32-bit word:
-  static constexpr int cols_demanded  = TN / 16;
-  static constexpr int k_per_col      = TK / 4;
-  static constexpr int words_per_thr  = TN * TK * Bits / 2048;
-  static constexpr int cols_per_word_num = 128;               // cols_per_word = 128 / (TK*Bits), as a ratio
-  static constexpr int cols_per_word_den = TK * Bits;
-  // <=1 means the whole-word packer in nfold_regroup_gmem suffices (it moves uint32s, so one column per word).
-  // >1 means several columns must be INTERLEAVED inside a word, which needs a bit-granular offline. int1 at
-  // TK=64 needs 2 -- and asserting this away as "impossible" is the mistake this header used to make.
-  static constexpr bool wholeword_packer_ok = cols_per_word_num <= cols_per_word_den;
+  // Also measured on the real TiledMma (same file): one thread demands WN/8 columns x TK/4 k each, and one swzl
+  // delivery is 4 words of 32/Bits codes. Both are functions of WN, not TN.
+  static constexpr int cols_demanded = WN / 8;
+  static constexpr int k_per_col     = TK / 4;
+  static constexpr int words_per_dlv = 4;
+  static constexpr int cols_per_word = WN / 32;               // = cols_demanded / words_per_dlv
+  // 1 means nfold_regroup_gmem's whole-uint32 moves suffice. >1 means columns must be INTERLEAVED inside a word,
+  // which it cannot express. This is the cost of the only escape from over-delivery: raising WN.
+  static constexpr bool wholeword_packer_ok = cols_per_word <= 1;
 };
 
-// CheckDelivery<> is what a kernel instantiation fires. It asserts ONE thing: the swzl must not hand a thread
-// more codes than its mma fragment has slots. Over-delivery has no recovery -- the surplus is simply never
-// fetched. Under-delivery is fine and common (int4 lives there and just issues more swzl steps).
+// CheckDelivery<> is what a kernel instantiation fires. It asserts the ONE hard constraint: a thread cannot use
+// more codes than its mma fragment has slots, because the surplus is never fetched.
 //
-// `slots = 8*(TN/32)*(TK/16)` was verified against cute's partition_B, but only for the DEFAULT 32x32 warp tile
-// (leg5_perthread.cu: 256/64/64/128 predicted and measured for the four shapes tried). The Q3 B-concat sweep
-// runs 16x32 warps at TM=16, where the TiledMMA -- and therefore the slot count -- is a different shape. So the
-// guard skips anything that is not 32x32 rather than assert a number it does not model.
+//     delivery = 16 * 8 / Bits          one swzl hands a thread 16 BYTES
+//     slots    = WN * TK / 32           fp16 B-fragment slots per thread
 //
-// WHAT IS DELIBERATELY *NOT* ASSERTED: an earlier version added `TK*Bits >= 128`, on the theory that a folded
-// column could not be narrower than a half-run. That was wrong; see the retraction in fold_derivation/README.md.
-// Bits outside (0,8) means "not a sub-byte B plane" (fp16 / int8 / an absent second plane) and is skipped.
+// The slots formula is MEASURED against cute's partition_B on the builder's real TiledMma -- WarpOnN = TN/WN and
+// PermN = WarpOnN*16 -- over twelve configurations, including all nine ppu001 reference points and three WN
+// variants (fold_derivation/l5_slots.cu). Note what it does NOT contain: **TN**. B is partitioned across the
+// warps in N, so widening the tile widens the work, not the per-thread fragment. That is why raising TN never
+// bought anything, and it is why an earlier version of this file -- which used slots = 8*(TN/32)*(TK/16) -- was
+// wrong. That form is right only when TN == 2*WN, and at TN=128/WN=32 it over-estimated slots 2x and would have
+// PASSED int1 (64,128,64), a configuration measured broken on the box.
+//
+// Over-delivery alone separates all nine reference points, 9/9. Written out, the condition is
+//     WN * TK * Bits >= 4096
+// which at the WM=WN=32 every fold test passes reduces to TK*Bits >= 128 -- int1 >= 128, int2 >= 64, int4 >= 32.
+//
+// THE ESCAPE, and it is real: slots scales with WN. At WN=64 int1 at TK=64 has slots == delivery == 128 and is
+// feasible. But raising WN also raises how many logical columns must share one 32-bit word,
+//     cols_per_word = WN / 32
+// (also measured, same file) -- so WN=64 needs a packer that interleaves TWO columns inside a word, which
+// nfold_regroup_gmem's whole-uint32 moves cannot express. The two constraints pincer int1 at TK=64: WN must rise
+// to fix delivery, and raising WN forces the packer upgrade. Both, or neither.
 template <int Bits, int TN, int TK, int WM, int WN, class = void>
 struct CheckDelivery { static constexpr bool ok = true; };
 
 template <int Bits, int TN, int TK, int WM, int WN>
-struct CheckDelivery<Bits, TN, TK, WM, WN, std::enable_if_t<(Bits > 0 && Bits < 8 && WM == 32 && WN == 32)>> {
-  static constexpr int delivery = 16 * 8 / Bits;              // one swzl hands a thread 16 BYTES
-  static constexpr int slots    = 8 * (TN / 32) * (TK / 16);  // fp16 B-fragment slots per thread
+struct CheckDelivery<Bits, TN, TK, WM, WN, std::enable_if_t<(Bits > 0 && Bits < 8)>> {
+  static constexpr int delivery = 16 * 8 / Bits;   // one swzl delivery, in codes
+  static constexpr int slots    = WN * TK / 32;    // fp16 B-fragment slots per thread
   static_assert(delivery <= slots,
       "fold: one swzl delivery carries more codes than this thread's mma fragment has slots, and the surplus is "
-      "never fetched. Raise TileShape.N (a fold at this TK needs TN >= 128 for int1, >= 64 for int2), or raise "
-      "TileShape.K.");
+      "never fetched. Need WN*TK*Bits >= 4096. Raise TileShape.K, or raise the warp N extent WN -- raising "
+      "TileShape.N does NOT help, because B is split across the warps in N and slots does not depend on TN. "
+      "Note that raising WN past 32 also requires a bit-granular offline packer (cols_per_word = WN/32).");
   static constexpr bool ok = true;
 };
 

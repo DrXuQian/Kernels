@@ -1,8 +1,8 @@
 // Will the new build-time guard reject anything that works today?
 //
-// The guard (fold::CheckDelivery) depends on (Bits, TN, TK) and engages only for the 32x32 warp tile. Section 1
-// instantiates every such combination the tree reaches; if this file compiles, no existing kernel instantiation
-// can be rejected.
+// The guard (fold::CheckDelivery) is `delivery <= slots` with slots = WN*TK/32, so it depends on (Bits, TK, WN)
+// -- notably NOT on TN. Section 1 instantiates every such combination the tree reaches; if this file compiles, no
+// existing kernel instantiation can be rejected.
 //
 // Section 2 is the wider, informational pass: every concrete (Bits, TM, TN, TK, Stages, WM, WN) tuple in the
 // tree, through the full FoldTraits -- occupancy, and the derived cols_per_word that says whether the offline
@@ -28,7 +28,10 @@ static_assert(G<2, 64, 64>::v && G<2,128, 64>::v, "int2 folded");
 static_assert(G<4, 64, 64>::v && G<4,128, 64>::v && G<4, 64,128>::v && G<4, 64,256>::v, "int4");
 static_assert(fold::CheckDelivery<16,64,64,32,32>::ok && fold::CheckDelivery<8,64,64,32,32>::ok
               && fold::CheckDelivery<0,64,64,32,32>::ok, "non-sub-byte / absent plane must be skipped");
-static_assert(fold::CheckDelivery<1,64,64,16,32>::ok, "non-32x32 warp tile must be skipped, not judged");
+// WM is irrelevant to the guard (B is not split across the M warps), and the 16x32 configs the Q3 sweep
+// actually ships all run at TK=256, where int1 has slots=256 against a 128-code delivery.
+static_assert(fold::CheckDelivery<1, 64,256,16,32>::ok && fold::CheckDelivery<2, 64,256,16,32>::ok
+              && fold::CheckDelivery<1,256,256,16,32>::ok, "the shipped 16x32 configs");
 
 // ---------------------------------------------------------------- section 2: full traits on real tuples
 struct Row { const char* src; int bits; int tm, tn, tk, st, wm, wn; int F, Ng, deliv, slots, smem, warps, blocks; };
@@ -80,7 +83,7 @@ int main() {
                 eq ? "   (I1 exactly tight)" : "");
   }
   std::printf("\n  all %d instantiated -- every FoldTraits invariant holds. %d sit exactly at delivery == slots:\n"
-              "  correct today, but with no headroom, so lowering their TN would silently drop weights.\n",
+              "  correct today, but with no headroom, so lowering their TK (or WN) would silently drop weights.\n",
               nrows, tight);
   return 0;
 }
