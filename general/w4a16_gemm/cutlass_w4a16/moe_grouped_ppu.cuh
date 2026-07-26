@@ -117,13 +117,22 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // forbidden (64,128,64) with nothing to stop it. Sub-byte B only: fp16/int8 B never folds. A bare alias would
   // NOT do: naming a specialization as a template argument does not instantiate it, so the asserts would stay
   // asleep. fold::Check<> below reads a member, which requires completeness and therefore fires them.
-  static_assert(fold::Check<MOEG_BITS, cute::size<2>(TileShape{})>::ok, "B plane: TileShape.K too small");
-  // B-concat: the two planes share one TileShape.K, so the NARROWER plane has to satisfy the bound too. That is
-  // what pins Q3 (int2+int1) and Q5 (int4+int1) to TK=128 while Q6 (int4+int2) may use TK=64.
-  static_assert(fold::Check<(std::is_void_v<PlaneB2> ? 0 : cutlass::sizeof_bits<
-                                std::conditional_t<std::is_void_v<PlaneB2>, cutlass::half_t, PlaneB2>>::value),
-                            cute::size<2>(TileShape{})>::ok,
-                "second B plane: TileShape.K too small for its width");
+  // The one fold constraint that is real AND verified against cute: a thread cannot use more codes than its
+  // fragment has slots, because the surplus is never fetched. `slots` below was checked against
+  // partition_B for the default 32x32 warp tile only, so the guard is scoped to that -- the Q3 B-concat sweep
+  // runs 16x32 warps, where this TiledMMA (and hence the slot count) is a different shape.
+  //
+  // NOT asserted here, deliberately: an earlier version of this guard also demanded TK*Bits >= 128 ("a folded
+  // column cannot be narrower than a half-run"). That was WRONG -- see fold_derivation/. It assumed one logical
+  // column per 32-bit word, which is a limitation of the offline packer, not of the hardware.
+  static_assert(fold::CheckDelivery<MOEG_BITS, cute::size<1>(TileShape{}), cute::size<2>(TileShape{}),
+                                    cute::size<0>(WarpShape{}), cute::size<1>(WarpShape{})>::ok,
+                "B plane: swzl over-delivers -- the fragment has fewer slots than one delivery carries");
+  static_assert(fold::CheckDelivery<(std::is_void_v<PlaneB2> ? 0 : cutlass::sizeof_bits<
+                                        std::conditional_t<std::is_void_v<PlaneB2>, cutlass::half_t, PlaneB2>>::value),
+                                    cute::size<1>(TileShape{}), cute::size<2>(TileShape{}),
+                                    cute::size<0>(WarpShape{}), cute::size<1>(WarpShape{})>::ok,
+                "second B plane: swzl over-delivers at this TileShape");
   const int scale_k = (k + group_size - 1) / group_size;
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));   // mainloop: single L-strided base
   // N-FOLD: a folded weight buffer is physically (N/FoldF) rows x (FoldF*K) codes -- one physical row carries TWO

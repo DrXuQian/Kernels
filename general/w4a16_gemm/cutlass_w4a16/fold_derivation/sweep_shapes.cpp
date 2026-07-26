@@ -1,13 +1,12 @@
 // Will the new build-time guard reject anything that works today?
 //
-// The guard (fold::Check) depends on NOTHING but (Bits, TileShape.K). So enumerating the distinct (Bits, TK)
-// pairs that appear anywhere in the tree is an EXHAUSTIVE answer -- tile M, tile N, warp shape and stage count
-// cannot change the verdict. Section 1 instantiates every such pair; if this file compiles, no existing kernel
-// instantiation can be rejected.
+// The guard (fold::CheckDelivery) depends on (Bits, TN, TK) and engages only for the 32x32 warp tile. Section 1
+// instantiates every such combination the tree reaches; if this file compiles, no existing kernel instantiation
+// can be rejected.
 //
-// Section 2 is the wider, informational pass: every concrete (Bits, TM, TN, TK, Stages, WM, WN) tuple found in
-// the tree, run through the full FoldTraits including the invariants the guard deliberately leaves out. This is
-// where a config with too small a TN, or an occupancy cliff, would show up.
+// Section 2 is the wider, informational pass: every concrete (Bits, TM, TN, TK, Stages, WM, WN) tuple in the
+// tree, through the full FoldTraits -- occupancy, and the derived cols_per_word that says whether the offline
+// packer has to interleave columns inside a 32-bit word.
 //
 //   g++ -O2 -std=c++17 sweep_shapes.cpp -o sweep && ./sweep
 #include "../fold_traits.hpp"
@@ -20,12 +19,16 @@
 //   test_fold_int2.cu          int1 @ TK=128, int2 @ TK=64 and 128, int4 @ TK=64 and 128
 //   moe_grouped_ppu.cuh users  int4 (default ElementB) @ TK=64 and 128
 //   misc W4A16/W2A16 tests     @ TK=256
-template <int Bits, int TK> struct GuardOK { static constexpr bool v = fold::Check<Bits, TK>::ok; };
-static_assert(GuardOK<1, 128>::v && GuardOK<1, 256>::v, "int1");
-static_assert(GuardOK<2,  64>::v && GuardOK<2, 128>::v && GuardOK<2, 256>::v, "int2");
-static_assert(GuardOK<4,  64>::v && GuardOK<4, 128>::v && GuardOK<4, 256>::v, "int4");
-static_assert(fold::Check<16, 64>::ok && fold::Check<8, 64>::ok && fold::Check<0, 64>::ok,
-              "non-sub-byte / absent plane must be skipped, not rejected");
+// The guard is CheckDelivery<Bits, TN, TK, WM, WN> and it only engages for the 32x32 warp tile, so the pairs
+// that matter are (Bits, TN, TK) at WM=WN=32. Everything else is skipped by construction.
+template <int B, int TN, int TK> struct G { static constexpr bool v = fold::CheckDelivery<B,TN,TK,32,32>::ok; };
+static_assert(G<1, 64,128>::v && G<1,128,128>::v && G<1, 64,256>::v && G<1,128,256>::v && G<1,256,256>::v, "int1");
+static_assert(G<2, 32,256>::v && G<2, 64,128>::v && G<2,128,128>::v && G<2, 64,256>::v && G<2,128,256>::v, "int2");
+static_assert(G<2, 64, 64>::v && G<2,128, 64>::v, "int2 folded");
+static_assert(G<4, 64, 64>::v && G<4,128, 64>::v && G<4, 64,128>::v && G<4, 64,256>::v, "int4");
+static_assert(fold::CheckDelivery<16,64,64,32,32>::ok && fold::CheckDelivery<8,64,64,32,32>::ok
+              && fold::CheckDelivery<0,64,64,32,32>::ok, "non-sub-byte / absent plane must be skipped");
+static_assert(fold::CheckDelivery<1,64,64,16,32>::ok, "non-32x32 warp tile must be skipped, not judged");
 
 // ---------------------------------------------------------------- section 2: full traits on real tuples
 struct Row { const char* src; int bits; int tm, tn, tk, st, wm, wn; int F, Ng, deliv, slots, smem, warps, blocks; };
@@ -61,8 +64,8 @@ int main() {
   // --- misc W4A16 / W2A16 / real-weight tests
   add<4,64, 64,256,3,32,32>("misc"); add<2,64, 64,256,3,32,32>("misc"); add<1,64, 64,256,3,32,32>("misc");
 
-  std::printf("SECTION 1 -- guard exhaustive over distinct (Bits,TK): compiled, so nothing in the tree is rejected.\n");
-  std::printf("             pairs covered: int1{128,256} int2{64,128,256} int4{64,128,256} + skipped{0,8,16}\n\n");
+  std::printf("SECTION 1 -- guard (over-delivery) over every (Bits,TN,TK) in the tree: compiled => nothing rejected.\n");
+  std::printf("             plus the skip paths: fp16/int8/absent plane, and any non-32x32 warp tile.\n\n");
   std::printf("SECTION 2 -- full FoldTraits on %d concrete tuples from the tree\n\n", nrows);
   std::printf("  %-32s %5s %-16s %2s %3s %5s %5s %7s %5s %6s\n",
               "source", "width", "tile(M,N,K)/warp", "F", "Ng", "deliv", "slots", "smem", "warps", "blocks");
@@ -76,8 +79,8 @@ int main() {
                 r.src, w, tile, r.F, r.Ng, r.deliv, r.slots, r.smem, r.warps, r.blocks,
                 eq ? "   (I1 exactly tight)" : "");
   }
-  std::printf("\n  all %d instantiated -- every FoldTraits invariant holds, including the ones the kernel guard\n"
-              "  deliberately omits (I1, alignment, run size). %d sit exactly at the I1 boundary: correct today,\n"
-              "  but they have no headroom, so lowering their TN would silently drop weights.\n", nrows, tight);
+  std::printf("\n  all %d instantiated -- every FoldTraits invariant holds. %d sit exactly at delivery == slots:\n"
+              "  correct today, but with no headroom, so lowering their TN would silently drop weights.\n",
+              nrows, tight);
   return 0;
 }

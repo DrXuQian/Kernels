@@ -1,17 +1,19 @@
-// LEG 3: the predicate that LEG 1 + LEG 2 imply, checked against every box reference point.
+// LEG 3 -- what actually separates the nine ppu001 reference points, after the retraction.
 //
-// LEG 1 (leg1_runword.cpp, exact copy of ppu_tsm_ld_swzl_sim SWAP=true):
-//     run-word = (v%2)*4 + (lane%4)     -- the 32B run is a 2x4 grid: v%2 picks a 4-word HALF,
-//                                          lane%4 picks the word inside that half.
-// LEG 2 (leg2_frag.cu, cute partition_B of the real TiledMMA):
-//     the fragment's N depends on lane/4 and the value bits ONLY; lane%4 moves K (stride 2), never N.
+// The first version of this file tested `TK*Bits >= 128` and reported 0/9 mismatches. True, but misleading: it
+// fits the data while blaming the wrong thing. Two predicates are at work, with completely different status.
 //
-// THEOREM. All four lanes of a lane/4 group demand the SAME N, and they receive the four different words of a
-// half. So every word of a half must carry the same logical column => a folded column occupies EXACTLY 4 words
-// = 16 bytes. A 32B run therefore holds at most 2 columns:
-//         F <= 2      <=>      TK * Bits in {128 (F=2), 256 (F=1)}
-// This is a property of the swzl delivery grid vs the mma fragment. It is NOT a converter limitation, so no
-// converter rewrite can lift it.
+//   P1  OVER-DELIVERY (hardware).  delivery <= slots.  A thread cannot use more codes than its fragment has
+//       slots; the surplus is never fetched. Only a bigger TN or TK fixes this.
+//
+//   P2  WHOLE-WORD PACKER (software).  cols_per_word = 128/(TK*Bits) <= 1.  nfold_regroup_gmem moves whole
+//       uint32 words, so at most ONE logical column can live in a word. When a thread's demand needs two
+//       columns per word, that packer supplies half the columns -- exactly the measured n_used = n % Ng.
+//       A bit-granular offline lifts it.
+//
+// P1 alone gets 8/9. P1 && P2 gets 9/9. Reporting only the conjunction is what let me write "int1 can never run
+// at TK=64" into a header, when the honest statement is "int1 at TK=64 needs a better offline".
+//
 //   g++ -O2 -std=c++17 leg3_predicate.cpp -o leg3 && ./leg3
 #include <cstdio>
 #include <initializer_list>
@@ -19,45 +21,54 @@
 struct Ref { const char* name; int bits, tm, tn, tk; bool works; const char* note; };
 
 int main() {
-  // every configuration ever run on ppu001, with its measured verdict
   Ref refs[] = {
     {"int4", 4, 64,  64,  64,  true,  "55.9% MFU"},
     {"int2", 2, 64,  64,  64,  true,  "53.2% MFU (fold)"},
     {"int2", 2, 64, 128,  64,  true,  "bad=0"},
     {"int2", 2, 64,  64, 128,  true,  "original unfolded path"},
-    {"int1", 1, 32, 128, 128,  true,  "54.3% MFU (fold, winner)"},
-    {"int1", 1, 64,  64, 128,  true,  "36.4% MFU"},
+    {"int1", 1, 32, 128, 128,  true,  "bad=0 (MFU unverified)"},
+    {"int1", 1, 64,  64, 128,  true,  "bad=0 (MFU unverified)"},
     {"int1", 1, 64,  64, 256,  true,  "original unfolded path"},
-    {"int1", 1, 64,  64,  64,  false, "measured random ~41%"},
-    {"int1", 1, 64, 128,  64,  false, "measured random ~41%"},
+    {"int1", 1, 64,  64,  64,  false, "random ~41%"},
+    {"int1", 1, 64, 128,  64,  false, "random ~41%"},
   };
 
-  printf("LEG 3 -- predicate  words_per_column == 4  (i.e. TK*Bits in {128,256}, i.e. F <= 2)\n\n");
-  printf("  %-5s %-14s %5s %6s %8s %6s  %-9s %-9s %s\n",
-         "type", "tile(M,N,K)", "F", "run B", "col words", "TK*b", "predicts", "measured", "note");
+  printf("LEG 3 -- two predicates, only one of which is a hardware limit\n\n");
+  printf("  %-5s %-14s %6s %6s %8s %5s %6s  %-4s %-4s %-7s %-8s %s\n",
+         "type", "tile(M,N,K)", "deliv", "slots", "cols/wd", "cols", "words", "P1", "P2", "P1&&P2", "measured", "note");
 
-  int wrong = 0;
+  int only_p1 = 0, both = 0;
   for (auto& r : refs) {
-    int contig  = r.tk * r.bits / 8;                 // bytes one column contributes along K
-    int F       = contig >= 32 ? 1 : 32 / contig;    // columns folded into the 32B run
-    int colw    = r.tk * r.bits / 32;                // uint32 words one folded column occupies
-    bool pred   = (colw == 4 || colw == 8);          // 4 words (F=2) or the whole run (F=1)
+    const int slots    = 8 * (r.tn / 32) * (r.tk / 16);
+    const int delivery = 16 * 8 / r.bits;
+    const int cols     = r.tn / 16;                       // columns one thread demands (cute: partition_B)
+    const int words    = r.tn * r.tk * r.bits / 2048;     // 32-bit words it is handed
+    const bool p1 = delivery <= slots;                    // hardware
+    const bool p2 = 128 <= r.tk * r.bits;                 // whole-word packer, i.e. cols_per_word <= 1
     char tile[24]; snprintf(tile, sizeof tile, "(%d,%d,%d)", r.tm, r.tn, r.tk);
-    bool agree = (pred == r.works);
-    if (!agree) ++wrong;
-    printf("  %-5s %-14s %5d %6d %8d %6d  %-9s %-9s %s%s\n",
-           r.name, tile, F, contig * F, colw, r.tk * r.bits,
-           pred ? "OK" : "BAD", r.works ? "OK" : "BAD", r.note, agree ? "" : "   <-- MISMATCH");
+    char cpw[12];  snprintf(cpw, sizeof cpw, "%.2f", 128.0 / (r.tk * r.bits));
+    only_p1 += (p1 == r.works);
+    both    += ((p1 && p2) == r.works);
+    printf("  %-5s %-14s %6d %6d %8s %5d %6d  %-4s %-4s %-7s %-8s %s%s\n",
+           r.name, tile, delivery, slots, cpw, cols, words,
+           p1 ? "ok" : "BAD", p2 ? "ok" : "BAD", (p1 && p2) ? "ok" : "BAD",
+           r.works ? "ok" : "BAD", r.note,
+           (p1 != r.works && (p1 && p2) == r.works) ? "   <-- only P2 fails here" : "");
   }
-  printf("\n  mismatches: %d / %d\n", wrong, int(sizeof(refs)/sizeof(refs[0])));
+  printf("\n  P1 alone : %d/9 agree\n  P1 && P2 : %d/9 agree\n", only_p1, both);
 
-  printf("\n  reachable TK per width (the ONLY legal fold points):\n");
-  for (int bits : {8, 4, 2, 1})
-    printf("    int%-2d : TK = %3d (F=1, run is one column)   TK = %3d (F=2, two columns of 16B)\n",
-           bits, 256 / bits, 128 / bits);
-  printf("\n  => int1's smallest legal TK is 128. TK=64 needs F=4, which asks the fragment for an N that varies\n");
-  printf("     with lane%%4 -- LEG 2 says that does not exist. A 4-way converter cannot help: the data for the\n");
-  printf("     other two columns is delivered to the WRONG LANES, and a converter only relabels registers\n");
-  printf("     inside one thread.\n");
+  printf("\n  The row where they differ is int1 (64,128,64): 128 codes into 128 slots, so the COUNTING is exact\n"
+         "  and a valid placement exists. Its thread wants 8 columns and gets 4 words, so each word must carry\n"
+         "  TWO columns -- which a uint32-granular packer cannot express. Nothing in the hardware forbids it.\n");
+
+  printf("\n  cols-per-word by (width, TK). >1 is where a bit-granular offline is required:\n    %-7s", "");
+  for (int tk : {32, 64, 128, 256}) printf("  TK=%-5d", tk);
+  printf("\n");
+  for (int bits : {4, 2, 1}) {
+    printf("    int%-4d", bits);
+    for (int tk : {32, 64, 128, 256}) printf("  %-8.2f", 128.0 / (tk * bits));
+    printf("\n");
+  }
+  printf("    (0.50 is the opposite case -- one column spanning two words -- which int4 already does today)\n");
   return 0;
 }

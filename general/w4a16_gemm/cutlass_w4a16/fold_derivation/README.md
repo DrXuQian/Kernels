@@ -74,17 +74,17 @@ that would actually confirm it.
 
 ## Knock-on: which TK each two-plane (B-concat) format may use
 
-Both planes of a B-concat share one `TileShape.K`, so the predicate has to hold for the **narrower** plane too.
-That fixes the choice with no search:
+Both planes share one `TileShape.K`, and the hard limit (`delivery <= slots`) has to hold for the narrower one.
+The packer limit binds separately, and it is the one that moves:
 
-| format | planes | TK=32 | TK=64 | TK=128 | verdict |
-|---|---|---|---|---|---|
-| Q6_K | int4 + int2 | int2 8 B ✗ | int4 F=1, int2 **F=2** ✓ | int2 F=1 (no fold) | **TK=64** — and the int2 plane does fold |
-| Q3_K | int2 + int1 | ✗ | int1 8 B ✗ | int2 F=1, int1 **F=2** ✓ | **TK=128** |
-| Q5_K | int4 + int1 | ✗ | int1 8 B ✗ | int4 F=1 (64 B col), int1 **F=2** ✓ | **TK=128** |
+| format | planes | with today's whole-word packer | once the packer is bit-granular |
+|---|---|---|---|
+| Q6_K | int4 + int2 | **TK=64** — int4 F=1, int2 F=2, both `cols/word <= 1` | unchanged |
+| Q3_K | int2 + int1 | **TK=128** — int1 would need `cols/word = 2` at TK=64 | **TK=64**, at TN >= 128 |
+| Q5_K | int4 + int1 | **TK=128** — same reason | **TK=64**, at TN >= 128 |
 
-So Q6 gets what it needed — its int2 plane folds at TK=64, which is the 53%-class geometry. Q3 and Q5 are pinned
-at TK=128 by their int1 plane, and at gs=16 that means `SK=8`.
+Q6 needs nothing new: its int2 plane already folds at TK=64. Q3 and Q5 are held at TK=128 only by the packer, so
+the bit-granular offline unblocks them too — which matters, because at gs=16 TK=128 means `SK=8`.
 
 ## Open question this leaves, and the cheap way to settle it
 
