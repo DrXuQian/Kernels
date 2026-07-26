@@ -1,0 +1,3 @@
+#pragma once
+#include <type_traits>
+namespace hggc { namespace std { using namespace ::std; } }

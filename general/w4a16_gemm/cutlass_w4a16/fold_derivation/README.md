@@ -5,13 +5,13 @@ ppu001 with a derivation you can re-run in seconds, and they agree with every co
 
 ```
 g++ -O2 -std=c++17 leg1_runword.cpp   -o leg1  && ./leg1
-nvcc -std=c++17 -I<stubs> -I<actlize>/include leg2_frag.cu -o leg2 && ./leg2
+nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include leg2_frag.cu -o leg2 && ./leg2
 g++ -O2 -std=c++17 leg3_predicate.cpp -o leg3  && ./leg3
 g++ -O2 -std=c++17 ft_check.cpp       -o ftchk && ./ftchk
 ```
 
-`<stubs>` is any directory holding empty `hggc*.h` headers; cute pulls them in through `cute/util/debug.hpp`,
-but nothing in these programs runs on a device.
+`stub_inc/` holds the `hggc*.h` headers cute pulls in through `cute/util/debug.hpp`. Nothing here runs on a
+device — leg2 only asks cute to partition a layout on the host.
 
 ## The two legs
 
@@ -61,8 +61,9 @@ the obvious fix is a four-way variant with `{0,16,32,48}`. It cannot work: at `F
 converter only relabels registers inside one thread.
 
 The practical consequence is that int1 is pinned at TK=128, so at gs=16 it carries `SK=8` where int2 and int4
-carry `SK=4`. That is the entire int1 gs=16 gap (ScaleOnly 54.3% at gs=32 against 45.3% at gs=16, while int2 is
-flat across the two). Closing it means working on the scale path, not the fold.
+carry `SK=4`. That lines up with int1's gs=16 gap (ScaleOnly 54.3% at gs=32 against 45.3% at gs=16, while int2 is
+flat across the two), which points at the scale path rather than the fold — see the last section for the run
+that would actually confirm it.
 
 ## Knock-on: which TK each two-plane (B-concat) format may use
 
