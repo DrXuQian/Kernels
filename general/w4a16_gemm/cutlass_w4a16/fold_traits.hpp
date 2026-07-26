@@ -13,32 +13,56 @@
 //
 // VALIDATED AGAINST EVERY BOX REFERENCE POINT (7 correct + 2 known-broken); the invariants below are exactly the
 // predicate that separates them:
-//   int4 (64, 64, 64)  F=1  deliv  32  slots  64   OK   55.9%
-//   int2 (64, 64, 64)  F=2  deliv  64  slots  64   OK   53.2%
-//   int2 (64,128, 64)  F=2  deliv  64  slots 128   OK   bad=0
-//   int2 (64, 64,128)  F=1  deliv  64  slots 128   OK   original validated path
-//   int1 (32,128,128)  F=2  deliv 128  slots 256   OK   54.3%
-//   int1 (64, 64,128)  F=2  deliv 128  slots 128   OK   36.4%
-//   int1 (64, 64,256)  F=1  deliv 128  slots 256   OK   original validated path
-//   int1 (64, 64, 64)  F=4  deliv 128  slots  64   BAD  over-delivery (I1 catches it)
-//   int1 (64,128, 64)  F=4  deliv 128  slots 128   BAD  balanced yet broken (only I2 catches it)
-// The last row is why I1 alone is not enough.
+//   int4 (64, 64, 64)  F=1  deliv  32  slots  64  colw 8   OK   55.9%
+//   int2 (64, 64, 64)  F=2  deliv  64  slots  64  colw 4   OK   53.2%
+//   int2 (64,128, 64)  F=2  deliv  64  slots 128  colw 4   OK   bad=0
+//   int2 (64, 64,128)  F=1  deliv  64  slots 128  colw 8   OK   original validated path
+//   int1 (32,128,128)  F=2  deliv 128  slots 256  colw 4   OK   54.3%
+//   int1 (64, 64,128)  F=2  deliv 128  slots 128  colw 4   OK   36.4%
+//   int1 (64, 64,256)  F=1  deliv 128  slots 256  colw 8   OK   original validated path
+//   int1 (64, 64, 64)  F=4  deliv 128  slots  64  colw 2   BAD  over-delivery (I1 catches it too)
+//   int1 (64,128, 64)  F=4  deliv 128  slots 128  colw 2   BAD  balanced yet broken (only I2 catches it)
+//   int4 (64, 64,128)  F=1  deliv  32  slots 128  colw16   OK   untested, must stay ALLOWED (colw > run)
+// Row 9 is why I1 alone is not enough; row 10 is why I2 must be a one-sided bound rather than an equality.
+// I2 separates all nine measured points on its own, but I1 stays because it is independent: it catches TN too
+// small at a legal colw (e.g. int1 TN=32 TK=128 delivers 128 codes into 64 slots).
 #pragma once
 #include <cstddef>
 
 namespace fold {
 
-// How many N-groups the dequant converter can address inside one register. The int1/int2 converters place the
-// N-half with  base = (32|16)*(v&1) + 2*(v>=2), i.e. a TWO-way split -- so a fold that packs 4 N-columns into one
-// run has no way to route groups 2 and 3, which is exactly the int1 F=4 failure. Raising this is a converter change
-// (4-way N placement), and it is what would let int1 drop to TK=64 and stop paying double FINE-scale cost at gs=16
-// (int1 ScaleOnly 54.3% at gs=32 but only 45.3% at gs=16, while int2/int4 are flat, because SK = TK/gs and int1 is
-// pinned at TK=128).
-#if defined(MIXGEMM_INT1_NWAY4)
-inline constexpr int kConverterNWays = 4;   // 4-way int1 converter enabled (bases {0,16,32,48})
-#else
-inline constexpr int kConverterNWays = 2;
-#endif
+// WHY F IS CAPPED AT 2 -- derived, not probe-fitted, and verifiable locally with no box.
+// (scratchpad/leg1_runword.cpp, leg2_frag.cu, leg3_predicate.cpp)
+//
+// LEG 1, from ppu_tsm_ld_swzl_sim's SWAP=true branch (the B operand's instantiation, and the one calibrated
+// against hardware by the w2a16 cube-width bug). Strip the two swizzle terms -- they cancel against the AIU
+// write's matching .swzl -- and the LOGICAL word a thread reads is
+//         row      = (v/2)*8 + lane/4
+//         run-word = (v%2)*4 + lane%4
+// so a row's 32B run is addressed as a 2x4 GRID: v%2 picks a 4-word HALF, lane%4 picks the word inside it.
+// Nothing else reaches a run-word (checked for all 128 (lane,v) pairs).
+//
+// LEG 2, from cute's partition_B on the real TiledMMA: the fragment's N is a function of lane/4 and the value
+// bits ONLY. lane%4 moves K, at stride 2, and never touches N.
+//
+// THEOREM. The four lanes of a lane/4 group all demand the SAME N, and they receive the four different words of
+// a half. Every word of a half must therefore carry the same logical column, so a folded column can never be
+// narrower than a half-run (4 words = 16 B), and a 32B run holds at most two columns:
+//         a folded column is at least a half-run   <=>   TK * Bits >= 128   (and then F <= 2 follows)
+// A column WIDER than a run is unaffected -- it just spans several 32B slices, which is the ordinary unfolded
+// case (int4 at TK=128 is 64 B/column and perfectly legal). The bound is one-sided.
+// Checked against all nine box reference points: 0 mismatches (leg3_predicate.cpp).
+//
+// COROLLARY, and the reason this constant is not simply "raise it later": F=4 is NOT blocked by the converter.
+// The converter's bases {0,32,2,34} look like a 2-way N split, and the obvious move is to write a 4-way variant
+// with bases {0,16,32,48}. That was tried and reverted, because it cannot work in principle -- with F=4 the
+// third and fourth columns of a run are delivered to DIFFERENT LANES (f = 2*(v%2) + (lane%4)/2), and a converter
+// only relabels registers inside one thread. No converter reaches another lane's registers.
+//
+// CONSEQUENCE. int1's smallest legal TK is 128, so at gs=16 it carries SK=8 while int2/int4 carry SK=4 -- that
+// is the whole of int1's gs=16 gap (ScaleOnly 54.3% at gs=32 vs 45.3% at gs=16, where int2 is flat). Closing it
+// means attacking the scale path, not the fold.
+inline constexpr int kMaxFold = 2;
 
 template <int Bits, int TM, int TN, int TK, int Stages = 3>
 struct FoldTraits {
@@ -52,6 +76,7 @@ struct FoldTraits {
   // ---- the two quantities that must agree ----
   static constexpr int delivery = 16 * 8 / Bits;                  // one swzl instruction hands a thread 16 BYTES
   static constexpr int slots    = 8 * (TN / 32) * (TK / 16);      // fp16 B-fragment slots per thread
+  static constexpr int col_words = TK * Bits / 32;                // uint32 words one folded column occupies
 
   // ---- occupancy ----
   static constexpr int a_smem   = TM * TK * 2;                    // fp16 A tile per stage
@@ -68,11 +93,17 @@ struct FoldTraits {
   static_assert(delivery <= slots,
       "fold: swzl delivers more codes than the mma fragment has slots; the surplus is silently never read "
       "(this is int1 F=4 at TN=64). Raise TN or TK, or lower F.");
-  // I2: the converter can only route kConverterNWays N-groups per register.
-  static_assert(F <= kConverterNWays,
-      "fold: F exceeds the converter's N-way capacity, so the extra N-groups cannot be routed and read back as "
-      "group 0 (this is int1 F=4 at TN=128, which satisfies I1 yet still fails). Raise kConverterNWays only "
-      "together with a converter that places that many N-groups.");
+  // I2: a folded column must be at least a whole 4-word half of the run. Otherwise the column a lane receives
+  //     varies with lane%4, and LEG 2 says the fragment's N never does -- so the surplus columns land on the
+  //     wrong lanes. This is int1 F=4 at TN=128, which satisfies I1 yet still fails.
+  //     Not fixable in the converter (see kMaxFold above); the only lever is TK.
+  //     Only a LOWER bound: a column wider than a run (int4 at TK=128 -> 64 B) just spans several slices, which
+  //     is the ordinary unfolded case and always fine. What is forbidden is a column NARROWER than a half-run.
+  static_assert(TK * Bits >= 128,
+      "fold: a folded column must be at least 16 B (TK*Bits >= 128) so that the four words a half-run hands to "
+      "the four lanes all belong to ONE column. Below that, the column varies with lane%4 and the mma fragment "
+      "has no such N. int1 therefore cannot go below TK=128, int2 below TK=64, int4 below TK=32.");
+  static_assert(F <= kMaxFold, "fold: F > 2 is unreachable -- see the derivation above");
   static_assert(TN % F == 0, "fold: TileN must divide into F groups");
   static_assert(TK % 16 == 0 && TN % 32 == 0 && TM % 32 == 0, "fold: tile must be mma-atom aligned");
   static_assert(contig_bytes * F == 32 || F == 1, "fold: the folded run must be exactly 32B");
