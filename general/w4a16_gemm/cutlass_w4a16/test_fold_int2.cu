@@ -118,5 +118,40 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("  fold int2 TK=64 vs host codes: bad=%d/%d %s\n", bad, M*N, bad == 0 ? "MATCH" : "MISMATCH");
+
+  // PERF (only meaningful once correct): the whole point of the fold is A-smem = TileM*TK*2 at TK=64 instead of 128,
+  // i.e. int2 should move from its TK=128 ceiling (37.1% gs=32 / 30.9% gs=16) toward int4@TK64's measured 55.8%/53.1%.
+  if (bad == 0 && getenv("FOLD_PERF")) {
+    const int PM = atoi(getenv("FOLD_PERF"));            // FOLD_PERF=<M> e.g. 2048
+    const int PN = 4096, PK = 4096;
+    const int psk = PK / gs;
+    cutlass::DeviceAllocation<half_t> pA((size_t)PM*PK), pS((size_t)psk*PN), pZ((size_t)psk*PN), pD((size_t)PM*PN);
+    cutlass::DeviceAllocation<uint2_t> pB((size_t)PK*PN);
+    { std::vector<half_t> a((size_t)PM*PK, half_t(0.01f)), s((size_t)psk*PN, half_t(0.05f)), z((size_t)psk*PN, half_t(0.f));
+      pA.copy_from_host(a.data()); pS.copy_from_host(s.data()); pZ.copy_from_host(z.data()); }
+    std::vector<GS> ps(1, cute::make_shape(PM, PN, PK));
+    cutlass::DeviceAllocation<GS> psd(1); psd.copy_from_host(ps.data());
+    std::vector<DStride> psdh{cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(PM, PN, 1))};
+    std::vector<int> pgm{PM}, pof{0}; std::vector<half_t*> ppd{pD.get()};
+    cutlass::DeviceAllocation<half_t*> ppD(1); ppD.copy_from_host(ppd.data());
+    cutlass::DeviceAllocation<DStride> psD(1); psD.copy_from_host(psdh.data());
+    cutlass::DeviceAllocation<int> pgM(1); pgM.copy_from_host(pgm.data());
+    cutlass::DeviceAllocation<int> pOf(1); pOf.copy_from_host(pof.data());
+    const size_t pwsb = (size_t)cutlass::ceil_div(PM,16)*cutlass::ceil_div(PN,64)*64;
+    cutlass::DeviceAllocation<char> pws(pwsb);
+    auto run = [&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
+        pA.get(), pB.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+        PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr); };
+    for (int i = 0; i < 3; ++i) run();
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    hggcEvent_t e0, e1; hggcEventCreate(&e0); hggcEventCreate(&e1);
+    hggcEventRecord(e0); for (int i = 0; i < 30; ++i) run(); hggcEventRecord(e1);
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    float ms = 0; hggcEventElapsedTime(&ms, e0, e1);
+    const double us = (double)ms * 1e3 / 30, tf = 2.0*PM*PN*PK / (us*1e-6) / 1e12;
+    std::printf("  [fold perf] M=%d N=%d K=%d gs=%d : %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n",
+                PM, PN, PK, gs, us, tf, 100.0*tf*1e12/500.0e12);
+    std::printf("     compare: int2@TK128 = 37.1%% (gs=32) / 30.9%% (gs=16) ; int4@TK64 = 55.8%% / 53.1%%\n");
+  }
   return bad == 0 ? 0 : 1;
 }
