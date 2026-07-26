@@ -650,17 +650,20 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
 // disagreed with this walk regardless of the within-run placement).
 // The WITHIN-run element order keeps the standard pipeline's crumb order, so run this on the standard preprocess
 // output and only MOVE whole 16-code words.
-inline void nfold_regroup_gmem_int2(int8_t* out, const int8_t* in_std,
-                                    const std::vector<size_t>& shape, int fold_tn, int fold_tk)
+// BITS-parameterised: int2 uses F=2 / 16 codes per uint32, int1 uses F=4 / 32 codes. Everything else in the
+// derivation is bit-width agnostic (it only moves whole uint32 words, preserving the pipeline's crumb order).
+inline void nfold_regroup_gmem(int8_t* out, const int8_t* in_std,
+                               const std::vector<size_t>& shape, int fold_tn, int fold_tk, int bits)
 {
     const size_t K = shape.size() == 2 ? shape[0] : shape[1];
     const size_t N = shape.size() == 2 ? shape[1] : shape[2];
-    const int    F   = 2;                       // int2 @ TK=64
+    const int    F   = (32 * 8 / bits) / fold_tk;   // columns needed to fill the 32B run (int2@64 -> 2, int1@64 -> 4)
+    const int    CPW = 32 / bits;                   // codes per uint32 word (int2 -> 16, int1 -> 32)
     const int    Ng  = fold_tn / F;
     const int    kCon = 256;
-    const int    WPK = fold_tk / 16;            // words per (n, K-tile)
-    const int    WPN = (int)(K / 16);           // words per n in the STANDARD interleaved-256 buffer
-    const int    W_ROW = kCon / 16;             // words per physical row segment (kCon elements)
+    const int    WPK = fold_tk / CPW;           // words per (n, K-tile)
+    const int    WPN = (int)(K / CPW);          // words per n in the STANDARD interleaved-256 buffer
+    const int    W_ROW = kCon / CPW;            // words per physical row segment (kCon elements)
     const uint32_t* src = reinterpret_cast<const uint32_t*>(in_std);
     uint32_t*       dst = reinterpret_cast<uint32_t*>(out);
     const size_t nrow = N / F, nkb = (K * F) / kCon;
@@ -684,6 +687,10 @@ inline void nfold_regroup_gmem_int2(int8_t* out, const int8_t* in_std,
               dst[dst_w] = src[src_w];
             }
 }
+
+inline void nfold_regroup_gmem_int2(int8_t* out, const int8_t* in_std,
+                                    const std::vector<size_t>& shape, int fold_tn, int fold_tk)
+{ nfold_regroup_gmem(out, in_std, shape, fold_tn, fold_tk, /*bits=*/2); }
 
 inline void nfold_column_pairs_ppu(int8_t*                    out,
                                    const int8_t*              in,

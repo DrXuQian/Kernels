@@ -21,6 +21,7 @@
 
 using half_t  = cutlass::half_t;
 using uint2_t = cutlass::uint2b_t;
+using uint1_t = cutlass::uint1b_t;
 using GS      = moe_grouped_ppu::GroupShape;
 using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
@@ -33,8 +34,8 @@ int main(int argc, char** argv) {
   gs = argc > 3 ? atoi(argv[3]) : 32;
   M = K;                                   // identity A
   const int scale_k = K / gs;
-  std::printf("[fold-int2] M=K=%d N=%d gs=%d  FOLD: TileShape.K=64, FoldF=2 (operand run = 128 elems = 32B)\n",
-              M, N, gs);
+  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  FOLD: TileShape.K=64, FoldF=%d (32B run)\n",
+              M, N, gs, fbits, (32 * 8 / fbits) / 64);
 
   // q2 codes, transposed to [N][K] and packed 4/byte, then the OFFLINE FOLD (FoldTK=64) in preprocess.
   // LABELLED input (argv[4]): make the weight code SPELL OUT its own source index, so a wrong fold reads back as a
@@ -54,13 +55,22 @@ int main(int argc, char** argv) {
                               label_mode == 1 ? "n" : "k", label_shift, label_shift + 1);
   std::vector<int> qT((size_t)K * N);
   for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n * K + k] = q[(size_t)k * N + n];
-  std::vector<int8_t> packed((size_t)K * N / 4, 0);
+  // FOLD_BITS=1 -> int1 (F=4 at TK=64), default int2 (F=2). The fold derivation is bit-width agnostic; only the
+  // packing density (codes/byte) and the element type change. int1 is the bigger prize: it is stuck at 2 blk/12%
+  // occupancy at its forced TK=256, and folding to TK=64 should give 10 blk/62% (even past int4's 8 blk, since its
+  // weights are smaller). It is also the prerequisite for Q3/Q5 reaching the ceiling.
+  const int fbits = getenv("FOLD_BITS") ? atoi(getenv("FOLD_BITS")) : 2;
+  const int epb   = 8 / fbits;                      // codes per byte
+  const int cmask = (1 << fbits) - 1;
+  for (auto& v : q) v = (uint8_t)(v & cmask);       // clamp codes to the format
+  for (auto& v : qT) v &= cmask;
+  std::vector<int8_t> packed((size_t)K * N / epb, 0);
   for (size_t i = 0; i < packed.size(); ++i) {
     int8_t b = 0;
-    for (int t = 0; t < 4; ++t) b |= int8_t((qT[4 * i + t] & 0x3) << (2 * t));
+    for (int t = 0; t < epb; ++t) b |= int8_t((qT[epb * i + t] & cmask) << (fbits * t));
     packed[i] = b;
   }
-  std::vector<int8_t> Bp(packed.size());
+  std::vector<int8_t> Bp(packed.size());   // same byte count as `packed` (regroup only permutes whole words)
   // FoldTK=64: the N-fold step (nfold_column_pairs_ppu) runs after interleave-256.
   // DERIVED placement (nfold_place_derived_int2) INSTEAD of the standard relayout: it maps each logical (n,k) of a
   // 64x64 tile straight to the physical (word, crumb) the folded kernel reads. Verified locally: 4096 logical
@@ -68,21 +78,24 @@ int main(int argc, char** argv) {
   // relayout for an A/B (that baseline gave n=0..31 correct at k=0, everything else wrong).
   // Standard preprocess FIRST (all 5 steps), then the fold is a WORD-LEVEL regroup on its output that preserves the
   // pipeline's own crumb order -- see nfold_regroup_words_int2. NFOLD_STD=1 skips the regroup (baseline A/B).
-  preprocess_weights_for_mixed_gemm<false, 256, 0>(
-      Bp.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
+  const QuantTypeClass qtc = (fbits == 1) ? QuantTypeClass::PACKED_INT1_WEIGHT_ONLY
+                                          : QuantTypeClass::PACKED_INT2_WEIGHT_ONLY;
+  preprocess_weights_for_mixed_gemm<false, 256, 0>(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, qtc);
   if (!getenv("NFOLD_STD")) {
     std::vector<int8_t> tmp(Bp.size());
-    nfold_regroup_gmem_int2(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64);
+    nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64, fbits);
     Bp.swap(tmp);
   }
 
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> dB((size_t)K*N);
+  cutlass::DeviceAllocation<uint1_t> dB1((size_t)K*N);
   { std::vector<half_t> a((size_t)M*K, half_t(0.f));
     for (int m = 0; m < M; ++m) a[(size_t)m*K + m] = half_t(1.f);
     std::vector<half_t> s((size_t)scale_k*N, half_t(1.f)), z((size_t)scale_k*N, half_t(0.f));
     dA.copy_from_host(a.data()); dSc.copy_from_host(s.data()); dZr.copy_from_host(z.data()); }
-  dB.copy_from_host(reinterpret_cast<uint2_t const*>(Bp.data()));
+  if (fbits == 1) dB1.copy_from_host(reinterpret_cast<uint1_t const*>(Bp.data()));
+  else            dB.copy_from_host(reinterpret_cast<uint2_t const*>(Bp.data()));
 
   std::vector<GS> shp(1, cute::make_shape(M, N, K));
   cutlass::DeviceAllocation<GS> shpd(1); shpd.copy_from_host(shp.data());
@@ -100,9 +113,14 @@ int main(int argc, char** argv) {
   // filter_and_run picks the group-size schedule; the fold wrapper is applied inside launch via MOEG_CALL, so here
   // we go through filter_and_run with TK=64 -- which for plain int2 would be ILLEGAL (16B run) and is exactly what
   // the fold makes legal.
-  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
-      dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
-      M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
+  if (fbits == 1)
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint1_t>(
+        dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
+        M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
+  else
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
+        dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
+        M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
