@@ -8,7 +8,14 @@ g++ -O2 -std=c++17 leg1_runword.cpp   -o leg1  && ./leg1
 nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include leg2_frag.cu -o leg2 && ./leg2
 g++ -O2 -std=c++17 leg3_predicate.cpp -o leg3  && ./leg3
 g++ -O2 -std=c++17 ft_check.cpp       -o ftchk && ./ftchk
+g++ -O2 -std=c++17 sweep_shapes.cpp   -o sweep && ./sweep
 ```
+
+`sweep_shapes.cpp` is the "will this break the build" check. The kernel-side guard depends on nothing but
+`(Bits, TileShape.K)`, so enumerating the distinct pairs the tree uses is exhaustive — section 1 does that, and
+section 2 runs all 45 concrete `(Bits, TM, TN, TK, Stages, WM, WN)` tuples through the full `FoldTraits`,
+including the invariants the guard leaves out. All 45 pass. Four sit exactly at the I1 boundary
+(`delivery == slots`): correct today, no headroom, so lowering their TN would silently drop weights.
 
 `stub_inc/` holds the `hggc*.h` headers cute pulls in through `cute/util/debug.hpp`. Nothing here runs on a
 device — leg2 only asks cute to partition a layout on the host.

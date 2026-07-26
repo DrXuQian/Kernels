@@ -28,6 +28,7 @@
 // small at a legal colw (e.g. int1 TN=32 TK=128 delivers 128 codes into 64 slots).
 #pragma once
 #include <cstddef>
+#include <type_traits>
 
 namespace fold {
 
@@ -68,7 +69,10 @@ namespace fold {
 // conclusion is drawn from them. Fixed in test_fold_int2.cu; the labels now carry the launched TileShape.
 inline constexpr int kMaxFold = 2;
 
-template <int Bits, int TM, int TN, int TK, int Stages = 3>
+// WM/WN default to the common 32x32 warp tile. They only feed the occupancy estimate -- pass the real ones when
+// analysing a config that uses something else (the Q3 B-concat sweep runs 16x32 warps at TM=16, which divides by
+// zero under a hardcoded /32).
+template <int Bits, int TM, int TN, int TK, int Stages = 3, int WM = 32, int WN = 32>
 struct FoldTraits {
   // ---- fold geometry ----
   static constexpr int contig_bytes = TK * Bits / 8;              // bytes one N-column contributes along K
@@ -86,9 +90,9 @@ struct FoldTraits {
   static constexpr int a_smem   = TM * TK * 2;                    // fp16 A tile per stage
   static constexpr int b_smem   = Ng * (F * TK * Bits / 8);
   static constexpr int smem     = (a_smem + b_smem) * Stages;
-  static constexpr int warps    = (TM / 32) * (TN / 32);
+  static constexpr int warps    = ((TM + WM - 1) / WM) * ((TN + WN - 1) / WN);
   static constexpr int blk_smem = 262144 / smem;                  // 256KB per CU (hard cap)
-  static constexpr int blk_warp = 64 / warps;                     // 64 warps per CU
+  static constexpr int blk_warp = 64 / (warps > 0 ? warps : 1);   // 64 warps per CU
   static constexpr int blocks   = blk_smem < blk_warp ? blk_smem : blk_warp;
 
   // ---- invariants (both needed; each one alone mis-predicts a real reference point) ----
@@ -109,8 +113,36 @@ struct FoldTraits {
       "has no such N. int1 therefore cannot go below TK=128, int2 below TK=64, int4 below TK=32.");
   static_assert(F <= kMaxFold, "fold: F > 2 is unreachable -- see the derivation above");
   static_assert(TN % F == 0, "fold: TileN must divide into F groups");
-  static_assert(TK % 16 == 0 && TN % 32 == 0 && TM % 32 == 0, "fold: tile must be mma-atom aligned");
+  // The mma atom is 16x16x16, so 16 -- not 32 -- is the real granularity. TM=16 is a shipped shape (the Q3
+  // B-concat sweep's small-M configs) and must not be rejected.
+  static_assert(TK % 16 == 0 && TN % 16 == 0 && TM % 16 == 0, "fold: tile must be mma-atom aligned");
   static_assert(contig_bytes * F == 32 || F == 1, "fold: the folded run must be exactly 32B");
+};
+
+// Check<> is what a kernel instantiation fires. It deliberately asserts ONLY the theorem -- the TK*Bits bound --
+// and NOT the rest of FoldTraits, for a reason worth stating:
+//
+//   * TK*Bits >= 128 depends on nothing but the B width and TileShape.K. No warp layout, no TN, no epilogue. It is
+//     the one predicate I can verify by inspection against every instantiation in the tree (sweep_shapes.cpp does
+//     exactly that), so putting it in the build cannot break a config that works today.
+//   * I1 (delivery <= slots) is real but its `slots` term assumes the 32x32 warp tile. The Q3 B-concat sweep runs
+//     16x32 warps, so a kernel-side I1 would be asserting a number I do not model faithfully. It stays in
+//     FoldTraits for offline analysis, where the caller can pass the true WM/WN.
+//
+// Bits outside (0,8) means "not a sub-byte B plane" (fp16 / int8 / an absent second plane) and is skipped.
+// Worth knowing, from I1 rather than the theorem: folding (F=2) additionally needs TN >= 64. At TN=32 a thread is
+// handed more codes than its fragment has slots.
+template <int Bits, int TK, class = void>
+struct Check { static constexpr bool ok = true; };
+
+template <int Bits, int TK>
+struct Check<Bits, TK, std::enable_if_t<(Bits > 0 && Bits < 8)>> {
+  static_assert(TK * Bits >= 128,
+      "fold: a folded column must be at least 16 B (TK*Bits >= 128) so that the four words a half-run hands to "
+      "the four lanes all belong to ONE column. Below that the column varies with lane%4, and the mma fragment "
+      "has no such N -- the surplus columns are delivered to other lanes entirely. int1 cannot go below TK=128, "
+      "int2 below TK=64, int4 below TK=32. See fold_derivation/ for the two-leg proof.");
+  static constexpr bool ok = true;
 };
 
 } // namespace fold

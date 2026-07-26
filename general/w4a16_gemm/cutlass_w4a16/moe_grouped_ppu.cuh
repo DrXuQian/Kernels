@@ -18,6 +18,7 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "fold_traits.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
 #include "ppu_include.hpp"
@@ -111,6 +112,18 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   static constexpr int MOEG_BITS  = cutlass::sizeof_bits<ElementB>::value;
   static constexpr int MOEG_RUN_B = cute::size<2>(TileShape{}) * MOEG_BITS / 8;
   static constexpr int MOEG_FOLD  = MOEG_RUN_B >= 32 ? 1 : (32 / MOEG_RUN_B);
+  // Make the fold invariants actually FIRE. Until this line, fold_traits.hpp was included by nobody and its
+  // static_asserts were inert commentary -- which is precisely how the perf harness came to launch int1 at the
+  // forbidden (64,128,64) with nothing to stop it. Sub-byte B only: fp16/int8 B never folds. A bare alias would
+  // NOT do: naming a specialization as a template argument does not instantiate it, so the asserts would stay
+  // asleep. fold::Check<> below reads a member, which requires completeness and therefore fires them.
+  static_assert(fold::Check<MOEG_BITS, cute::size<2>(TileShape{})>::ok, "B plane: TileShape.K too small");
+  // B-concat: the two planes share one TileShape.K, so the NARROWER plane has to satisfy the bound too. That is
+  // what pins Q3 (int2+int1) and Q5 (int4+int1) to TK=128 while Q6 (int4+int2) may use TK=64.
+  static_assert(fold::Check<(std::is_void_v<PlaneB2> ? 0 : cutlass::sizeof_bits<
+                                std::conditional_t<std::is_void_v<PlaneB2>, cutlass::half_t, PlaneB2>>::value),
+                            cute::size<2>(TileShape{})>::ok,
+                "second B plane: TileShape.K too small for its width");
   const int scale_k = (k + group_size - 1) / group_size;
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));   // mainloop: single L-strided base
   // N-FOLD: a folded weight buffer is physically (N/FoldF) rows x (FoldF*K) codes -- one physical row carries TWO
