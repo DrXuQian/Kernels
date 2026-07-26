@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
       Bp.data(), packed.data(), {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
   if (!getenv("NFOLD_STD")) {
     std::vector<int8_t> tmp(Bp.size());
-    nfold_regroup_words_int2(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64);
+    nfold_regroup_gmem_int2(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, /*fold_tk=*/64);
     Bp.swap(tmp);
   }
 

@@ -638,43 +638,51 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
 // 32B run. The two folded N-columns land in the lower vs upper mma-K atom blocks (cute_nfold2.cu: 0/64 cross-contam),
 // so the mainloop consumes them as 2 output-N groups reusing one A -- no reduce, no converter change.
 // Placement VERIFIED bijective and consistent with the fragment split in scratchpad/nfold_p11.cpp.
-// N-FOLD offline placement, built from the GROUND TRUTH of the existing pipeline (scratchpad/pipe_truth.py, which
-// re-implements all 5 relayout steps and extracts the logical->physical map of the hardware-validated int2 path).
-//
-// GROUND TRUTH (this corrected a wrong assumption that cost many rounds): one uint32 holds codes of a SINGLE n --
-//     word  = n * (K/16) + k_block          (n-major; 16 codes per word)
-//     crumb d -> k = 8*(d%8) + (d>>3)  within that word's 64-k block
-// My earlier "target table" claimed a uint32 held both n and n+32 (from composing cute's fragment map with the
-// converter order). That was wrong -- it assumed a fragment slot ordering that does not hold -- which is why the
-// resulting placement measured ~72% wrong, i.e. essentially random.
-//
-// Consequently the fold is a WORD-LEVEL regroup that PRESERVES the pipeline's own crumb order: the folded physical row
-// r must carry n=r's k-tile words followed by n=(r+Ng)'s, so that one 32B run holds two logical N columns:
-//     folded_row r  =  [ n=r's (TK/16) words ] [ n=r+Ng's (TK/16) words ]
-// Run this on the OUTPUT of the standard preprocess (so all 5 steps, including split-at-8, already applied).
-inline void nfold_regroup_words_int2(int8_t* out, const int8_t* in_std,
-                                     const std::vector<size_t>& shape, int fold_tn, int fold_tk)
+// N-FOLD offline placement, derived from the KERNEL'S OWN gmem address arithmetic (not from a guessed arrangement).
+// Read straight out of the fold collective's load_init_B (interleaved-256 branch) + AiuDesc::init:
+//     folded mB layout : shape (N/F, (kCon, K*F/kCon)), stride (kCon, (1, kCon*(N/F)))
+//     AIU descriptor   : dim_h = N/F, dim_w = kCon, cube_h = Ng, cube_w = AiuContElemSize
+//     gB tiler         : N steps by Ng, K steps by F*TK
+// => the buffer is (N/F) PHYSICAL ROWS, each kCon elements contiguous, and within a row each F*TK-element run holds
+//    F logical N columns x TK k each. Output block [n0, n0+TN) reads physical rows [n0/F, n0/F + Ng).
+// Everything above is pure layout arithmetic from source -- no hardware unknown -- which is why this replaces the
+// previous five guessed arrangements (each of which measured 72-75%, i.e. random, because the global arrangement
+// disagreed with this walk regardless of the within-run placement).
+// The WITHIN-run element order keeps the standard pipeline's crumb order, so run this on the standard preprocess
+// output and only MOVE whole 16-code words.
+inline void nfold_regroup_gmem_int2(int8_t* out, const int8_t* in_std,
+                                    const std::vector<size_t>& shape, int fold_tn, int fold_tk)
 {
     const size_t K = shape.size() == 2 ? shape[0] : shape[1];
     const size_t N = shape.size() == 2 ? shape[1] : shape[2];
-    const int    F = 2;                                  // int2 at TK=64 -> FoldF = 2
-    const int    Ng = fold_tn / F;                       // physical rows per tile
-    const int    WPK = fold_tk / 16;                     // uint32 words per (n, K-tile): 64 codes / 16
-    const int    WPN = (int)(K / 16);                     // words per n in the standard layout
+    const int    F   = 2;                       // int2 @ TK=64
+    const int    Ng  = fold_tn / F;
+    const int    kCon = 256;
+    const int    WPK = fold_tk / 16;            // words per (n, K-tile)
+    const int    WPN = (int)(K / 16);           // words per n in the STANDARD interleaved-256 buffer
+    const int    W_ROW = kCon / 16;             // words per physical row segment (kCon elements)
     const uint32_t* src = reinterpret_cast<const uint32_t*>(in_std);
     uint32_t*       dst = reinterpret_cast<uint32_t*>(out);
-    for (size_t k0 = 0; k0 + fold_tk <= K; k0 += fold_tk)
-      for (size_t n0 = 0; n0 + fold_tn <= N; n0 += fold_tn) {
-        const size_t tile = (k0 / fold_tk) * (N / fold_tn) + (n0 / fold_tn);
-        uint32_t* tbase = dst + tile * (size_t)Ng * F * WPK;
-        for (int r = 0; r < Ng; ++r)
+    const size_t nrow = N / F, nkb = (K * F) / kCon;
+    for (size_t r = 0; r < nrow; ++r)                       // physical row
+      for (size_t kb = 0; kb < nkb; ++kb)                   // super-tile along folded K
+        for (int t = 0; t < kCon / (F * fold_tk); ++t)      // K-tiles inside this super-tile
           for (int f = 0; f < F; ++f)
             for (int w = 0; w < WPK; ++w) {
-              const size_t n_src = n0 + r + (size_t)f * Ng;         // partner column is n + Ng (in-tile)
-              const size_t src_w = n_src * WPN + (k0 / 16) + w;     // standard layout: n-major, 16 codes/word
-              tbase[(size_t)r * F * WPK + (size_t)f * WPK + w] = src[src_w];
+              // which logical (n, K-tile) supplies this word
+              const size_t tile_n0 = (r / Ng) * fold_tn;                     // output block this row serves
+              const size_t n_log   = tile_n0 + (r % Ng) + (size_t)f * Ng;    // partner column is n + Ng
+              const size_t ktile   = (kb * (kCon / (F * fold_tk)) + t);      // which fold_tk block along K
+              const size_t src_w   = n_log * WPN + ktile * WPK + w;          // standard buffer is n-major
+              // destination: row r, element offset within row = t*(F*fold_tk) + f*fold_tk (+ w*16)
+              // destination = PLANE-major: stride (kCon, (1, kCon*(N/F))) makes super-tile kb a separate plane of
+              // (N/F) rows, so kb selects the plane and r indexes rows inside it. (Verified locally: 4096/4096 words
+              // written, zero collisions, zero out-of-range.)
+              const size_t dst_w = kb * (nrow * (size_t)W_ROW)
+                                 + r * (size_t)W_ROW
+                                 + (size_t)t * (F * WPK) + (size_t)f * WPK + w;
+              dst[dst_w] = src[src_w];
             }
-      }
 }
 
 inline void nfold_column_pairs_ppu(int8_t*                    out,
