@@ -184,6 +184,16 @@ int main(int argc, char** argv) {
       }
       int bad2 = 0, shown2 = 0;
       std::printf("  [decode %s_used]\n", axis == 0 ? "n" : "k");
+      // FULL map for one slice, matched or not -- the first-10-mismatches view hides the shape of the permutation.
+      if (axis == 0) {                       // n_used across a whole row (m=0)
+        std::printf("    m=0 n_used[n=0..%d]:", (N < 64 ? N : 64) - 1);
+        for (int n2 = 0; n2 < N && n2 < 64; ++n2) std::printf(" %d", idx[(size_t)0*N + n2]);
+        std::printf("\n");
+      } else {                               // k_used down a column (n=0), want == m
+        std::printf("    n=0 k_used[m=0..%d]:", (M < 64 ? M : 64) - 1);
+        for (int m2 = 0; m2 < M && m2 < 64; ++m2) std::printf(" %d", idx[(size_t)m2*N + 0]);
+        std::printf("\n");
+      }
       for (int m2 = 0; m2 < M && shown2 < 10; ++m2) for (int n2 = 0; n2 < N && shown2 < 10; ++n2) {
         const int want = (axis == 0) ? n2 : m2;               // identity A: output row m reads k=m
         const int got  = idx[(size_t)m2*N+n2];
