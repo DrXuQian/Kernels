@@ -90,10 +90,16 @@ struct FoldTraits {
   static constexpr int cols_demanded = WN / 8;
   static constexpr int k_per_col     = TK / 4;
   static constexpr int words_per_dlv = 4;
-  static constexpr int cols_per_word = WN / 32;               // = cols_demanded / words_per_dlv
-  // 1 means nfold_regroup_gmem's whole-uint32 moves suffice. >1 means columns must be INTERLEAVED inside a word,
-  // which it cannot express. This is the cost of the only escape from over-delivery: raising WN.
-  static constexpr bool wholeword_packer_ok = cols_per_word <= 1;
+  // NO cols_per_word HERE, ON PURPOSE. Two derivations of it disagree and neither is trustworthy yet:
+  //   * cols_demanded / words_per_dlv = WN/32 -- wrong, it assumes each column lives in exactly one word, but a
+  //     column's k is spread across several words while a word also holds several columns;
+  //   * the L2 o L3 o L4 composition (l6_derive.cu) says F, and that CONTRADICTS the shipped packer:
+  //     nfold_regroup_gmem does dst[dst_w] = src[src_w] with src_w indexed by a single n_log, so the folded buffer
+  //     provably has ONE column per word -- and it measures bad=0 on ppu001 at exactly the config the
+  //     composition claims needs two.
+  // So one leg of that composition is wrong despite each leg having been checked in isolation. Until the
+  // calibration in l6_derive.cu's header is done, any cols_per_word constant here would be a guess with a
+  // static_assert's authority. See fold_derivation/README.md.
 };
 
 // CheckDelivery<> is what a kernel instantiation fires. It asserts the ONE hard constraint: a thread cannot use
