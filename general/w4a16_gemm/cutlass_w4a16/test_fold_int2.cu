@@ -185,6 +185,10 @@ int main(int argc, char** argv) {
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, cutlass::int4b_t>(
             pA.get(), pB4.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (fbits == 1 && scale_only)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3, uint1_t>(
+            pA.get(), pB1.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else if (fbits == 1)
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, uint1_t>(
             pA.get(), pB1.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
@@ -210,7 +214,8 @@ int main(int argc, char** argv) {
     float ms = 0; hggcEventElapsedTime(&ms, e0, e1);
     const double us = (double)ms * 1e3 / 30, tf = 2.0*PM*PN*PK / (us*1e-6) / 1e12;
     std::printf("  [fold perf] %-9s %-9s M=%d N=%d K=%d gs=%d : %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n",
-                use_i4 ? "int4@TK64" : "int2fold", scale_only ? "ScaleOnly" : "ScaleZero",
+                use_i4 ? "int4@TK64" : (fbits == 1 ? "int1f@TK128" : "int2f@TK64"),
+                scale_only ? "ScaleOnly" : "ScaleZero",
                 PM, PN, PK, gs, us, tf, 100.0*tf*1e12/500.0e12);
     std::printf("     compare: int2@TK128 = 37.1%% (gs=32) / 30.9%% (gs=16) ; int4@TK64 = 55.8%% / 53.1%%\n");
   }
