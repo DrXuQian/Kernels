@@ -41,9 +41,20 @@ int main(int argc, char** argv) {
   // balances at TK=128 (128 = 128). At int1/TK=64 it would be 128 codes into 64 slots -- every shape assert still
   // passes (B MMA_N=2 matches accum, MMA_K=4 matches A), so it compiles and silently drops half the data, which is
   // exactly the 44.9%-random result measured for int1 fold at TK=64.
-  const int ftk = getenv("FOLD_TK") ? atoi(getenv("FOLD_TK")) : (fbits == 1 ? 128 : 64);
-  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  FOLD: TileShape.K=%d, FoldF=%d (32B run)\n",
-              M, N, gs, fbits, ftk, (32 * 8 / fbits) / ftk);
+  // Binding constraint: fragment slots == swzl delivery, where
+  //     slots    = 8*(TN/32)*(TK/16)          (fp16 B fragment per thread)
+  //     delivery = 16 bytes/thread = 16*8/bits codes
+  // TN is a FREE VARIABLE too -- fixating on TK was my error, and it forced int1 to TK=128 (A-smem 16KB, 5 blk).
+  //     int1 TN=64  TK=64  : slots  64 < 128 -> OVERFLOW, half the converted data dropped (the 44.9% result)
+  //     int1 TN=128 TK=64  : slots 128 = 128 -> BALANCED, A-smem back to 8KB like int4/int2-fold, and since int1
+  //                          weights are the smallest the total smem is smaller than int4's: 9 blk vs 8.
+  // (int4@TK64 has slots 64 > delivery 32, i.e. it UNDER-delivers and issues more swzl steps -- workable. Only
+  //  OVER-delivery is fatal, which is exactly what broke int1.)
+  const int ftk = getenv("FOLD_TK") ? atoi(getenv("FOLD_TK")) : 64;
+  const int ftn = getenv("FOLD_TN") ? atoi(getenv("FOLD_TN")) : (fbits == 1 ? 128 : 64);
+  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  TileShape=(64,%d,%d) FoldF=%d | slots=%d delivery=%d\n",
+              M, N, gs, fbits, ftn, ftk, (32 * 8 / fbits) / ftk,
+              8 * (ftn / 32) * (ftk / 16), 16 * 8 / fbits);
 
   // q2 codes, transposed to [N][K] and packed 4/byte, then the OFFLINE FOLD (FoldTK=64) in preprocess.
   // LABELLED input (argv[4]): make the weight code SPELL OUT its own source index, so a wrong fold reads back as a
@@ -90,7 +101,7 @@ int main(int argc, char** argv) {
   preprocess_weights_for_mixed_gemm<false, 256, 0>(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, qtc);
   if (!getenv("NFOLD_STD")) {
     std::vector<int8_t> tmp(Bp.size());
-    nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, /*fold_tn=*/64, ftk, fbits);
+    nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, ftn, ftk, fbits);
     Bp.swap(tmp);
   }
 
@@ -121,7 +132,7 @@ int main(int argc, char** argv) {
   // we go through filter_and_run with TK=64 -- which for plain int2 would be ILLEGAL (16B run) and is exactly what
   // the fold makes legal.
   if (fbits == 1)
-    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, uint1_t>(
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 128, 64, 32, 32, 3, uint1_t>(
         dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
         M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   else
@@ -202,11 +213,11 @@ int main(int argc, char** argv) {
             pA.get(), pB4.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else if (fbits == 1 && scale_only)
-        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3, uint1_t>(
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 128, 64, 32, 32, 3, uint1_t>(
             pA.get(), pB1.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else if (fbits == 1)
-        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3, uint1_t>(
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 128, 64, 32, 32, 3, uint1_t>(
             pA.get(), pB1.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else if (scale_only)
@@ -221,7 +232,7 @@ int main(int argc, char** argv) {
       run(); CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
       std::printf("  [acu] one launch: %s %s gs=%d\n",
                   use_i4 ? (ftk == 128 ? "int4@TK128" : "int4@TK64")
-                       : (fbits == 1 ? "int1f@TK128" : (ftk == 128 ? "int2@TK128" : "int2f@TK64")),
+                       : (fbits == 1 ? "int1f@128x64" : (ftk == 128 ? "int2@TK128" : "int2f@TK64")),
                   scale_only ? "ScaleOnly" : "ScaleZero", gs);
       return 0;
     }
@@ -234,7 +245,7 @@ int main(int argc, char** argv) {
     const double us = (double)ms * 1e3 / 30, tf = 2.0*PM*PN*PK / (us*1e-6) / 1e12;
     std::printf("  [fold perf] %-9s %-9s M=%d N=%d K=%d gs=%d : %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n",
                 use_i4 ? (ftk == 128 ? "int4@TK128" : "int4@TK64")
-                       : (fbits == 1 ? "int1f@TK128" : (ftk == 128 ? "int2@TK128" : "int2f@TK64")),
+                       : (fbits == 1 ? "int1f@128x64" : (ftk == 128 ? "int2@TK128" : "int2f@TK64")),
                 scale_only ? "ScaleOnly" : "ScaleZero",
                 PM, PN, PK, gs, us, tf, 100.0*tf*1e12/500.0e12);
     std::printf("     compare: int2@TK128 = 37.1%% (gs=32) / 30.9%% (gs=16) ; int4@TK64 = 55.8%% / 53.1%%\n");
