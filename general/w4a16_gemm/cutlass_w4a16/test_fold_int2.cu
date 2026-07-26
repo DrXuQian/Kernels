@@ -149,6 +149,53 @@ int main(int argc, char** argv) {
         M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
+  // FOLD_DECODE=1: recover WHICH logical (n,k) each output slot actually consumed, instead of theorising about it.
+  // A 1-bit code can carry one label bit, so the index is decoded bit-plane by bit-plane: run the kernel once per bit
+  // with q = ((n or k) >> b) & mask, read the bit back out of D (scale=1, zero=0, A=identity => D == the code), and
+  // OR it into place. This is the technique that cracked int2; three successive mechanistic theories for int1
+  // (degenerate Ng, slots-vs-delivery, pairing) were all wrong, so measure instead.
+  if (getenv("FOLD_DECODE")) {
+    auto run_once = [&](std::vector<uint8_t> const& qq, std::vector<half_t>& out) {
+      std::vector<int> t2((size_t)K*N);
+      for (int k2 = 0; k2 < K; ++k2) for (int n2 = 0; n2 < N; ++n2) t2[(size_t)n2*K+k2] = qq[(size_t)k2*N+n2];
+      std::vector<int8_t> pk((size_t)K*N/epb, 0);
+      for (size_t i = 0; i < pk.size(); ++i) { int8_t bb=0;
+        for (int t = 0; t < epb; ++t) bb |= int8_t((t2[epb*i+t] & cmask) << (fbits*t)); pk[i]=bb; }
+      std::vector<int8_t> bp(pk.size());
+      preprocess_weights_for_mixed_gemm<false, 256, 0>(bp.data(), pk.data(), {(size_t)K,(size_t)N}, qtc);
+      if (!getenv("NFOLD_STD")) { std::vector<int8_t> tm(bp.size());
+        nfold_regroup_gmem(tm.data(), bp.data(), {(size_t)K,(size_t)N}, ftn, ftk, fbits); bp.swap(tm); }
+      if (fbits == 1) dB1.copy_from_host(reinterpret_cast<uint1_t const*>(bp.data()));
+      else            dB.copy_from_host(reinterpret_cast<uint2_t const*>(bp.data()));
+      if (ftn == 128) CORR_DISPATCH(128); else CORR_DISPATCH(64);
+      CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+      out.resize((size_t)M*N); dD.copy_to_host(out.data());
+    };
+    for (int axis = 0; axis < 2; ++axis) {                    // 0 = decode n, 1 = decode k
+      std::vector<int> idx((size_t)M*N, 0);
+      const int nbits_idx = (axis == 0) ? 8 : 8;              // N,K <= 256
+      for (int b = 0; b < nbits_idx; ++b) {
+        std::vector<uint8_t> qq((size_t)K*N);
+        for (int k2 = 0; k2 < K; ++k2) for (int n2 = 0; n2 < N; ++n2)
+          qq[(size_t)k2*N+n2] = (uint8_t)((((axis == 0) ? n2 : k2) >> b) & cmask);
+        std::vector<half_t> dd; run_once(qq, dd);
+        for (size_t i = 0; i < (size_t)M*N; ++i)
+          idx[i] |= (((int)std::lround((double)float(dd[i]))) & 1) << b;
+      }
+      int bad2 = 0, shown2 = 0;
+      std::printf("  [decode %s_used]\n", axis == 0 ? "n" : "k");
+      for (int m2 = 0; m2 < M && shown2 < 10; ++m2) for (int n2 = 0; n2 < N && shown2 < 10; ++n2) {
+        const int want = (axis == 0) ? n2 : m2;               // identity A: output row m reads k=m
+        const int got  = idx[(size_t)m2*N+n2];
+        if (got != want) { std::printf("    (m=%3d,n=%3d) %s_used=%3d want=%3d delta=%+4d xor=%3d\n",
+                                       m2, n2, axis == 0 ? "n" : "k", got, want, got-want, got^want); ++shown2; }
+      }
+      for (int m2 = 0; m2 < M; ++m2) for (int n2 = 0; n2 < N; ++n2)
+        if (idx[(size_t)m2*N+n2] != ((axis == 0) ? n2 : m2)) ++bad2;
+      std::printf("    -> bad=%d/%d %s\n", bad2, M*N, bad2 ? "PERMUTED" : "identity");
+    }
+    return 0;
+  }
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
   int bad = 0, shown = 0;
   for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
