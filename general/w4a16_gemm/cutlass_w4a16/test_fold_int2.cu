@@ -203,7 +203,9 @@ int main(int argc, char** argv) {
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr); };
     if (getenv("FOLD_ONCE")) {                 // acu: emit exactly ONE kernel launch
       run(); CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-      std::printf("  [acu] one launch emitted (%s, gs=%d)\n", use_i4 ? "int4@TK64" : "int2-fold@TK64", gs);
+      std::printf("  [acu] one launch: %s %s gs=%d\n",
+                  use_i4 ? "int4@TK64" : (fbits == 1 ? "int1f@TK128" : "int2f@TK64"),
+                  scale_only ? "ScaleOnly" : "ScaleZero", gs);
       return 0;
     }
     for (int i = 0; i < 3; ++i) run();
