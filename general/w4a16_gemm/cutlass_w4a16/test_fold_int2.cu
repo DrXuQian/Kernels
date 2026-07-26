@@ -50,10 +50,17 @@ int main(int argc, char** argv) {
   //                          weights are the smallest the total smem is smaller than int4's: 9 blk vs 8.
   // (int4@TK64 has slots 64 > delivery 32, i.e. it UNDER-delivers and issues more swzl steps -- workable. Only
   //  OVER-delivery is fatal, which is exactly what broke int1.)
-  const int ftk = getenv("FOLD_TK") ? atoi(getenv("FOLD_TK")) : 64;
+  // Reaching 50%+ needs A-smem = TM*TK*2 down to 8KB. TK is not the only lever -- TM is one too, and int1's only
+  // VERIFIED-correct fold is F=2 (F=4 is broken: the decode showed n_used = n%Ng and k_used = (m/8)*8+m%4, i.e. the
+  // fragment only ever covers 64 of the run's 256 codes, which offline placement cannot fix). So instead of forcing
+  // F=4, keep F=2 and halve TM:
+  //     int1 TM=32 TN=128 TK=128 F=2 -> A 8KB, 8 blk, 4 warps/blk, 50% warp occupancy, slots 256 > deliv 128
+  //   which matches int4 (8 blk, 4 warps/blk, 50%, under-delivery) column for column, with a smaller B tile.
+  const int ftm = getenv("FOLD_TM") ? atoi(getenv("FOLD_TM")) : (fbits == 1 ? 32 : 64);
+  const int ftk = getenv("FOLD_TK") ? atoi(getenv("FOLD_TK")) : (fbits == 1 ? 128 : 64);
   const int ftn = getenv("FOLD_TN") ? atoi(getenv("FOLD_TN")) : (fbits == 1 ? 128 : 64);
-  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  TileShape=(64,%d,%d) FoldF=%d | slots=%d delivery=%d\n",
-              M, N, gs, fbits, ftn, ftk, (32 * 8 / fbits) / ftk,
+  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  TileShape=(%d,%d,%d) FoldF=%d | slots=%d delivery=%d\n",
+              M, N, gs, fbits, ftm, ftn, ftk, (32 * 8 / fbits) / ftk,
               8 * (ftn / 32) * (ftk / 16), 16 * 8 / fbits);
 
   // q2 codes, transposed to [N][K] and packed 4/byte, then the OFFLINE FOLD (FoldTK=64) in preprocess.
@@ -131,18 +138,20 @@ int main(int argc, char** argv) {
   // filter_and_run picks the group-size schedule; the fold wrapper is applied inside launch via MOEG_CALL, so here
   // we go through filter_and_run with TK=64 -- which for plain int2 would be ILLEGAL (16B run) and is exactly what
   // the fold makes legal.
-#define CORR_DISPATCH(TNV)                                                                                    \
+#define CORR_DISPATCH(TMV, TNV, TKV)                                                                                    \
   do {                                                                                                        \
     if (fbits == 1)                                                                                           \
-      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, TNV, 64, 32, 32, 3, uint1_t>(             \
+      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMV, TNV, TKV, 32, 32, 3, uint1_t>(             \
           dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                            \
           M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                      \
     else                                                                                                      \
-      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, TNV, 64, 32, 32, 3, uint2_t>(             \
+      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMV, TNV, TKV, 32, 32, 3, uint2_t>(             \
           dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                             \
           M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                      \
   } while (0)
-  if (ftn == 128) CORR_DISPATCH(128); else CORR_DISPATCH(64);
+  if (ftm == 32) { if (ftk == 128) CORR_DISPATCH(32, 128, 128); else CORR_DISPATCH(32, 128, 64); }
+  else if (ftn == 128) { if (ftk == 128) CORR_DISPATCH(64, 128, 128); else CORR_DISPATCH(64, 128, 64); }
+  else                 { if (ftk == 128) CORR_DISPATCH(64,  64, 128); else CORR_DISPATCH(64,  64,  64); }
   if (false)
     moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
         dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
@@ -167,7 +176,9 @@ int main(int argc, char** argv) {
         nfold_regroup_gmem(tm.data(), bp.data(), {(size_t)K,(size_t)N}, ftn, ftk, fbits); bp.swap(tm); }
       if (fbits == 1) dB1.copy_from_host(reinterpret_cast<uint1_t const*>(bp.data()));
       else            dB.copy_from_host(reinterpret_cast<uint2_t const*>(bp.data()));
-      if (ftn == 128) CORR_DISPATCH(128); else CORR_DISPATCH(64);
+      if (ftm == 32) { if (ftk == 128) CORR_DISPATCH(32, 128, 128); else CORR_DISPATCH(32, 128, 64); }
+  else if (ftn == 128) { if (ftk == 128) CORR_DISPATCH(64, 128, 128); else CORR_DISPATCH(64, 128, 64); }
+  else                 { if (ftk == 128) CORR_DISPATCH(64,  64, 128); else CORR_DISPATCH(64,  64,  64); }
       CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
       out.resize((size_t)M*N); dD.copy_to_host(out.data());
     };
