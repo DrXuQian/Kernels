@@ -17,8 +17,8 @@
 //   int2 (64, 64, 64)  F=2  deliv  64  slots  64  colw 4   OK   53.2%
 //   int2 (64,128, 64)  F=2  deliv  64  slots 128  colw 4   OK   bad=0
 //   int2 (64, 64,128)  F=1  deliv  64  slots 128  colw 8   OK   original validated path
-//   int1 (32,128,128)  F=2  deliv 128  slots 256  colw 4   OK   54.3%
-//   int1 (64, 64,128)  F=2  deliv 128  slots 128  colw 4   OK   36.4%
+//   int1 (32,128,128)  F=2  deliv 128  slots 256  colw 4   OK   bad=0 (MFU UNVERIFIED, see below)
+//   int1 (64, 64,128)  F=2  deliv 128  slots 128  colw 4   OK   bad=0 (MFU UNVERIFIED, see below)
 //   int1 (64, 64,256)  F=1  deliv 128  slots 256  colw 8   OK   original validated path
 //   int1 (64, 64, 64)  F=4  deliv 128  slots  64  colw 2   BAD  over-delivery (I1 catches it too)
 //   int1 (64,128, 64)  F=4  deliv 128  slots 128  colw 2   BAD  balanced yet broken (only I2 catches it)
@@ -59,9 +59,13 @@ namespace fold {
 // third and fourth columns of a run are delivered to DIFFERENT LANES (f = 2*(v%2) + (lane%4)/2), and a converter
 // only relabels registers inside one thread. No converter reaches another lane's registers.
 //
-// CONSEQUENCE. int1's smallest legal TK is 128, so at gs=16 it carries SK=8 while int2/int4 carry SK=4 -- that
-// is the whole of int1's gs=16 gap (ScaleOnly 54.3% at gs=32 vs 45.3% at gs=16, where int2 is flat). Closing it
-// means attacking the scale path, not the fold.
+// CONSEQUENCE. int1's smallest legal TK is 128, so at gs=16 it carries SK=8 while int2/int4 carry SK=4.
+//
+// CAUTION ON int1's RECORDED MFU. Every int1 throughput number on file (54.3% at gs=32, 45.3% at gs=16) was
+// produced by a harness whose perf lambda hardcoded (64,128,64) -- the F=4 shape this header forbids -- while
+// its correctness check ran the env-selected (32,128,128). bad=0 and the MFU therefore came from DIFFERENT
+// tiles. The CORRECTNESS results stand; the throughput numbers do not, and int1 must be re-measured before any
+// conclusion is drawn from them. Fixed in test_fold_int2.cu; the labels now carry the launched TileShape.
 inline constexpr int kMaxFold = 2;
 
 template <int Bits, int TM, int TN, int TK, int Stages = 3>
