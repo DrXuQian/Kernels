@@ -131,11 +131,19 @@ int main(int argc, char** argv) {
   // filter_and_run picks the group-size schedule; the fold wrapper is applied inside launch via MOEG_CALL, so here
   // we go through filter_and_run with TK=64 -- which for plain int2 would be ILLEGAL (16B run) and is exactly what
   // the fold makes legal.
-  if (fbits == 1)
-    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 128, 64, 32, 32, 3, uint1_t>(
-        dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
-        M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
-  else
+#define CORR_DISPATCH(TNV)                                                                                    \
+  do {                                                                                                        \
+    if (fbits == 1)                                                                                           \
+      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, TNV, 64, 32, 32, 3, uint1_t>(             \
+          dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                            \
+          M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                      \
+    else                                                                                                      \
+      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, TNV, 64, 32, 32, 3, uint2_t>(             \
+          dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                             \
+          M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                      \
+  } while (0)
+  if (ftn == 128) CORR_DISPATCH(128); else CORR_DISPATCH(64);
+  if (false)
     moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
         dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
         M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);
