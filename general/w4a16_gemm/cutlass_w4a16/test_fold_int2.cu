@@ -139,9 +139,25 @@ int main(int argc, char** argv) {
     cutlass::DeviceAllocation<int> pOf(1); pOf.copy_from_host(pof.data());
     const size_t pwsb = (size_t)cutlass::ceil_div(PM,16)*cutlass::ceil_div(PN,64)*64;
     cutlass::DeviceAllocation<char> pws(pwsb);
-    auto run = [&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
-        pA.get(), pB.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
-        PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr); };
+    // FOLD_INT4=1: run int4@TK64 instead -- SAME geometry (TM64/TK64, A-smem 8KB, SK=TK/gs, 4 mma K-atoms), only the
+    // B format differs, so an acu A/B isolates why int2-fold is more gs-sensitive (42.0 vs 53.1 at gs=16, while at
+    // gs=32 it is 52.2 vs 55.8).
+    cutlass::DeviceAllocation<cutlass::int4b_t> pB4((size_t)PK*PN);
+    const bool use_i4 = getenv("FOLD_INT4") != nullptr;
+    auto run = [&]{
+      if (use_i4)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, cutlass::int4b_t>(
+            pA.get(), pB4.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
+            pA.get(), pB.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr); };
+    if (getenv("FOLD_ONCE")) {                 // acu: emit exactly ONE kernel launch
+      run(); CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+      std::printf("  [acu] one launch emitted (%s, gs=%d)\n", use_i4 ? "int4@TK64" : "int2-fold@TK64", gs);
+      return 0;
+    }
     for (int i = 0; i < 3; ++i) run();
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
     hggcEvent_t e0, e1; hggcEventCreate(&e0); hggcEventCreate(&e1);
