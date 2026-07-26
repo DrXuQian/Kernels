@@ -144,10 +144,24 @@ int main(int argc, char** argv) {
     // gs=32 it is 52.2 vs 55.8).
     cutlass::DeviceAllocation<cutlass::int4b_t> pB4((size_t)PK*PN);
     const bool use_i4 = getenv("FOLD_INT4") != nullptr;
+    // FOLD_SCALEONLY=1 -> FinegrainedScaleOnly (zeros=nullptr). CRITICAL for fair comparison: the recorded int4
+    // "ceiling" numbers (55.8% gs=32 / 53.1% gs=16) came from the bench's I4 macro, which uses ScaleOnly, while the
+    // fold test used ScaleZero. In the FINE path every mma atom reloads the scale, and WITH zero it reloads twice --
+    // so the zero cost grows as gs shrinks (gs=16: 4 reloads -> 8). That, not the weight format, is what the earlier
+    // "int2-fold 42.0 vs int4 53.1" gap was measuring.
+    const bool scale_only = getenv("FOLD_SCALEONLY") != nullptr;
     auto run = [&]{
-      if (use_i4)
+      if (use_i4 && scale_only)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 64, 32, 32, 3, cutlass::int4b_t>(
+            pA.get(), pB4.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (use_i4)
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, cutlass::int4b_t>(
             pA.get(), pB4.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (scale_only)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 64, 32, 32, 3, uint2_t>(
+            pA.get(), pB.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
             PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3, uint2_t>(
@@ -165,7 +179,8 @@ int main(int argc, char** argv) {
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
     float ms = 0; hggcEventElapsedTime(&ms, e0, e1);
     const double us = (double)ms * 1e3 / 30, tf = 2.0*PM*PN*PK / (us*1e-6) / 1e12;
-    std::printf("  [fold perf] M=%d N=%d K=%d gs=%d : %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n",
+    std::printf("  [fold perf] %-9s %-9s M=%d N=%d K=%d gs=%d : %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n",
+                use_i4 ? "int4@TK64" : "int2fold", scale_only ? "ScaleOnly" : "ScaleZero",
                 PM, PN, PK, gs, us, tf, 100.0*tf*1e12/500.0e12);
     std::printf("     compare: int2@TK128 = 37.1%% (gs=32) / 30.9%% (gs=16) ; int4@TK64 = 55.8%% / 53.1%%\n");
   }
