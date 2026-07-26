@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
   gs = argc > 3 ? atoi(argv[3]) : 32;
   M = K;                                   // identity A
   const int scale_k = K / gs;
+  const int fbits = getenv("FOLD_BITS") ? atoi(getenv("FOLD_BITS")) : 2;   // 1 = int1 (F=4), 2 = int2 (F=2)
   std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  FOLD: TileShape.K=64, FoldF=%d (32B run)\n",
               M, N, gs, fbits, (32 * 8 / fbits) / 64);
 
@@ -59,7 +60,6 @@ int main(int argc, char** argv) {
   // packing density (codes/byte) and the element type change. int1 is the bigger prize: it is stuck at 2 blk/12%
   // occupancy at its forced TK=256, and folding to TK=64 should give 10 blk/62% (even past int4's 8 blk, since its
   // weights are smaller). It is also the prerequisite for Q3/Q5 reaching the ceiling.
-  const int fbits = getenv("FOLD_BITS") ? atoi(getenv("FOLD_BITS")) : 2;
   const int epb   = 8 / fbits;                      // codes per byte
   const int cmask = (1 << fbits) - 1;
   for (auto& v : q) v = (uint8_t)(v & cmask);       // clamp codes to the format
