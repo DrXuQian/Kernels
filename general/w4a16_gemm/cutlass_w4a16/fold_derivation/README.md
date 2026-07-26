@@ -9,6 +9,8 @@ nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include leg2_frag.c
 g++ -O2 -std=c++17 leg3_predicate.cpp -o leg3  && ./leg3
 g++ -O2 -std=c++17 ft_check.cpp       -o ftchk && ./ftchk
 g++ -O2 -std=c++17 sweep_shapes.cpp   -o sweep && ./sweep
+nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l2l3_layouts.cu -o l2l3 && ./l2l3
+nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include leg5_perthread.cu -o leg5 && ./leg5
 ```
 
 `sweep_shapes.cpp` is the "will this break the build" check. The kernel-side guard depends on nothing but
@@ -96,3 +98,36 @@ One box run settles it without touching the fold: **int4 at TK=128, gs=32 vs gs=
 same converter — only `SK` moves 4 → 8. If int4 also drops ~9 points there, the cost is `SK`-driven and
 format-independent, and the scale path is the next thing to work on. If it stays flat, something int1-specific
 is going on and the 9 points are elsewhere.
+
+
+## The index chains, as cute Layouts (`l2l3_layouts.cu`)
+
+Three maps stand between a weight bit in gmem and the mma. Each is currently open-coded in a different file,
+which is where every fold bug has hidden. Two of them are plain linear layouts, and the third is cute's own:
+
+| | map | expressed as |
+|---|---|---|
+| **L2** | `(lane, vreg)` → logical 32-bit word in the cube | `((4,8),(2,2)):((1,8),(4,64))` |
+| **L3** | `(bit, vreg)` → fp16 element of the converter's 128 | `((2,2,2,2,2),(2,2)):((2,8,16,32,1),(64,4))` |
+| **L4** | fp16 element → logical `(n, k)` | `partition_B`, indexed linearly |
+
+Each is checked against an independent model rather than a restatement of itself — L2 against
+`ppu_tsm_ld_swzl_sim`'s own arithmetic, L3 against the sixteen `_E()` mask constants read straight out of the
+instruction semantics. Both come out with **0 mismatches over all 128 (lane, vreg) / (bit, vreg) pairs, and both
+are bijections.**
+
+L3 is the interesting one. The converter looked non-linear because of its `off8 = {0,1,4,5,8,9,12,13}` lookup
+table, but `off8[b] == b0 + 4*b1 + 8*b2` — so the whole dequant emission order is a layout. That is exactly the
+thing [[ppu-swzl-cute-modelable]] argued should be modelled instead of the copy atoms: **the offline permutation
+becomes derivable rather than probe-fitted.**
+
+L4 needs no work at all: the converter writes through
+`make_tensor(tCrB_mma(_,_,k_block*K_ATOM_PER_COPY).data(), cvt_in.layout())`, i.e. consecutive elements from a
+pointer into a compact register fragment, so the converter's element index *is* `partition_B`'s linear index.
+
+### What L5 still needs
+
+Composing L2∘L3∘L4 and inverting gives the offline placement directly. The one missing input is from the
+collective, not from cute: when a fragment takes several copy-atom instances (int1 at TK=128 takes two, since
+`tCrB_load` is 32 B per thread while one swzl delivers 16 B), which `coord_h` / slice feeds each group of four
+vregs. That is a read of `retile_D` and the copy loop, not a derivation.
