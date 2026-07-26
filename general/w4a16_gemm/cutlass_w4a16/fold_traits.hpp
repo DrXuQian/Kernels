@@ -34,7 +34,11 @@ namespace fold {
 // (4-way N placement), and it is what would let int1 drop to TK=64 and stop paying double FINE-scale cost at gs=16
 // (int1 ScaleOnly 54.3% at gs=32 but only 45.3% at gs=16, while int2/int4 are flat, because SK = TK/gs and int1 is
 // pinned at TK=128).
+#if defined(MIXGEMM_INT1_NWAY4)
+inline constexpr int kConverterNWays = 4;   // 4-way int1 converter enabled (bases {0,16,32,48})
+#else
 inline constexpr int kConverterNWays = 2;
+#endif
 
 template <int Bits, int TM, int TN, int TK, int Stages = 3>
 struct FoldTraits {
