@@ -68,6 +68,9 @@ struct FoldTraits {
   static constexpr int warps    = ((TM + WM - 1) / WM) * ((TN + WN - 1) / WN);
   static constexpr int blk_smem = 262144 / smem;                  // 256KB per CU (hard cap)
   static constexpr int blk_warp = 64 / (warps > 0 ? warps : 1);   // 64 warps per CU
+  // WARNING: this omits the REGISTER limit and is therefore not the occupancy the hardware gives you. acu showed
+  // shared memory allowing 10 blocks where registers allowed 4. Use fold::warps_per_cu<> below for anything
+  // performance-related; this stays only because ft_check prints it alongside the fold geometry.
   static constexpr int blocks   = blk_smem < blk_warp ? blk_smem : blk_warp;
 
   // ---- invariants ----
@@ -159,6 +162,52 @@ inline constexpr int regs_per_thread = WM * WN / 32              // accumulator,
                                      + WN * TK / 256 * (Zero ? 2 : 1);   // scale (+ zero)
 template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
 inline constexpr bool regs_ok = regs_per_thread<TM, TN, TK, WM, WN, Zero> <= 256;
+
+// OCCUPANCY, corrected by acu. My blk formula was min(smem_limit, warp_limit) and it was MISSING THE REGISTER
+// LIMIT, which is why blk kept failing to order the data. acu on ladder rungs 3 and 4:
+//     rung 3  Regs=112  256 thr/blk  Block Limit Registers ...  theoretical 32 warp/CU  achieved 31.0
+//     rung 4  Regs=186  128 thr/blk  Block Limit Registers 4    theoretical 16 warp/CU  achieved 15.2
+// and it says so outright: "theoretical occupancy (25.0%) is limited by the number of required registers", with
+// shared memory allowing 10 blocks where registers allow 4.
+//
+// REGISTERS ARE BILLED ROUNDED UP TO A POWER OF TWO. Reverse it from acu's own warp counts: 131072/32 warps =
+// 128 reg/thread for a kernel reporting 112, and 131072/16 = 256 for one reporting 186. So 112 is billed as 128
+// and 186 as 256 -- 129 registers cost exactly as much as 256. That cliff, not the raw count, is what matters,
+// and it is why regs=176 and regs=104 behave like different animals while 176 vs 240 do not.
+inline constexpr int regs_per_cu = 131072;
+template <int R>
+inline constexpr int regs_billed = R <= 32 ? 32 : R <= 64 ? 64 : R <= 128 ? 128 : R <= 256 ? 256 : 512;
+template <int TM, int TN, int TK, int WM, int WN, int Stages, int Bits, int Gs = 32, bool Zero = false>
+inline constexpr int warps_per_cu = [] {
+  constexpr int warps = (TM / WM) * (TN / WN);
+  constexpr int smem  = (TM * TK * 2 + TN * TK * Bits / 8 + TN * (TK / Gs) * 2 * (Zero ? 2 : 1)) * Stages;
+  constexpr int blk_s = 262144 / smem;
+  constexpr int blk_w = 64 / warps;
+  constexpr int blk_r = regs_per_cu
+                      / (regs_billed<regs_per_thread<TM, TN, TK, WM, WN, Zero>> * warps * 32);
+  constexpr int blk   = blk_s < blk_w ? (blk_s < blk_r ? blk_s : blk_r) : (blk_w < blk_r ? blk_w : blk_r);
+  return blk * warps;
+}();
+
+// THE MODEL, and it took three tries to get here because each earlier attempt varied only ONE of two independent
+// factors. Over 25 measured points across all three widths (int1 sweep + the int4/int2/int1 ladders):
+//
+//                        cvt/mma = 4              cvt/mma = 8
+//     warps/CU >= 32     mean 52.1%  n=6          mean 39.1%  n=6     (-13.0)
+//     warps/CU <= 16     mean 46.1%  n=16         mean 32.0%  n=2     (-20.1)
+//                             (-6.0)
+//
+// The cvt/mma axis separates with NO overlap in either row -- it is a genuine cliff, ~13 points. The warps/CU axis
+// OVERLAPS at cvt/mma=4 (47.8-50.2 appears in both cells), so it is a mean shift of ~6-7 points, not a cliff. The
+// two are roughly additive.
+//
+// WHY THE EARLIER STORIES LOOKED CONTRADICTORY. The int1 sweep's high-warp configs were all WM=16 (cvt/mma=8), so
+// raising warps/CU appeared to HURT; the ladder's high-warp configs were WM=32 (cvt/mma=4), so raising warps/CU
+// appeared to HELP. Same quantity, opposite apparent sign, because each experiment moved the other factor too.
+//
+// PRESCRIPTION: cvt/mma = 4 (WM >= 32) AND warps/CU >= 32. The second needs registers billed at <= 128, which at
+// TK=64 means WN=32 -- and the delivery bound forbids that for int1. That is int1's ceiling, stated in the two
+// quantities that actually govern it.
 
 // CONVERTER AMORTISATION -- the objective, and it is NOT the register count.
 //

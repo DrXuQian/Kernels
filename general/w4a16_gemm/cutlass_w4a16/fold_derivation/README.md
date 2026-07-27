@@ -423,3 +423,45 @@ one-shot expansion into the fp16 fragment that forces fragment >= delivery. Chun
 int1 run `WN=32`, i.e. rung 3 or rung 1 — where int4 measures 52.7% and 56.0% and int1 has run 4-6 points ahead of
 int4 on every rung they share. That is an extrapolated **+5 to +8 points** for int1, anchored in the ladder rather
 than assumed.
+
+
+## acu on rungs 3 vs 4: my `blk` formula was missing the register limit
+
+| | rung 3 | rung 4 |
+|---|---|---|
+| grid × block | (32,32,1) × **256** = 8 warps/blk | (32,32,1) × **128** = 4 warps/blk |
+| Regs | **112** | **186** |
+| Theoretical occupancy | 50% — **32 warps/CU** | **25% — 16 warps/CU** |
+| Achieved | 48.4% — 31.0 warps | **23.74% — 15.20 warps** |
+| Block Limit **Registers** | — | **4** |
+| Block Limit Shared Mem | — | 10 |
+
+acu says it outright: *"theoretical occupancy (25.0%) is limited by the number of required registers"* — shared
+memory allows 10 blocks, registers allow 4. My `blk = min(262144/smem, 64/warps)` had **no register term**, which is
+why `blk` kept failing to order the data: I was computing the wrong quantity.
+
+**Registers are billed rounded up to a power of two.** Reverse it from acu's own warp counts: `131072/32 = 128`
+reg/thread for a kernel reporting 112, and `131072/16 = 256` for one reporting 186. So **129 registers cost exactly
+as much as 256**, and that cliff — not the raw count — is what matters. `fold::regs_billed<>` and
+`fold::warps_per_cu<>` now encode this, with static_asserts pinned to acu's two measured points.
+
+### Two independent factors, over 25 points across all three widths
+
+| | `cvt/mma = 4` | `cvt/mma = 8` |
+|---|---|---|
+| `warps/CU >= 32` | mean **52.1%** (n=6) | mean 39.1% (n=6) — **−13.0** |
+| `warps/CU <= 16` | mean 46.1% (n=16) — **−6.0** | mean 32.0% (n=2) — −20.1 |
+
+The `cvt/mma` axis separates with **no overlap in either row** — a genuine ~13-point cliff. The `warps/CU` axis
+**overlaps** at `cvt/mma=4` (47.8–50.2 appears in both cells), so it is a ~6-point mean shift, not a cliff. The two
+are roughly additive.
+
+**Why the earlier stories looked contradictory.** The int1 sweep's high-warp configs were all `WM=16`
+(`cvt/mma=8`), so raising `warps/CU` appeared to *hurt*; the ladder's high-warp configs were `WM=32`
+(`cvt/mma=4`), so raising it appeared to *help*. Same quantity, opposite apparent sign — because each experiment
+moved the other factor too. Neither single-factor story was wrong about its own axis; both were wrong to be stated
+alone.
+
+**Prescription:** `cvt/mma = 4` (`WM >= 32`) **and** `warps/CU >= 32`. The second needs registers billed at <= 128,
+which at `TK=64` means `WN=32` — and the delivery bound forbids that for int1. int1's ceiling is now stated in the
+two quantities that actually govern it, and `WN=32` is exactly what the N-chunked conversion would unlock.
