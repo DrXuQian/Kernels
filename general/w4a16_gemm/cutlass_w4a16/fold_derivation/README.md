@@ -245,3 +245,50 @@ uses, fold and unfolded, several N-tiles and k-tiles:
 Bit-identical output means swapping the five steps for the derived walk is safe *by construction* rather than by
 argument. The five steps stay in place until the box regression is green — the point of this file is that the
 decision no longer rests on reasoning.
+
+## The performance model, and two prescriptions it got wrong (`l26_convert_amort.cu`)
+
+The tile sweep took int1 from 42.0% to 50.2% MFU, but it took two refuted predictions to get the objective right.
+
+**Refuted #1 — "more atoms per k-iteration hides the scale reload better", so TK=256.** Measured 23.0-32.1%, and
+**4.5%** with zero. The cause is the register file, not hiding: TK=256 costs 320 regs/thread (352 with zero) against
+a 256 budget, so it spills. `TK` controls the register file, not overlap.
+
+**Refuted #2 — minimise `regs_per_thread`, so `w16x64`.** `accum = WM*WN/32` depends only on the warp shape and the
+delivery bound constrains only `WN`, so `w16x64` keeps int1's `TK=64` legal on 128 regs instead of 176. Measured
+**39.7% against 50.0%** — fewer registers, comparable occupancy, 10.3 points worse.
+
+**What actually separates all 20 points**, with no overlap and no crossing:
+
+| group | measured | note |
+|---|---|---|
+| `WM=32`, regs ≤ 256 | 40.9 – **50.2%** | 10 points |
+| `WM=16`, regs ≤ 256 | 31.9 – 39.8% | 8 points; the best of these has `blk=32`, the *highest* occupancy in the sweep |
+| regs > 256 | 4.5 – 39.0% | spilled |
+
+The best `WM=16` config has the highest occupancy in the sweep and still loses to the *worst* `WM=32` config
+(`blk=4`). Occupancy orders configs within a group; it cannot cross between them.
+
+**The mechanism, counted from cute rather than argued.** Every B fragment element must be converted (lop3 + fma) and
+scaled before it can enter an mma. Per thread per k-tile:
+
+```
+mma instructions  = (WM/16)*(WN/16)*(TK/16)
+B elems to cvt    = 8*(WN/16)*(TK/16)
+cvt elems per mma = 128/WM            <- WN and TK cancel EXACTLY; only WM survives
+```
+
+Each B fragment feeds `WM/16` mma instructions down M, so `WM/16` is the converter amortisation factor. `WM=16`
+means every converted element feeds exactly one mma. This is the quantised-B analogue of arithmetic intensity, at
+the register file rather than at HBM — and it is why buying registers by cutting `WM` was exactly backwards.
+
+So the model is **three-tier**, in priority order: (1) stay under 256 regs, (2) maximise `WM/16`, (3) then maximise
+`blocks`. `l26` prints `cvt/mma` for all 20 measured points; it is 4.00 for every `WM=32` row and 8.00 for every
+`WM=16` row.
+
+**int1 is structurally capped at `amort=2`.** Reaching `amort=4` needs `WM=64`, and under the delivery bound
+`WN*TK >= 4096` the register minimum over the whole legal space is 272: with `WN*TK` fixed the B and scale terms are
+constant at 80, and `2*WN + TK` is minimised at `TK = 2*WN`, giving `TK=64/WN=64` or `TK=128/WN=32` — both 272 > 256.
+`ft_check.cpp` asserts this. int4's bound is 8× looser (`WN*TK >= 1024`), so `amort=4` **is** reachable there at
+`(64,64,32) w64x32` = 116 regs, against the 55.9% production config's `amort=2`. That is an untried lever on the
+shipped int4 path.

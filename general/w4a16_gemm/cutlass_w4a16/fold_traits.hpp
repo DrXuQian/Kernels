@@ -147,11 +147,11 @@ inline constexpr bool warp_shape_ok = (WM > 0 && WN > 0 && TM % WM == 0 && TN % 
 //     S     = WN*TK/256         fp16, cosize is slots/4 (measured in l21), doubled with zero
 // Measured agreement (int1, gs=32, ScaleOnly unless noted):
 //     (32,128,128) w32x32  176 regs  blocks  7  -> 42.0%      (32,128,128) w32x32 s2  176  blocks 11 -> 46.5%
-//     (32,128, 64) w32x64  176 regs  blocks 23  -> 50.1%      (32,128,256) w32x32 s2  320  blocks  5 -> 23.0%
+//     (32,128, 64) w32x64  176 regs  blocks 23  -> 50.0%      (32,128,256) w32x32 s2  320  blocks  5 -> 23.0%
 //     (32,128,256) w32x32 s2 with zero  352 regs             ->  5.8%   (gs=16: 352 -> 4.5%)
-// So the picture is two-tier: above 256 the config spills and collapses; below it, `blocks` decides. TK=256 was
-// pursued on a "more atoms per iteration hides the scale reload better" theory that the box refuted -- the register
-// file, not hiding, is what TK controls.
+//     (32,128,128) w32x64 s3            288 regs             -> 39.0%
+// TK=256 was pursued on a "more atoms per iteration hides the scale reload better" theory that the box refuted --
+// the register file, not hiding, is what TK controls.
 template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
 inline constexpr int regs_per_thread = WM * WN / 32              // accumulator, fp32
                                      + WM * TK / 64              // A fragment
@@ -159,6 +159,45 @@ inline constexpr int regs_per_thread = WM * WN / 32              // accumulator,
                                      + WN * TK / 256 * (Zero ? 2 : 1);   // scale (+ zero)
 template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
 inline constexpr bool regs_ok = regs_per_thread<TM, TN, TK, WM, WN, Zero> <= 256;
+
+// CONVERTER AMORTISATION -- the objective, and it is NOT the register count.
+//
+// A PRESCRIPTION DERIVED FROM regs_per_thread ALONE FAILED ON THE BOX. accum = WM*WN/32 depends only on the warp
+// shape and the delivery bound constrains only WN, so w16x64 keeps int1's TK=64 legal while halving the
+// accumulator: 128 estimated regs against 176. Measured 39.7% against 50.0%. Fewer registers, comparable
+// occupancy, 10.3 points worse.
+//
+// What separates all 20 measured points, with no overlap, is WM:
+//     WM=32, regs<=256 : 40.9 - 50.2%   (10 points)
+//     WM=16, regs<=256 : 31.9 - 39.8%   ( 8 points)
+// and the best WM=16 point has blk=32, the HIGHEST occupancy in the sweep, while the worst WM=32 point has blk=4,
+// the lowest -- so `blocks` orders WITHIN a group but cannot cross between them.
+//
+// THE MECHANISM (counted from cute in fold_derivation/l26_convert_amort.cu, not argued). In a mixed-input GEMM
+// every B fragment element must be converted (lop3 + fma) and scaled before it can enter an mma. Per thread per
+// k-tile:
+//     mma instructions  = (WM/16)*(WN/16)*(TK/16)
+//     B elems to cvt    = 8*(WN/16)*(TK/16)
+//     cvt elems per mma = 128/WM                    <- WN and TK cancel EXACTLY; only WM survives
+// Each B fragment feeds WM/16 mma instructions down the M direction, so WM/16 is the amortisation factor. WM=16
+// means every converted element feeds exactly one mma and the converter cost per unit of math doubles. This is the
+// quantised-B analogue of arithmetic intensity, at the register file rather than at HBM -- and it is why a
+// prescription that bought registers by cutting WM was exactly backwards.
+//
+// SO THE MODEL IS THREE-TIER, in priority order:
+//     1. regs > 256          -> spills, collapses      (23.0% / 39.0% / 5.8% / 4.5%)
+//     2. maximise WM/16      -> converter amortisation (the 39.8 / 40.9 cliff)
+//     3. then maximise blocks                          (orders within a WM group)
+//
+// int1 IS STRUCTURALLY CAPPED AT amort=2. Reaching amort=4 needs WM=64, and under the delivery bound WN*TK >= 4096
+// the register minimum over the whole legal space is 272: with WN*TK fixed the B+scale terms are constant at 80 and
+// 2*WN + TK is minimised at TK=2*WN, giving TK=64/WN=32 or TK=128/WN=32 -- both 272 > 256. int4's bound is 8x
+// looser (WN*TK >= 1024), so amort=4 is reachable there at (64,64,32) w64x32 = 116 regs, against the 55.9%
+// production config's amort=2. That is an untried lever on the SHIPPED int4 path.
+template <int WM>
+inline constexpr int amort = WM / 16;                 // mma instructions each B fragment element feeds
+template <int WM>
+inline constexpr int cvt_per_mma = 128 / WM;          // B elements converted per mma instruction issued
 
 template <int Bits, int TN, int TK, int WM, int WN>
 inline constexpr bool deliverable = (Bits <= 0 || Bits >= 8) ? true : ((16 * 8 / Bits) <= (WN * TK / 32));

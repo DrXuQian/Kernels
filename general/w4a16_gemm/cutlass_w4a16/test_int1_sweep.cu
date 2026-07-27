@@ -3,13 +3,14 @@
 // WHY A SEPARATE FILE. test_fold_int2.cu is the verified correctness harness; a sweep needs many extra kernel
 // instantiations and would slow its build for everyone. Nothing here is on the correctness path.
 //
-// WHAT THE SWEEP IS FOR. After the box overturned my scale model, only two knobs remain for int1 and they pull
-// against each other:
-//     occupancy  -- smaller TM*TK per stage means more blocks
-//     hiding     -- atoms per k-iteration = TK/16; at gs=16 APG = gs/16 = 1 puts a reload on EVERY atom, so more
-//                   atoms per iteration means more work to overlap the reload against
-// Measured so far (ScaleOnly gs=32): (32,128,128) w32x32 s3 = 42.0%, (64,128,64) w32x64 s3 = 46.4%. Occupancy alone
-// does not explain a 4.4 point gap (blocks 7 vs 8), so this is exploration, not confirmation of a prediction.
+// WHAT THE SWEEP FOUND (20 configs, ScaleOnly gs=32, 42.0% -> 50.2%). Three knobs, in the priority order the data
+// forces -- see the three-tier model in fold_traits.hpp:
+//     1. register budget -- over ~256 estimated regs/thread the config spills and collapses (TK=256: 23.0%)
+//     2. cvt/mma = 128/WM -- converter amortisation, and the DOMINANT term. It separated all 20 points with no
+//        overlap: cvt/mma=4 gave 40.9-50.2%, cvt/mma=8 gave 31.9-39.8%, and no amount of occupancy crossed the gap
+//     3. occupancy (stages, smem) -- orders configs within one cvt/mma group, and is worth ~4-8 points there
+// The second one is the correction: two rounds were spent on occupancy and on a register-count prescription that
+// measured 10.3 points WORSE than the config it was meant to beat. Those rows are kept in the sweep as evidence.
 //
 // THE WEIGHT BUFFER DEPENDS ON (Bits, TN, TK) ONLY -- it is WN-INVARIANT, verified byte-for-byte in
 // fold_derivation/l20_derived_offline.cu at WN=32 and WN=64. So configs sharing a TK share a buffer, and the sweep
@@ -108,9 +109,13 @@ static void run_cfg(Buf& b, int gs, const char* note) {
   // spilling looks like, and having the number on the same line as the timing is how that became visible at all.
   constexpr int R = fold::regs_per_thread<TM, TN, TK, WM, WN, Q == QM::FinegrainedScaleZero>;
   const int blocks = std::min(262144 / smem, 64 / warps);
-  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | warps=%d smem=%6dB blk=%-2d regs=%-3d%s | %8.2f us  %5.1f%% MFU  %s\n",
+  // cvt/mma = 128/WM is the discriminator the register count missed: it separated the first 20 points of this sweep
+  // with no overlap (4.00 -> 40.9-50.2%, 8.00 -> 31.9-39.8%). Printed next to blk so the two can be read against
+  // each other, since they frequently pull in opposite directions.
+  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | warps=%d smem=%6dB blk=%-2d regs=%-3d%s cvt/mma=%d | %8.2f us  %5.1f%% MFU  %s\n",
               TM, TN, TK, WM, WN, ST, Q == QM::FinegrainedScaleZero ? "ScaleZero" : "ScaleOnly", gs,
-              warps, smem, blocks, R, R > 256 ? "!" : " ", us, 100.0 * tf * 1e12 / 500.0e12, note);
+              warps, smem, blocks, R, R > 256 ? "!" : " ", fold::cvt_per_mma<WM>,
+              us, 100.0 * tf * 1e12 / 500.0e12, note);
 }
 
 // upload the weight buffer for a given TK. TK=64 needs the bit-granular packer; the rest use the shipped offline.
@@ -163,15 +168,24 @@ int main(int argc, char** argv) {
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 64, 32, 64, 3>(b, gs, "measured 46.4% at gs=32");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 3>(b, gs, "B: TM=32");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 2>(b, gs, "B+C: TM=32 s2   <- 50.1% measured, best so far");
-  // The derived prescription: accum/thread = WM*WN/32 depends ONLY on the warp shape, and the delivery bound
-  // constrains WN alone, so WM is free. w16x64 keeps WN=64 (bound cleared) while halving the accumulator: 128
-  // estimated regs against 176. It also halves the warps, so blocks moves the other way -- the two effects oppose,
-  // which is exactly why this needs measuring rather than predicting.
-  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 16, 64, 2>(b, gs, "PRESCRIPTION: w16x64 s2");
-  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 16, 64, 3>(b, gs, "PRESCRIPTION: w16x64 s3");
-  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 64, 16, 64, 2>(b, gs, "w16x64 s2 TM=16");
+  // A PRESCRIPTION DERIVED FROM REGISTERS ALONE, AND HOW IT FAILED. accum = WM*WN/32 depends only on the warp
+  // shape and the delivery bound constrains only WN, so w16x64 keeps TK=64 legal while halving the accumulator:
+  // 128 estimated regs against 176. Measured 39.7% against 50.0% -- fewer registers, comparable occupancy, 10.3
+  // points WORSE. These four rows are kept because they are the evidence that the objective is cvt/mma = 128/WM
+  // (fold_traits.hpp), not the register count: every w16 row lands in 38.4-39.8% and every w32 row in 40.9-50.2%.
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 16, 64, 2>(b, gs, "REFUTED w16x64 s2 (cvt/mma 8)");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 16, 64, 3>(b, gs, "REFUTED w16x64 s3 (cvt/mma 8)");
+  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 64, 16, 64, 2>(b, gs, "REFUTED w16x64 s2 TM=16 (blk=32, still 39.8)");
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 64, 32, 64, 2>(b, gs, "w32x64 s2 TM=64");
-  run_cfg<QM::FinegrainedScaleOnly, 32, 256, 64, 32, 64, 2>(b, gs, "w32x64 s2 TN=256");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 256, 64, 32, 64, 2>(b, gs, "w32x64 s2 TN=256  <- 50.2% measured, best");
+
+  // THE DECISIVE TEST: tier 1 (register budget) against tier 2 (converter amortisation), which the three-tier model
+  // says must be resolved in favour of tier 1. w64x64 is the ONLY int1 shape that reaches amort=4 (cvt/mma=2, half
+  // the converter work of the current best) and the register minimum over the whole legal space is 272 -- 16 over
+  // budget, and regs_per_thread is an ESTIMATE, so 272 is exactly the margin where it might be wrong.
+  //   predicted: collapses to ~25-40% despite the best cvt/mma in the sweep
+  //   if instead it beats 50.2%: the 256 threshold is wrong and int1 has another factor-of-2 available
+  run_cfg<QM::FinegrainedScaleOnly, 64, 128, 64, 64, 64, 2>(b, gs, "TEST amort=4: cvt/mma=2 but 272 regs");
 
   // stages=2 was the single biggest knob at TK=128 (42.0 -> 46.5), so finish exploring it there. This needs the
   // TK=128 buffer back, so it is re-uploaded rather than run against the TK=64 one.
