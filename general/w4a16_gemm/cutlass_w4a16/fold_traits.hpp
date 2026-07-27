@@ -265,6 +265,16 @@ inline constexpr int warps_per_cu = [] {
 // needs 272 regs at every shape legal under WN*TK >= 4096; asserted in ft_check) but it is HARMLESS, because
 // cvt/mma=2 is worth +0.3 points. int4's production config is already at cvt/mma=4, so pushing it to 2 has nothing
 // to gain either -- do not spend a box run on it.
+// ESTIMATE-TO-MEASURED OFFSET. regs_per_thread is consistently ~22 BELOW what acu reports, at both points measured:
+//     estimate 164 -> acu 186        estimate 120 -> acu 142     (int1, (32,128,64) w32x64, unchunked / B-chunked)
+// The gap is address arithmetic, pipeline temporaries and the packed source registers -- things the model does not
+// count. It lives here rather than in a comment somewhere because every billing decision compares against 128 or 256,
+// so the estimate is useless without it: 120 looks like it clears 128 and does not.
+inline constexpr int regs_measured_offset = 22;
+template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
+inline constexpr int regs_billed_measured =
+    regs_billed<regs_per_thread<TM, TN, TK, WM, WN, Zero> + regs_measured_offset>;
+
 template <int WM>
 inline constexpr int amort = WM / 16;                 // mma instructions each B fragment element feeds
 template <int WM>
