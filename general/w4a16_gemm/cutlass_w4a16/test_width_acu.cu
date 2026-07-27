@@ -51,7 +51,7 @@
 // If this fails, the actlize SUBMODULE on the box is stale: the Kernels gitlink moved but `git submodule update` did
 // not run, so the build would silently produce a binary identical to the previous one. That ambiguity is what made an
 // "every acu counter is identical" A/B uninterpretable -- so it is a compile error, not a runtime surprise.
-#if !defined(PPU_SCALE_FRAGMENT_API) || PPU_SCALE_FRAGMENT_API < 2
+#if !defined(PPU_SCALE_FRAGMENT_API) || PPU_SCALE_FRAGMENT_API < 3
 #error "stale actlize submodule: run `git submodule update --init third_party/actlize` and rebuild"
 #endif
 
@@ -160,23 +160,6 @@ int main(int argc, char** argv) {
   const bool zero = getenv("ACU_ZERO") != nullptr;
   const int st = getenv("ACU_STAGES") ? atoi(getenv("ACU_STAGES")) : 2;
   if (st != 2 && st != 3) { std::printf("  ACU_STAGES must be 2 or 3\n"); return 1; }
-  // Which scale-fragment path this BINARY was built with. The point of printing it: acu's "Registers Per Thread" is
-  // the only way to confirm the broadcast actually reduced registers -- regs_per_thread in fold_traits is an
-  // ESTIMATE (it said 176 where acu measured 186), and a perf-neutral result is consistent with EITHER "registers
-  // dropped but stayed in the same power-of-two billing bucket" or "registers never dropped and the change is
-  // inert". Those are very different conclusions, so the A/B must be identifiable in the log it produced.
-  // Print the estimate for the mode ACTUALLY RUNNING. The saving is 12 registers for ScaleOnly and 24 for ScaleZero
-  // (the zero fragment shrinks by the same amount), and ScaleZero is the deployment shape -- GGUF Q3/Q5 affine -- so
-  // measuring only ScaleOnly would check the smaller half of the change on the path that matters less.
-#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
-  const char* sf = "MATERIALISED (PPU_SCALE_BCAST=0)";
-#else
-  const char* sf = "stride-0 BROADCAST (default)    ";
-#endif
-  std::printf("  scale fragment: %s  estimate %d regs (%s) -- compare acu's Registers/Thread\n",
-              sf, zero ? fold::regs_per_thread<TM, TN, TK, WM, WN, true>
-                       : fold::regs_per_thread<TM, TN, TK, WM, WN, false>,
-              zero ? "ScaleZero" : "ScaleOnly");
   std::printf("width isolation: ONE shared config (%d,%d,%d) w%dx%d s%d, bits is the only variable\n"
               "  M=%d N=%d K=%d gs=%d %s   (B smem differs by width, so blk differs -- it FAVOURS int1)\n",
               TM, TN, TK, WM, WN, st, PM, PN, PK, gs, zero ? "ScaleZero" : "ScaleOnly");

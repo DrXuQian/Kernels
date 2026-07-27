@@ -55,7 +55,7 @@
 // If this fails, the actlize SUBMODULE on the box is stale: the Kernels gitlink moved but `git submodule update` did
 // not run, so the build would silently produce a binary identical to the previous one. That ambiguity is what made an
 // "every acu counter is identical" A/B uninterpretable -- so it is a compile error, not a runtime surprise.
-#if !defined(PPU_SCALE_FRAGMENT_API) || PPU_SCALE_FRAGMENT_API < 2
+#if !defined(PPU_SCALE_FRAGMENT_API) || PPU_SCALE_FRAGMENT_API < 3
 #error "stale actlize submodule: run `git submodule update --init third_party/actlize` and rebuild"
 #endif
 
@@ -169,19 +169,8 @@ int main(int argc, char** argv) {
   PK = argc > 2 ? atoi(argv[2]) : 4096;
   const int gs = argc > 3 ? atoi(argv[3]) : 32;
   PM = argc > 4 ? atoi(argv[4]) : 2048;
-  // Which scale-fragment path this binary was BUILT with, printed at RUN time. A build-time message() is useless
-  // here: build.sh redirects cmake's stdout to cmake.log, so an A/B could silently compare two identical binaries
-  // and the operator would have no way to notice. regs_per_thread is gated on the same macro, so the number moves
-  // with the path and is a second, independent witness.
-#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
-  const char* scale_path = "MATERIALISED (old path, PPU_SCALE_BCAST=0)";
-#else
-  const char* scale_path = "stride-0 BROADCAST (default)";
-#endif
-  std::printf("int1 sweep  M=%d N=%d K=%d gs=%d   (buffer depends on (TN,TK) only -- WN-invariant, see l20)\n"
-              "  scale fragment: %s   -> regs at (32,128,64) w32x64 = %d ScaleOnly / %d ScaleZero\n\n",
-              PM, PN, PK, gs, scale_path,
-              fold::regs_per_thread<32,128,64,32,64,false>, fold::regs_per_thread<32,128,64,32,64,true>);
+  std::printf("int1 sweep  M=%d N=%d K=%d gs=%d   (buffer depends on (TN,TK) only -- WN-invariant, see l20)\n\n",
+              PM, PN, PK, gs);
   Buf b; make_buffers(b, gs);
 
   std::printf("== TK=128 group (shipped offline). A: vary TM at fixed TK. D: WN is free -- same buffer.\n");
