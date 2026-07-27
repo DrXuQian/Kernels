@@ -27,12 +27,19 @@
 //     cute::transform(tCrB_mma(_,_,atom), tCrS(_,_,0), tCrB_mma(_,_,atom), multiplies{})
 // against a B fragment of the same shape. The cost is up to 256 smem requests and 4x the scale registers.
 //
+// CORRECTION TO THE HEADLINE NUMBER. nslot is what the partition ASKS for, not what the copy ISSUES. cute's
+// copy(Copy_Atom<...>, src, dst) already auto-filters -- it takes nullspace(layout<1>(dst_v)) and divides both
+// operands by it, skipping redundant iterations along the DESTINATION's stride-0 modes. That is in the general
+// CopyAtom overload rather than gated on AutoFilter, so the collective gets it today. The destination fragment
+// distinguishes nreg registers, so ~nreg requests are issued for ne distinct values: 4x redundant, not 16-64x.
+// The register saving (nreg -> ne, also 4x) is the definite part, and it is tier-1.
+//
 // THE FIX THAT SUBSUMES THE INTERLEAVE. Keep the replicated SHAPE the transform needs, but stop materialising it:
 //     tCrS_ld = compact fragment of ne elements          <- the copy targets this: ne loads, not nslot
 //     tCrS_bc = make_tensor(tCrS_ld.data(), <B-fragment shape, stride 0 on the k modes>)
 // and hand tCrS_bc to transform. The transform is BYTE-IDENTICAL in what it computes -- it just reads the same
 // register 4x instead of 4 copies of it. Gains, all measured here rather than hoped for:
-//     smem requests per reload : nslot -> ne          16-64x
+//     smem requests per reload : ~nreg -> ne          4x  (NOT 16-64x -- see the correction below)
 //     scale registers          : nreg  -> ne           4x   (and this is tier-1: TK=256's 320 regs included 32 here)
 //     ScaleZero                : both halves shrink, so it beats the interleave's 2x on its own
 // This does NOT touch the transform, the B path, or the offline -- which is why it is a safer change than the

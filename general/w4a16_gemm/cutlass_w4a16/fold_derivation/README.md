@@ -366,11 +366,21 @@ tCrS_ld = compact fragment of `ne` elements                                   //
 tCrS_bc = make_tensor(tCrS_ld.data(), <B-fragment shape, stride 0 on k modes>) // handed to transform
 ```
 
+**CORRECTION to the 16–64× figure.** cute's `copy(Copy_Atom<...>, src, dst)` already auto-filters: it computes
+`nullspace(layout<1>(dst_v))` and divides both operands by it, so redundant iterations along the **destination's**
+stride-0 modes are skipped — and this is in the general CopyAtom overload, not gated on `AutoFilter`, so the
+collective's `copy(smem_tiled_copy_S, ...)` gets it today. The destination fragment distinguishes 32 registers, so
+what is actually issued is ~32 requests for 8 distinct values, i.e. **4× redundant, not 16–64×**. The 128 figure is
+what the partition *asks for*, not what the copy *issues*.
+
 | | before | after |
 |---|---|---|
-| smem requests per reload | 64–256 | 4–8 (**16–64×**) |
-| scale registers | 16–64 halves | 4–8 (**4×**, and this is tier-1 — TK=256's 320 regs included 32 here) |
+| smem requests per reload | ~32 (of 128 asked) | 8 (**4×**, an upper bound) |
+| scale registers | 16–64 halves | 4–8 (**4×**, definite, and tier-1 — TK=256's 320 regs included 32 here) |
 | ScaleZero | two full copies | both halves shrink, beating the interleave's 2× on its own |
+
+This also explains *why* the fix works mechanically and needs no hand-written filtering: making the destination's
+nullspace bigger is exactly the lever AutoFilter keys on, and `zipped_divide` handles the correspondence.
 
 It touches neither the transform, the B path, nor the offline — which makes it a *safer* change than the interleave,
 not merely a bigger one. The earlier fused-FMA attempt regressed 52.3% → 33.5% precisely because it rewrote the
