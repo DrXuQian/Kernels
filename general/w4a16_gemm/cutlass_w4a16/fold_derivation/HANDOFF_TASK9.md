@@ -63,7 +63,33 @@ For the int1 converter's 16 pairs (pair `t` carries codes `t` and `t+16`, which 
 This is why **#5 was a real prerequisite, not hygiene**: against the old hand-written offset table there is nothing
 to gate on.
 
-## Where I stopped, and the blocker
+## STATUS UPDATE: the chunked path is written but rests on TWO UNVERIFIED assumptions
+
+The converter and the mainloop wiring are in, behind `PPU_B_CHUNK` (default off; the default path is byte-identical
+and both harnesses parse clean without the flag). But it was built on top of two assumptions expressed as
+`static_assert`s:
+
+* `K_BLOCK_MAX == 1` — one copy step per k-tile, so copy → convert → mma all sit inside one `k_block` and there is
+  neither a cross-iteration hazard nor a B prefetch overlap to lose
+* `K_ATOM_PER_COPY == 4` — four mma-K atoms per delivery, so chunk index == k-atom index and `NChunk = 4`
+
+**Writing the dependent code before measuring those was a process error.** A `static_assert` makes a wrong assumption
+*loud* but not *cheap*: if either is false the per-atom design changes shape (needs a double-buffered `tCrB_load`, a
+different chunk count), and I would only learn that from a failed box build after everything was written.
+
+`PPU_MMA_PROBE=1` now prints both from the **default** build — one line, no risk:
+
+```bash
+PPU_DEFS=PPU_MMA_PROBE=1 TARGET=test_fold_int2 ./build.sh
+FOLD_BITS=1 FOLD_TK=64 FOLD_BITPACK=1 $D/test_fold_int2 256 512 32
+# expect: [mma probe] K_BLOCK_MAX(CPY_K)=1  K_ATOM_PER_COPY=4  MMA_K(tCrB_mma)=4  MMA_N=4  Scale_TileK=2
+```
+
+**Confirm that line before building or trusting `PPU_B_CHUNK`.** If `K_BLOCK_MAX != 1`, `transform_B_atom` is reading
+the wrong copy step's codes and the design needs double-buffering first. If `K_ATOM_PER_COPY != 4`, `NChunk` is wrong
+and `MixGemmInt1Emit<Chunk, 4>` in `transform_B_atom` must be parameterised on it.
+
+## Where I stopped originally, and the first blocker
 
 I edited `MixGemmNumericArrayConverter<half_t, uint1b_t, 128>`'s emission loop to `if constexpr (kEmit(t)) _E(...)`
 and **reverted it**, because:
