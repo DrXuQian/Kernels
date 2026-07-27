@@ -66,9 +66,12 @@ int main(int argc, char** argv) {
   const int dwn = bitpack_ ? 64 : 32;
   // slots = WN*TK/32, MEASURED against partition_B on the builder's real TiledMma (fold_derivation/l5_slots.cu).
   // The old form here was 8*(TN/32)*(TK/16) = TN*TK/64, which is only right when TN == 2*WN.
-  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  TileShape=(%d,%d,%d) warp=%dx%d FoldF=%d | slots=%d delivery=%d%s\n",
+  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  TileShape=(%d,%d,%d) warp=%dx%d FoldF=%d | slots=%d delivery=%d%s%s\n",
               M, N, gs, fbits, dtm, dtn, dtk, 32, dwn, (32 * 8 / fbits) / dtk,
-              dwn * dtk / 32, 16 * 8 / fbits, bitpack_ ? "  [BITPACK]" : "");
+              dwn * dtk / 32, 16 * 8 / fbits, bitpack_ ? "  [BITPACK]" : "",
+              // FOLD_SVARY leaves no trace otherwise, and a log that cannot show which inputs were used is how a
+              // round of int1 MFU numbers got invalidated. Say it either way, so "blind" is visible too.
+              svary ? "  [SVARY]" : "  [scale=1.0 EVERYWHERE -- BLIND to scale plumbing]");
 
   // q2 codes, transposed to [N][K] and packed 4/byte, then the OFFLINE FOLD (FoldTK=64) in preprocess.
   // LABELLED input (argv[4]): make the weight code SPELL OUT its own source index, so a wrong fold reads back as a
