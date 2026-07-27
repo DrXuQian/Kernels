@@ -494,3 +494,33 @@ Two real levers, neither free: more waves (smaller tiles — fights the register
 constraint), or stream-K. Persistent scheduling was already tried in the MoE work and **non-persistent won** there
 (24% → 49%); those notes put the last-wave tail at ~5% and say stream-K is the only fix. Known magnitude, known
 remedy, known not to be cheap.
+
+
+## The scale broadcast: validated numerically, and a pre-registered prediction that it will NOT help occupancy
+
+`FOLD_SVARY=1` on the box, with the period-13 pattern that can actually see an 8/16/32 misassignment:
+
+```
+fold int1 TK=64 (64,128,64) w32x64 vs host codes x scale(g,n): bad=0/131072 MATCH
+fold int2 TK=64 (64, 64,64) w32x32 vs host codes x scale(g,n): bad=0/131072 MATCH
+```
+
+So the stride-0 broadcast fragment assigns the right scale to every mma slot on hardware, for both int1 F=4 and
+int2 F=2. l28's equivalence-class argument was local and structural; this is the hardware confirmation, and it took
+two attempts to build a probe that could fail (the first pattern had period 8 against displacements of 8 and 32).
+
+**Pre-registered before measuring perf.** Power-of-two register billing changes what to expect:
+
+| config | regs before → after | billed |
+|---|---|---|
+| int1 `(32,128,64) w32x64` ScaleOnly | 176 → 162 | 256 → 256 |
+| int1 `(32,128,64) w32x64` ScaleZero | 192 → 164 | 256 → 256 |
+| int1 `(32,128,128) w32x32` ScaleZero | 192 → 168 | 256 → 256 |
+| int4 `(64,64,64) w32x32` ScaleOnly | 104 → 98 | 128 → 128 |
+
+The 12–24 registers saved cross **no** billing boundary in any config we run, so `warps_per_cu` is unchanged and
+**the broadcast cannot improve occupancy**. Its only remaining benefit is the 4× reduction in scale-reload smem
+traffic. Therefore: **ScaleOnly should move little, possibly within noise; ScaleZero is where it should show**, since
+the zero diagnostic priced the scale copy at ~49.6 us out of 327 us (~15%) and the broadcast shrinks both halves.
+
+If ScaleOnly moves a lot, the traffic model is incomplete and that is the interesting result — not a success.
