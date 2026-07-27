@@ -513,14 +513,50 @@ two attempts to build a probe that could fail (the first pattern had period 8 ag
 
 | config | regs before → after | billed |
 |---|---|---|
-| int1 `(32,128,64) w32x64` ScaleOnly | 176 → 162 | 256 → 256 |
-| int1 `(32,128,64) w32x64` ScaleZero | 192 → 164 | 256 → 256 |
-| int1 `(32,128,128) w32x32` ScaleZero | 192 → 168 | 256 → 256 |
+| int1 `(32,128,64) w32x64` ScaleOnly | 176 → 164 | 256 → 256 |
+| int1 `(32,128,64) w32x64` ScaleZero | 192 → 168 | 256 → 256 |
 | int4 `(64,64,64) w32x32` ScaleOnly | 104 → 98 | 128 → 128 |
 
-The 12–24 registers saved cross **no** billing boundary in any config we run, so `warps_per_cu` is unchanged and
-**the broadcast cannot improve occupancy**. Its only remaining benefit is the 4× reduction in scale-reload smem
-traffic. Therefore: **ScaleOnly should move little, possibly within noise; ScaleZero is where it should show**, since
-the zero diagnostic priced the scale copy at ~49.6 us out of 327 us (~15%) and the broadcast shrinks both halves.
+(The first version of this table said 162/164 — I had used `TN/WN`, the warp count in N, where the fragment's cosize
+needs `MMA_N = WN/16`. The saving is 12 registers, 24 with zero; the conclusion is unaffected.)
+
+The registers saved cross **no** billing boundary in any config we run, so `warps_per_cu` is unchanged and **the
+broadcast cannot improve occupancy**. Its only remaining benefit is the 4× reduction in scale-reload smem traffic.
+Therefore: **ScaleOnly should move little, possibly within noise; ScaleZero is where it should show**, since the zero
+diagnostic priced the scale copy at ~49.6 us out of 327 us (~15%) and the broadcast shrinks both halves.
 
 If ScaleOnly moves a lot, the traffic model is incomplete and that is the interesting result — not a success.
+
+### Measured: correct on all three widths, and PERF-NEUTRAL. The diagnosis that motivated it was wrong.
+
+| | ScaleOnly | ScaleZero | delta | previously recorded delta |
+|---|---|---|---|---|
+| gs=32 TK=128 | 327.35 us (42.0%) | 376.85 us (36.5%) | **+49.50 us** | +49.6 us |
+| gs=16 TK=128 | 369.50 us (37.2%) | 451.44 us (30.4%) | **+81.94 us** | +83.0 us |
+
+Every ScaleOnly line in the 20-config sweep also reproduces the earlier numbers to within run-to-run noise
+(42.0/41.9, 49.9, 50.2, 48.5/48.6, 44.7/44.6). **Cutting the scale reload's smem requests to a quarter changed
+nothing.**
+
+Correctness, on the other hand, is now real on all three widths:
+
+```
+fold int1 TK=64 (64,128,64) w32x64 vs host codes x scale(g,n): bad=0/131072 MATCH
+fold int2 TK=64 (64, 64,64) w32x32 vs host codes x scale(g,n): bad=0/131072 MATCH
+[xcheck grouped L=1] (A) vs dequant golden  max_rel=0 bad=0/1048576 MATCH
+                     (B) vs stock kernel    max_rel=0 bad=0/1048576 MATCH
+```
+
+**What the negative result refutes.** The zero diagnostic offered a two-way split: *"if the zero cost tracks `gs` it
+is the COPY; if it is flat in `gs` it is the TRANSFORM."* The cost does track `gs` — and narrowing the copy 4× did
+nothing. So the split was incomplete. A third quantity also tracks `gs`: **the per-reload smem round-trip latency**,
+which depends on the NUMBER of reloads (`K/gs`) and not at all on how many values each one moves. That is consistent
+with the kernel being latency-bound at `cvt/mma = 4`.
+
+So the remedy is not a narrower reload but an **earlier** one — prefetch the next group's scale so the round trip
+overlaps independent work. Reducing the reload count itself is not available: it is `K/gs`, fixed by the quantisation
+format.
+
+The broadcast is kept: it is the cute-correct construction, costs nothing, saves 12–24 registers, and could matter at
+a shape that sits near a billing boundary. But it is not a performance fix and the record should not read as if it
+were.

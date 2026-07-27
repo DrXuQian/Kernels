@@ -159,7 +159,15 @@ template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
 inline constexpr int regs_per_thread = WM * WN / 32              // accumulator, fp32
                                      + WM * TK / 64              // A fragment
                                      + WN * TK / 64              // B fragment
-                                     + WN * TK / 256 * (Zero ? 2 : 1);   // scale (+ zero)
+#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
+                                     + WN * TK / 256 * (Zero ? 2 : 1);   // scale (+ zero), MATERIALISED fragment
+#else
+                                     // Stride-0 broadcast fragment (make_scale_fragment): cosize is 2*MMA_N halves
+                                     // = WN/8 halves = WN/16 registers, independent of TK. Measured against l28 on
+                                     // every config in the tree. NOTE this saving crosses no power-of-two billing
+                                     // boundary in any shape we run, which is why it measured perf-neutral.
+                                     + WN / 16 * (Zero ? 2 : 1);
+#endif
 template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
 inline constexpr bool regs_ok = regs_per_thread<TM, TN, TK, WM, WN, Zero> <= 256;
 
