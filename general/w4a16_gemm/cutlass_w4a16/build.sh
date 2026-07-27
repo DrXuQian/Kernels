@@ -68,6 +68,7 @@ BUILD="$ACTLIZE/build_w4a16_compare"
 rm -rf "$BUILD" && mkdir -p "$BUILD" && cd "$BUILD"
 cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" \
   -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" -DBENCH_QUANT="$QUANT" -DTSK="$TSK" \
+  -DPPU_EXTRA_DEFS="${PPU_DEFS:-}" \
   >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
 TARGET="${TARGET:-bench_cutlass_w4a16}"
 make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log

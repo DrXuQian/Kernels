@@ -1,3 +1,21 @@
+# A/B hook: PPU_DEFS=<space-separated defines> ./build.sh applies them to every target defined below. Added because
+# comparing a collective change against the path it replaces otherwise means editing a TRACKED header between runs,
+# and the box builds from COMMITTED state -- so an A/B would need two commits and two pulls. e.g.
+#   PPU_DEFS=PPU_SCALE_BCAST=0 TARGET=test_int1_sweep ./build.sh
+# NOTE the two forms. hgcc (the DEVICE compiler) is driven by a custom command that does NOT see
+# target_compile_definitions -- see the comment further down -- so a define meant for device code MUST go through
+# DEV_COMPILE_FLAGS as a verbatim -D flag. Using add_compile_definitions here would have silently reached only the
+# host compile, and an A/B of a collective change would then have compared two IDENTICAL device binaries.
+set(_PPU_EXTRA_DEV)     # verbatim -D flags for hgcc
+set(_PPU_EXTRA_HOST)    # bare NAME=VALUE for target_compile_definitions
+if(PPU_EXTRA_DEFS)
+  string(REPLACE " " ";" _PPU_EXTRA_HOST "${PPU_EXTRA_DEFS}")
+  foreach(_d IN LISTS _PPU_EXTRA_HOST)
+    list(APPEND _PPU_EXTRA_DEV "-D${_d}")
+  endforeach()
+  message(STATUS "PPU_EXTRA_DEFS -> device ${_PPU_EXTRA_DEV} / host ${_PPU_EXTRA_HOST}")
+endif()
+
 # CMakeLists for the actlize-side W4A16 comparison bench. This is NOT built by the marlin Makefile -- actlize
 # uses a different toolchain (hgcc device compiler + the PPU SDK's hggc runtime, driven by
 # third_party/actlize/cmake/PPUToolchain.cmake), not the bare nvcc our marlin kernels build with.
@@ -192,7 +210,9 @@ target_compile_options(test_grouped_int1_perf PRIVATE -w)
 cutlass_example_add_executable(
   test_fold_int2
   test_fold_int2.cu
+  DEV_COMPILE_FLAGS ${_PPU_EXTRA_DEV}
 )
+target_compile_definitions(test_fold_int2 PRIVATE ${_PPU_EXTRA_HOST})
 target_compile_options(test_fold_int2 PRIVATE -w)
 
 # int1 tile sweep, kept OUT of test_fold_int2 so the verified correctness harness does not pay for the extra
@@ -203,7 +223,9 @@ target_compile_options(test_fold_int2 PRIVATE -w)
 cutlass_example_add_executable(
   test_int1_sweep
   test_int1_sweep.cu
+  DEV_COMPILE_FLAGS ${_PPU_EXTRA_DEV}
 )
+target_compile_definitions(test_int1_sweep PRIVATE ${_PPU_EXTRA_HOST})
 target_compile_options(test_int1_sweep PRIVATE -w)
 
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
@@ -237,5 +259,7 @@ target_compile_options(test_w2a16_real PRIVATE -w)
 cutlass_example_add_executable(
   test_width_acu
   test_width_acu.cu
+  DEV_COMPILE_FLAGS ${_PPU_EXTRA_DEV}
 )
+target_compile_definitions(test_width_acu PRIVATE ${_PPU_EXTRA_HOST})
 target_compile_options(test_width_acu PRIVATE -w)

@@ -389,3 +389,37 @@ transform into a scalar loop.
 One thing this could not settle locally: whether the PPU compiler already CSEs the redundant `ld.shared`. actlize's
 cute gates `CUTE_HOST_DEVICE` and its global functors on `__HGGCCC__`, so it will not compile for device under nvcc
 and the PTX cannot be counted here. The fix makes the question moot by removing the redundancy structurally.
+
+
+## What the ladder found: the 10 points are `WN`, and int1 is locked out of `WN=32`
+
+int4's home tile (55.9%) and int1's tile (45.9% for int4) differ in four things at once, and none of `blk`,
+`warps/CU` or HBM traffic explained the gap. `ACU_LADDER=1` walks between them one variable per rung:
+
+| rung | changed | int4 | int2 | int1 |
+|---|---|---|---|---|
+| 1 `(64,64,64) w32x32 s3` — home | — | 56.0% | 53.3% | illegal |
+| 2 | stages 3 → 2 | 52.0% | 50.5% | illegal |
+| 3 `(64,128,64) w32x32 s2` | TN 64 → 128 | **52.7%** | **47.8%** | illegal |
+| 4 `(64,128,64) w32x64 s2` | **WN 32 → 64** | **42.4%** | **42.8%** | 48.4% |
+| 5 `(32,128,64) w32x64 s2` | TM 64 → 32 | 46.0% | 48.3% | 50.0% |
+
+**The drop is rung 3 → 4: `WN` 32 → 64, costing int4 −10.3 points and int2 −5.0.** Every other rung moves a few
+points. And int2 dropping at the same rung is what makes this a **tile** property rather than an int4 property —
+which was the open prerequisite for the register-reuse work.
+
+`regs_per_thread` jumps 104 → 176 at exactly that rung (`WN` doubles both the accumulator and the B fragment), but
+176 is far below the measured knee — 272 registers cost nothing at equal `blk` — so the register count is a marker
+here, not the mechanism. What `WN=64` costs is still open, and it is now a well-targeted acu question: rungs 3 and 4,
+one variable, 10 points, and `ACU_RUNG=n ACU_ONE=1` gives a clean single launch for each.
+
+**Why this settles int1's ceiling.** The delivery bound `WN*TK*Bits >= 4096` pins int1 to `WN >= 64` at `TK=64`, so
+int1 can only ever occupy rungs 4 and 5 — it is structurally locked out of the `WN=32` family where every width does
+better. int1's 50.0% is not 1-bit arithmetic being slow; it is 1-bit arithmetic being denied the good tile. Note
+int1 is the *fastest* width on both rungs it can reach (rung 4: 48.4% vs 42.8/42.4; rung 5: 50.0% vs 48.3/46.0).
+
+This also prices the N-chunked conversion: a 16 B delivery arrives as only four packed registers, and it is the
+one-shot expansion into the fp16 fragment that forces fragment >= delivery. Chunking the expansion in N would let
+int1 run `WN=32`, i.e. rung 3 or rung 1 — where int4 measures 52.7% and 56.0% and int1 has run 4-6 points ahead of
+int4 on every rung they share. That is an extrapolated **+5 to +8 points** for int1, anchored in the ladder rather
+than assumed.
