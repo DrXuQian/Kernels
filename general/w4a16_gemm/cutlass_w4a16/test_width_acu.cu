@@ -26,7 +26,9 @@
 // BOTH land at blk=15. int1@s3 against int4@s2 is therefore same-shape, same-occupancy, width-only.
 // The banner prints blk either way, so the comparison being made is in the log rather than implied.
 //
-//   Build: TARGET=test_width_acu ./build.sh
+//   Build: TARGET=test_width_acu ./build.sh                   PLAIN build -- int1 measures 48.6% at the best config
+//          PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_width_acu ./build.sh    CHUNKED -- 63.7%. The define is NOT the default;
+//          the printed line ends in CHUNK or plain, so check it before believing an acu capture.
 //   Run:   ./test_width_acu [bits] [M] [N] [K] [gs]        bits in {1,2,4}, default 1
 //          ACU_ONE=1 ./test_width_acu 4                    exactly ONE kernel launch, for acu
 //          ACU_ZERO=1                                      ScaleZero instead of ScaleOnly
@@ -129,14 +131,26 @@ static void run_rung(int gs, bool zero, const char* note) {
   const int warps = (TMr / WMr) * (TNr / WNr);
   const int smem  = (TMr * TKr * 2 + TNr * TKr * Bits / 8 + TNr * (TKr / gs) * 2 * (zero ? 2 : 1)) * ST;
   const int blk   = std::min(262144 / smem, 64 / warps);
+  // WHICH KERNEL WAS MEASURED. This binary used to be completely chunk-blind: no witness that PPU_B_CHUNK reached the
+  // compile line, and regs= always the UNCHUNKED model. int1 at (64,128,64) w64x64 s2 is 63.7% chunked and 48.6%
+  // plain, so a ~50% acu capture of "the best config" is the PLAIN BUILD, not a bad measurement -- and nothing in the
+  // output said so. An acu capture that cannot name the kernel it profiled is not evidence. (kBChunk in the collective
+  // is int1-only, hence chunk-N/A rather than CHUNK for widths 2 and 4.)
+#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
+  constexpr bool kCh = true;
+  constexpr int R = fold::regs_per_thread_chunked<TMr, TNr, TKr, WMr, WNr, false>;
+#else
+  constexpr bool kCh = false;
   constexpr int R = fold::regs_per_thread<TMr, TNr, TKr, WMr, WNr, false>;
+#endif
+  const char* chtag = kCh ? (Bits == 1 ? "CHUNK" : "chunk-N/A") : "plain";
 
   if (getenv("ACU_ONE")) {                          // exactly ONE launch, so acu sees a clean kernel
     once(zero);
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-    std::printf("  [acu] ONE launch: int%d F=%d (%d,%d,%d) w%dx%d s%d %s gs=%d | smem=%dB blk=%d regs=%d cvt/mma=%d  %s\n",
+    std::printf("  [acu] ONE launch: int%d F=%d (%d,%d,%d) w%dx%d s%d %s gs=%d | smem=%dB blk=%d regs=%d bill=%d cvt/mma=%d %s | %s\n",
                 Bits, F, TMr, TNr, TKr, WMr, WNr, ST, zero ? "ScaleZero" : "ScaleOnly", gs,
-                smem, blk, R, fold::cvt_per_mma<WMr>, note);
+                smem, blk, R, fold::regs_billed<R>, fold::cvt_per_mma<WMr>, chtag, note);
     return;
   }
   for (int i = 0; i < 3; ++i) once(zero);
@@ -146,10 +160,11 @@ static void run_rung(int gs, bool zero, const char* note) {
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   float ms = 0; hggcEventElapsedTime(&ms, e0, e1);
   const double us = (double)ms * 1e3 / 30, tf = 2.0 * PM * PN * PK / (us * 1e-6) / 1e12;
-  std::printf("  int%d F=%d (%2d,%3d,%2d) w%dx%-2d s%d %s gs=%-3d | warps=%d smem=%6dB blk=%-2d regs=%d cvt/mma=%d"
+  std::printf("  int%d F=%d (%2d,%3d,%2d) w%dx%-2d s%d %s gs=%-3d | warps=%d smem=%6dB blk=%-2d regs=%d bill=%d cvt/mma=%d %s"
               " | %8.2f us  %5.1f%% MFU  %s\n",
               Bits, F, TMr, TNr, TKr, WMr, WNr, ST, zero ? "ScaleZero" : "ScaleOnly", gs,
-              warps, smem, blk, R, fold::cvt_per_mma<WMr>, us, 100.0 * tf * 1e12 / 500.0e12, note);
+              warps, smem, blk, R, fold::regs_billed<R>, fold::cvt_per_mma<WMr>, chtag,
+              us, 100.0 * tf * 1e12 / 500.0e12, note);
 }
 
 int main(int argc, char** argv) {
