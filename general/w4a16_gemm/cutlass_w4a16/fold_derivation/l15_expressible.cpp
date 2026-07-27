@@ -31,7 +31,13 @@ template <class F> static void bitperm(const char* tag, int N, F f) {
 static int ssv(int slice) { return (((slice & 1) << 1) + ((slice & 2) >> 1)) * 2; }
 
 int main() {
-  printf("L15 -- expressibility of what is left\n\n");
+  printf("L15 -- expressibility of what is left\n");
+  printf("  *** CORRECTION: the cross-slice conclusion below was WRONG, and l19_multislice.cu overturned it. ***\n"
+         "  The rotate that carries for slices 2 and 3 is part of the SWIZZLE, which the AIU write cancels, so the\n"
+         "  LOGICAL map has no rotate and needs no custom functor -- the slice is one more mode with stride 8.\n"
+         "  l19 measured it: {strip,keep} x {slice-major,rowblock-major}, and only strip+slice-major yields the fp16\n"
+         "  identity at 2 and 4 slices. What follows is about the PHYSICAL address, which is not what has to be\n"
+         "  modelled. Kept because the distinction is the whole lesson.\n\n");
   printf("  == converter emission (L3), per width\n");
   bitperm("int4 (4x base8 + 2 swaps)", 32, l3_int4);
   bitperm("int1", 128, [](int j){ const int v=j/32, c=j%32, b0=c&1,b1=(c>>1)&1,b2=(c>>2)&1,cc=(c>>3)&1,d=(c>>4)&1;

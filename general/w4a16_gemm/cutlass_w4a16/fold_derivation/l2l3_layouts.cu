@@ -106,8 +106,9 @@ int main() {
     printf("   (WordsPerRow=%d, valid=%s)\n", CT::LogicalWordsPerRow, CT::LogicalTVValid ? "yes" : "no");
     int dis = 0;
     for (int lane = 0; lane < 32; ++lane) for (int v = 0; v < 4; ++v) {
-      auto crd = make_coord(make_coord(lane % 4, lane / 4), make_coord(v % 2, v / 2));
-      if (SwzlDelivery{}(crd) != typename CT::LogicalTV{}(crd)) ++dis;
+      auto crd = make_coord(make_coord(lane % 4, lane / 4), make_coord(v % 2, v / 2), 0);   // slice 0
+      auto crd2 = make_coord(make_coord(lane % 4, lane / 4), make_coord(v % 2, v / 2));
+      if (SwzlDelivery{}(crd2) != typename CT::LogicalTV{}(crd)) ++dis;
     }
     printf("      local copy vs the traits member: %d / 128 differ -> %s\n", dis, dis ? "DRIFTED" : "same map");
   }
