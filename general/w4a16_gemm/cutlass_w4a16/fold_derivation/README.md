@@ -9,6 +9,7 @@ nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include leg2_frag.c
 g++ -O2 -std=c++17 leg3_predicate.cpp -o leg3  && ./leg3
 g++ -O2 -std=c++17 ft_check.cpp       -o ftchk && ./ftchk
 g++ -O2 -std=c++17 sweep_shapes.cpp   -o sweep && ./sweep
+./gen_guard_check.sh          # run this before pushing anything the box will compile
 nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l2l3_layouts.cu -o l2l3 && ./l2l3
 nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include leg5_perthread.cu -o leg5 && ./leg5
 nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l5_slots.cu -o l5s && ./l5s
@@ -170,3 +171,20 @@ Composing L2∘L3∘L4 and inverting gives the offline placement directly. The o
 collective, not from cute: when a fragment takes several copy-atom instances (int1 at TK=128 takes two, since
 `tCrB_load` is 32 B per thread while one swzl delivers 16 B), which `coord_h` / slice feeds each group of four
 vregs. That is a read of `retile_D` and the copy loop, not a derivation.
+
+
+## Before pushing: `gen_guard_check.sh`
+
+`fold_traits.hpp` is plain C++ and the dispatch ladders are right there in the sources, so **a guard failure on the
+box is always something that could have been found locally.** One was not: `CORR_DISPATCH(64,64,64)` at `fbits==1`
+is int1 at TK=64 and WN=32, which over-delivers, and the ladder instantiates it regardless of the runtime `ftk`.
+`sweep_shapes.cpp` section 1 missed it because that list is hand-written from reading the code.
+
+`gen_guard_check.sh` extracts the instantiations mechanically instead:
+
+* dispatch macros -> every sub-byte width crossed in, warp shape taken from *which* macro (CORR/FOLD at 32x32,
+  BITPACK at 32x64). A rejected combination is fine **if** the macro gates on `fold::deliverable`.
+* explicit `filter_and_run<...>` -> width is named and nothing gates it, so a rejected one is a hard failure.
+
+The gate and the guard are the same expression — `fold::deliverable<Bits,TN,TK,WM,WN>` — so they cannot drift. A
+hand-written equivalent condition (`TKV >= 128`) was the first fix and was replaced for exactly that reason.

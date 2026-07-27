@@ -156,14 +156,25 @@ int main(int argc, char** argv) {
   // filter_and_run picks the group-size schedule; the fold wrapper is applied inside launch via MOEG_CALL, so here
   // we go through filter_and_run with TK=64 -- which for plain int2 would be ILLEGAL (16B run) and is exactly what
   // the fold makes legal.
-#define CORR_DISPATCH(TMV, TNV, TKV)                                                                                    \
+// The int1 branch is compile-time gated. At WN=32 the fragment has slots = WN*TK/32 = TK, while one swzl delivery
+// carries 128 int1 codes, so int1 below TK=128 OVER-DELIVERS and the surplus is never fetched -- that is the
+// configuration ppu001 measured as garbage. The ladder below instantiates every (TM,TN,TK) combination regardless
+// of the runtime ftk, so without `if constexpr` it instantiates int1 at TK=64 and trips fold::CheckDelivery at
+// compile time. int1 at TK=64 is reachable, but only at WN=64 -- that is what BITPACK_DISPATCH is for.
+#define CORR_DISPATCH(TMV, TNV, TKV)                                                                          \
   do {                                                                                                        \
-    if (fbits == 1)                                                                                           \
-      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMV, TNV, TKV, 32, 32, 3, uint1_t>(             \
-          dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                            \
-          M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                      \
-    else                                                                                                      \
-      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMV, TNV, TKV, 32, 32, 3, uint2_t>(             \
+    if (fbits == 1) {                                                                                         \
+      if constexpr (fold::deliverable<1, TNV, TKV, 32, 32>)                                                   \
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMV, TNV, TKV, 32, 32, 3, uint1_t>(         \
+            dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                          \
+            M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                     \
+      else {                                                                                                  \
+        std::printf("  int1 at TK=%d over-delivers at WN=32 (slots=%d < 128 codes). Use FOLD_BITPACK=1 with"  \
+                    " FOLD_TN=128 FOLD_TK=64, which dispatches at WN=64.\n", TKV, 32 * TKV / 32);              \
+        return 2;                                                                                             \
+      }                                                                                                       \
+    } else                                                                                                    \
+      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMV, TNV, TKV, 32, 32, 3, uint2_t>(           \
           dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                             \
           M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                      \
   } while (0)

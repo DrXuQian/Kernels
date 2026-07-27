@@ -126,6 +126,13 @@ struct FoldTraits {
 // (also measured, same file) -- so WN=64 needs a packer that interleaves TWO columns inside a word, which
 // nfold_regroup_gmem's whole-uint32 moves cannot express. The two constraints pincer int1 at TK=64: WN must rise
 // to fix delivery, and raising WN forces the packer upgrade. Both, or neither.
+// The predicate itself, exposed so a CALLER can gate on it with `if constexpr` instead of hand-writing an
+// equivalent condition. A dispatch ladder that instantiates every (TM,TN,TK) triple regardless of the runtime
+// choice will otherwise instantiate illegal ones and trip the static_assert -- which is what happened on the box
+// with int1 at TK=64 from CORR_DISPATCH(64,64,64). Gate and guard must be the SAME expression or they drift.
+template <int Bits, int TN, int TK, int WM, int WN>
+inline constexpr bool deliverable = (Bits <= 0 || Bits >= 8) ? true : ((16 * 8 / Bits) <= (WN * TK / 32));
+
 template <int Bits, int TN, int TK, int WM, int WN, class = void>
 struct CheckDelivery { static constexpr bool ok = true; };
 

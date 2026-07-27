@@ -13,6 +13,11 @@
 #include <cstdio>
 
 // ---------------------------------------------------------------- section 1: the guard, exhaustively
+// *** SECTION 1 IS NOT THE REAL CHECK. *** The list below is HAND-WRITTEN from reading the sources, and it missed
+// CORR_DISPATCH(64,64,64) at fbits==1 -- int1 at TK=64, WN=32, which over-delivers -- because a dispatch ladder
+// instantiates every (TM,TN,TK) triple regardless of the runtime choice. The box build caught it; this file did
+// not. Use gen_guard_check.sh, which extracts the instantiations from the sources mechanically instead of
+// restating what I believe they are. Section 1 stays only as a fast smoke test.
 // Every distinct (Bits, TK) reachable from the tree. Sources:
 //   test_q3_bconcat_bench.cu   BC/I1 @ TK=256 (uint2+uint1), I2 @ TK=128, I4 @ TK=64 and 128
 //   test_q3_bconcat_real.cu    (uint2b_t, uint1b_t) @ TK=256
