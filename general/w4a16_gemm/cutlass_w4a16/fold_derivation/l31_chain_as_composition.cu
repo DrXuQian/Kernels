@@ -1,4 +1,22 @@
-// L31 -- WORK IN PROGRESS, 1 of 7 configs passing. Do not read a green line from this file as a result.
+// L31 -- WORK IN PROGRESS AND IT SEGFAULTS. Do not run it expecting a result.
+//
+// THE ONE DURABLE FINDING, and it is readable straight off two printed layouts rather than inferred:
+//     thr_layout_vmnk       = (32,2,2,1):(1,32,64,0)              linear t: warpM at stride 32, warpN at 64
+//     thrfrg_B(sB) thr part = ((4,8),(2,1)):((2,64),(1024,0))     first mode is (lane,(warpN,warpM)) -- warpN FIRST
+// THE TWO WARP ORDERS ARE OPPOSITE. t=32 is warpM=1/warpN=0 with true base 0, but thrfrg_B reads it as warpN=1 and
+// adds 1024; t=64 is the exact mirror. That is the whole reason six of seven configs were off by a constant n, and
+// (32,128,128) w32x32 passed only because its two warps happen to make the swap a no-op.
+//
+// cute's own fix is thridx_2_thrid = right_inverse(thr_layout_vmnk), which get_layoutB_TV() composes in. An earlier
+// attempt applied it as an INTEGER (t2id(t) inside make_coord) and that changed nothing -- because evaluating it
+// discards the tuple structure, so thrfrg_B re-decomposes the integer colex and the wrong order comes straight back.
+// It has to be composed as a LAYOUT. Doing that is what this file now attempts, and the attempt segfaults; the
+// remaining bug is in the compose, not in the diagnosis above.
+//
+// HOW I SHOULD HAVE GOT HERE. Four rounds were spent swapping expressions and diffing totals. What actually produced
+// the answer in one step was printing the candidate layouts and the ground truth SIDE BY SIDE for a handful of
+// (t, f). That is the same technique that localised the ladder's 10 points and the int2 pairing bug, and I did not
+// reach for it here.
 //
 // FOUR cute API CONVENTIONS PINNED SO FAR, each after a wrong assumption cost a round. Recording them because the
 // pattern is the point: every one had to come from cute's source, and guessing was wrong every time.
@@ -96,18 +114,26 @@ static bool check(const char* tag) {
   // the layout, so part.layout()(0) is 0 for EVERY thread while the real coordinate is not -- which showed up as a
   // constant offset for every t != 0 on the first version of this file. get_layoutB_TV() is the thread-inclusive
   // form, (thr, val) -> tile offset, so nothing is lost and no per-thread slicing is needed at all.
-  // get_layoutB_TV() is the WRONG tool and cute's source says why: its reference is
-  //     make_layout(make_shape(tile_size_mnk<1>(), tile_size_mnk<2>()))
-  // which (a) has NO stride, so it is COLUMN-major -- codomain n + N*k, not n*TK + k -- and (b) is sized by the MMA
-  // tile (WON*16), not the block tile TN. At int1/TK=128 that produced 512 = 32*16 against a hand value of 8.
-  // thrfrg_B(sB) is the right one: unsliced, so the thread is a MODE rather than an iterator offset, and over the
-  // FULL tensor, so the codomain is sB's own offset = n*TK + k.
-  // ...and thrfrg_B's FIRST MODE IS bthrid = (v,n,k), NOT the linear thread index. get_layoutB_TV's source shows the
-  // conversion: right_inverse(thr_layout_vmnk_). Without it w32x32 coincidentally agreed while w32x64 was off by a
-  // constant n=16 -- the third cute convention this file has had to pin from source rather than assume.
-  auto tvt  = Mma{}.thrfrg_B(sB);
-  auto t2id = right_inverse(Mma{}.get_thr_layout_vmnk());
-  auto Frag = composition(pi, emit_all);                            // (code, vreg, inst) -> fragment index
+  // THE DERIVATION, taken from cute's own get_layoutB_TV() source rather than guessed. That function builds
+  //     thrfrg_B(ref_B).compose(btile, _).compose(thridx_2_thrid, _)
+  // and its only problem for us is ref_B: make_layout(make_shape(tile_size_mnk<1>(), tile_size_mnk<2>())) has NO
+  // stride, so it is COLUMN-major, and it is sized by the MMA tile (WON*16) rather than the block TN. Apply the same
+  // two composes to OUR sB and the codomain is sB's own offset = n*TK + k.
+  //
+  // What each compose fixes, read off the printed layouts:
+  //   thr_layout_vmnk       = (32,2,2,1):(1,32,64,0)      linear t: warpM at stride 32, warpN at 64
+  //   thrfrg_B(sB) thr part = ((4,8),(2,1)):((2,64),(1024,0))   first mode is (lane,(warpN,warpM)) -- warpN FIRST
+  // The two warp orders are OPPOSITE, which is the whole bug: t=32 is warpM=1/warpN=0 (true base 0) but thrfrg_B
+  // reads it as warpN=1 (+1024), and t=64 is the mirror. thridx_2_thrid = right_inverse(thr_layout_vmnk) is exactly
+  // that reordering -- and feeding its INTEGER output into make_coord (my previous attempt) throws the tuple
+  // structure away, so thrfrg_B re-decomposes it colex and the wrong order comes straight back. It has to be
+  // composed as a LAYOUT, not evaluated and re-packed.
+  auto vmnk  = Mma{}.get_thr_layout_vmnk();
+  auto btile = make_tile(_, make_tile(make_layout(make_shape (size<1>(vmnk), size<2>(vmnk)),
+                                                  make_stride(     Int<0>{},      Int<1>{})),   // B ignores ThrM
+                                      _));
+  auto TV    = Mma{}.thrfrg_B(sB).compose(btile, _).compose(right_inverse(vmnk), _);
+  auto Frag  = composition(pi, emit_all);                           // (code, vreg, inst) -> fragment index
   long bad = 0; int shown = 0;
   for (int t = 0; t < 32*WOM*WON; ++t) {
     auto id   = Mma{}.get_thread_slice(t).partition_B(make_identity_tensor(make_shape(Int<TN>{},Int<TK>{})));
@@ -118,7 +144,7 @@ static bool check(const char* tag) {
           if (flat < 0 || flat >= NS) continue;
           auto c = id(pi(flat));
           const int hand = int(get<0>(c))*TK + int(get<1>(c));      // exactly l20's line
-          const int comp = int(tvt.layout()(make_coord(t2id(t), Frag(j + CPW * v + VEC * inst))));  // one cute expr
+          const int comp = int(TV(make_coord(t, Frag(j + CPW * v + VEC * inst))));   // one cute expression
           ++bad;
           if (hand == comp) --bad;
           else if (shown < 4) {
