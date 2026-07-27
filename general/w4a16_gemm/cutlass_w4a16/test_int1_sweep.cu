@@ -120,13 +120,20 @@ static void run_cfg(Buf& b, int gs, const char* note) {
   // compile and run -- they just collapse. TK=256 with zero measures 4.5% MFU at 352 estimated regs, which is what
   // spilling looks like, and having the number on the same line as the timing is how that became visible at all.
   constexpr int R = fold::regs_per_thread<TM, TN, TK, WM, WN, Q == QM::FinegrainedScaleZero>;
-  const int blocks = std::min(262144 / smem, 64 / warps);
+  // blk USED TO BE min(smem, warps) HERE AND THAT WAS WRONG -- it omitted the register limit, so it printed 23 for
+  // the best config where the hardware gives 8 (131072/(256*64)); acu confirmed the register limit directly
+  // ("Block Limit Registers 4" against "Block Limit Shared Mem 10" on a ladder rung). Every blk number in the early
+  // analysis of this sweep was inflated for the 256-billing configs. warps/CU is the quantity the two-factor model
+  // uses, so print that, and keep the smem-only bound beside it since it shows WHICH limit binds.
+  const int blk_smem = 262144 / smem;
+  const int wcu = fold::warps_per_cu<TM, TN, TK, WM, WN, ST, 1, 32, Q == QM::FinegrainedScaleZero>;
+  const int blocks = wcu / warps;
   // cvt/mma = 128/WM is the discriminator the register count missed: it separated the first 20 points of this sweep
   // with no overlap (4.00 -> 40.9-50.2%, 8.00 -> 31.9-39.8%). Printed next to blk so the two can be read against
   // each other, since they frequently pull in opposite directions.
-  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | warps=%d smem=%6dB blk=%-2d regs=%-3d%s cvt/mma=%d | %8.2f us  %5.1f%% MFU  %s\n",
+  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | wrp=%d smem=%6dB blk=%-2d(smem %2d) w/CU=%-2d regs=%-3d bill=%-3d cvt/mma=%d | %8.2f us  %5.1f%% MFU  %s\n",
               TM, TN, TK, WM, WN, ST, Q == QM::FinegrainedScaleZero ? "ScaleZero" : "ScaleOnly", gs,
-              warps, smem, blocks, R, R > 256 ? "!" : " ", fold::cvt_per_mma<WM>,
+              warps, smem, blocks, blk_smem, wcu, R, fold::regs_billed<R>, fold::cvt_per_mma<WM>,
               us, 100.0 * tf * 1e12 / 500.0e12, note);
 }
 
