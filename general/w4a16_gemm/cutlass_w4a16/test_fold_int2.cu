@@ -61,6 +61,10 @@ int main(int argc, char** argv) {
   const int ftn = getenv("FOLD_TN") ? atoi(getenv("FOLD_TN")) : (fbits == 1 ? 128 : 64);
   // FOLD_BITPACK dispatches at (64,128,64) with a 32x64 warp tile, so the banner must say so -- printing the
   // env-derived shape instead is how a run can look like it measured one tile while measuring another.
+  // Declared up here, not next to the buffers: the BANNER prints it and the golden further down uses it, and the
+  // banner comes first. (The local syntax gate caught this after the first placement compiled only for the golden.)
+  const bool svary = getenv("FOLD_SVARY") != nullptr;
+  auto sc_at = [](int g, int n) { return 1.f + 0.0625f * (float)((n + g) & 7); };
   const bool bitpack_ = getenv("FOLD_BITPACK") != nullptr;
   const int dtm = bitpack_ ? 64 : ftm, dtn = bitpack_ ? 128 : ftn, dtk = bitpack_ ? 64 : ftk;
   const int dwn = bitpack_ ? 64 : 32;
@@ -143,9 +147,6 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> dB((size_t)K*N);
   cutlass::DeviceAllocation<uint1_t> dB1((size_t)K*N);
-  // Hoisted out of the buffer-fill block below: the golden further down needs both.
-  const bool svary = getenv("FOLD_SVARY") != nullptr;
-  auto sc_at = [](int g, int n) { return 1.f + 0.0625f * (float)((n + g) & 7); };
   { std::vector<half_t> a((size_t)M*K, half_t(0.f));
     for (int m = 0; m < M; ++m) a[(size_t)m*K + m] = half_t(1.f);
     // FOLD_SVARY=1 -- WITHOUT THIS, A SCALE-PLUMBING CHANGE IS UNTESTED. The default scale is 1.0 EVERYWHERE, so
