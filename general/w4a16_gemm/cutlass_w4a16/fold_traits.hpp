@@ -159,17 +159,14 @@ template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
 inline constexpr int regs_per_thread = WM * WN / 32              // accumulator, fp32
                                      + WM * TK / 64              // A fragment
                                      + WN * TK / 64              // B fragment
-#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
-                                     + WN * TK / 256 * (Zero ? 2 : 1);   // scale (+ zero), MATERIALISED fragment
-#else
-                                     // Stride-0 broadcast fragment (make_scale_fragment): cosize is 2*MMA_N halves
-                                     // = WN/8 halves = WN/16 registers, independent of TK. Measured against l28 on
-                                     // every config in the tree. NOTE this saving crosses no power-of-two billing
-                                     // boundary in any shape we run, which is why it measured perf-neutral.
-                                     + WN / 16 * (Zero ? 2 : 1);
-#endif
+                                     // Scale fragment: cosize is 32 halves = 16 registers at every shape in the tree
+                                     // (l21, l27), i.e. WN*TK/256. It briefly read WN/16 for the stride-0 broadcast
+                                     // experiment; that was REVERTED as a no-op, and leaving the formula behind was an
+                                     // inconsistency ft_check caught (it asserts 272 for the amort=4 shape and got 260).
+                                     + WN * TK / 256 * (Zero ? 2 : 1);
 template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
 inline constexpr bool regs_ok = regs_per_thread<TM, TN, TK, WM, WN, Zero> <= 256;
+
 
 // OCCUPANCY, corrected by acu. My blk formula was min(smem_limit, warp_limit) and it was MISSING THE REGISTER
 // LIMIT, which is why blk kept failing to order the data. acu on ladder rungs 3 and 4:
@@ -182,9 +179,22 @@ inline constexpr bool regs_ok = regs_per_thread<TM, TN, TK, WM, WN, Zero> <= 256
 // 128 reg/thread for a kernel reporting 112, and 131072/16 = 256 for one reporting 186. So 112 is billed as 128
 // and 186 as 256 -- 129 registers cost exactly as much as 256. That cliff, not the raw count, is what matters,
 // and it is why regs=176 and regs=104 behave like different animals while 176 vs 240 do not.
+// ESTIMATE-TO-MEASURED OFFSET. regs_per_thread is consistently ~22 BELOW what acu reports, at both points measured:
+//     estimate 176 -> acu 186        estimate 128 -> acu 142     (int1, (32,128,64) w32x64, unchunked / B-chunked)
+// so ~10 and ~14; 12 splits them. IT DOES NOT EXTRAPOLATE RELIABLY: the chunked sweep gained +10.2 points at
+// (32,128,128) w32x32, which only makes sense if that config crossed into the 128 bucket, yet 120 + 12 = 132 says it
+// did not. Two anchor points cannot call a boundary. Treat the model as ordering configs, not as deciding buckets --
+// only acu on the specific config does that.
+// The gap is address arithmetic, pipeline temporaries and the packed source registers -- things the model does not
+// count. It lives here rather than in a comment somewhere because every billing decision compares against 128 or 256,
+// so the estimate is useless without it: 120 looks like it clears 128 and does not.
+inline constexpr int regs_measured_offset = 12;
 inline constexpr int regs_per_cu = 131072;
 template <int R>
 inline constexpr int regs_billed = R <= 32 ? 32 : R <= 64 ? 64 : R <= 128 ? 128 : R <= 256 ? 256 : 512;
+template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
+inline constexpr int regs_billed_measured =
+    regs_billed<regs_per_thread<TM, TN, TK, WM, WN, Zero> + regs_measured_offset>;
 template <int TM, int TN, int TK, int WM, int WN, int Stages, int Bits, int Gs = 32, bool Zero = false>
 inline constexpr int warps_per_cu = [] {
   constexpr int warps = (TM / WM) * (TN / WN);
@@ -193,6 +203,25 @@ inline constexpr int warps_per_cu = [] {
   constexpr int blk_w = 64 / warps;
   constexpr int blk_r = regs_per_cu
                       / (regs_billed<regs_per_thread<TM, TN, TK, WM, WN, Zero>> * warps * 32);
+  constexpr int blk   = blk_s < blk_w ? (blk_s < blk_r ? blk_s : blk_r) : (blk_w < blk_r ? blk_w : blk_r);
+  return blk * warps;
+}();
+// CHUNK-AWARE variant. The B fragment holds ONE k-atom instead of MMA_K of them, so its term is 4*MMA_N = WN/4
+// instead of WN*TK/64. Added because the sweep printed the UNCHUNKED model in a chunked build -- regs=260/bill=512 next
+// to a 63.7% MFU that only makes sense at bill=256 -- which is the third time in this work that a log failed to
+// describe the run that produced it.
+template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
+inline constexpr int regs_per_thread_chunked = WM * WN / 32          // accumulator, fp32
+                                             + WM * TK / 64          // A fragment, still whole
+                                             + WN / 4                // B: 4*MMA_N = 4*(WN/16), one k-atom
+                                             + WN * TK / 256 * (Zero ? 2 : 1);
+template <int TM, int TN, int TK, int WM, int WN, int Stages, int Bits, int Gs = 32, bool Zero = false>
+inline constexpr int warps_per_cu_chunked = [] {
+  constexpr int warps = (TM / WM) * (TN / WN);
+  constexpr int smem  = (TM * TK * 2 + TN * TK * Bits / 8 + TN * (TK / Gs) * 2 * (Zero ? 2 : 1)) * Stages;
+  constexpr int blk_r = regs_per_cu
+      / (regs_billed<regs_per_thread_chunked<TM, TN, TK, WM, WN, Zero> + regs_measured_offset> * warps * 32);
+  constexpr int blk_s = 262144 / smem, blk_w = 64 / warps;
   constexpr int blk   = blk_s < blk_w ? (blk_s < blk_r ? blk_s : blk_r) : (blk_w < blk_r ? blk_w : blk_r);
   return blk * warps;
 }();
@@ -265,15 +294,7 @@ inline constexpr int warps_per_cu = [] {
 // needs 272 regs at every shape legal under WN*TK >= 4096; asserted in ft_check) but it is HARMLESS, because
 // cvt/mma=2 is worth +0.3 points. int4's production config is already at cvt/mma=4, so pushing it to 2 has nothing
 // to gain either -- do not spend a box run on it.
-// ESTIMATE-TO-MEASURED OFFSET. regs_per_thread is consistently ~22 BELOW what acu reports, at both points measured:
-//     estimate 164 -> acu 186        estimate 120 -> acu 142     (int1, (32,128,64) w32x64, unchunked / B-chunked)
-// The gap is address arithmetic, pipeline temporaries and the packed source registers -- things the model does not
-// count. It lives here rather than in a comment somewhere because every billing decision compares against 128 or 256,
-// so the estimate is useless without it: 120 looks like it clears 128 and does not.
-inline constexpr int regs_measured_offset = 22;
-template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
-inline constexpr int regs_billed_measured =
-    regs_billed<regs_per_thread<TM, TN, TK, WM, WN, Zero> + regs_measured_offset>;
+
 
 template <int WM>
 inline constexpr int amort = WM / 16;                 // mma instructions each B fragment element feeds

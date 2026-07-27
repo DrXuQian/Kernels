@@ -126,21 +126,35 @@ static void run_cfg(Buf& b, int gs, const char* note) {
   // regs is an ESTIMATE (fold_traits.hpp) and it is printed rather than asserted, because the over-budget configs
   // compile and run -- they just collapse. TK=256 with zero measures 4.5% MFU at 352 estimated regs, which is what
   // spilling looks like, and having the number on the same line as the timing is how that became visible at all.
+  // WHICH MODEL, and whether this binary was built with chunking. The previous version always printed the UNCHUNKED
+  // model, so a chunked run showed regs=260/bill=512 beside a 63.7% MFU that is only possible at bill=256. A log has
+  // to describe the run that produced it -- third time in this work.
+#if defined(PPU_B_CHUNK) && (PPU_B_CHUNK != 0)
+  constexpr bool kCh = true;
+  constexpr int R = fold::regs_per_thread_chunked<TM, TN, TK, WM, WN, Q == QM::FinegrainedScaleZero>;
+  const int wcu   = fold::warps_per_cu_chunked<TM, TN, TK, WM, WN, ST, 1, 32, Q == QM::FinegrainedScaleZero>;
+#else
+  constexpr bool kCh = false;
   constexpr int R = fold::regs_per_thread<TM, TN, TK, WM, WN, Q == QM::FinegrainedScaleZero>;
+  const int wcu   = fold::warps_per_cu<TM, TN, TK, WM, WN, ST, 1, 32, Q == QM::FinegrainedScaleZero>;
+#endif
+  // NChunk, so a config whose chunking silently did not apply is visible. TK=256 came back bit-identical to the
+  // unchunked run, which is what a skipped path looks like.
+  constexpr int kSlots = WN * TK / 32, kKbm = kSlots / 128, kNChunk = kKbm ? (TK / 16) / kKbm : 0;
   // blk USED TO BE min(smem, warps) HERE AND THAT WAS WRONG -- it omitted the register limit, so it printed 23 for
   // the best config where the hardware gives 8 (131072/(256*64)); acu confirmed the register limit directly
   // ("Block Limit Registers 4" against "Block Limit Shared Mem 10" on a ladder rung). Every blk number in the early
   // analysis of this sweep was inflated for the 256-billing configs. warps/CU is the quantity the two-factor model
   // uses, so print that, and keep the smem-only bound beside it since it shows WHICH limit binds.
   const int blk_smem = 262144 / smem;
-  const int wcu = fold::warps_per_cu<TM, TN, TK, WM, WN, ST, 1, 32, Q == QM::FinegrainedScaleZero>;
   const int blocks = wcu / warps;
   // cvt/mma = 128/WM is the discriminator the register count missed: it separated the first 20 points of this sweep
   // with no overlap (4.00 -> 40.9-50.2%, 8.00 -> 31.9-39.8%). Printed next to blk so the two can be read against
   // each other, since they frequently pull in opposite directions.
-  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | wrp=%d smem=%6dB blk=%-2d(smem %2d) w/CU=%-2d regs=%-3d bill=%-3d cvt/mma=%d | %8.2f us  %5.1f%% MFU  %s\n",
+  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | wrp=%d smem=%6dB blk=%-2d w/CU=%-2d regs=%-3d bill=%-3d cvt=%d %s | %8.2f us  %5.1f%% MFU  %s\n",
               TM, TN, TK, WM, WN, ST, Q == QM::FinegrainedScaleZero ? "ScaleZero" : "ScaleOnly", gs,
-              warps, smem, blocks, blk_smem, wcu, R, fold::regs_billed<R>, fold::cvt_per_mma<WM>,
+              warps, smem, blocks, wcu, R, fold::regs_billed<R + fold::regs_measured_offset>, fold::cvt_per_mma<WM>,
+              kCh ? (kNChunk ? "CHUNK" : "chunk-N/A") : "plain",
               us, 100.0 * tf * 1e12 / 500.0e12, note);
 }
 
