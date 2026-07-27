@@ -52,6 +52,13 @@
 #include "unfused_weight_dequantize.hpp"
 #include "moe_grouped_ppu.cuh"
 
+// If this fails, the actlize SUBMODULE on the box is stale: the Kernels gitlink moved but `git submodule update` did
+// not run, so the build would silently produce a binary identical to the previous one. That ambiguity is what made an
+// "every acu counter is identical" A/B uninterpretable -- so it is a compile error, not a runtime surprise.
+#if !defined(PPU_SCALE_FRAGMENT_API) || PPU_SCALE_FRAGMENT_API < 2
+#error "stale actlize submodule: run `git submodule update --init third_party/actlize` and rebuild"
+#endif
+
 using cutlass::half_t;
 using uint1_t = cutlass::uint1b_t;
 using GS      = moe_grouped_ppu::GroupShape;
