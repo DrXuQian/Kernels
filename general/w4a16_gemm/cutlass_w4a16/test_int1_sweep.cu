@@ -220,6 +220,33 @@ int main(int argc, char** argv) {
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 128, 32, 32, 2>(b, gs, "TK=128 TM=64 s2");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 16, 32, 2>(b, gs, "TK=128 w16x32 s2");
 
+  // CHUNK GROUP. Build with PPU_DEFS=PPU_B_CHUNK=1 and run this twice, with and without, for the A/B.
+  //
+  // The B fragment drops from 4*MMA_N*MMA_K to 4*MMA_N registers, so the saving is 4*(WN/16)*(TK/16 - 1) -- it GROWS
+  // with TK. That moves the interesting configs away from TK=64: at TK=64 the estimate goes 164 -> 116, and
+  // 116 + 22 (the measured offset) = 138 > 128, so it stays in the 256 bucket. acu confirms exactly that -- 186 -> 142
+  // registers with occupancy unchanged. At TK=128 the estimate reaches 106, i.e. 128 measured, which is EXACTLY the
+  // boundary: the offset is fitted on two points, so +-2 flips the bucket and the model cannot call it.
+  //
+  // TK=256 is the one worth the most: it currently measures 23.0% because 320 estimated registers bill at 512. With
+  // chunking the estimate is 170 -> 192 measured -> 256 billed, and warps/CU doubles. That is a config going from
+  // register-dead to alive, not a tuning delta.
+  //
+  // NChunk = K_ATOM_PER_COPY = MMA_K / K_BLOCK_MAX, so it is 4 at TK=64 and 8 at TK=128/256 with WN=32. at() and
+  // keep() are layout compositions over tCrB_mma's own layout, so they follow MMA_N/MMA_K without code changes --
+  // which is the point of having made them derived rather than hand-typed.
+  std::printf("\n== CHUNK GROUP (PPU_B_CHUNK). B regs 4*MMA_N*MMA_K -> 4*MMA_N, so the saving grows with TK.\n");
+  upload_weights<128, 128>(b);
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 2>(b, gs, "CHUNK: est 162->106, bucket 256->128 (BOUNDARY)");
+  run_cfg<QM::FinegrainedScaleOnly, 64, 128, 128, 32, 32, 2>(b, gs, "CHUNK: est 162->106, warps/CU 16->32");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 3>(b, gs, "CHUNK: same at s3");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 64, 3>(b, gs, "CHUNK: est 260->148, bucket 512->256");
+  upload_weights<128, 256>(b);
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 256, 32, 32, 2>(b, gs, "CHUNK: was 23.0% (512 bucket) -> 256");
+  run_cfg<QM::FinegrainedScaleOnly, 64, 128, 256, 32, 32, 2>(b, gs, "CHUNK: TK=256 TM=64");
+  upload_weights<128, 64>(b);
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 2>(b, gs, "CHUNK control: TK=64 should NOT cross (138>128)");
+
   if (getenv("FOLD_ZDIAG")) {
     std::printf("\n== ZERO DIAGNOSTIC. reloads = K/gs, transforms = K/16. If the zero cost tracks gs it is the COPY\n");
     std::printf("   (interleave sS/sZ); if it is flat in gs it is the TRANSFORM (fuse multiplies+plus into one FMA).\n");
