@@ -20,14 +20,18 @@
 // so int1 sits EXACTLY on the delivery bound and the others under it. It is also int1's measured optimum, so int4 is
 // the one being moved off its home shape -- which is the right direction: if int4 still wins here, the gap is width.
 //
-// NOT A FAIR-OCCUPANCY COMPARISON, and it cannot be made one: B smem is TN*TK*Bits/8 = 1024 / 2048 / 4096 B, so at
-// equal stages int1 gets MORE blocks (23 / 19 / 17). That favours int1, so any int4 win here is a LOWER BOUND on the
-// width cost. The banner prints each width's blk so this is visible in the log rather than implied.
+// OCCUPANCY IS NOT EQUAL AT EQUAL STAGES, but it can be made equal. B smem is TN*TK*Bits/8 = 1024 / 2048 / 4096 B,
+// so at s2 the blocks/CU come out 23 / 19 / 15 -- which FAVOURS int1, so an int4 win at s2 is already a lower bound
+// on the width cost. To remove the last asymmetry, ACU_STAGES=3 puts int1 at 16896 B and int4 at s2's 17408 B:
+// BOTH land at blk=15. int1@s3 against int4@s2 is therefore same-shape, same-occupancy, width-only.
+// The banner prints blk either way, so the comparison being made is in the log rather than implied.
 //
 //   Build: TARGET=test_width_acu ./build.sh
 //   Run:   ./test_width_acu [bits] [M] [N] [K] [gs]        bits in {1,2,4}, default 1
 //          ACU_ONE=1 ./test_width_acu 4                    exactly ONE kernel launch, for acu
 //          ACU_ZERO=1                                      ScaleZero instead of ScaleOnly
+//          ACU_STAGES=3                                    int1@s3 and int4@s2 BOTH land at blk=15 -- the
+//                                                          same-shape same-occupancy control
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -46,7 +50,7 @@ using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
 // THE shared config. Changing it changes it for all three widths, which is the entire point of this file.
-static constexpr int TM = 32, TN = 128, TK = 64, WM = 32, WN = 64, ST = 2;
+static constexpr int TM = 32, TN = 128, TK = 64, WM = 32, WN = 64;
 static_assert(fold::warp_shape_ok<TM, TN, WM, WN>, "shared config: warp tile must divide the block tile");
 static_assert(fold::deliverable<1, TN, TK, WM, WN>, "shared config must be legal for int1 (the tightest bound)");
 static_assert(fold::deliverable<2, TN, TK, WM, WN>, "shared config must be legal for int2");
@@ -78,7 +82,7 @@ static void pack_weights(std::vector<int8_t>& out) {
   }
 }
 
-template <int Bits, class QElem>
+template <int Bits, int ST, class QElem>
 static void run_width(int gs, bool zero) {
   constexpr int contig = TK * Bits / 8, F = contig >= 32 ? 1 : 32 / contig;
   const int sk = PK / gs;
@@ -143,13 +147,23 @@ int main(int argc, char** argv) {
   PK = argc > 4 ? atoi(argv[4]) : 4096;
   const int gs = argc > 5 ? atoi(argv[5]) : 32;
   const bool zero = getenv("ACU_ZERO") != nullptr;
+  const int st = getenv("ACU_STAGES") ? atoi(getenv("ACU_STAGES")) : 2;
+  if (st != 2 && st != 3) { std::printf("  ACU_STAGES must be 2 or 3\n"); return 1; }
   std::printf("width isolation: ONE shared config (%d,%d,%d) w%dx%d s%d, bits is the only variable\n"
               "  M=%d N=%d K=%d gs=%d %s   (B smem differs by width, so blk differs -- it FAVOURS int1)\n",
-              TM, TN, TK, WM, WN, ST, PM, PN, PK, gs, zero ? "ScaleZero" : "ScaleOnly");
-  switch (bits) {
-    case 1: run_width<1, cutlass::uint1b_t>(gs, zero); break;
-    case 2: run_width<2, cutlass::uint2b_t>(gs, zero); break;
-    case 4: run_width<4, cutlass::int4b_t >(gs, zero); break;
+              TM, TN, TK, WM, WN, st, PM, PN, PK, gs, zero ? "ScaleZero" : "ScaleOnly");
+  // ACU_STAGES lets the occupancy advantage be CANCELLED rather than just noted. B smem is 1024/2048/4096 B, so at
+  // equal stages int1 gets more blocks; but int1 at s3 (16896 B) and int4 at s2 (17408 B) both land at blk=15, which
+  // is a same-shape same-occupancy control where bit width really is the only difference left.
+  if (st == 2) switch (bits) {
+    case 1: run_width<1, 2, cutlass::uint1b_t>(gs, zero); break;
+    case 2: run_width<2, 2, cutlass::uint2b_t>(gs, zero); break;
+    case 4: run_width<4, 2, cutlass::int4b_t >(gs, zero); break;
+    default: std::printf("  bits must be 1, 2 or 4\n"); return 1;
+  } else switch (bits) {
+    case 1: run_width<1, 3, cutlass::uint1b_t>(gs, zero); break;
+    case 2: run_width<2, 3, cutlass::uint2b_t>(gs, zero); break;
+    case 4: run_width<4, 3, cutlass::int4b_t >(gs, zero); break;
     default: std::printf("  bits must be 1, 2 or 4\n"); return 1;
   }
   return 0;
