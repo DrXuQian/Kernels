@@ -36,7 +36,12 @@ template<int Bits,int TN,int TK,int WM,int WN> void probe(const char* tag){
       make_tensor(make_smem_ptr((cutlass::half_t*)nullptr), make_layout(Shape<Int<TN>,Int<TK>>{},Stride<Int<TK>,_1>{})));
   auto ld = S8{}.get_thread_slice(0).partition_fragment_B(
       make_tensor(make_smem_ptr((int8_t*)nullptr), make_layout(Shape<Int<Ng>,Int<BPR>>{},Stride<Int<BPR>,_1>{})));
-  auto in = recast<cutlass::uint1b_t>(ld(_,_,0));
+  // MUST recast to the ACTUAL element type. This line used to hardcode uint1b_t, which made the int2/int4 rows
+  // report bit counts instead of code counts (chunk offsets 0,128,...,896 for a 64-element fragment -- an
+  // impossible answer that I very nearly read as an out-of-bounds bug in the collective).
+  using EB = cute::conditional_t<Bits==1, cutlass::uint1b_t,
+             cute::conditional_t<Bits==2, cutlass::uint2b_t, cutlass::int4b_t>>;
+  auto in = recast<EB>(ld(_,_,0));
   printf("  %-16s int%d TN=%3d TK=%3d w%dx%d | F=%d Ng=%3d BPR=%2d\n", tag,Bits,TN,TK,WM,WN,F,Ng,BPR);
   printf("      tCrB_mma  "); print(mma.layout()); printf("   size=%d\n", int(size(mma)));
   printf("      tCrB_load "); print(ld.layout());  printf("   size=%d int8\n", int(size(ld)));
@@ -48,8 +53,12 @@ template<int Bits,int TN,int TK,int WM,int WN> void probe(const char* tag){
 }
 int main(){
   printf("L9 -- cvt_in's layout, i.e. where convert_tensor actually writes each chunk\n\n");
-  probe<1,128,128,32,32>("calib");
-  probe<1,128, 64,32,64>("target");
-  probe<2, 64, 64,32,32>("int2 fold");
+  probe<1,128,128,32,32>("calib F=2");
+  probe<1,128, 64,32,64>("target F=2");
+  probe<2, 64, 64,32,32>("int2 fold F=2");
+  printf("  == F=1 configs: these need SEVERAL copy instances, which no earlier model covered\n");
+  probe<4, 64, 64,32,32>("int4 F=1 (production)");
+  probe<2, 64,128,32,32>("int2 F=1");
+  probe<1, 64,256,32,32>("int1 F=1");
   return 0;
 }
