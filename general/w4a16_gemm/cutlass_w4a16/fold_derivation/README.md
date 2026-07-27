@@ -627,3 +627,39 @@ not read as though it might become one.
 codegen question, and for register-resident, fully-unrolled, provably-equal values the compiler usually wins first.
 Before optimising a cute-level redundancy, check whether it survives to the ISA — which for this toolchain means acu,
 because actlize's cute cannot be compiled for device under nvcc to read the PTX.
+
+## N-chunked conversion: what it is for, after two wrong framings
+
+**It is not about relaxing the delivery bound.** The bound is about *arrival*, not expansion — a delivery is a fixed
+16 B and chunking the conversion cannot change how many codes turn up. I briefly concluded from that the whole idea
+was pointless and would need to discard half of every delivery. That was wrong, because I had aimed at the wrong `WN`.
+
+`slots = 8*MMA_N*MMA_K` with `MMA_N = WN/16`:
+
+| | MMA_N | slots | vs 128 codes (int1) |
+|---|---|---|---|
+| `WN=32` | 2 | 64 | over-delivery — half belongs to **other threads**, and a converter cannot cross lanes |
+| `WN=64` | 4 | **128** | every code is useful |
+
+So the target is `WN=64`, where nothing is wasted. **What chunking is for is the B fragment's 64 registers**, which
+are what push the total over the power-of-two billing boundary:
+
+`(64,128,64) w32x64 s2`, warps/blk = 4, smem 19456 B, slots 128 = delivery 128:
+
+| c | accum | A | B | S | total | billed | blk | warps/CU | cell |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 64 | 32 | 64 | 4 | 164 | 256 | 4 | 16 | bad — **today, measured 48.4%** |
+| 2 | 64 | 32 | 32 | 4 | 136 | 256 | 4 | 16 | bad |
+| **4** | 64 | 32 | **16** | 4 | **120** | **128** | 8 | **32** | **good** |
+
+`c=4` is one `MMA_N` atom per chunk (8·1·4 = 32 fp16), and the mainloop already loops per `k_block` through
+`transform_B_kblock(..., k_block, K_ATOM_PER_COPY, ...)` — copy and convert are already separate, so the structure
+exists. `c=2` does **not** cross the boundary: `accum = WM*WN/32 = 64` is immovable.
+
+**Expected:** the good cell (`cvt/mma=4` *and* `warps/CU >= 32`) measures 52.7% for int4 and 47.8% for int2 at
+rung 3, and int1 runs 4–6 points above int2 on every rung they share → **~54% against today's 50.2%**.
+
+**Carry the broadcast lesson.** Verify with acu that the register drop survives to the ISA before believing it.
+Unlike the scale fragment, B's 128 values are all *distinct*, so the compiler cannot coalesce them — but it may
+already be staggering their live ranges across `k_block`s, which would blunt the peak-liveness argument. The check is
+cheap and decisive: `Registers Per Thread` must fall into the 128 bucket and `warps/CU` must read 32.
