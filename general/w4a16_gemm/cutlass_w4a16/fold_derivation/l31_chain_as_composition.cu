@@ -1,52 +1,30 @@
-// L31 -- WORK IN PROGRESS AND IT SEGFAULTS. Do not run it expecting a result.
+// L31 -- PASSES, 7/7 configs, 0 mismatch. Link 3 of 6 is cute.
 //
-// THE ONE DURABLE FINDING, and it is readable straight off two printed layouts rather than inferred:
-//     thr_layout_vmnk       = (32,2,2,1):(1,32,64,0)              linear t: warpM at stride 32, warpN at 64
-//     thrfrg_B(sB) thr part = ((4,8),(2,1)):((2,64),(1024,0))     first mode is (lane,(warpN,warpM)) -- warpN FIRST
-// THE TWO WARP ORDERS ARE OPPOSITE. t=32 is warpM=1/warpN=0 with true base 0, but thrfrg_B reads it as warpN=1 and
-// adds 1024; t=64 is the exact mirror. That is the whole reason six of seven configs were off by a constant n, and
-// (32,128,128) w32x32 passed only because its two warps happen to make the swap a no-op.
+// The offline's logical side is now ONE expression instead of four hand-spliced lines:
+//     TV    = thrfrg_B(sB).layout().compose(btile, _).compose(right_inverse(thr_layout_vmnk), _)
+//     Frag  = composition(pi, emit_all)
+//     logical(t, i) = TV(make_coord(t, Frag(i)))          -> n*TK + k
 //
-// cute's own fix is thridx_2_thrid = right_inverse(thr_layout_vmnk), which get_layoutB_TV() composes in. An earlier
-// attempt applied it as an INTEGER (t2id(t) inside make_coord) and that changed nothing -- because evaluating it
-// discards the tuple structure, so thrfrg_B re-decomposes the integer colex and the wrong order comes straight back.
-// It has to be composed as a LAYOUT. Doing that is what this file now attempts, and the attempt segfaults; the
-// remaining bug is in the compose, not in the diagnosis above.
+// THREE REAL BUGS ON THE WAY, all found by PRINTING candidates next to ground truth rather than by swapping
+// expressions and diffing totals. Four rounds went to the latter and produced nothing; the former produced each
+// answer in one step. Same technique that localised the ladder's 10 points and the int2 pairing bug.
 //
-// HOW I SHOULD HAVE GOT HERE. Four rounds were spent swapping expressions and diffing totals. What actually produced
-// the answer in one step was printing the candidate layouts and the ground truth SIDE BY SIDE for a handful of
-// (t, f). That is the same technique that localised the ladder's 10 points and the int2 pairing bug, and I did not
-// reach for it here.
+//   1. WARP ORDER IS OPPOSITE between the two views, readable straight off the layouts:
+//          thr_layout_vmnk       = (32,2,2,1):(1,32,64,0)            linear t: warpM stride 32, warpN 64
+//          thrfrg_B(sB) thr part = ((4,8),(2,1)):((2,64),(1024,0))   first mode (lane,(warpN,warpM))
+//      t=32 is warpM=1/warpN=0 with true base 0, but thrfrg_B reads warpN=1 and adds 1024; t=64 mirrors it. Six of
+//      seven configs were off by a constant n, and (32,128,128) w32x32 passed only because with two warps the swap
+//      is a no-op -- a single passing config is not evidence.
+//   2. right_inverse(vmnk) MUST BE COMPOSED AS A LAYOUT, not evaluated. Applying it as an integer inside make_coord
+//      changed nothing at all, because evaluating it discards the tuple structure and thrfrg_B re-decomposes the
+//      integer colex, bringing the wrong order straight back.
+//   3. .layout() BEFORE .compose(). Composing the TENSOR returns a tensor over sB's nullptr, and evaluating it
+//      DEREFERENCES -- that was the segfault, and it printed nothing because stdout was buffered.
 //
-// FOUR cute API CONVENTIONS PINNED SO FAR, each after a wrong assumption cost a round. Recording them because the
-// pattern is the point: every one had to come from cute's source, and guessing was wrong every time.
-//   1. composition(A,B) IS pointwise A(B(i)) here -- verified, so the algebra was never the problem
-//   2. thr.partition_B(sB) puts the thread base in the ITERATOR, not the layout, so part.layout()(0) == 0 for EVERY
-//      thread
-//   3. get_layoutB_TV()'s reference is make_layout(make_shape(tile_size_mnk<1>(), tile_size_mnk<2>())) -- NO stride,
-//      hence COLUMN-major (codomain n + N*k, not n*TK + k), and sized by the MMA tile (WON*16), not the block TN
-//   4. thrfrg_B's first mode is bthrid = (v,n,k), so a linear thread index needs
-//      right_inverse(get_thr_layout_vmnk()) -- BUT applying that changed nothing here (config 1 still 0, config 2
-//      still 8192), so assumption 4 was ALSO wrong about what is broken
-//
-// STILL OPEN: only (32,128,128) w32x32 passes. Everything with WON != 2-on-a-32-wide-warp-tile is off by a constant
-// n, so the remaining error is in how the warp's N position enters -- not in emit, not in pi, not in the composition.
-//
-// HONEST ASSESSMENT before anyone spends more on this: link 3 is a MAINTAINABILITY refactor with zero measured perf
-// payoff, and it has now cost four rounds on API conventions. The productive next move is probably NOT another
-// all-at-once attempt: build the map one MODE at a time against l20's working table (which mode reproduces? which
-// diverges?) instead of composing everything and diffing the total. That localises, the way the ladder localised the
-// 10 points and the way the controlled-input probe localised the int2 pairing bug.
-//
-// STATE: the two composition layers are each verified POINTWISE (a separate diagnostic showed
-// composition(pi, emit)(i) == pi(emit(i)) and part.layout()(f) == the (n,k) offset, for every point checked), so the
-// algebra is sound. Two wiring problems remain, in order of discovery:
-//   1. FIXED: thr.partition_B(sB) bakes the thread base into the ITERATOR, not the layout, so part.layout()(0) is 0
-//      for every thread. get_layoutB_TV() is the thread-inclusive form and is what this now uses.
-//   2. OPEN: get_layoutB_TV()'s CODOMAIN CONVENTION does not match n*TK + k. At int1/TK=128 the hand map gives 8
-//      where the TV form gives 512, i.e. one of them is column-major over (TN,TK) or is indexing the tile rather
-//      than the element. That has to be pinned down from cute's source, not guessed -- guessing conventions is what
-//      cost the earlier rounds.
+// get_layoutB_TV() cannot be used directly here for two reasons its source makes plain: its reference is
+// make_layout(make_shape(tile_size_mnk<1>(), tile_size_mnk<2>())) with NO stride, hence COLUMN-major (codomain
+// n + N*k, not n*TK + k), and it is sized by the MMA tile (WON*16) rather than the block TN. Applying its two
+// composes to OUR sB is what works.
 //
 // L31 -- link 3 of 6: the offline placement as a COMPOSITION of layouts instead of hand-spliced index arithmetic.
 //
@@ -132,7 +110,8 @@ static bool check(const char* tag) {
   auto btile = make_tile(_, make_tile(make_layout(make_shape (size<1>(vmnk), size<2>(vmnk)),
                                                   make_stride(     Int<0>{},      Int<1>{})),   // B ignores ThrM
                                       _));
-  auto TV    = Mma{}.thrfrg_B(sB).compose(btile, _).compose(right_inverse(vmnk), _);
+  auto TV    = Mma{}.thrfrg_B(sB).layout().compose(btile, _).compose(right_inverse(vmnk), _);  // .layout()! composing
+  // the TENSOR instead returns a tensor over sB's nullptr, and evaluating it DEREFERENCES -- that was the segfault.
   auto Frag  = composition(pi, emit_all);                           // (code, vreg, inst) -> fragment index
   long bad = 0; int shown = 0;
   for (int t = 0; t < 32*WOM*WON; ++t) {
