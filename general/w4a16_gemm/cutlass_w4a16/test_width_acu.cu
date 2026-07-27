@@ -158,13 +158,18 @@ int main(int argc, char** argv) {
   // ESTIMATE (it said 176 where acu measured 186), and a perf-neutral result is consistent with EITHER "registers
   // dropped but stayed in the same power-of-two billing bucket" or "registers never dropped and the change is
   // inert". Those are very different conclusions, so the A/B must be identifiable in the log it produced.
+  // Print the estimate for the mode ACTUALLY RUNNING. The saving is 12 registers for ScaleOnly and 24 for ScaleZero
+  // (the zero fragment shrinks by the same amount), and ScaleZero is the deployment shape -- GGUF Q3/Q5 affine -- so
+  // measuring only ScaleOnly would check the smaller half of the change on the path that matters less.
 #if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
-  std::printf("  scale fragment: MATERIALISED (PPU_SCALE_BCAST=0)   estimate %d regs -- compare acu's Registers/Thread\n",
-              fold::regs_per_thread<TM, TN, TK, WM, WN, false>);
+  const char* sf = "MATERIALISED (PPU_SCALE_BCAST=0)";
 #else
-  std::printf("  scale fragment: stride-0 BROADCAST (default)       estimate %d regs -- compare acu's Registers/Thread\n",
-              fold::regs_per_thread<TM, TN, TK, WM, WN, false>);
+  const char* sf = "stride-0 BROADCAST (default)    ";
 #endif
+  std::printf("  scale fragment: %s  estimate %d regs (%s) -- compare acu's Registers/Thread\n",
+              sf, zero ? fold::regs_per_thread<TM, TN, TK, WM, WN, true>
+                       : fold::regs_per_thread<TM, TN, TK, WM, WN, false>,
+              zero ? "ScaleZero" : "ScaleOnly");
   std::printf("width isolation: ONE shared config (%d,%d,%d) w%dx%d s%d, bits is the only variable\n"
               "  M=%d N=%d K=%d gs=%d %s   (B smem differs by width, so blk differs -- it FAVOURS int1)\n",
               TM, TN, TK, WM, WN, st, PM, PN, PK, gs, zero ? "ScaleZero" : "ScaleOnly");
