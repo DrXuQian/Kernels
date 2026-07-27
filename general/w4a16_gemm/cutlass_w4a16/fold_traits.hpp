@@ -139,6 +139,27 @@ template <int TM, int TN, int WM, int WN>
 inline constexpr bool warp_shape_ok = (WM > 0 && WN > 0 && TM % WM == 0 && TN % WN == 0
                                        && TM / WM >= 1 && TN / WN >= 1 && (TM / WM) * (TN / WN) <= 16);
 
+// REGISTER PRESSURE per thread. An ESTIMATE, not the compiler's allocation, so it warns rather than blocks -- the
+// over-budget configs below do compile, they just run at 4.5% MFU. Derived and then checked against the box:
+//     accum = WM*WN/32          fp32, and note it depends ONLY on the warp shape, not on TM or TN
+//     A     = WM*TK/64          fp16, A is duplicated across the N warps
+//     B     = WN*TK/64          fp16, = slots/2
+//     S     = WN*TK/256         fp16, cosize is slots/4 (measured in l21), doubled with zero
+// Measured agreement (int1, gs=32, ScaleOnly unless noted):
+//     (32,128,128) w32x32  176 regs  blocks  7  -> 42.0%      (32,128,128) w32x32 s2  176  blocks 11 -> 46.5%
+//     (32,128, 64) w32x64  176 regs  blocks 23  -> 50.1%      (32,128,256) w32x32 s2  320  blocks  5 -> 23.0%
+//     (32,128,256) w32x32 s2 with zero  352 regs             ->  5.8%   (gs=16: 352 -> 4.5%)
+// So the picture is two-tier: above 256 the config spills and collapses; below it, `blocks` decides. TK=256 was
+// pursued on a "more atoms per iteration hides the scale reload better" theory that the box refuted -- the register
+// file, not hiding, is what TK controls.
+template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
+inline constexpr int regs_per_thread = WM * WN / 32              // accumulator, fp32
+                                     + WM * TK / 64              // A fragment
+                                     + WN * TK / 64              // B fragment
+                                     + WN * TK / 256 * (Zero ? 2 : 1);   // scale (+ zero)
+template <int TM, int TN, int TK, int WM, int WN, bool Zero = false>
+inline constexpr bool regs_ok = regs_per_thread<TM, TN, TK, WM, WN, Zero> <= 256;
+
 template <int Bits, int TN, int TK, int WM, int WN>
 inline constexpr bool deliverable = (Bits <= 0 || Bits >= 8) ? true : ((16 * 8 / Bits) <= (WN * TK / 32));
 

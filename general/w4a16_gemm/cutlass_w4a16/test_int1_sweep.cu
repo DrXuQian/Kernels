@@ -31,6 +31,8 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <algorithm>
+#include "fold_traits.hpp"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
@@ -101,9 +103,14 @@ static void run_cfg(Buf& b, int gs, const char* note) {
   const double us = (double)ms * 1e3 / 30, tf = 2.0 * PM * PN * PK / (us * 1e-6) / 1e12;
   const int warps = (TM / WM) * (TN / WN), sk = TK / gs;
   const int smem = (TM * TK * 2 + TN * TK / 8 + TN * sk * 2 * (Q == QM::FinegrainedScaleZero ? 2 : 1)) * ST;
-  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | warps=%d smem=%6dB atoms=%-2d | %8.2f us  %5.1f%% MFU  %s\n",
+  // regs is an ESTIMATE (fold_traits.hpp) and it is printed rather than asserted, because the over-budget configs
+  // compile and run -- they just collapse. TK=256 with zero measures 4.5% MFU at 352 estimated regs, which is what
+  // spilling looks like, and having the number on the same line as the timing is how that became visible at all.
+  constexpr int R = fold::regs_per_thread<TM, TN, TK, WM, WN, Q == QM::FinegrainedScaleZero>;
+  const int blocks = std::min(262144 / smem, 64 / warps);
+  std::printf("  (%3d,%3d,%3d) w%dx%-3d s%d %-9s gs=%-3d | warps=%d smem=%6dB blk=%-2d regs=%-3d%s | %8.2f us  %5.1f%% MFU  %s\n",
               TM, TN, TK, WM, WN, ST, Q == QM::FinegrainedScaleZero ? "ScaleZero" : "ScaleOnly", gs,
-              warps, smem, TK / 16, us, 100.0 * tf * 1e12 / 500.0e12, note);
+              warps, smem, blocks, R, R > 256 ? "!" : " ", us, 100.0 * tf * 1e12 / 500.0e12, note);
 }
 
 // upload the weight buffer for a given TK. TK=64 needs the bit-granular packer; the rest use the shipped offline.
@@ -155,7 +162,23 @@ int main(int argc, char** argv) {
   upload_weights<128, 64>(b);
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 64, 32, 64, 3>(b, gs, "measured 46.4% at gs=32");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 3>(b, gs, "B: TM=32");
-  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 2>(b, gs, "B+C: TM=32 s2");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 2>(b, gs, "B+C: TM=32 s2   <- 50.1% measured, best so far");
+  // The derived prescription: accum/thread = WM*WN/32 depends ONLY on the warp shape, and the delivery bound
+  // constrains WN alone, so WM is free. w16x64 keeps WN=64 (bound cleared) while halving the accumulator: 128
+  // estimated regs against 176. It also halves the warps, so blocks moves the other way -- the two effects oppose,
+  // which is exactly why this needs measuring rather than predicting.
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 16, 64, 2>(b, gs, "PRESCRIPTION: w16x64 s2");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 16, 64, 3>(b, gs, "PRESCRIPTION: w16x64 s3");
+  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 64, 16, 64, 2>(b, gs, "w16x64 s2 TM=16");
+  run_cfg<QM::FinegrainedScaleOnly, 64, 128, 64, 32, 64, 2>(b, gs, "w32x64 s2 TM=64");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 256, 64, 32, 64, 2>(b, gs, "w32x64 s2 TN=256");
+
+  // stages=2 was the single biggest knob at TK=128 (42.0 -> 46.5), so finish exploring it there. This needs the
+  // TK=128 buffer back, so it is re-uploaded rather than run against the TK=64 one.
+  std::printf("\n== back to TK=128 to finish the stages=2 line\n");
+  upload_weights<128, 128>(b);
+  run_cfg<QM::FinegrainedScaleOnly, 64, 128, 128, 32, 32, 2>(b, gs, "TK=128 TM=64 s2");
+  run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 16, 32, 2>(b, gs, "TK=128 w16x32 s2");
 
   if (getenv("FOLD_ZDIAG")) {
     std::printf("\n== ZERO DIAGNOSTIC. reloads = K/gs, transforms = K/16. If the zero cost tracks gs it is the COPY\n");

@@ -19,8 +19,8 @@ ppu_mma_aiu_multistage_with_scale.hpp(719): error: too many arguments in functio
 ppu_mma_aiu_multistage_with_scale.hpp(827): error: too many arguments in function call
 ppu_mma_builder.inl(121): error: expected a type specifier
 ppu_tile_scheduler_stream_k.hpp(248): error: more than one instance of constructor "dim3::dim3" matches the argument list:
-test_int1_sweep.cu(96): error: more than one operator "<<" matches these operands:
-test_int1_sweep.cu(99): error: more than one operator "<<" matches these operands:
+test_int1_sweep.cu(101): error: more than one operator "<<" matches these operands:
+test_int1_sweep.cu(98): error: more than one operator "<<" matches these operands:
 workspace.h(121): error: identifier "HGresult" is undefined
 workspace.h(123): error: identifier "hgMemsetD32Async" is undefined
 workspace.h(126): error: identifier "hgMemsetD16Async" is undefined
