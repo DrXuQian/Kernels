@@ -292,3 +292,60 @@ constant at 80, and `2*WN + TK` is minimised at `TK = 2*WN`, giving `TK=64/WN=64
 `ft_check.cpp` asserts this. int4's bound is 8× looser (`WN*TK >= 1024`), so `amort=4` **is** reachable there at
 `(64,64,32) w64x32` = 116 regs, against the 55.9% production config's `amort=2`. That is an untried lever on the
 shipped int4 path.
+
+## Step 2 was going to interleave `sS`/`sZ`. It should not be built (`l27_scale_contiguity.cu`)
+
+The zero diagnostic pointed at the copy rather than the transform (the ScaleZero delta grows with `gs`: +49.6 us at
+`gs=32`, +83.0 us at `gs=16`, while the transform count is `gs`-independent), so the plan was to interleave `sS` and
+`sZ` into one tensor with a trailing extent-2 mode — one copy of twice the width instead of two. A 2×.
+
+**The prerequisite checks out**: interleaving is a *loss* if the reads are already vectorized, because it splits a
+contiguous run apart. Measured max contiguous run is **1 half in every config**, so nothing is broken by it. (A
+permuted layout that tries to group a thread's own elements only reaches max-run 2 — my "transpose `n` from `(b,a)`
+to `(a,b)` makes it 8" derivation was wrong about the per-thread `n` set.)
+
+**But the number that makes it irrelevant**: one scale reload asks for 64–256 slots per thread to fetch 4–8 distinct
+smem elements.
+
+| config | slots asked | distinct | redundancy | fragment reg-halves |
+|---|---|---|---|---|
+| int4 `(64,64,64) w32x32` — production | 64 | 4 | **16×** | 16 for 4 values |
+| int1 `(32,128,64) w32x64` — best | 128 | 8 | **16×** | 32 for 8 values |
+| int1 `(32,128,256) w32x32` | 256 | 4 | **64×** | 64 for 4 values |
+
+The cause is structural and sits in the partition layout:
+
+```
+((_1,(_2,_2,_2,_4)),_4,_1,_2):((_0,(_1@1,_8@1,_8@0,_16@1)),_32@0,_0,_1@2)
+                                      ^^^^   ^^^^   ^^^^^
+```
+
+Three val modes walk mode-1 of the `(TN, 1, SK)` scale tensor — and that mode has **extent 1**. `sS` is
+`k`-invariant, but `make_tiled_copy_B` builds the copy for the *full* B tile (`TN × TK`), so every `k`-walking mode
+collapses to stride 0 and re-requests the same element. The fragment mirrors B's shape for the same reason, so the
+replication is materialised in registers too — 4× in every config.
+
+The replication is not an accident: it is what makes the transform a shuffle-free elementwise
+`transform(tCrB_mma(_,_,atom), tCrS(_,_,0), ..., multiplies{})` against a B fragment of the same shape. The price is
+up to 256 smem requests and 4× the scale registers.
+
+**The fix that subsumes the interleave.** Keep the replicated *shape* the transform needs, stop materialising it:
+
+```cpp
+tCrS_ld = compact fragment of `ne` elements                                   // the copy targets this
+tCrS_bc = make_tensor(tCrS_ld.data(), <B-fragment shape, stride 0 on k modes>) // handed to transform
+```
+
+| | before | after |
+|---|---|---|
+| smem requests per reload | 64–256 | 4–8 (**16–64×**) |
+| scale registers | 16–64 halves | 4–8 (**4×**, and this is tier-1 — TK=256's 320 regs included 32 here) |
+| ScaleZero | two full copies | both halves shrink, beating the interleave's 2× on its own |
+
+It touches neither the transform, the B path, nor the offline — which makes it a *safer* change than the interleave,
+not merely a bigger one. The earlier fused-FMA attempt regressed 52.3% → 33.5% precisely because it rewrote the
+transform into a scalar loop.
+
+One thing this could not settle locally: whether the PPU compiler already CSEs the redundant `ld.shared`. actlize's
+cute gates `CUTE_HOST_DEVICE` and its global functors on `__HGGCCC__`, so it will not compile for device under nvcc
+and the PTX cannot be counted here. The fix makes the question moot by removing the redundancy structurally.
