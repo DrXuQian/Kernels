@@ -662,7 +662,6 @@ inline void nfold_regroup_gmem(int8_t* out, const int8_t* in_std,
     const int    Ng  = fold_tn / F;
     const int    kCon = 256;
     const int    WPK = fold_tk / CPW;           // words per (n, K-tile)
-    const int    WPN = (int)(K / CPW);          // words per n in the STANDARD interleaved-256 buffer
     const int    W_ROW = kCon / CPW;            // words per physical row segment (kCon elements)
     const uint32_t* src = reinterpret_cast<const uint32_t*>(in_std);
     uint32_t*       dst = reinterpret_cast<uint32_t*>(out);
@@ -750,64 +749,13 @@ inline void nfold_regroup_gmem_int2(int8_t* out, const int8_t* in_std,
                                     const std::vector<size_t>& shape, int fold_tn, int fold_tk)
 { nfold_regroup_gmem(out, in_std, shape, fold_tn, fold_tk, /*bits=*/2); }
 
-inline void nfold_column_pairs_ppu(int8_t*                    out,
-                                   const int8_t*              in,
-                                   const std::vector<size_t>& shape,
-                                   QuantTypeClass             quant_type,
-                                   const int                  fold_tk,   // TileShape.K in ELEMENTS (e.g. 64)
-                                   const int                  fold_tn = 64)  // TileShape.N -- the fold group PERIOD
-{
-    const int    bits        = get_bits_in_quant_type(quant_type);
-    const size_t num_experts = shape.size() == 2 ? 1 : shape[0];
-    const size_t K           = shape.size() == 2 ? shape[0] : shape[1];   // rows
-    const size_t N           = shape.size() == 2 ? shape[1] : shape[2];   // cols
-    const int    EPV  = 32 / bits;              // elements per uint32 vec
-    const int    VRPT = 256 / EPV;              // uint32-vecs per 256-K super-tile (matches interleave RowsPerTile=256)
-    const int    TKv  = fold_tk / EPV;          // uint32-vecs per FoldTK
-    const int    F    = (32 * 8 / bits) / fold_tk;   // fold factor: how many N columns fill one 32B run
-    const int    nsuper = int(K) / 256;
-    const int    chunks = VRPT / TKv;
-    assert(F >= 2 && "nfold: FoldTK too large (single column already >= 32B, no fold needed)");
-    assert(int(N) % F == 0 && VRPT % TKv == 0 && int(K) % 256 == 0 && "nfold: shape not fold-divisible");
-    const uint32_t* src = reinterpret_cast<const uint32_t*>(in);
-    uint32_t*       dst = reinterpret_cast<uint32_t*>(out);
-    for (size_t e = 0; e < num_experts; ++e) {
-        const size_t moff = e * (N * K / EPV);
-        for (int T = 0; T < nsuper; ++T)
-            for (size_t g = 0; g < N / F; ++g)
-                for (int ci = 0; ci < chunks; ++ci)
-                    for (int f = 0; f < F; ++f)
-                        for (int j = 0; j < TKv; ++j) {
-                            // CROSS-HALF pairing: the MMA pairs logical column n with n + N/F (not n with n+1).
-                            // Derived from the fragment slot maps (scratchpad/cute_nfold7.cu): at mma K-atom j the MMA
-                            // wants (n, k=16j+..) from swzl atom j and (n + Ng, same k) from swzl atom j+F/..., i.e.
-                            // the SECOND half of the folded run must carry the column Ng away, not the neighbour.
-                            // Adjacent pairing (n = g*F + f) is what produced the measured n_used = n & ~1.
-                            // TILE-PERIODIC grouping (not global): the kernel iterates B in TileShape.N-wide tiles, so a
-                            // column may only be folded with a partner INSIDE its own tile -- pairing n with n+N/F
-                            // (global halves) puts the partner in a different tile, which the block never loads. The
-                            // fold group must therefore repeat with period fold_tn: within each tile of fold_tn
-                            // columns, physical row g takes logical columns g and g + fold_tn/F.
-                            // DERIVED placement (scratchpad/derive2.cu, no probing): composing the converter's
-                            // fixed emission order sigma with cute's B-fragment slot->(n,k) map gives, per vreg,
-                            //   (crumb>>1)&1 == 0  ->  logical column n
-                            //   (crumb>>1)&1 == 1  ->  logical column n + TN/F
-                            // i.e. the folded partner is n + TN/F (in-tile), interleaved at a granularity of TWO
-                            // crumbs -- NOT the run's first/second half. Placing the partner at the half-run boundary
-                            // (my earlier attempts, adjacent or cross-half) mis-registers every 2 crumbs, which is
-                            // exactly the measured n_used = n//2. Calibration: the same composition reproduces the
-                            // validated split-at-8 for int2@TK128 (converter pair (t,t+8) == adjacent logical k).
-                            const size_t tile   = g / (fold_tn / F);
-                            const size_t g_in   = g % (fold_tn / F);
-                            const size_t n      = tile * fold_tn + g_in + f * (fold_tn / F);
-                            const int    i     = ci * TKv + j;                          // tile_idx within super-tile
-                            const size_t o_off = (size_t)T * VRPT * N + g * F * VRPT
-                                               + (size_t)ci * F * TKv + (size_t)f * TKv + j;
-                            const size_t i_off = (size_t)T * VRPT * N + n * VRPT + i;
-                            dst[moff + o_off] = src[moff + i_off];
-                        }
-    }
-}
+// nfold_column_pairs_ppu USED TO LIVE HERE and has been deleted. It was dead code (nothing called it) whose
+// comments carried a DISPROVEN derivation -- that the pipeline interleaves several N columns inside one vreg
+// "at crumb level". fold_derivation/l7_groundtruth.cu measures the shipped pipeline as SINGLE-column per
+// 32-bit word, and l13 confirms it across int1/int2/int4. Keeping a wrong explanation next to working code
+// is not free: I independently re-derived the same wrong placement in l6 and believed it BECAUSE it matched
+// this comment. The working placement is nfold_regroup_gmem (whole-uint32) and, for cols_per_word > 1,
+// nfold_place_bits_int1_tk64 (bit-granular, generated by l10 from the verified chain).
 
 // FoldTK: 0 = no N-fold (default; existing callers byte-identical). >0 = TileShape.K in ELEMENTS to fold to.
 template<bool is_rowmajor, int RowsPerTile, int FoldTK = 0>
@@ -846,17 +794,20 @@ void preprocess_weights_for_mixed_gemm(int8_t*                    preprocessed_q
         interleave_column_major_tensor_ppu(dst_buf.data(), src_buf.data(), shape, quant_type, RowsPerTile);
         src_buf.swap(dst_buf);
     }
-    // N-FOLD: intentionally NOT a separate step any more. Derived locally (scratchpad/derive*.cu) and recorded in
-    // memory: the EXISTING pipeline (permute_B_rows_for_mixed_gemm + the two transposes + interleave-256) already
-    // interleaves several N columns into one 32B contiguous run AT CRUMB LEVEL -- proven from the validated
-    // int2@TK128 config, where cute maps vreg0/crumb0 -> (n0,k0) but vreg0/crumb2 -> (n32,k0), and one vreg is 16
-    // contiguous crumbs of ONE smem row. Appending a whole-uint32 vector permutation after interleave-256 therefore
-    // SCRAMBLES an interleave that was already correct -- which is exactly why the probe kept measuring
-    // n_used = n&~1 / n//2. The fold must instead come from parameterising the existing steps for the folded
-    // (TN, TK/F) shape; `nfold_column_pairs_ppu` is kept below only as a record of the abandoned approach.
+    // N-FOLD is not a step here; the caller applies it afterwards. A CORRECTION to what this comment used to say:
+    // it claimed the pipeline above "already interleaves several N columns into one 32B contiguous run AT CRUMB
+    // LEVEL", citing vreg0/crumb0 -> (n0,k0) versus vreg0/crumb2 -> (n32,k0). That is FALSE. Running the pipeline
+    // and recovering its map bit by bit (fold_derivation/l7_groundtruth.cu, and l13 across int1/int2/int4) shows
+    // every 32-bit word holds ONE logical column: the two transposes preserve the n axis, permute_B_rows permutes
+    // K, interleave-256 relocates whole uint32 vecs, and add_bias_and_interleave reorders bits WITHIN a word.
+    //
+    // The old claim also argued against the approach that actually works: nfold_regroup_gmem IS "a whole-uint32
+    // permutation after interleave-256", and it is the validated one. What it must do -- and what the version of
+    // this file before fold_derivation/l13 got wrong -- is invert interleave-256 properly rather than treat its
+    // output as n-major, which only holds at K == 256.
     static_assert(FoldTK == 0,
-        "N-fold via a separate post-interleave step is abandoned (it scrambles the pipeline's own crumb interleave); "
-        "parameterise the existing steps for the folded shape instead -- see ppu-aiu-n-contiguous-load memory");
+        "the fold is applied by the caller (nfold_regroup_gmem, or nfold_place_bits_* when a word must carry "
+        "several logical columns), not by a FoldTK parameter here");
     add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }

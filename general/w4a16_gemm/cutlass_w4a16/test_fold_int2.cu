@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     packed[i] = b;
   }
   std::vector<int8_t> Bp(packed.size());   // same byte count as `packed` (regroup only permutes whole words)
-  // FoldTK=64: the N-fold step (nfold_column_pairs_ppu) runs after interleave-256.
+  // The N-fold runs after interleave-256, as a whole-uint32 regroup (nfold_regroup_gmem).
   // DERIVED placement (nfold_place_derived_int2) INSTEAD of the standard relayout: it maps each logical (n,k) of a
   // 64x64 tile straight to the physical (word, crumb) the folded kernel reads. Verified locally: 4096 logical
   // positions -> 4096 distinct physical positions, no collisions/misses. Set NFOLD_STD=1 to fall back to the standard
