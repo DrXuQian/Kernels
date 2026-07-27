@@ -663,3 +663,47 @@ rung 3, and int1 runs 4–6 points above int2 on every rung they share → **~54
 Unlike the scale fragment, B's 128 values are all *distinct*, so the compiler cannot coalesce them — but it may
 already be staggering their live ranges across `k_block`s, which would blunt the peak-liveness argument. The check is
 cheap and decisive: `Registers Per Thread` must fall into the 128 bucket and `warps/CU` must read 32.
+
+## Chunked B conversion: int1 50.2% → **63.7%**, and the two factors are ordered, not additive
+
+Same-round A/B of `PPU_B_CHUNK`, 21 configs. The unchunked control reproduces every previously recorded number to
+within 0.2 points (42.0, 46.5, 23.0, 31.9, 49.8, 50.2, 48.6, 44.7), so the surrounding refactors — `apply_scale_atom`,
+the shared emitter, `MixGemmEmit` as a cute Layout — are **performance-neutral**, which is the control that makes the
+deltas below attributable.
+
+| config | cvt/mma | unchunked | chunked | Δ |
+|---|---|---|---|---|
+| **`(64,128,64) w64x64 s2`** | **2** | 48.6% | **63.7%** | **+15.1** |
+| `(64,128,128) w32x32 s3` | 4 | 41.0% | 54.8% | +13.8 |
+| `(32,128,128) w32x32 s3` | 4 | 42.0% | 54.0% | +12.0 |
+| `(32,128,128) w32x32 s2` | 4 | 46.5% | 56.6% | +10.1 |
+| `(32,128,64) w32x64 s2` | 4 | 49.8% | 52.7% | +2.9 |
+| `(32,128,256) w32x32 s2` | 4 | 23.0% | 23.0% | 0.0 |
+| six `w16x*` rows | 8 | 38.4–39.8% | 38.0–39.9% | **−0.5 … +1.0** |
+
+Grouped by the converter-amortisation axis:
+
+| | n | mean Δ | range |
+|---|---|---|---|
+| `cvt/mma = 2` | 1 | **+15.1** | — |
+| `cvt/mma = 4` | 12 | +6.5 | +0.0 … +13.8 |
+| `cvt/mma = 8` | 8 | **+0.2** | −0.5 … +1.0 |
+
+### The two factors are ORDERED, and this retracts an earlier conclusion
+
+I had recorded *"`cvt/mma = 2` is worth +0.3 points"*, from `w64x64` measuring 48.7% against a `cvt/mma = 4` peer's
+48.4% at equal `blk`. That was true **only because the config was register-starved** — 512-billed, `warps/CU = 8`.
+Chunking drops it to 256 and doubles `warps/CU`, and *then* `cvt/mma = 2` is worth **eleven points over the best
+`cvt/mma = 4` config**. So the two axes are not additive: **the second one only pays once the first is not
+saturating**, in either direction.
+
+The `cvt/mma = 8` rows are the mirror image and an independent confirmation: at `TK=128` they free exactly the same 56
+registers as the `w32x32` rows that gained +10, and they gain **nothing**. That axis is a throughput ceiling, and
+freeing registers underneath a ceiling buys nothing.
+
+### `TK=256` returned bit-identical both times
+
+23.0 → 23.0 and 31.9 → 31.9. That is what a **skipped path** looks like, not a null result — the sweep now prints
+`CHUNK` / `chunk-N/A` per row so it is visible rather than inferred. The suspect is the emitter's
+`size(FragLayout) == kOut` assertion: at `TK=256` the fragment is 256 elements while one delivery covers 128, so
+either the assertion is too strict or the config silently took the default path.
