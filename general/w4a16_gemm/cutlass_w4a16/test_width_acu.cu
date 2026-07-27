@@ -32,11 +32,14 @@
 //          ACU_ZERO=1                                      ScaleZero instead of ScaleOnly
 //          ACU_STAGES=3                                    int1@s3 and int4@s2 BOTH land at blk=15 -- the
 //                                                          same-shape same-occupancy control
+//          ACU_LADDER=1 ./test_width_acu 4                 walk int4's home tile -> int1's tile, ONE variable per
+//                                                          rung, to localise its unexplained 10-point drop
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <type_traits>
 #include "fold_traits.hpp"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
@@ -61,7 +64,7 @@ static int PM = 2048, PN = 4096, PK = 4096;
 // Build the weight buffer for a given width at TK=64. All three fold differently and each has its own validated
 // offline: int1 F=4 needs the bit-granular packer (whole-word moves cannot put two logical columns in one word),
 // int2 F=2 and int4 F=1 go through the shipped preprocess (+ regroup where it folds).
-template <int Bits>
+template <int Bits, int TNp>
 static void pack_weights(std::vector<int8_t>& out) {
   constexpr int EPB = 8 / Bits, MASK = (1 << Bits) - 1;
   constexpr int contig = TK * Bits / 8, F = contig >= 32 ? 1 : 32 / contig;
@@ -71,20 +74,20 @@ static void pack_weights(std::vector<int8_t>& out) {
     nk[i / EPB] |= int8_t((int((i * 2654435761u >> 7) & MASK)) << (Bits * (i % EPB)));
   out.assign(bytes, 0);
   if (Bits == 1 && TK == 64) {
-    nfold_place_bits_int1_tk64(out.data(), nk.data(), PN, PK, TN, TK);
+    nfold_place_bits_int1_tk64(out.data(), nk.data(), PN, PK, TNp, TK);
   } else {
     const auto qtc = Bits == 1 ? QuantTypeClass::PACKED_INT1_WEIGHT_ONLY
                    : Bits == 2 ? QuantTypeClass::PACKED_INT2_WEIGHT_ONLY
                                : QuantTypeClass::PACKED_INT4_WEIGHT_ONLY;
     preprocess_weights_for_mixed_gemm<false, 256, 0>(out.data(), nk.data(), {(size_t)PK, (size_t)PN}, qtc);
     if (F > 1) { std::vector<int8_t> f(bytes);
-                 nfold_regroup_gmem(f.data(), out.data(), {(size_t)PK, (size_t)PN}, TN, TK, Bits); out.swap(f); }
+                 nfold_regroup_gmem(f.data(), out.data(), {(size_t)PK, (size_t)PN}, TNp, TK, Bits); out.swap(f); }
   }
 }
 
-template <int Bits, int ST, class QElem>
-static void run_width(int gs, bool zero) {
-  constexpr int contig = TK * Bits / 8, F = contig >= 32 ? 1 : 32 / contig;
+template <int Bits, int TMr, int TNr, int TKr, int WMr, int WNr, int ST, class QElem>
+static void run_rung(int gs, bool zero, const char* note) {
+  constexpr int contig = TKr * Bits / 8, F = contig >= 32 ? 1 : 32 / contig;
   const int sk = PK / gs;
 
   cutlass::DeviceAllocation<half_t> A((size_t)PM * PK), S((size_t)sk * PN), Z((size_t)sk * PN), D((size_t)PM * PN);
@@ -92,7 +95,7 @@ static void run_width(int gs, bool zero) {
   { std::vector<half_t> a((size_t)PM * PK, half_t(0.01f)), s((size_t)sk * PN, half_t(0.05f)),
                         z((size_t)sk * PN, half_t(0.f));
     A.copy_from_host(a.data()); S.copy_from_host(s.data()); Z.copy_from_host(z.data()); }
-  { std::vector<int8_t> w; pack_weights<Bits>(w);
+  { std::vector<int8_t> w; pack_weights<Bits, TNr>(w);
     B.copy_from_host(reinterpret_cast<QElem const*>(w.data())); }
 
   std::vector<GS> shp_h{cute::make_shape(PM, PN, PK)};
@@ -106,25 +109,25 @@ static void run_width(int gs, bool zero) {
   cutlass::DeviceAllocation<char> ws(wsb);
 
   auto once = [&](bool z) {
-    if (z) moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TM, TN, TK, WM, WN, ST, QElem>(
+    if (z) moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMr, TNr, TKr, WMr, WNr, ST, QElem>(
              A.get(), B.get(), S.get(), Z.get(), pD.get(), sD.get(), gm.get(), PM, PN, PK, 1, gs,
              shp.get(), shp_h.data(), off.get(), ws.get(), wsb, nullptr);
-    else   moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, TM, TN, TK, WM, WN, ST, QElem>(
+    else   moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, TMr, TNr, TKr, WMr, WNr, ST, QElem>(
              A.get(), B.get(), S.get(), nullptr, pD.get(), sD.get(), gm.get(), PM, PN, PK, 1, gs,
              shp.get(), shp_h.data(), off.get(), ws.get(), wsb, nullptr);
   };
 
-  const int warps = (TM / WM) * (TN / WN);
-  const int smem  = (TM * TK * 2 + TN * TK * Bits / 8 + TN * (TK / gs) * 2 * (zero ? 2 : 1)) * ST;
+  const int warps = (TMr / WMr) * (TNr / WNr);
+  const int smem  = (TMr * TKr * 2 + TNr * TKr * Bits / 8 + TNr * (TKr / gs) * 2 * (zero ? 2 : 1)) * ST;
   const int blk   = std::min(262144 / smem, 64 / warps);
-  constexpr int R = fold::regs_per_thread<TM, TN, TK, WM, WN, false>;
+  constexpr int R = fold::regs_per_thread<TMr, TNr, TKr, WMr, WNr, false>;
 
   if (getenv("ACU_ONE")) {                          // exactly ONE launch, so acu sees a clean kernel
     once(zero);
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-    std::printf("  [acu] ONE launch: int%d F=%d (%d,%d,%d) w%dx%d s%d %s gs=%d | smem=%dB blk=%d regs=%d cvt/mma=%d\n",
-                Bits, F, TM, TN, TK, WM, WN, ST, zero ? "ScaleZero" : "ScaleOnly", gs,
-                smem, blk, R, fold::cvt_per_mma<WM>);
+    std::printf("  [acu] ONE launch: int%d F=%d (%d,%d,%d) w%dx%d s%d %s gs=%d | smem=%dB blk=%d regs=%d cvt/mma=%d  %s\n",
+                Bits, F, TMr, TNr, TKr, WMr, WNr, ST, zero ? "ScaleZero" : "ScaleOnly", gs,
+                smem, blk, R, fold::cvt_per_mma<WMr>, note);
     return;
   }
   for (int i = 0; i < 3; ++i) once(zero);
@@ -134,10 +137,10 @@ static void run_width(int gs, bool zero) {
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   float ms = 0; hggcEventElapsedTime(&ms, e0, e1);
   const double us = (double)ms * 1e3 / 30, tf = 2.0 * PM * PN * PK / (us * 1e-6) / 1e12;
-  std::printf("  int%d F=%d (%d,%d,%d) w%dx%d s%d %s gs=%-3d | smem=%6dB blk=%-2d regs=%d cvt/mma=%d"
-              " | %8.2f us  %5.1f%% MFU\n",
-              Bits, F, TM, TN, TK, WM, WN, ST, zero ? "ScaleZero" : "ScaleOnly", gs,
-              smem, blk, R, fold::cvt_per_mma<WM>, us, 100.0 * tf * 1e12 / 500.0e12);
+  std::printf("  int%d F=%d (%2d,%3d,%2d) w%dx%-2d s%d %s gs=%-3d | warps=%d smem=%6dB blk=%-2d regs=%d cvt/mma=%d"
+              " | %8.2f us  %5.1f%% MFU  %s\n",
+              Bits, F, TMr, TNr, TKr, WMr, WNr, ST, zero ? "ScaleZero" : "ScaleOnly", gs,
+              warps, smem, blk, R, fold::cvt_per_mma<WMr>, us, 100.0 * tf * 1e12 / 500.0e12, note);
 }
 
 int main(int argc, char** argv) {
@@ -152,18 +155,55 @@ int main(int argc, char** argv) {
   std::printf("width isolation: ONE shared config (%d,%d,%d) w%dx%d s%d, bits is the only variable\n"
               "  M=%d N=%d K=%d gs=%d %s   (B smem differs by width, so blk differs -- it FAVOURS int1)\n",
               TM, TN, TK, WM, WN, st, PM, PN, PK, gs, zero ? "ScaleZero" : "ScaleOnly");
-  // ACU_STAGES lets the occupancy advantage be CANCELLED rather than just noted. B smem is 1024/2048/4096 B, so at
-  // equal stages int1 gets more blocks; but int1 at s3 (16896 B) and int4 at s2 (17408 B) both land at blk=15, which
-  // is a same-shape same-occupancy control where bit width really is the only difference left.
+  // ACU_LADDER=1: walk from int4's HOME tile to int1's tile changing ONE variable per rung. int4 measures 55.9% at
+  // home and 45.9% at int1's tile, a 10-point gap that blk (8 vs 15, backwards), warps/CU (32 vs 30, equal) and HBM
+  // traffic (1342 vs 1074 MB, backwards) all fail to explain. Four things differ at once -- TM, TN, WN and stages --
+  // so a ladder localises the drop to one of them, and may settle it without acu at all.
+  //
+  //   rung 1  (64, 64,64) w32x32 s3   home                        55.9% measured
+  //   rung 2  (64, 64,64) w32x32 s2   stages 3 -> 2
+  //   rung 3  (64,128,64) w32x32 s2   TN     64 -> 128
+  //   rung 4  (64,128,64) w32x64 s2   WN     32 -> 64
+  //   rung 5  (32,128,64) w32x64 s2   TM     64 -> 32               int1's tile, 45.9% measured
+  //
+  // Rungs 1-3 have WN=32 so slots=64: legal for int4 (deliv 32) and int2 (64) but NOT int1 (128), hence the
+  // if constexpr gate rather than a comment saying "int1 skips these".
+  if (getenv("ACU_LADDER")) {
+    std::printf("\n== LADDER: one variable per rung, int4 home -> int1's tile (rungs 1-3 need WN=32, illegal for int1)\n");
+    auto ladder = [&](auto tag) {
+      constexpr int Bt = decltype(tag)::value;
+      using QE = std::conditional_t<Bt == 1, cutlass::uint1b_t,
+                 std::conditional_t<Bt == 2, cutlass::uint2b_t, cutlass::int4b_t>>;
+      if constexpr (fold::deliverable<Bt, 64, 64, 32, 32>) {
+        run_rung<Bt, 64,  64, 64, 32, 32, 3, QE>(gs, zero, "rung 1: int4 HOME (55.9% measured)");
+        run_rung<Bt, 64,  64, 64, 32, 32, 2, QE>(gs, zero, "rung 2: stages 3 -> 2");
+        run_rung<Bt, 64, 128, 64, 32, 32, 2, QE>(gs, zero, "rung 3: TN 64 -> 128");
+      } else {
+        std::printf("  int%d: rungs 1-3 skipped -- slots=64 < delivery=%d (over-delivery)\n", Bt, 16 * 8 / Bt);
+      }
+      run_rung<Bt, 64, 128, 64, 32, 64, 2, QE>(gs, zero, "rung 4: WN 32 -> 64");
+      run_rung<Bt, 32, 128, 64, 32, 64, 2, QE>(gs, zero, "rung 5: TM 64 -> 32  = int1's tile (45.9% measured)");
+    };
+    switch (bits) {
+      case 1: ladder(std::integral_constant<int,1>{}); break;
+      case 2: ladder(std::integral_constant<int,2>{}); break;
+      case 4: ladder(std::integral_constant<int,4>{}); break;
+      default: std::printf("  bits must be 1, 2 or 4\n"); return 1;
+    }
+    return 0;
+  }
+
+  // Default: the single shared config, which is what the width comparison uses. ACU_STAGES cancels the occupancy
+  // asymmetry -- int1@s3 (16896 B) and int4@s2 (17408 B) both land at blk=15.
   if (st == 2) switch (bits) {
-    case 1: run_width<1, 2, cutlass::uint1b_t>(gs, zero); break;
-    case 2: run_width<2, 2, cutlass::uint2b_t>(gs, zero); break;
-    case 4: run_width<4, 2, cutlass::int4b_t >(gs, zero); break;
+    case 1: run_rung<1, TM, TN, TK, WM, WN, 2, cutlass::uint1b_t>(gs, zero, "shared config"); break;
+    case 2: run_rung<2, TM, TN, TK, WM, WN, 2, cutlass::uint2b_t>(gs, zero, "shared config"); break;
+    case 4: run_rung<4, TM, TN, TK, WM, WN, 2, cutlass::int4b_t >(gs, zero, "shared config"); break;
     default: std::printf("  bits must be 1, 2 or 4\n"); return 1;
   } else switch (bits) {
-    case 1: run_width<1, 3, cutlass::uint1b_t>(gs, zero); break;
-    case 2: run_width<2, 3, cutlass::uint2b_t>(gs, zero); break;
-    case 4: run_width<4, 3, cutlass::int4b_t >(gs, zero); break;
+    case 1: run_rung<1, TM, TN, TK, WM, WN, 3, cutlass::uint1b_t>(gs, zero, "shared config"); break;
+    case 2: run_rung<2, TM, TN, TK, WM, WN, 3, cutlass::uint2b_t>(gs, zero, "shared config"); break;
+    case 4: run_rung<4, TM, TN, TK, WM, WN, 3, cutlass::int4b_t >(gs, zero, "shared config"); break;
     default: std::printf("  bits must be 1, 2 or 4\n"); return 1;
   }
   return 0;
