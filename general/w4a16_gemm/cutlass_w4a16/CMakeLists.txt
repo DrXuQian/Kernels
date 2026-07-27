@@ -195,6 +195,17 @@ cutlass_example_add_executable(
 )
 target_compile_options(test_fold_int2 PRIVATE -w)
 
+# int1 tile sweep, kept OUT of test_fold_int2 so the verified correctness harness does not pay for the extra
+# instantiations. Explores the two knobs left after the box overturned the scale model -- occupancy (TM*TK per stage)
+# and reload hiding (atoms per iteration = TK/16) -- plus FOLD_ZDIAG=1, which separates whether the ScaleZero cost is
+# the per-reload smem copy or the per-atom transform. Those two want completely different fixes.
+#   Build: TARGET=test_int1_sweep ./build.sh ; run: ./<bin> [N] [K] [gs] [M]
+cutlass_example_add_executable(
+  test_int1_sweep
+  test_int1_sweep.cu
+)
+target_compile_options(test_int1_sweep PRIVATE -w)
+
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
 cutlass_example_add_executable(

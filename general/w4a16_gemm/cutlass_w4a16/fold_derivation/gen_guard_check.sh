@@ -44,6 +44,17 @@ while read -r MAC TN TK; do
   for B in 1 2; do emit "$B" "$TN" "$TK" 32 "$WN" "macro:$MAC"; done
 done < "$FLAG.m"
 
+# Indirect instantiations: a sweep may wrap filter_and_run in its own template, so the literal grep above cannot
+# see the configs. run_cfg<QM, TM, TN, TK, WM, WN, ST> is that wrapper in test_int1_sweep.cu -- a real blind spot the
+# first version of this script had, found while adding that file.
+grep -rhoE 'run_cfg<[^>]*>' "$SRC"/*.cu | tr -d ' ' \
+  | sed -E 's/run_cfg<[A-Za-z:_]+,([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)>/\2 \3 \4 \5 uint1_t/' \
+  | grep -E '^[0-9]' | sort -u > "$FLAG.w"
+while read -r TN TK WM WN E; do
+  [ -n "${E:-}" ] || continue
+  emit 1 "$TN" "$TK" "$WM" "$WN" "indirect:run_cfg"
+done < "$FLAG.w"
+
 grep -rhoE 'filter_and_run<[^;]{0,200}' "$SRC"/*.cu | tr -d ' ' \
   | grep -oE '<[A-Za-z:_]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[A-Za-z_:0-9]+' \
   | sed -E 's/<[A-Za-z:_]+,[0-9]+,([0-9]+),([0-9]+),([0-9]+),([0-9]+),[0-9]+,(.*)/\1 \2 \3 \4 \5/' | sort -u > "$FLAG.e"
@@ -66,5 +77,5 @@ elif grep -q gatedbad "$FLAG" 2>/dev/null; then
 else
   echo "OK: every enumerated instantiation is deliverable."
 fi
-rm -f "$FLAG" "$FLAG.m" "$FLAG.e" "$GEN" "$BIN"
+rm -f "$FLAG" "$FLAG.m" "$FLAG.e" "$FLAG.w" "$GEN" "$BIN"
 exit $rc

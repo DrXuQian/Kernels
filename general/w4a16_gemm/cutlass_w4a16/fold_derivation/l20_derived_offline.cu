@@ -149,6 +149,21 @@ int main() {
   ok &= compare<2, 64,  64,  64, 32, 32>("int2 fold", 256, 512);
   ok &= compare<2, 64, 128,  64, 32, 32>("int2 fold wideN", 256, 512);
   ok &= compare<4, 64,  64,  32, 32, 32>("int4 fold TK=32", 256, 512);
+  printf("  == does the SHIPPED offline still match at WN=64? The offline is WN-independent (it only takes TN/TK/bits)\n");
+  printf("     but the REQUIRED placement depends on WN through the fragment, so it can be right for only one WN.\n");
+  ok &= compare<1, 32, 128, 128, 32, 64>("int1 TK128 WN=64", 256, 512);
+  ok &= compare<1, 64, 128, 256, 32, 64>("int1 TK256 WN=64", 256, 512);
+  printf("     => placement is WN-INVARIANT: pi and partition_B both move with MMA_N and the changes cancel.\n");
+  printf("        So WN only changes the DELIVERY BOUND, not the required buffer. What forces a bit-granular packer\n");
+  printf("        is TK: at int1/TK=64 a 32-bit word must carry two logical columns, which whole-word moves cannot do.\n");
+  { std::vector<int> codes((size_t)256*512);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = int((i*2654435761u >> 7) & 1);
+    std::vector<int8_t> a((size_t)256*512/8), b;
+    place_derived<1,64,128,64,32,64>(a, codes, 256, 512);
+    place_shipped<1,128,64>(b, codes, 256, 512);
+    size_t d = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) ++d;
+    printf("  int1 TK=64 WN=64 (needs bitpack)  256x512 : %zu / %zu bytes differ  %s\n", d, a.size(),
+           d ? "<-- shipped offline CANNOT express it, as expected" : "<-- unexpectedly identical"); }
   printf("  == unfolded (F=1) configs, including int4's production shape\n");
   ok &= compare<4, 64,  64,  64, 32, 32>("int4 PRODUCTION", 128, 512);
   ok &= compare<2, 64,  64, 128, 32, 32>("int2 unfolded", 128, 512);
