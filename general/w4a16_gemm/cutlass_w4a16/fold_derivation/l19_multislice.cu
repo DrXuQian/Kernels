@@ -1,4 +1,10 @@
-// L19 -- extend L2 to cubes wider than 32B, using the fp16 identity as the arbiter.
+// L19 -- the fp16 IDENTITY check, for any number of 32B slices. (l17_fp16_identity.cu was merged in here; it only
+// covered a single slice and reported the wider cubes as SKIPPED, which is the case that actually needed deciding.)
+//
+// WHY THE fp16 IDENTITY IS THE STRONGEST CHECK AVAILABLE. fp16 has no converter and no offline relayout, so
+//     gmem tile (n,k) -> AIU (linear) -> smem -> L2^-1 -> fragment -> mma wants (n',k')
+// must come out as n'==n, k'==k everywhere. Nothing exists in that path to hide a compensating error: if L2 were
+// wrong there is no converter emission and no offline permutation left to cancel it. And it needs no box.
 //
 // L2 was derived for ONE 32B slice by stripping both swizzle terms from ppu_tsm_ld_swzl_sim:
 //     vreg_vec_idx_swz1 = vreg_vec_idx ^ (vreg_line_idx % 2)          <- XOR
@@ -98,9 +104,11 @@ static void probe(const char* tag) {
 }
 
 int main() {
-  printf("L19 -- multi-slice L2, arbitrated by the fp16 identity\n\n");
-  probe<64, 16, 32, 32>("1 slice (control)");
-  probe<64, 32, 32, 32>("2 slices");
-  probe<64, 64, 32, 32>("4 slices (fp16 production?)");
+  printf("L19 -- the fp16 identity, over 1/2/4 slices, arbitrating the cross-slice term\n\n");
+  probe<64,  16, 32, 32>("1 slice (control)");
+  probe<128, 16, 32, 32>("1 slice wide N");
+  probe<64,  32, 32, 32>("2 slices");
+  probe<64,  64, 32, 32>("4 slices (dense fp16 shape)");
+  probe<128, 64, 32, 32>("4 slices wide N");
   return 0;
 }

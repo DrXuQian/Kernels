@@ -213,3 +213,35 @@ qualifier complaints that the real hgcc does not; those are ignored, and so is o
 source files count.** Verified in both directions: reintroducing the `bad` bug makes it exit 1, removing it exit 0.
 
 It is a syntax gate, not a build. It says the file parses; it says nothing about the kernel being correct.
+
+
+## Step 1: the derived offline (`l20_derived_offline.cu`)
+
+L18 pinned down why an offline relayout exists at all:
+
+> the ONLY reason is that `MixGemmEmit != identity`.
+
+fp16 needs none, because there the swzl read already delivers the mma operand order (`L2 o fragment = I`). For
+sub-byte the converter sits in between and breaks that correspondence, and the offline is exactly the compensation.
+
+So the placement is derivable: for each physical `(row, word, bit)` the chain says which logical `(n, k)` belongs
+there — `LogicalTV` for the swzl, `MixGemmEmit` for the converter, `pi = frag.layout()^-1`, `partition_B` for the
+mma — and the offline is that walk. The one non-positional piece is int4's `+8`, applied explicitly, since a layout
+says where a code goes and not what it becomes.
+
+**It is proven bit-identical to the shipped offline before anything is replaced**, on every configuration the tree
+uses, fold and unfolded, several N-tiles and k-tiles:
+
+| config | bytes differing |
+|---|---|
+| int1 fold (32,128,128) | 0 / 16384 |
+| int2 fold (64,64,64) | 0 / 32768 |
+| int2 fold wideN (64,128,64) | 0 / 32768 |
+| int4 fold TK=32 | 0 / 65536 |
+| **int4 (64,64,64) — production** | **0 / 32768** |
+| int2 unfolded (64,64,128) | 0 / 16384 |
+| int1 unfolded (64,64,256) | 0 / 8192 |
+
+Bit-identical output means swapping the five steps for the derived walk is safe *by construction* rather than by
+argument. The five steps stay in place until the box regression is green — the point of this file is that the
+decision no longer rests on reasoning.
