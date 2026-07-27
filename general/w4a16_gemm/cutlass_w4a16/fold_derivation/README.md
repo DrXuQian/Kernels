@@ -1,5 +1,12 @@
 # Where the N-fold's limits come from
 
+> **Method, traps and the perf model now live in the `ppu-cutlass-mixed-gemm` skill.** This file keeps the
+> harness inventory and the MEASUREMENTS. Five narrative sections were removed after their lessons were
+> generalised into the skill: the two-wrong-turns retraction, the sS/sZ interleave that should not be built, the
+> scale-broadcast prediction and its retraction, and the two wrong framings of N-chunking. What was deleted was
+> prose; every number below was measured on ppu001.
+
+
 Four standalone programs. **None of them needs the box** — that is the point. They replace probe-fitting on
 ppu001 with a derivation you can re-run in seconds, and they agree with every configuration ever measured there.
 
@@ -72,43 +79,6 @@ delivery <= slots        i.e.   WN * TK * Bits >= 4096
 
 Over-delivery is unrecoverable — a thread cannot use more codes than its fragment has slots, and the surplus is
 never fetched. At the `WM=WN=32` every fold test passes, this reduces to `TK*Bits >= 128`.
-
-## Two wrong turns, and what each got right
-
-| version | claim | verdict |
-|---|---|---|
-| v1 | `TK*Bits >= 128`, therefore `F <= 2`, therefore int1 can never use TK=64 | right inequality, **wrong reason**, and the "never" was wrong |
-| v2 | that bound is not real; the offline packer is what fails | right that int1@TK=64 is reachable, **wrong** that the bound is not real |
-
-v1's error: LEG 2 shows the four lanes of a `lane/4` group demand the same *set* of N, and I read it as the same
-*single* N, then concluded a folded column must fill a half-run. A thread demands many columns, so nothing forces
-that. v2's error: it also used the stub warp layout, so its `cols_per_word` came out 2 for a config where the
-real layout gives 1 — at `WN=32` the packer was never the binding constraint.
-
-**Where the escape actually is:** `slots` scales with `WN`. Same int1 at TK=64 —
-
-| WN | slots | delivery | verdict | cols/word |
-|---|---|---|---|---|
-| 32 | 64 | 128 | over-delivery — impossible | 1 |
-| 64 | 128 | 128 | tight — **feasible** | 2 |
-| 128 | 256 | 128 | under — feasible, with headroom | 4 |
-
-The price is the thing v2 found, which is real but only bites once `WN > 32`:
-
-```
-cols_per_word = WN / 32     how many logical columns must share one 32-bit word
-```
-
-`nfold_regroup_gmem` moves whole `uint32`s (`dst[dst_w] = src[src_w]`), so it can only ever do 1. **int1 at TK=64
-needs both a higher WN and a bit-granular packer** — the two constraints pincer it, and neither alone suffices.
-
-Smallest legal TK:
-
-| | WN=32 | WN=64 | WN=128 |
-|---|---|---|---|
-| int4 | 32 | 16 | 16 |
-| int2 | 64 | 32 | 16 |
-| int1 | **128** | **64** | 32 |
 
 ## What this rules out
 
@@ -323,74 +293,6 @@ optimum `w32x64 s2` at `TK=64` is exactly that.
 **harmless**, because `cvt/mma=2` is worth +0.3 points. int4's production config is already at `cvt/mma=4`, so there
 is nothing to gain there either. Do not spend a box run on it.
 
-## Step 2 was going to interleave `sS`/`sZ`. It should not be built (`l27_scale_contiguity.cu`)
-
-The zero diagnostic pointed at the copy rather than the transform (the ScaleZero delta grows with `gs`: +49.6 us at
-`gs=32`, +83.0 us at `gs=16`, while the transform count is `gs`-independent), so the plan was to interleave `sS` and
-`sZ` into one tensor with a trailing extent-2 mode — one copy of twice the width instead of two. A 2×.
-
-**The prerequisite checks out**: interleaving is a *loss* if the reads are already vectorized, because it splits a
-contiguous run apart. Measured max contiguous run is **1 half in every config**, so nothing is broken by it. (A
-permuted layout that tries to group a thread's own elements only reaches max-run 2 — my "transpose `n` from `(b,a)`
-to `(a,b)` makes it 8" derivation was wrong about the per-thread `n` set.)
-
-**But the number that makes it irrelevant**: one scale reload asks for 64–256 slots per thread to fetch 4–8 distinct
-smem elements.
-
-| config | slots asked | distinct | redundancy | fragment reg-halves |
-|---|---|---|---|---|
-| int4 `(64,64,64) w32x32` — production | 64 | 4 | **16×** | 16 for 4 values |
-| int1 `(32,128,64) w32x64` — best | 128 | 8 | **16×** | 32 for 8 values |
-| int1 `(32,128,256) w32x32` | 256 | 4 | **64×** | 64 for 4 values |
-
-The cause is structural and sits in the partition layout:
-
-```
-((_1,(_2,_2,_2,_4)),_4,_1,_2):((_0,(_1@1,_8@1,_8@0,_16@1)),_32@0,_0,_1@2)
-                                      ^^^^   ^^^^   ^^^^^
-```
-
-Three val modes walk mode-1 of the `(TN, 1, SK)` scale tensor — and that mode has **extent 1**. `sS` is
-`k`-invariant, but `make_tiled_copy_B` builds the copy for the *full* B tile (`TN × TK`), so every `k`-walking mode
-collapses to stride 0 and re-requests the same element. The fragment mirrors B's shape for the same reason, so the
-replication is materialised in registers too — 4× in every config.
-
-The replication is not an accident: it is what makes the transform a shuffle-free elementwise
-`transform(tCrB_mma(_,_,atom), tCrS(_,_,0), ..., multiplies{})` against a B fragment of the same shape. The price is
-up to 256 smem requests and 4× the scale registers.
-
-**The fix that subsumes the interleave.** Keep the replicated *shape* the transform needs, stop materialising it:
-
-```cpp
-tCrS_ld = compact fragment of `ne` elements                                   // the copy targets this
-tCrS_bc = make_tensor(tCrS_ld.data(), <B-fragment shape, stride 0 on k modes>) // handed to transform
-```
-
-**CORRECTION to the 16–64× figure.** cute's `copy(Copy_Atom<...>, src, dst)` already auto-filters: it computes
-`nullspace(layout<1>(dst_v))` and divides both operands by it, so redundant iterations along the **destination's**
-stride-0 modes are skipped — and this is in the general CopyAtom overload, not gated on `AutoFilter`, so the
-collective's `copy(smem_tiled_copy_S, ...)` gets it today. The destination fragment distinguishes 32 registers, so
-what is actually issued is ~32 requests for 8 distinct values, i.e. **4× redundant, not 16–64×**. The 128 figure is
-what the partition *asks for*, not what the copy *issues*.
-
-| | before | after |
-|---|---|---|
-| smem requests per reload | ~32 (of 128 asked) | 8 (**4×**, an upper bound) |
-| scale registers | 16–64 halves | 4–8 (**4×**, definite, and tier-1 — TK=256's 320 regs included 32 here) |
-| ScaleZero | two full copies | both halves shrink, beating the interleave's 2× on its own |
-
-This also explains *why* the fix works mechanically and needs no hand-written filtering: making the destination's
-nullspace bigger is exactly the lever AutoFilter keys on, and `zipped_divide` handles the correspondence.
-
-It touches neither the transform, the B path, nor the offline — which makes it a *safer* change than the interleave,
-not merely a bigger one. The earlier fused-FMA attempt regressed 52.3% → 33.5% precisely because it rewrote the
-transform into a scalar loop.
-
-One thing this could not settle locally: whether the PPU compiler already CSEs the redundant `ld.shared`. actlize's
-cute gates `CUTE_HOST_DEVICE` and its global functors on `__HGGCCC__`, so it will not compile for device under nvcc
-and the PTX cannot be counted here. The fix makes the question moot by removing the redundancy structurally.
-
-
 ## What the ladder found: the 10 points are `WN`, and int1 is locked out of `WN=32`
 
 int4's home tile (55.9%) and int1's tile (45.9% for int4) differ in four things at once, and none of `blk`,
@@ -496,71 +398,6 @@ constraint), or stream-K. Persistent scheduling was already tried in the MoE wor
 remedy, known not to be cheap.
 
 
-## The scale broadcast: validated numerically, and a pre-registered prediction that it will NOT help occupancy
-
-`FOLD_SVARY=1` on the box, with the period-13 pattern that can actually see an 8/16/32 misassignment:
-
-```
-fold int1 TK=64 (64,128,64) w32x64 vs host codes x scale(g,n): bad=0/131072 MATCH
-fold int2 TK=64 (64, 64,64) w32x32 vs host codes x scale(g,n): bad=0/131072 MATCH
-```
-
-So the stride-0 broadcast fragment assigns the right scale to every mma slot on hardware, for both int1 F=4 and
-int2 F=2. l28's equivalence-class argument was local and structural; this is the hardware confirmation, and it took
-two attempts to build a probe that could fail (the first pattern had period 8 against displacements of 8 and 32).
-
-**Pre-registered before measuring perf.** Power-of-two register billing changes what to expect:
-
-| config | regs before → after | billed |
-|---|---|---|
-| int1 `(32,128,64) w32x64` ScaleOnly | 176 → 164 | 256 → 256 |
-| int1 `(32,128,64) w32x64` ScaleZero | 192 → 168 | 256 → 256 |
-| int4 `(64,64,64) w32x32` ScaleOnly | 104 → 98 | 128 → 128 |
-
-(The first version of this table said 162/164 — I had used `TN/WN`, the warp count in N, where the fragment's cosize
-needs `MMA_N = WN/16`. The saving is 12 registers, 24 with zero; the conclusion is unaffected.)
-
-The registers saved cross **no** billing boundary in any config we run, so `warps_per_cu` is unchanged and **the
-broadcast cannot improve occupancy**. Its only remaining benefit is the 4× reduction in scale-reload smem traffic.
-Therefore: **ScaleOnly should move little, possibly within noise; ScaleZero is where it should show**, since the zero
-diagnostic priced the scale copy at ~49.6 us out of 327 us (~15%) and the broadcast shrinks both halves.
-
-If ScaleOnly moves a lot, the traffic model is incomplete and that is the interesting result — not a success.
-
-### Measured: a NO-OP in generated code. L27's premise confused cute's layout with codegen.
-
-| | ScaleOnly | ScaleZero | delta | previously recorded delta |
-|---|---|---|---|---|
-| gs=32 TK=128 | 327.35 us (42.0%) | 376.85 us (36.5%) | **+49.50 us** | +49.6 us |
-| gs=16 TK=128 | 369.50 us (37.2%) | 451.44 us (30.4%) | **+81.94 us** | +83.0 us |
-
-Every ScaleOnly line in the 20-config sweep also reproduces the earlier numbers to within run-to-run noise
-(42.0/41.9, 49.9, 50.2, 48.5/48.6, 44.7/44.6). **Cutting the scale reload's smem requests to a quarter changed
-nothing.**
-
-Correctness, on the other hand, is now real on all three widths:
-
-```
-fold int1 TK=64 (64,128,64) w32x64 vs host codes x scale(g,n): bad=0/131072 MATCH
-fold int2 TK=64 (64, 64,64) w32x32 vs host codes x scale(g,n): bad=0/131072 MATCH
-[xcheck grouped L=1] (A) vs dequant golden  max_rel=0 bad=0/1048576 MATCH
-                     (B) vs stock kernel    max_rel=0 bad=0/1048576 MATCH
-```
-
-**What the negative result refutes.** The zero diagnostic offered a two-way split: *"if the zero cost tracks `gs` it
-is the COPY; if it is flat in `gs` it is the TRANSFORM."* The cost does track `gs` — and narrowing the copy 4× did
-nothing. So the split was incomplete. A third quantity also tracks `gs`: **the per-reload smem round-trip latency**,
-which depends on the NUMBER of reloads (`K/gs`) and not at all on how many values each one moves. That is consistent
-with the kernel being latency-bound at `cvt/mma = 4`.
-
-So the remedy is not a narrower reload but an **earlier** one — prefetch the next group's scale so the round trip
-overlaps independent work. Reducing the reload count itself is not available: it is `K/gs`, fixed by the quantisation
-format.
-
-The broadcast is kept: it is the cute-correct construction, costs nothing, saves 12–24 registers, and could matter at
-a shape that sits near a billing boundary. But it is not a performance fix and the record should not read as if it
-were.
-
 ## MixGemmEmit is now the converters' emission source (`l29_emit_is_converter.cu`)
 
 `MixGemmEmit<Bits>` existed, self-asserted bijectivity, and had **zero callers** — the hand-written `h2[]` offsets in
@@ -591,78 +428,6 @@ same failure mode as the perf lambda that timed a different tile than it checked
 **Still hand-written:** the 2-plane converter (`MixGemm2Plane_uint2_uint1`) keeps its own `base` computation. That is
 task #8, and it is the one place where cute's layout algebra would genuinely simplify rather than merely verify.
 
-
-## Retraction: the scale broadcast is a no-op, and why
-
-With the actlize submodule confirmed fresh (`git submodule update` had silently been skipped on the first attempt,
-which is what the `PPU_SCALE_FRAGMENT_API` gate now prevents), acu still reports **identical registers** for
-`bc_only`/`bc_zero` against the materialised path. So the conclusion is (b): **the change does not alter generated
-code.**
-
-**The error was conceptual.** L27 said the replication was "materialised in registers", but that was a statement
-about the *cute layout*, not about codegen. The 32 half slots held only 8 distinct values, all in registers, in a
-fully unrolled loop, with the equalities provable — the compiler had already coalesced them. Likewise cute's
-`AutoFilter` reduced the copy to the destination's nullspace (32 iterations), and the compiler CSE'd those down to the
-8 distinct addresses. Nothing was left to save.
-
-acu corroborates independently: measured **186** registers where the old estimate was 176 and the new one 164 — *above
-both*. The scale fragment's contribution is buried under address arithmetic and pipeline temporaries, so a 12-register
-delta is not resolvable in that number at all.
-
-**What survives, and what does not:**
-
-| claim | status |
-|---|---|
-| "16–64× redundant smem requests" | already corrected to 4×; now **retracted entirely** — the compiler CSE'd it |
-| "4× fewer scale registers" | **retracted as a codegen claim**; true only of the cute layout |
-| "correct on all three widths" | needs re-running: the earlier `bad=0` was on the stale submodule |
-| the zero delta tracks `gs` (+49.5 → +81.9 us) | **stands** — measured twice, and it is a per-reload LATENCY cost, which no amount of narrowing addresses |
-| task #9's register argument | **unaffected**, and for a concrete reason: B's 128 fragment values are all DISTINCT, so the compiler cannot coalesce them the way it coalesced the replicated scale |
-
-The broadcast is **kept but relabelled**: it is the cute-correct construction, it costs nothing, and
-`scale_frag_cosize()` plus the API gate are useful on their own. It is not a performance change and the record should
-not read as though it might become one.
-
-**The generalisable lesson.** A cute layout describes what the *program* asks for. Whether the hardware does it is a
-codegen question, and for register-resident, fully-unrolled, provably-equal values the compiler usually wins first.
-Before optimising a cute-level redundancy, check whether it survives to the ISA — which for this toolchain means acu,
-because actlize's cute cannot be compiled for device under nvcc to read the PTX.
-
-## N-chunked conversion: what it is for, after two wrong framings
-
-**It is not about relaxing the delivery bound.** The bound is about *arrival*, not expansion — a delivery is a fixed
-16 B and chunking the conversion cannot change how many codes turn up. I briefly concluded from that the whole idea
-was pointless and would need to discard half of every delivery. That was wrong, because I had aimed at the wrong `WN`.
-
-`slots = 8*MMA_N*MMA_K` with `MMA_N = WN/16`:
-
-| | MMA_N | slots | vs 128 codes (int1) |
-|---|---|---|---|
-| `WN=32` | 2 | 64 | over-delivery — half belongs to **other threads**, and a converter cannot cross lanes |
-| `WN=64` | 4 | **128** | every code is useful |
-
-So the target is `WN=64`, where nothing is wasted. **What chunking is for is the B fragment's 64 registers**, which
-are what push the total over the power-of-two billing boundary:
-
-`(64,128,64) w32x64 s2`, warps/blk = 4, smem 19456 B, slots 128 = delivery 128:
-
-| c | accum | A | B | S | total | billed | blk | warps/CU | cell |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | 64 | 32 | 64 | 4 | 164 | 256 | 4 | 16 | bad — **today, measured 48.4%** |
-| 2 | 64 | 32 | 32 | 4 | 136 | 256 | 4 | 16 | bad |
-| **4** | 64 | 32 | **16** | 4 | **120** | **128** | 8 | **32** | **good** |
-
-`c=4` is one `MMA_N` atom per chunk (8·1·4 = 32 fp16), and the mainloop already loops per `k_block` through
-`transform_B_kblock(..., k_block, K_ATOM_PER_COPY, ...)` — copy and convert are already separate, so the structure
-exists. `c=2` does **not** cross the boundary: `accum = WM*WN/32 = 64` is immovable.
-
-**Expected:** the good cell (`cvt/mma=4` *and* `warps/CU >= 32`) measures 52.7% for int4 and 47.8% for int2 at
-rung 3, and int1 runs 4–6 points above int2 on every rung they share → **~54% against today's 50.2%**.
-
-**Carry the broadcast lesson.** Verify with acu that the register drop survives to the ISA before believing it.
-Unlike the scale fragment, B's 128 values are all *distinct*, so the compiler cannot coalesce them — but it may
-already be staggering their live ranges across `k_block`s, which would blunt the peak-liveness argument. The check is
-cheap and decisive: `Registers Per Thread` must fall into the 128 bucket and `warps/CU` must read 32.
 
 ## Chunked B conversion: int1 50.2% → **63.7%**, and the two factors are ordered, not additive
 
