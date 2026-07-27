@@ -1,30 +1,35 @@
-// L21 -- map the scale/zero path. NOT a correctness proof: a shape survey plus two things worth measuring.
+// L21 -- map the scale/zero path. A shape survey, plus two corrections to my own first reading of it.
 //
-// Nothing had ever modelled this path, and it carries the gs=16 penalty (7-14 points), so "we would not know what to
-// optimise" was the honest state.
+// Nothing had ever modelled this path and it carries the gs=16 penalty, so this is about being able to say what it
+// does before proposing a change.
 //
-// FIRST, A FALSE ALARM I ALMOST REPORTED. My initial probe used partition_B on the (TN,1) scale tensor to read its
-// coordinates and found garbage (4164, -1492614480) at most slots, which reads exactly like "the wrong scale is
-// applied". It was an OUT-OF-BOUNDS host read: partition_B computes addresses, and a K extent of 1 against an mma
-// whose K tile is TK indexes past the tensor. The collective never does that -- it uses partition_fragment_B only to
-// borrow the SHAPE, and the values arrive through copy() from partition_S. Lesson repeated: a probe that reads
-// garbage looks identical to a bug.
+// CORRECTION 1 -- A FALSE ALARM. My first probe used partition_B on the (TN,1) scale tensor to read its coordinates
+// and got garbage (4164, -1492614480) at most slots, which reads exactly like "the wrong scale is applied to B". It
+// was an OUT-OF-BOUNDS host read: partition_B computes addresses, and a K extent of 1 against an mma whose K tile is
+// TK indexes past the tensor. The collective never does that -- it uses partition_fragment_B only to borrow the
+// SHAPE for make_fragment_like, and the values arrive through copy() from partition_S.
 //
-// WHAT THE SHAPES SAY (dumped below):
-//   * tCrS is partitioned LIKE B, so its size follows B's fragment -- 128 half at TK=128, 256 at TK=256.
-//     make_fragment_like allocates that compactly: 64 regs/thread at TK=128, 128 at TK=256, DOUBLED with zero.
-//     Against 256 regs/thread that is a large footprint for a value that is per-(n, group).
-//   * the transform consumes tCrS(_,_,0) -- 16 elements -- and always slice 0, i.e. the SAME 16 every atom, while
-//     each copy writes the full 128. So the copy is 8x wider than what is read.
-//   * tCsS's strides are mostly 0 (((_0,(_0,_0,_8,_0)),_64,_0,_128)), so the smem side is largely a broadcast
-//     rather than 128 distinct loads -- the register footprint is the real cost, not the smem traffic.
+// CORRECTION 2 -- I REPORTED THE WRONG QUANTITY. I read the scale fragment's register cost off size(), which counts
+// COORDINATES. What costs registers is cosize(), the storage extent, and this layout has stride-0 modes:
+//     tCrS  ((_2,_2,_2),_2,_8):((_0,_0,_1),_16,_2)     size=128  cosize=32
+// make_fragment_like PRESERVES the zero strides, so the fragment is 32 half = 16 regs/thread, not the 64 I claimed.
+// The stride-0 modes are the mma atom's K direction, where a per-(n, group) scale has nothing to vary -- so the
+// broadcast is exactly right and there is no waste to reclaim. Measured below; tCrB_mma is printed alongside for
+// contrast (size == cosize there, because B really does vary in every mode).
 //
-// TWO THINGS TO MEASURE ON THE BOX before optimising, because register pressure is exactly the kind of thing I have
-// no business predicting from a layout dump:
-//   1. the actual regs/thread and occupancy for ScaleOnly vs ScaleZero at TK=128 vs TK=256
-//   2. whether shrinking tCrS to the 16 elements the transform uses changes anything, or the compiler already
-//      eliminates the rest
+//     TK=128:  scale 32 half = 16 regs/thread   (x2 with zero)      B fragment 128 half
+//     TK=256:  scale 64 half = 32 regs/thread                       B fragment 256 half
 //
+// So the answer to "did registers go up" is no, twice over: nothing in this work changed kernel code at all, and the
+// scale fragment was never as large as size() suggested.
+//
+// WHAT REMAINS TRUE: the cost formula from the FINE branch. APG = gs/16 atoms per group, reload at
+// atom_idx % APG == 0, so reloads per k-iteration = MMA_K/APG = TK/gs = SK, doubled with zero. int1 is pinned at
+// TK>=128 by the delivery bound, so at gs=16 it carries SK=8 where int2/int4 at TK=64 carry SK=4. That is read off
+// the code rather than inferred, and it is the only quantitative claim here that a box run should be asked to
+// confirm.
+//
+//   nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l21_scalezero_shapes.cu -o l21 && ./l21
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/copy_atom.hpp"
@@ -58,8 +63,13 @@ template<int TN,int TK,int SK,int WON> void go(const char* tag){
   auto tCsS = thrS.partition_S(sS);
   printf("     tCsS            "); print(tCsS.layout()); printf("  rank=%d\n", int(rank(tCsS)));
   auto ownS = make_fragment_like<cutlass::half_t>(fragS);
-  printf("     make_fragment_like(tCrS)  size=%d half = %d regs/thread   (x2 with zero = %d)\n",
-         int(size(ownS)), int(size(ownS))/2, int(size(ownS)));
+  // size() counts COORDINATES; cosize() is the storage extent, which is what costs registers. A layout with
+  // stride-0 modes has cosize < size, and reporting size as the register cost is simply wrong.
+  printf("     tCrS partition   size=%d cosize=%d\n", int(size(fragS)), int(cosize(fragS.layout())));
+  printf("     make_fragment_like  layout "); print(ownS.layout());
+  printf("   size=%d cosize=%d -> %d half = %d regs/thread (x2 with zero)\n",
+         int(size(ownS)), int(cosize(ownS.layout())), int(cosize(ownS.layout())), int(cosize(ownS.layout()))/2);
+  printf("     tCrB_mma for comparison   size=%d cosize=%d\n", int(size(fragB)), int(cosize(fragB.layout())));
   auto view = thrS.retile_D(ownS);
   printf("     tCrS_copy_view  "); print(view.layout()); printf("  size=%d\n", int(size(view)));
   printf("     transform slice tCrS(_,_,0) size = %d ;  copy dst view(_,_,0) size = %d\n\n",
