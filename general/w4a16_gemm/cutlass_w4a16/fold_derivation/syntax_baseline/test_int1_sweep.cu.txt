@@ -1,28 +1,14 @@
-copy_ppu.hpp(111): error: calling a __device__ function("_ZN4cute21cast_smem_ptr_to_uintE1?") from a __host__ __device__ function("copy") is not allowed
-copy_ppu.hpp(135): error: calling a __device__ function("_ZN4cute21cast_smem_ptr_to_uintE1?") from a __host__ __device__ function("copy") is not allowed
-copy_ppu.hpp(159): error: calling a __device__ function("_ZN4cute21cast_smem_ptr_to_uintE1?") from a __host__ __device__ function("copy") is not allowed
-copy_ppu.hpp(183): error: calling a __device__ function("_ZN4cute21cast_smem_ptr_to_uintE1?") from a __host__ __device__ function("copy") is not allowed
-copy_ppu.hpp(63): error: calling a __device__ function("cute::cast_smem_ptr_to_uint(const void *)") from a __host__ __device__ function("copy") is not allowed
-copy_ppu.hpp(87): error: calling a __device__ function("_ZN4cute21cast_smem_ptr_to_uintE1?") from a __host__ __device__ function("copy") is not allowed
-gemm_configs.hpp(912): error: expected a type specifier
-mma_ppu.h(122): error: calling a __device__ function("_ZN49_INTERNAL_2ad44c5e_18_test_int1_sweep_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed
-mma_ppu.h(162): error: calling a __device__ function("_ZN49_INTERNAL_2ad44c5e_18_test_int1_sweep_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed
-mma_ppu.h(163): error: calling a __device__ function("_ZN49_INTERNAL_2ad44c5e_18_test_int1_sweep_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed
-mma_ppu.h(206): error: calling a __device__ function("_ZN49_INTERNAL_2ad44c5e_18_test_int1_sweep_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed
-mma_ppu.h(207): error: calling a __device__ function("_ZN49_INTERNAL_2ad44c5e_18_test_int1_sweep_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed
-mma_ppu.h(84): error: calling a __device__ function("_ZN49_INTERNAL_2ad44c5e_18_test_int1_sweep_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed
-ppu_mma_aiu_multistage_batch_array_overlap_prologue.hpp(183): error: type name is not allowed
-ppu_mma_aiu_multistage_batch_array_overlap_prologue.hpp(184): error: type name is not allowed
-ppu_mma_aiu_multistage_with_scale.hpp(689): error: too many arguments in function call
-ppu_mma_aiu_multistage_with_scale.hpp(695): error: too many arguments in function call
-ppu_mma_aiu_multistage_with_scale.hpp(719): error: too many arguments in function call
-ppu_mma_aiu_multistage_with_scale.hpp(827): error: too many arguments in function call
-ppu_mma_builder.inl(121): error: expected a type specifier
-ppu_tile_scheduler_stream_k.hpp(248): error: more than one instance of constructor "dim3::dim3" matches the argument list:
-test_int1_sweep.cu(101): error: more than one operator "<<" matches these operands:
-test_int1_sweep.cu(98): error: more than one operator "<<" matches these operands:
-workspace.h(121): error: identifier "HGresult" is undefined
-workspace.h(123): error: identifier "hgMemsetD32Async" is undefined
-workspace.h(126): error: identifier "hgMemsetD16Async" is undefined
-workspace.h(129): error: identifier "hgMemsetD8Async" is undefined
-workspace.h(134): error: identifier "hgGetErrorString" is undefined
+1 copy_ppu.hpp(): error: calling a __device__ function("cute::cast_smem_ptr_to_uint(const void *)") from a __host__ __device__ function("copy") is not allowed
+1 gemm_configs.hpp(): error: expected a type specifier
+1 ppu_mma_builder.inl(): error: expected a type specifier
+1 ppu_tile_scheduler_stream_k.hpp(): error: more than one instance of constructor "dim3::dim3" matches the argument list:
+1 workspace.h(): error: identifier "HGresult" is undefined
+1 workspace.h(): error: identifier "hgGetErrorString" is undefined
+1 workspace.h(): error: identifier "hgMemsetD16Async" is undefined
+1 workspace.h(): error: identifier "hgMemsetD32Async" is undefined
+1 workspace.h(): error: identifier "hgMemsetD8Async" is undefined
+2 ppu_mma_aiu_multistage_batch_array_overlap_prologue.hpp(): error: type name is not allowed
+2 test_int1_sweep.cu(): error: more than one operator "<<" matches these operands:
+4 ppu_mma_aiu_multistage_with_scale.hpp(): error: too many arguments in function call
+5 copy_ppu.hpp(): error: calling a __device__ function("_ZN4cute21cast_smem_ptr_to_uintE1?") from a __host__ __device__ function("copy") is not allowed
+6 mma_ppu.h(): error: calling a __device__ function("_ZN49_INTERNAL_2ad44c5e_18_test_int1_sweep_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed

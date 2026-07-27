@@ -28,10 +28,15 @@ FILES=${*:-"$SRC/test_fold_int2.cu"}
 rc=0
 for f in $FILES; do
   base=$(basename "$f")
-  # signature = file:line + the message, with paths stripped so it is stable across checkouts
+  # signature = file + the MESSAGE, with the LINE NUMBER STRIPPED. Line numbers made the gate false-positive on
+  # every edit that shifted the noise (adding 12 lines to test_fold_int2 reported 5 "NEW ERRORS" that were the same
+  # 5 known ones), and a gate that cries wolf on every edit is a gate that stops being read -- which is how a real
+  # error gets through. Dropping the line number costs the ability to distinguish two identical messages at
+  # different lines; the count guard below covers that.
   sig=$(nvcc -std=c++17 -D__HGGCCC__ -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
         -cuda -o /dev/null -x cu "$f" -Wno-deprecated-gpu-targets 2>&1 \
-        | grep ": error" | sed -E 's#^.*/([^/]+)#\1#' | sort -u)
+        | grep ": error" | sed -E 's#^.*/([^/]+)#\1#; s#\(([0-9]+)\)#()#' | sort | uniq -c \
+        | sed -E 's/^ +//' | sort)
   bl="$BLDIR/$base.txt"
   if [ "$RECORD" = 1 ]; then
     printf '%s\n' "$sig" > "$bl"
