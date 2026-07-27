@@ -560,3 +560,33 @@ format.
 The broadcast is kept: it is the cute-correct construction, costs nothing, saves 12–24 registers, and could matter at
 a shape that sits near a billing boundary. But it is not a performance fix and the record should not read as if it
 were.
+
+## MixGemmEmit is now the converters' emission source (`l29_emit_is_converter.cu`)
+
+`MixGemmEmit<Bits>` existed, self-asserted bijectivity, and had **zero callers** — the hand-written `h2[]` offsets in
+each converter were still the truth, so a new bit width still meant hand-deriving the emission order. That is exactly
+where the int2 `σ_n = n & ~8` bug came from.
+
+`l29` encodes each converter's **actual** map from its own source and diffs it against `MixGemmEmit`:
+
+| converter | structure | result |
+|---|---|---|
+| int2 `<half_t,uint2b_t,64>` | flat table: `base = 16*(v&1)+2*(v>=2)`, offsets `{0,1,4,5,8,9,12,13}`, lop3 masks putting crumb `c<8` in the low half2 lane and `c+8` in the high | **0 mismatch** |
+| int4 `<DstType,int4b_t,32>` | **composed**: base-8's internal order ∘ vreg permutation `(0,2,1,3)` ∘ 4-element block swap `(1↔2, 5↔6)` | **0 mismatch** |
+| int1 `<half_t,uint1b_t,128>` | two levels (`reg`, `reg>>8`) with a 16-offset step | **0 mismatch** |
+
+int4 is the load-bearing one: **three independent permutations composing exactly onto a closed form** is much stronger
+evidence for the model than any single flat table agreeing.
+
+**What changed.** int2 and int1 compute the index as `MixGemmEmit<Bits>::index(t, v) / 2`. int4 is **pinned by
+`static_assert`** rather than rewritten — its composed form is all risk on the 55.9% production path, and an assert
+delivers the same invariant (change either side and the build fails). The **masks stay literal** everywhere: they
+encode a code's *bit position*, a value transform, and a layout describes where a code goes, not what it becomes.
+
+**A stale comment, caught by the harness.** My first `emit_int1` encoded the comment block *above* the int1 struct —
+which describes the **Stage-1 magic-OR implementation** that the current lop3 code replaced. 120 of 128 entries
+mismatched. The accurate description was inside `convert()` all along. Read the code, not the comment: this is the
+same failure mode as the perf lambda that timed a different tile than it checked.
+
+**Still hand-written:** the 2-plane converter (`MixGemm2Plane_uint2_uint1`) keeps its own `base` computation. That is
+task #8, and it is the one place where cute's layout algebra would genuinely simplify rather than merely verify.
