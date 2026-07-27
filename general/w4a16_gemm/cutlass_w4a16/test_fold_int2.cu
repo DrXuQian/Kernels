@@ -140,9 +140,25 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> dB((size_t)K*N);
   cutlass::DeviceAllocation<uint1_t> dB1((size_t)K*N);
+  // Hoisted out of the buffer-fill block below: the golden further down needs both.
+  const bool svary = getenv("FOLD_SVARY") != nullptr;
+  auto sc_at = [](int g, int n) { return 1.f + 0.0625f * (float)((n + g) & 7); };
   { std::vector<half_t> a((size_t)M*K, half_t(0.f));
     for (int m = 0; m < M; ++m) a[(size_t)m*K + m] = half_t(1.f);
+    // FOLD_SVARY=1 -- WITHOUT THIS, A SCALE-PLUMBING CHANGE IS UNTESTED. The default scale is 1.0 EVERYWHERE, so
+    // every scale register holds the same value and it does not matter which one a given mma slot reads. That makes
+    // this harness blind to exactly the thing the stride-0 broadcast fragment changes (which register each slot
+    // reads), and it reported bad=0 for that change without exercising it at all.
+    //
+    // With A=identity and 1-bit codes, D[m][n] is either 0 or scale(g,n) -- the output IS the scale the slot used, so
+    // a misassignment cannot hide. Values are exact in fp16 (steps of 1/16) so the tolerance can be tight: a
+    // one-position error is 0.0625 against a 0.02 tolerance. Only the SCALE is varied, not the zero, because the
+    // correctness dispatch hardcodes its quant mode -- and tCrS and tCrZ come from the SAME make_scale_fragment
+    // call, so validating the scale validates the zero's layout too.
     std::vector<half_t> s((size_t)scale_k*N, half_t(1.f)), z((size_t)scale_k*N, half_t(0.f));
+    if (svary)
+      for (int g = 0; g < scale_k; ++g)
+        for (int n = 0; n < N; ++n) s[(size_t)g*N + n] = half_t(sc_at(g, n));
     dA.copy_from_host(a.data()); dSc.copy_from_host(s.data()); dZr.copy_from_host(z.data()); }
   if (fbits == 1) dB1.copy_from_host(reinterpret_cast<uint1_t const*>(Bp.data()));
   else            dB.copy_from_host(reinterpret_cast<uint2_t const*>(Bp.data()));
@@ -273,8 +289,9 @@ int main(int argc, char** argv) {
   int bad = 0, shown = 0;
   for (int m = 0; m < M; ++m) for (int n = 0; n < N; ++n) {
     double got = (double)float(hD[(size_t)m*N + n]);
-    double exp = (double)q[(size_t)m*N + n];          // scale=1, zero=0 => D == code
-    if (std::abs(got - exp) > 0.25) {
+    // A is the identity and M==K, so the k of output (m,n) is m and its scale group is m/gs.
+    double exp = (double)q[(size_t)m*N + n] * (svary ? (double)sc_at(m / gs, n) : 1.0);
+    if (std::abs(got - exp) > (svary ? 0.02 : 0.25)) {
       ++bad;
       if (shown < 16) { std::printf("    m=%d n=%d | got=%.2f exp=%.2f%s\n", m, n, got, exp,
           label_mode == 1 ? "   (got = the n-field the kernel actually read)" :
