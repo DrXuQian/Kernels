@@ -1,4 +1,24 @@
-// L31 -- WORK IN PROGRESS. DOES NOT PASS YET. Do not read a green line from this file; there isn't one.
+// L31 -- WORK IN PROGRESS, 1 of 7 configs passing. Do not read a green line from this file as a result.
+//
+// FOUR cute API CONVENTIONS PINNED SO FAR, each after a wrong assumption cost a round. Recording them because the
+// pattern is the point: every one had to come from cute's source, and guessing was wrong every time.
+//   1. composition(A,B) IS pointwise A(B(i)) here -- verified, so the algebra was never the problem
+//   2. thr.partition_B(sB) puts the thread base in the ITERATOR, not the layout, so part.layout()(0) == 0 for EVERY
+//      thread
+//   3. get_layoutB_TV()'s reference is make_layout(make_shape(tile_size_mnk<1>(), tile_size_mnk<2>())) -- NO stride,
+//      hence COLUMN-major (codomain n + N*k, not n*TK + k), and sized by the MMA tile (WON*16), not the block TN
+//   4. thrfrg_B's first mode is bthrid = (v,n,k), so a linear thread index needs
+//      right_inverse(get_thr_layout_vmnk()) -- BUT applying that changed nothing here (config 1 still 0, config 2
+//      still 8192), so assumption 4 was ALSO wrong about what is broken
+//
+// STILL OPEN: only (32,128,128) w32x32 passes. Everything with WON != 2-on-a-32-wide-warp-tile is off by a constant
+// n, so the remaining error is in how the warp's N position enters -- not in emit, not in pi, not in the composition.
+//
+// HONEST ASSESSMENT before anyone spends more on this: link 3 is a MAINTAINABILITY refactor with zero measured perf
+// payoff, and it has now cost four rounds on API conventions. The productive next move is probably NOT another
+// all-at-once attempt: build the map one MODE at a time against l20's working table (which mode reproduces? which
+// diverges?) instead of composing everything and diffing the total. That localises, the way the ladder localised the
+// 10 points and the way the controlled-input probe localised the int2 pairing bug.
 //
 // STATE: the two composition layers are each verified POINTWISE (a separate diagnostic showed
 // composition(pi, emit)(i) == pi(emit(i)) and part.layout()(f) == the (n,k) offset, for every point checked), so the
@@ -76,7 +96,17 @@ static bool check(const char* tag) {
   // the layout, so part.layout()(0) is 0 for EVERY thread while the real coordinate is not -- which showed up as a
   // constant offset for every t != 0 on the first version of this file. get_layoutB_TV() is the thread-inclusive
   // form, (thr, val) -> tile offset, so nothing is lost and no per-thread slicing is needed at all.
-  auto tv   = Mma{}.get_layoutB_TV();
+  // get_layoutB_TV() is the WRONG tool and cute's source says why: its reference is
+  //     make_layout(make_shape(tile_size_mnk<1>(), tile_size_mnk<2>()))
+  // which (a) has NO stride, so it is COLUMN-major -- codomain n + N*k, not n*TK + k -- and (b) is sized by the MMA
+  // tile (WON*16), not the block tile TN. At int1/TK=128 that produced 512 = 32*16 against a hand value of 8.
+  // thrfrg_B(sB) is the right one: unsliced, so the thread is a MODE rather than an iterator offset, and over the
+  // FULL tensor, so the codomain is sB's own offset = n*TK + k.
+  // ...and thrfrg_B's FIRST MODE IS bthrid = (v,n,k), NOT the linear thread index. get_layoutB_TV's source shows the
+  // conversion: right_inverse(thr_layout_vmnk_). Without it w32x32 coincidentally agreed while w32x64 was off by a
+  // constant n=16 -- the third cute convention this file has had to pin from source rather than assume.
+  auto tvt  = Mma{}.thrfrg_B(sB);
+  auto t2id = right_inverse(Mma{}.get_thr_layout_vmnk());
   auto Frag = composition(pi, emit_all);                            // (code, vreg, inst) -> fragment index
   long bad = 0; int shown = 0;
   for (int t = 0; t < 32*WOM*WON; ++t) {
@@ -88,7 +118,7 @@ static bool check(const char* tag) {
           if (flat < 0 || flat >= NS) continue;
           auto c = id(pi(flat));
           const int hand = int(get<0>(c))*TK + int(get<1>(c));      // exactly l20's line
-          const int comp = int(tv(make_coord(t, Frag(j + CPW * v + VEC * inst))));   // one cute expression
+          const int comp = int(tvt.layout()(make_coord(t2id(t), Frag(j + CPW * v + VEC * inst))));  // one cute expr
           ++bad;
           if (hand == comp) --bad;
           else if (shown < 4) {
