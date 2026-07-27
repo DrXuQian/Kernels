@@ -465,3 +465,32 @@ alone.
 **Prescription:** `cvt/mma = 4` (`WM >= 32`) **and** `warps/CU >= 32`. The second needs registers billed at <= 128,
 which at `TK=64` means `WN=32` — and the delivery bound forbids that for int1. int1's ceiling is now stated in the
 two quantities that actually govern it, and `WN=32` is exactly what the N-chunked conversion would unlock.
+
+## The last-wave tail: ~11%, uniform across every config measured, and unreachable by tile tuning
+
+acu on rung 3 reports `Grid 1024`, `Waves Per CU 3.56`, and a tail note about *"3 full waves and a partial wave of 160
+thread blocks"*. That arithmetic closes exactly: `blocks/wave = CU * blk = 72 * 4 = 288`, and `1024 - 3*288 = 160`.
+It independently confirms both `CU = 72` and the register-limited `blk = 4`.
+
+**It is not a confound.** All five ladder rungs come out at 3.56 waves:
+
+| rung | grid | blk | blocks/wave | waves |
+|---|---|---|---|---|
+| 1, 2 | 2048 | 8 | 576 | 3.56 |
+| 3, 4 | 1024 | 4 | 288 | 3.56 |
+| 5 | 2048 | 8 | 576 | 3.56 |
+
+Not a coincidence — `waves = (M/WM)(N/WN) / (CU * warps_per_CU)`, i.e. total warps over warps the machine holds at
+once, and in these configs both scale together. So the rung 3 → 4 ten points are clean.
+
+**But it costs ~11% in absolute terms.** The last of four waves is only 55.6% full yet occupies a full wave's time:
+`0.25 * (1 - 0.556) = 11.1%`. Every MFU number on file is therefore measured against a **~89% achievable ceiling**,
+not 100% — the best cell's 52.1% mean is ~58.5% of what this grid can actually reach.
+
+**No tile can fix it.** `blocks/wave = 72*blk` always carries the factor **9**, while any power-of-2 tile yields a
+power-of-2 grid, which 9 never divides. A partial wave is structural on a 72-CU machine.
+
+Two real levers, neither free: more waves (smaller tiles — fights the register limit, currently *the* binding
+constraint), or stream-K. Persistent scheduling was already tried in the MoE work and **non-persistent won** there
+(24% → 49%); those notes put the last-wave tail at ~5% and say stream-K is the only fix. Known magnitude, known
+remedy, known not to be cheap.
