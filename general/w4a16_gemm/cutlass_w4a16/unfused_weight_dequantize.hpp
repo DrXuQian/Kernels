@@ -676,7 +676,17 @@ inline void nfold_regroup_gmem(int8_t* out, const int8_t* in_std,
               const size_t tile_n0 = (r / Ng) * fold_tn;                     // output block this row serves
               const size_t n_log   = tile_n0 + (r % Ng) + (size_t)f * Ng;    // partner column is n + Ng
               const size_t ktile   = (kb * (kCon / (F * fold_tk)) + t);      // which fold_tk block along K
-              const size_t src_w   = n_log * WPN + ktile * WPK + w;          // standard buffer is n-major
+              // BUG FIXED HERE. This used to be  n_log * WPN + ktile * WPK + w,  i.e. it read the
+              // interleave-256 output as if it were n-major with row pitch WPN = K/CPW. It is not:
+              // interleave_column_major_tensor_ppu writes  dst[nt*(vrpt*N) + c*vrpt + ti]  with nt = vr/vrpt,
+              // ti = vr%vrpt, vrpt = 256/CPW -- the k-SUPERTILE is the outer index, not n. The two coincide only
+              // when nvr == vrpt, i.e. K == 256, exactly one supertile. Every box run of the fold used the
+              // harness default 256x256, so the mistake never showed: at K=512 the old form fetched
+              // (n=0, k=256) where (n=64, k=0) was wanted -- measured in fold_derivation/l13_wholebuffer.cu,
+              // which is a whole-buffer regression rather than the single-tile ones that missed it.
+              const size_t vrpt   = 256 / CPW;                               // uint32 vecs per column per supertile
+              const size_t vr     = ktile * WPK + w;                         // vec index within column n_log
+              const size_t src_w  = (vr / vrpt) * (vrpt * N) + n_log * vrpt + (vr % vrpt);
               // destination: row r, element offset within row = t*(F*fold_tk) + f*fold_tk (+ w*16)
               // destination = PLANE-major: stride (kCon, (1, kCon*(N/F))) makes super-tile kb a separate plane of
               // (N/F) rows, so kb selects the plane and r indexes rows inside it. (Verified locally: 4096/4096 words
