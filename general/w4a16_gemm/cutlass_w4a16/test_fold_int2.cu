@@ -105,11 +105,29 @@ int main(int argc, char** argv) {
   // pipeline's own crumb order -- see nfold_regroup_words_int2. NFOLD_STD=1 skips the regroup (baseline A/B).
   const QuantTypeClass qtc = (fbits == 1) ? QuantTypeClass::PACKED_INT1_WEIGHT_ONLY
                                           : QuantTypeClass::PACKED_INT2_WEIGHT_ONLY;
-  preprocess_weights_for_mixed_gemm<false, 256, 0>(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, qtc);
-  if (!getenv("NFOLD_STD")) {
-    std::vector<int8_t> tmp(Bp.size());
-    nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, ftn, ftk, fbits);
-    Bp.swap(tmp);
+  // FOLD_BITPACK=1: int1 at TK=64 with WN=64. The whole-word regroup cannot express this placement (the fragment
+  // wants TWO logical columns inside each 32-bit word), so skip the five relayout steps and write the folded
+  // buffer directly from the DERIVED map -- fold_derivation/l10_placement.cu, which regresses to 0/16384 against
+  // the shipped offline on the TK=128 config before generating this one.
+  const bool bitpack = getenv("FOLD_BITPACK") != nullptr;
+  if (bitpack) {
+    if (fbits != 1 || ftk != 64 || ftn != 128) {
+      std::printf("  FOLD_BITPACK is derived for int1 TN=128 TK=64 only (got int%d TN=%d TK=%d)\n", fbits, ftn, ftk);
+      return 2;
+    }
+    std::vector<int8_t> nk((size_t)K * N / 8, 0);      // row-major (n,k), one code per bit
+    for (int n = 0; n < N; ++n) for (int k = 0; k < K; ++k) {
+      const size_t i = (size_t)n * K + k;
+      if (qT[(size_t)n * K + k] & 1) nk[i / 8] |= int8_t(1 << (i % 8));
+    }
+    nfold_place_bits_int1_tk64(Bp.data(), nk.data(), N, K, ftn, ftk);
+  } else {
+    preprocess_weights_for_mixed_gemm<false, 256, 0>(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, qtc);
+    if (!getenv("NFOLD_STD")) {
+      std::vector<int8_t> tmp(Bp.size());
+      nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, ftn, ftk, fbits);
+      Bp.swap(tmp);
+    }
   }
 
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);
@@ -149,7 +167,16 @@ int main(int argc, char** argv) {
           dA.get(), dB.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                             \
           M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                      \
   } while (0)
-  if (ftm == 32) { if (ftk == 128) CORR_DISPATCH(32, 128, 128); else CORR_DISPATCH(32, 128, 64); }
+// Same as CORR_DISPATCH but with the warp N extent at 64 -- int1 only, since that is the case that needs it.
+// slots = WN*TK/32, so int1 at TK=64 needs WN >= 64; the 32x32 ladder below can never satisfy it.
+#define BITPACK_DISPATCH(TMV, TNV, TKV)                                                                       \
+  do {                                                                                                        \
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMV, TNV, TKV, 32, 64, 3, uint1_t>(             \
+        dA.get(), dB1.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                              \
+        M, N, K, 1, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr);                        \
+  } while (0)
+  if (bitpack) BITPACK_DISPATCH(64, 128, 64);
+  else if (ftm == 32) { if (ftk == 128) CORR_DISPATCH(32, 128, 128); else CORR_DISPATCH(32, 128, 64); }
   else if (ftn == 128) { if (ftk == 128) CORR_DISPATCH(64, 128, 128); else CORR_DISPATCH(64, 128, 64); }
   else                 { if (ftk == 128) CORR_DISPATCH(64,  64, 128); else CORR_DISPATCH(64,  64,  64); }
   if (false)
@@ -163,6 +190,13 @@ int main(int argc, char** argv) {
   // with q = ((n or k) >> b) & mask, read the bit back out of D (scale=1, zero=0, A=identity => D == the code), and
   // OR it into place. This is the technique that cracked int2; three successive mechanistic theories for int1
   // (degenerate Ng, slots-vs-delivery, pairing) were all wrong, so measure instead.
+  if (getenv("FOLD_DECODE") && bitpack) {
+    // The decode path re-runs the preprocess+word-regroup offline and dispatches on the 32x32 ladder. Under
+    // FOLD_BITPACK both of those are wrong, and it would print a plausible-looking (n,k) map from a different
+    // configuration -- exactly the silent cross-config mismatch that invalidated the int1 MFU numbers.
+    std::printf("  FOLD_DECODE is not wired for FOLD_BITPACK (different offline AND different warp shape)\n");
+    return bad == 0 ? 0 : 1;
+  }
   if (getenv("FOLD_DECODE")) {
     auto run_once = [&](std::vector<uint8_t> const& qq, std::vector<half_t>& out) {
       std::vector<int> t2((size_t)K*N);

@@ -688,6 +688,54 @@ inline void nfold_regroup_gmem(int8_t* out, const int8_t* in_std,
             }
 }
 
+// BIT-GRANULAR fold placement. Writes the folded gmem buffer DIRECTLY from the row-major (n,k) codes -- it does
+// not run the five relayout steps, because the placement it needs is not "five steps then a whole-word regroup".
+//
+// WHY A NEW PACKER AT ALL. nfold_regroup_gmem moves whole uint32s, so every word it produces holds ONE logical
+// column. That is exactly what the mma wants while cols_per_word == 1, which holds for every configuration with a
+// 32x32 warp tile. But over-delivery (delivery <= slots, slots = WN*TK/32) forbids int1 below TK=128 at WN=32, and
+// the only escape is a wider warp N extent. At WN=64 the fragment asks for TWO columns inside each word, and a
+// whole-word move cannot express that.
+//
+// WHERE THE FORMULA COMES FROM. Derived, not probed: fold_derivation/l10_placement.cu composes the swzl delivery
+// (L2), the converter's emission order (L3), pi = partition_fragment_B(...).layout()^-1 (L8), and cute's
+// partition_B (L4), then fits a GF(2)-affine form and verifies it over every position. The same chain regresses to
+// 0/16384 against the REAL preprocess_weights_for_mixed_gemm + nfold_regroup_gmem on the box-verified
+// int1 (32,128,128) config, which is what makes it trustworthy for a config the shipped offline has never seen.
+//
+// int1, TN=128, TK=64, WN=64  (F=4, Ng=32, 8 words per row, 32 bits per word):
+//     n = row + 64*(wd>>2) + 32*((j>>3)&1)
+//     k = 2*(wd&3) + 8*(j&7) + (j>>4)
+// inverted, which is what this function walks:
+//     row = n & 31
+//     wd  = ((k >> 1) & 3) | (((n >> 6) & 1) << 2)
+//     j   = ((k >> 3) & 7) | (((n >> 5) & 1) << 3) | ((k & 1) << 4)
+// Compared with the TK=128 form, the single change is that j's bit 3 moves from k += 64 to n += 32: TK halving
+// frees a k bit and F doubling needs an n bit. That migration IS the second column inside each word.
+//
+// `in_nk` is row-major (n, k) one code per bit, exactly as the caller packs `qT`. NOT the preprocess output.
+inline void nfold_place_bits_int1_tk64(int8_t* out, const int8_t* in_nk, size_t N, size_t K,
+                                       int fold_tn = 128, int fold_tk = 64)
+{
+    const int F = 4, Ng = fold_tn / F, W_ROW = 8, CPW = 32;
+    assert(fold_tn == 128 && fold_tk == 64 && "derived for this shape only -- re-run l10_placement for others");
+    assert(N % fold_tn == 0 && K % fold_tk == 0 && "shape must tile");
+    const size_t nrow_total = N / F;
+    std::fill(out, out + (N * K / 8), int8_t(0));
+    for (size_t n = 0; n < N; ++n)
+      for (size_t k = 0; k < K; ++k) {
+        const size_t src_bit = n * K + k;
+        if (!((in_nk[src_bit / 8] >> (src_bit % 8)) & 1)) continue;
+        const size_t tile_n = n / fold_tn, kb = k / fold_tk;
+        const int    nl = int(n % fold_tn), kl = int(k % fold_tk);
+        const int    row = nl & (Ng - 1);
+        const int    wd  = ((kl >> 1) & 3) | (((nl >> 6) & 1) << 2);
+        const int    j   = ((kl >> 3) & 7) | (((nl >> 5) & 1) << 3) | ((kl & 1) << 4);
+        const size_t dst_bit = ((kb * nrow_total + tile_n * Ng + row) * W_ROW + wd) * CPW + j;
+        out[dst_bit / 8] |= int8_t(1 << (dst_bit % 8));
+      }
+}
+
 inline void nfold_regroup_gmem_int2(int8_t* out, const int8_t* in_std,
                                     const std::vector<size_t>& shape, int fold_tn, int fold_tk)
 { nfold_regroup_gmem(out, in_std, shape, fold_tn, fold_tk, /*bits=*/2); }
