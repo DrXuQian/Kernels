@@ -100,107 +100,46 @@ tCrB_mma : ((2,2,2), MMA_N, MMA_K) : ((1,2,4), 32, 8)
 confirms a wrong assumption is worse than no harness, because it reads as evidence. What was missing was ever
 *printing* the layout being reasoned about. `l34` now does.
 
-### What remains: the acu register check
+### Measured: registers 186 -> 142, real but not enough. And "the lost overlap" never existed.
 
-Correctness is settled; the open question is whether the saving reaches the ISA.
+acu on the chunked build at `(32,128,64) w32x64 s2`: **`Regs = 142`**, down from 186 — a real 44-register saving,
+unlike the scale broadcast which measured as a no-op. The estimate tracks: measured = estimate + 22 at both points
+(164 -> 186, 120 -> 142).
 
-```bash
-D=/sim/eec/shared/junfu.qx/Kernels/third_party/actlize/build_w4a16_compare/examples/99_kernels_w4a16_compare
-A=/sim/eec/shared/junfu.qx/asight/bin/acu
-PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_width_acu ./build.sh
-ACU_ONE=1 $A --set full -f -o chunk $D/test_width_acu 1 2048 4096 4096 32
+**But 142 still bills at 256, so occupancy is unchanged.** Power-of-two billing is confirmed rather than assumed: at
+rung 4 acu reported `Regs=186, 128 thr/blk, theoretical 16 warp/CU`, and `131072/16 = 8192` regs/warp = 256
+regs/thread. An 8- or 16-aligned model would predict 20 warps/CU there and is refuted by that point. So
+`131072/(256*64) = 8` blocks x 2 warps = **16 warps/CU**, same as before.
+
+**A CORRECTION.** Earlier notes in this file and in several commit messages said the first experiment "loses the B
+copy/mma overlap, so only the register count is meaningful". That was wrong. At `K_BLOCK_MAX == 1`:
+
+```cpp
+if (K_BLOCK_MAX > 1) { ...register prefetch... }      // skipped entirely
+auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;   // == 0 == k_block
 ```
 
-| `Registers Per Thread` | verdict |
-|---|---|
-| falls into the **128** bucket (from 186), `warps/CU` reads **32** | the saving is real — restore the B copy/mma overlap and measure MFU |
-| unchanged | the compiler was already staggering `tCrB_mma`'s live ranges across k-atoms. **Revert and stop** — do not spend another round |
+so there is **no register-level prefetch to lose**. The original order is `copy_B(this tile) -> convert ALL -> mma
+ALL`; the chunked one is `copy_B(this tile) -> (convert atom -> mma atom) x 4`. The copy is still hoisted; what moved
+is the converter's ALU work, from all-before to interleaved-with-mma — which is *better* overlap, not worse.
 
-B's 128 values are all *distinct*, so the compiler cannot coalesce them the way it coalesced the replicated scale
-(which is why the scale broadcast measured as a no-op). But it can still reorder, and that is the untested assumption.
+**So this build's MFU is meaningful**, and acu's 263.26 us against the harness's ~274-276 us for the same config is
+plausibly a real ~4% gain, with a mechanism: in a latency-bound kernel, interleaving converter ALU between mma issues
+fills slots. It still needs the harness's own timing to confirm, since acu and the harness measure by different paths.
 
-## Where I stopped originally, and the first blocker
+### The remaining lever: chunk A as well
 
-I edited `MixGemmNumericArrayConverter<half_t, uint1b_t, 128>`'s emission loop to `if constexpr (kEmit(t)) _E(...)`
-and **reverted it**, because:
-
-> **`v` is a runtime loop variable** (`for (int v = 0; v < 4; ++v)`), so `if constexpr` cannot depend on it.
-
-Two ways out, in preference order:
-
-1. **Template the per-vreg emission.** Move the `_E` macro out of `convert` and add
-   `template <int V> CUTLASS_DEVICE static void emit_vreg(uint32_t reg, uint32_t* h2)`, called four times with
-   `Int<0..3>`. Then `if constexpr (Emit::in_chunk(t, V))` is well-formed. Costs a small restructure of one
-   converter.
-2. **Plain `if` instead of `if constexpr`**, relying on `CUTLASS_PRAGMA_UNROLL` over `v` plus dead-code elimination.
-   One word of change, but the register benefit then *depends on* the compiler folding the branches — which is
-   exactly the kind of assumption the scale-broadcast episode punished. If this route is taken, the acu check below
-   is not optional.
-
-There is also a **plumbing** question: the converter is selected by array size `N` through `convert_tensor`, so a
-chunked variant cannot simply add template parameters to the existing specialisation. Cleanest is a separate
-`convert_chunk<Chunk, NChunk>(in, out)` helper that `transform_B_kblock` calls, leaving `convert_tensor` and the
-unchunked converter untouched.
-
-## Mainloop wiring, and the one ordering hazard
-
-`ppu_mma_aiu_fold.hpp` around lines 690–727 currently does, per `k_block`:
+To cross into the 128 bucket the estimate must reach <= 106 (measured = estimate + 22). It is 120 now, so 14 short.
+The only movable term left is A:
 
 ```
-copy_B_and_extra_info(..., k_block_next, ...)      // load NEXT k_block's packed codes into tCrB_load
-transform_B_kblock(..., k_block_next, ...)         // convert them immediately (whole delivery)
-...
-for k_loop in 0..K_ATOM_PER_COPY-1:                // consume the CURRENT k_block
-    gemm(tiled_mma, tCrA(_,_,atom), tCrB_mma(_,_,atom), accum)
+tCrA = (8, MMA_M=2, MMA_K=4) = 64 fp16 = 32 regs      live across the whole K loop
+per k-atom                   =  8 fp16 =  4 regs      saves 28
+=> estimate 92 -> measured ~114 -> billed 128 -> warps/CU 32
 ```
 
-Moving the transform into `k_loop` means it must read the **current** `k_block`'s codes — but `tCrB_load` has already
-been overwritten with `k_block_next`'s. `tCrB_load` is a single buffer. Options:
+A is *easier* than B: it is already fp16, so there is no converter, no chunk predicate and no scale — only
+`copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next))` to move into the mma loop. And by
+the same argument as above, at `K_BLOCK_MAX == 1` there is no A prefetch to lose either.
 
-* move the copy to **after** the `k_loop` — correct with one buffer, but **loses the B copy/mma overlap**;
-* double-buffer `tCrB_load` (it is only 4 registers per k_block, so 8 total) and keep the prefetch.
-
-For the **first experiment** take the simple one and accept the lost overlap, because:
-
-> **The MFU from that build is not the answer. Only the register count is.**
-
-## The acu check that decides whether to continue
-
-Run the first build and look at **exactly two numbers**:
-
-* `Registers Per Thread` must fall into the **128** bucket (from 186 measured at c=1, estimate 164)
-* `warps/CU` must read **32** (from 16)
-
-If they do not move, the compiler was already staggering `tCrB_mma`'s live ranges across `k_block`s and the whole
-idea is dead — **revert and stop**, do not spend a second round on it. Unlike the scale fragment, B's 128 values are
-all *distinct* so the compiler cannot coalesce them, but it can still reorder, and that is precisely the untested
-assumption.
-
-Only if the registers drop is it worth restoring the copy/mma overlap and measuring MFU.
-
-```bash
-D=/sim/eec/shared/junfu.qx/Kernels/third_party/actlize/build_w4a16_compare/examples/99_kernels_w4a16_compare
-A=/sim/eec/shared/junfu.qx/asight/bin/acu
-cd /sim/eec/shared/junfu.qx/Kernels && git pull --ff-only origin ppu_dev
-git submodule update --init third_party/actlize        # NOT optional -- see PPU_SCALE_FRAGMENT_API
-cd general/w4a16_gemm/cutlass_w4a16
-TARGET=test_fold_int2 ./build.sh
-FOLD_SVARY=1 FOLD_BITS=1 FOLD_TK=64 FOLD_BITPACK=1 $D/test_fold_int2 256 512 32   # correctness FIRST
-TARGET=test_width_acu ./build.sh
-ACU_ONE=1 $A --set full -f -o chunk $D/test_width_acu 1 2048 4096 4096 32
-```
-
-## Method notes worth carrying, earned expensively this session
-
-* **Print candidates beside ground truth; do not swap expressions and diff totals.** Four rounds went to the latter
-  on `l31` and produced nothing; the former produced each answer in one step. Same technique that localised the
-  ladder's 10 points and the int2 pairing bug.
-* **A cute layout describes what the *program* asks for; whether the hardware does it is a codegen question.** For
-  register-resident, fully-unrolled, provably-equal values the compiler usually wins first — that is why the scale
-  broadcast measured as a no-op. Check that a cute-level redundancy survives to the ISA *before* trading idiom for
-  it, which on this toolchain means acu (actlize's cute will not compile for device under nvcc, so the PTX cannot be
-  read).
-* **One passing config is not evidence.** `(32,128,128) w32x32` passed `l31` while six others failed, purely because
-  with two warps the warp-order swap is a no-op.
-* **Never assume `git submodule update` ran.** A stale submodule made an A/B compare two identical binaries with no
-  trace in any log; `PPU_SCALE_FRAGMENT_API` now turns that into a compile error.
+`accum = WM*WN/32 = 64` stays: it is the output and must live across the whole K loop.
