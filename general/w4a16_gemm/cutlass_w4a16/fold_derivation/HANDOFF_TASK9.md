@@ -63,31 +63,38 @@ For the int1 converter's 16 pairs (pair `t` carries codes `t` and `t+16`, which 
 This is why **#5 was a real prerequisite, not hygiene**: against the old hand-written offset table there is nothing
 to gate on.
 
-## STATUS UPDATE: the chunked path is written but rests on TWO UNVERIFIED assumptions
+## STATUS: the chunked path is written, and the "assumptions" turned out to be derivable
 
-The converter and the mainloop wiring are in, behind `PPU_B_CHUNK` (default off; the default path is byte-identical
-and both harnesses parse clean without the flag). But it was built on top of two assumptions expressed as
-`static_assert`s:
+Behind `PPU_B_CHUNK` (default off; the default path is byte-identical and both harnesses parse clean without it).
 
-* `K_BLOCK_MAX == 1` — one copy step per k-tile, so copy → convert → mma all sit inside one `k_block` and there is
-  neither a cross-iteration hazard nor a B prefetch overlap to lose
-* `K_ATOM_PER_COPY == 4` — four mma-K atoms per delivery, so chunk index == k-atom index and `NChunk = 4`
+**A correction worth reading, because it was a process error.** The first version hardcoded `tCrB_load(_,_,Int<0>{})`
+in `transform_B_atom` and then added `static_assert(K_BLOCK_MAX == 1)` to protect that shortcut — which made a
+limitation of *my implementation* look like a property of the *design*. It is not. `tCrB_load` has **one slot per copy
+step** (the copy writes `tCrB_copy_view(_,_,k_block_next)` while the conversion reads `(_,_,k_block)`), so deferring
+the conversion into the mma loop cannot see overwritten codes, and "convert inside the loop instead of all at once"
+works for **any** `K_BLOCK_MAX`. Fixed: `k_block` and `NChunk` are passed in.
 
-**Writing the dependent code before measuring those was a process error.** A `static_assert` makes a wrong assumption
-*loud* but not *cheap*: if either is false the per-atom design changes shape (needs a double-buffered `tCrB_load`, a
-different chunk count), and I would only learn that from a failed box build after everything was written.
+And `CPY_K` never needed probing either — it is `slots / delivery` in fp16 units:
 
-`PPU_MMA_PROBE=1` now prints both from the **default** build — one line, no risk:
+| | slots | delivery | `K_BLOCK_MAX` | k-atoms per copy step |
+|---|---|---|---|---|
+| int1 | 128 | 128 | **1** | 4 |
+| int2 | 128 | 64 | 2 | 2 |
+| int4 | 128 | 32 | 4 | 1 |
+
+int1 at the target shape has `delivery == slots`, so one copy fills the whole fragment — `K_BLOCK_MAX = 1` is
+arithmetic, not an assumption. Note int4 lands at 1 k-atom per copy step, i.e. `NChunk = 1`: nothing to chunk, which
+is correct since its B is already only 16 registers.
+
+The only constraint left is the emitter's own: 128 outputs must split evenly into `NChunk` chunks.
+
+`PPU_MMA_PROBE=1` is kept as a cheap confirmation of the derivation on hardware, but it is no longer load-bearing:
 
 ```bash
 PPU_DEFS=PPU_MMA_PROBE=1 TARGET=test_fold_int2 ./build.sh
-FOLD_BITS=1 FOLD_TK=64 FOLD_BITPACK=1 $D/test_fold_int2 256 512 32
+FOLD_SVARY=1 FOLD_BITS=1 FOLD_TK=64 FOLD_BITPACK=1 $D/test_fold_int2 256 512 32
 # expect: [mma probe] K_BLOCK_MAX(CPY_K)=1  K_ATOM_PER_COPY=4  MMA_K(tCrB_mma)=4  MMA_N=4  Scale_TileK=2
 ```
-
-**Confirm that line before building or trusting `PPU_B_CHUNK`.** If `K_BLOCK_MAX != 1`, `transform_B_atom` is reading
-the wrong copy step's codes and the design needs double-buffering first. If `K_ATOM_PER_COPY != 4`, `NChunk` is wrong
-and `MixGemmInt1Emit<Chunk, 4>` in `transform_B_atom` must be parameterised on it.
 
 ## Where I stopped originally, and the first blocker
 
