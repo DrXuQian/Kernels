@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
     // FOLD_BITPACK both of those are wrong, and it would print a plausible-looking (n,k) map from a different
     // configuration -- exactly the silent cross-config mismatch that invalidated the int1 MFU numbers.
     std::printf("  FOLD_DECODE is not wired for FOLD_BITPACK (different offline AND different warp shape)\n");
-    return bad == 0 ? 0 : 1;
+    return 2;   // `bad` is computed further down; 2 is the same "unsupported combination" code the shape check uses
   }
   if (getenv("FOLD_DECODE")) {
     auto run_once = [&](std::vector<uint8_t> const& qq, std::vector<half_t>& out) {

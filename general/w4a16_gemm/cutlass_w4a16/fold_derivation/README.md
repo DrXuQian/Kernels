@@ -188,3 +188,28 @@ is int1 at TK=64 and WN=32, which over-delivers, and the ladder instantiates it 
 
 The gate and the guard are the same expression — `fold::deliverable<Bits,TN,TK,WM,WN>` — so they cannot drift. A
 hand-written equivalent condition (`TKV >= 128`) was the first fix and was replaced for exactly that reason.
+
+
+## Before pushing anything the box compiles: two local gates
+
+```
+./gen_guard_check.sh     # every B-operand instantiation vs fold::deliverable
+./syntax_check.sh        # nvcc front end over the harness sources
+```
+
+Both exist because a failure they would have caught reached ppu001 instead:
+
+* `gen_guard_check.sh` — `CORR_DISPATCH(64,64,64)` at `fbits==1` is int1 at TK=64 and WN=32, which over-delivers,
+  and the ladder instantiates it whatever the runtime `ftk` is. `sweep_shapes.cpp` section 1 missed it because that
+  list is hand-written from reading the code.
+* `syntax_check.sh` — `return bad == 0 ? 0 : 1;` inside a block above where `bad` is declared. An
+  undeclared-identifier error in host code, i.e. the most local kind there is.
+
+`syntax_check.sh` runs `nvcc -cuda`, which is the front end only: inline PPU asm is an opaque string at that stage,
+so the file parses without an assembler for the target. `-D__HGGCCC__` is required or `CUTLASS_DEVICE` degrades to
+host `inline` and `__syncthreads` lands in host code. The actlize headers then emit a fixed set of host/device
+qualifier complaints that the real hgcc does not; those are ignored, and so is one stub artefact
+(`CUTLASS_PPU_CHECK`'s `std::cerr <<` becoming ambiguous against the stub runtime). **Only errors attributed to the
+source files count.** Verified in both directions: reintroducing the `bad` bug makes it exit 1, removing it exit 0.
+
+It is a syntax gate, not a build. It says the file parses; it says nothing about the kernel being correct.
