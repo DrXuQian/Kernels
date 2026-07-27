@@ -24,6 +24,13 @@ BLDIR="$(cd "$(dirname "$0")" && pwd)/syntax_baseline"
 mkdir -p "$BLDIR"
 RECORD=0
 if [ "${1:-}" = "--baseline" ]; then RECORD=1; shift; fi
+# EXTRA_DEFS lets a FLAG-ON variant get its own baseline, so a build that only breaks with a macro set is caught
+# locally instead of on the box. Two box round trips were burned on errors this would have shown:
+#   EXTRA_DEFS=-DPPU_B_CHUNK=1 ./syntax_check.sh --baseline <file>   then   EXTRA_DEFS=... ./syntax_check.sh <file>
+EXTRA_DEFS="${EXTRA_DEFS:-}"
+# NOTE the baseline file is deliberately NOT keyed on EXTRA_DEFS: a flag-on run is diffed against the flag-OFF
+# baseline, so anything that appears only with the macro set shows up as NEW. Keying it would have let me baseline my
+# own bugs.
 FILES=${*:-"$SRC/test_fold_int2.cu"}
 rc=0
 for f in $FILES; do
@@ -33,7 +40,7 @@ for f in $FILES; do
   # 5 known ones), and a gate that cries wolf on every edit is a gate that stops being read -- which is how a real
   # error gets through. Dropping the line number costs the ability to distinguish two identical messages at
   # different lines; the count guard below covers that.
-  sig=$(nvcc -std=c++17 -D__HGGCCC__ -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
+  sig=$(nvcc -std=c++17 -D__HGGCCC__ $EXTRA_DEFS -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
         -cuda -o /dev/null -x cu "$f" -Wno-deprecated-gpu-targets 2>&1 \
         | grep ": error" | sed -E 's#^.*/([^/]+)#\1#; s#\(([0-9]+)\)#()#' | sort | uniq -c \
         | sed -E 's/^ +//' | sort)

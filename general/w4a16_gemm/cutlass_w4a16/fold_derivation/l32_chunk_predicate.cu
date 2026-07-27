@@ -51,6 +51,39 @@ static bool check(const char* tag) {
   return bad == 0;
 }
 
+// ============================================================================================================
+// THE QUESTION THAT ACTUALLY DECIDES WHETHER CHUNKING IS FREE: is any conversion DUPLICATED?
+//
+// Each _EC line writes one uint32 = TWO halves, i.e. codes t (low lane) and t+16 (high lane). If those two codes fell
+// in DIFFERENT chunks, the line would have to be emitted twice and the converter work would grow. And across the
+// NChunk emit() calls the kept lines must partition the unchunked set exactly -- no line emitted twice, none dropped.
+// Counting it, not arguing it.
+static bool no_duplicate_work() {
+  constexpr int CPW = 32, NPAIR = 16, NCH = 4, kPer = 128 / NCH;
+  int emitted[NPAIR][4] = {};                 // how many times line (t, v) is emitted across all chunks
+  long straddle = 0;
+  for (int v = 0; v < 4; ++v)
+    for (int t = 0; t < NPAIR; ++t) {
+      // the two codes this line writes
+      const int lo = MixGemmEmit<1>::index(t, v), hi = MixGemmEmit<1>::index(t + 16, v);
+      if (hi != lo + 1) { printf("      line (t%2d,v%d): high lane is not lo+1 (%d vs %d)\n", t, v, hi, lo + 1); ++straddle; }
+      if (lo / kPer != hi / kPer) { printf("      line (t%2d,v%d) STRADDLES chunks %d and %d\n", t, v, lo/kPer, hi/kPer); ++straddle; }
+      for (int c = 0; c < NCH; ++c) if (lo / kPer == c) ++emitted[t][v];   // exactly the keep() predicate
+    }
+  long once = 0, twice = 0, never = 0;
+  for (int t = 0; t < NPAIR; ++t) for (int v = 0; v < 4; ++v)
+    (emitted[t][v] == 1) ? ++once : (emitted[t][v] > 1 ? ++twice : ++never);
+  printf("  int1 emission lines: %ld emitted exactly once, %ld more than once, %ld never | %ld straddling pair(s) %s\n",
+         once, twice, never, straddle,
+         (twice == 0 && never == 0 && straddle == 0) ? "<-- EXACT PARTITION, zero duplicated work" : "<-- DUPLICATED or LOST");
+  // and the arithmetic reason the pair never straddles: with bit4 = 0 the low-lane index is EVEN, and every other
+  // weight (2, 8, 16, 32, 64, 4) is even too, so lo % kPer <= kPer-2 and lo+1 stays in the same chunk.
+  long odd = 0;
+  for (int v = 0; v < 4; ++v) for (int t = 0; t < NPAIR; ++t) if (MixGemmEmit<1>::index(t, v) % 2) ++odd;
+  printf("  low-lane indices that are ODD: %ld (must be 0 -- that is WHY no pair can straddle a chunk edge)\n", odd);
+  return twice == 0 && never == 0 && straddle == 0 && odd == 0;
+}
+
 int main() {
   printf("L32 -- the chunk predicate: chunk = (weight terms >= CHUNK) / CHUNK, a STATIC function of (code, vreg)\n\n");
   bool ok = true;
@@ -60,9 +93,12 @@ int main() {
   ok &= check<2, 2>("int2 MMA_N=2");
   ok &= check<4, 4>("int4");
   ok &= check<4, 2>("int4 MMA_N=2");
+  printf("\n  == is any conversion DUPLICATED by chunking?\n");
+  ok &= no_duplicate_work();
   printf("\n  Because the chunk is static in (code, vreg), a chunk-aware converter is a COMPILE-TIME gate on the\n");
   printf("  existing emission loop -- both t and v are unrolled constants -- not a runtime selection. That is the\n");
   printf("  whole reason MixGemmEmit had to become the emission source first.\n");
   printf("\n  ALL: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
+
