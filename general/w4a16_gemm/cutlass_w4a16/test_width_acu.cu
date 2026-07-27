@@ -35,6 +35,7 @@
 //          ACU_LADDER=1 ./test_width_acu 4                 walk int4's home tile -> int1's tile, ONE variable per
 //                                                          rung, to localise its unexplained 10-point drop
 //          ACU_LADDER=1 ACU_RUNG=n ACU_ONE=1               ONE rung, ONE launch -- the acu form
+//          ACU_BEST=1 ACU_ONE=1                            the new best config (64,128,64) w64x64 s2, 63.7% chunked
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -176,6 +177,19 @@ int main(int argc, char** argv) {
   //
   // Rungs 1-3 have WN=32 so slots=64: legal for int4 (deliv 32) and int2 (64) but NOT int1 (128), hence the
   // if constexpr gate rather than a comment saying "int1 skips these".
+  // ACU_BEST=1: the new best config, (64,128,64) w64x64 s2, which measures 63.7% with PPU_B_CHUNK=1 against 48.6%
+  // without. It is not the shared config above (that one is w32x64, chosen so all three widths can run it), so it
+  // needs its own entry point. Legal for int1: slots = WN*TK/32 = 128 = delivery, and TM/WM=1, TN/WN=2 -> 2 warps.
+  if (getenv("ACU_BEST")) {
+    switch (bits) {
+      case 1: run_rung<1, 64, 128, 64, 64, 64, 2, cutlass::uint1b_t>(gs, zero, "NEW BEST w64x64 s2 (63.7% chunked)"); break;
+      case 2: run_rung<2, 64, 128, 64, 64, 64, 2, cutlass::uint2b_t>(gs, zero, "w64x64 s2"); break;
+      case 4: run_rung<4, 64, 128, 64, 64, 64, 2, cutlass::int4b_t >(gs, zero, "w64x64 s2"); break;
+      default: std::printf("  bits must be 1, 2 or 4\n"); return 1;
+    }
+    return 0;
+  }
+
   if (getenv("ACU_LADDER")) {
     // ACU_RUNG=n runs ONLY rung n, so ACU_ONE=1 ACU_RUNG=n is a single clean launch for acu. Without it,
     // ACU_ONE + the full ladder would emit five launches and acu would have nothing to attribute.
