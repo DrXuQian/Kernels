@@ -21,6 +21,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/numeric_types.h"
 #include "unfused_weight_dequantize.hpp"
+#include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
 #include <cstdio>
 #include <vector>
 #include <set>
@@ -169,7 +170,19 @@ static void regress(const char* tag, int NN, int KK, int (*l3)(int,int), const c
 int main() {
   printf("L12 -- int2 and int4: converter models, then full-chain regression\n\n");
 
-  printf("  == A. L3 per width, against an independent model of each converter\n");
+  printf("  == A0. the three local L3 models vs the UNIFIED cutlass::MixGemmEmit -- single source of truth\n");
+  { int b1 = 0, b2 = 0, b4 = 0;
+    for (int v = 0; v < 4; ++v) {
+      for (int c = 0; c < 32; ++c) if (l3_int1(c, v) != cutlass::MixGemmEmit<1>::index(c, v)) ++b1;
+      for (int c = 0; c < 16; ++c) if (l3_int2(c, v) != cutlass::MixGemmEmit<2>::index(c, v)) ++b2;
+    }
+    // int4's converter folds the vreg into a global code index; split it back out
+    for (int cg = 0; cg < 32; ++cg) if (l3_int4(cg, 0) != cutlass::MixGemmEmit<4>::index(cg % 8, cg / 8)) ++b4;
+    printf("      int1 %d/128   int2 %d/64   int4 %d/32 differ -> %s\n", b1, b2, b4,
+           (b1 || b2 || b4) ? "DRIFTED" : "ONE MAP, all three widths");
+  }
+
+  printf("\n  == A. L3 per width, against an independent model of each converter\n");
   { int bad = 0; std::set<int> seen;
     for (int v = 0; v < 4; ++v) for (int c = 0; c < 16; ++c) {
       if (l3_int2(c, v) != l3_int2_ref(c, v)) ++bad; seen.insert(l3_int2(c, v)); }

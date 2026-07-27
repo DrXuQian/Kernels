@@ -15,6 +15,9 @@
 //
 //   nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l2l3_layouts.cu -o l2l3 && ./l2l3
 #include "cute/tensor.hpp"
+#include "cute/arch/copy_ppu0010_aiu.hpp"
+#include "cute/ppu_tensor_mix.hpp"
+#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/numeric_types.h"
 #include <cstdio>
@@ -95,6 +98,19 @@ int main() {
   printf("L2 + L3 + L4 -- the hand-written index chains, as cute Layouts\n\n");
 
   printf("  L2 SwzlDelivery = "); print(SwzlDelivery{}); printf("\n");
+  // SINGLE SOURCE OF TRUTH: the same layout now lives in the copy atom's traits as LogicalTV. If these ever
+  // disagree, one of the two has been edited alone -- the failure mode that member exists to prevent.
+  {
+    using CT = Copy_Traits<PPU0010_TSM_LD_SWZL<cutlass::uint1b_t, 64, 256, true, false, 1>>;
+    printf("      Copy_Traits<...>::LogicalTV = "); print(typename CT::LogicalTV{});
+    printf("   (WordsPerRow=%d, valid=%s)\n", CT::LogicalWordsPerRow, CT::LogicalTVValid ? "yes" : "no");
+    int dis = 0;
+    for (int lane = 0; lane < 32; ++lane) for (int v = 0; v < 4; ++v) {
+      auto crd = make_coord(make_coord(lane % 4, lane / 4), make_coord(v % 2, v / 2));
+      if (SwzlDelivery{}(crd) != typename CT::LogicalTV{}(crd)) ++dis;
+    }
+    printf("      local copy vs the traits member: %d / 128 differ -> %s\n", dis, dis ? "DRIFTED" : "same map");
+  }
   int bad2 = 0, seen2[128] = {0};
   for (int lane = 0; lane < 32; ++lane)
     for (int v = 0; v < 4; ++v) {
