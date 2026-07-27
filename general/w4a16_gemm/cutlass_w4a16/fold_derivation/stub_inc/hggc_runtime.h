@@ -4,7 +4,7 @@
 #include <cstdarg>
 typedef int hggcError_t;
 enum { hggcSuccess = 0 };
-typedef void* hggcStream_t;
+typedef struct CUstream_st* hggcStream_t;
 struct hggcLaunchAttributeValue { int x; };
 struct hggcLaunchAttribute { int id; hggcLaunchAttributeValue val; };
 struct hggcLaunchConfig_t { int gridDim; int blockDim; size_t dynamicSmemBytes; hggcStream_t stream; hggcLaunchAttribute* attrs; int numAttrs; };
@@ -46,3 +46,17 @@ inline hggcError_t hggcSetDevice(int) { return hggcSuccess; }
 typedef int hggcDeviceAttr_t;
 enum { hggcDevAttrMultiProcessorCount = 1 };
 inline hggcError_t hggcDeviceGetAttribute(int* v, hggcDeviceAttr_t, int) { if (v) *v = 64; return hggcSuccess; }
+
+// -- enough of the launch/attribute API that cutlass/util and gemm_universal_* parse. Without these the front end
+//    emits a large, file-independent noise set, and a noise-pattern filter then has to be so loose that it hides real
+//    errors -- exactly how a TM=16/WM=32 template failure slipped past syntax_check.sh.
+struct CUstream_st;
+enum { hggcFuncAttributeMaxDynamicSharedMemorySize = 1, hggcOccupancyDisableCachingOverride = 2 };
+typedef unsigned long long HGdeviceptr;
+inline hggcError_t hggcFuncSetAttribute(const void*, int, int) { return hggcSuccess; }
+inline hggcError_t hggcDeviceSetLimit(int, size_t) { return hggcSuccess; }
+inline hggcError_t hggcOccupancyMaxActiveBlocksPerMultiprocessor(int* n, const void*, int, size_t) {
+  if (n) *n = 1; return hggcSuccess; }
+enum { HGGC_SUCCESS = 0 };
+inline void __ppu_barrier_arrive(int = 0) {}
+inline void __ppu_barrier_sync(int = 0) {}

@@ -79,6 +79,13 @@ static void make_buffers(Buf& b, int gs) {
 // One timed config. TK selects which weight buffer is valid, but the buffer is uploaded by the caller.
 template <QM Q, int TM, int TN, int TK, int WM, int WN, int ST>
 static void run_cfg(Buf& b, int gs, const char* note) {
+  // warpOnM = TM/WM and warpOnN = TN/WN must both be >= 1, or get_tiled_mma degenerates and the collective builder
+  // returns `int` -- which surfaces as "CollectiveEpilogue (aka int) cannot be used prior to ::" deep in
+  // gemm_universal_adapter.h. TM=16 therefore needs WM=16, which is what test_q3_bconcat_bench.cu uses and what I
+  // got wrong here by copying WM=32 across.
+  static_assert(fold::warp_shape_ok<TM, TN, WM, WN>,
+                "run_cfg: warp tile must divide the block tile (TM=16 needs WM=16, not WM=32)");
+  static_assert(fold::deliverable<1, TN, TK, WM, WN>, "run_cfg: violates the delivery bound WN*TK*Bits >= 4096");
   auto once = [&] {
     moe_grouped_ppu::filter_and_run<Q, TM, TN, TK, WM, WN, ST, uint1_t>(
         b.A.get(), b.B.get(), b.S.get(), Q == QM::FinegrainedScaleZero ? b.Z.get() : nullptr,
@@ -130,19 +137,19 @@ int main(int argc, char** argv) {
 
   std::printf("== TK=128 group (shipped offline). A: vary TM at fixed TK. D: WN is free -- same buffer.\n");
   upload_weights<128, 128>(b);
-  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 128, 32, 32, 3>(b, gs, "A: TM=16");
+  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 128, 16, 32, 3>(b, gs, "A: TM=16");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 3>(b, gs, "A: TM=32  <- measured 42.0% at gs=32");
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 128, 32, 32, 3>(b, gs, "A: TM=64");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 64, 3>(b, gs, "D: WN=64, same buffer");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 2>(b, gs, "C: stages=2");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 4>(b, gs, "C: stages=4");
-  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 128, 32, 32, 2>(b, gs, "A+C: TM=16 s2");
+  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 128, 16, 32, 2>(b, gs, "A+C: TM=16 s2");
 
   std::printf("\n== TK=256 group (shipped offline, F=1). B: most atoms per iteration = best hiding.\n");
   upload_weights<128, 256>(b);
-  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 256, 32, 32, 2>(b, gs, "B: TK=256 TM=16 s2");
+  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 256, 16, 32, 2>(b, gs, "B: TK=256 TM=16 s2");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 256, 32, 32, 2>(b, gs, "B: TK=256 TM=32 s2");
-  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 256, 32, 32, 3>(b, gs, "B: TK=256 TM=16 s3");
+  run_cfg<QM::FinegrainedScaleOnly, 16, 128, 256, 16, 32, 3>(b, gs, "B: TK=256 TM=16 s3");
 
   std::printf("\n== TK=64 group (bit-granular packer, WN>=64 required by the delivery bound).\n");
   upload_weights<128, 64>(b);

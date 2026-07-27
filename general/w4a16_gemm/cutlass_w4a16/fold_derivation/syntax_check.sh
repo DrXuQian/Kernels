@@ -1,29 +1,49 @@
 #!/usr/bin/env bash
-# Run nvcc's FRONT END over the harness sources locally, so a typo does not need a round trip to ppu001 to be found.
+# Run nvcc's FRONT END over a source locally, so a typo or a bad template instantiation does not need a round trip to
+# ppu001 to be found. `nvcc -cuda` stops after the front end and inline PPU asm is an opaque string at that stage, so
+# the file parses without an assembler for the target. -D__HGGCCC__ is required or CUTLASS_DEVICE degrades to host
+# `inline` and every __syncthreads lands in host code.
 #
-# WHY. `return bad == 0 ? 0 : 1;` in a block above where `bad` is declared shipped to the box and cost a build
-# cycle. It is an undeclared-identifier error in host code -- the most local kind of error there is.
+# WHY BASELINE-DIFF AND NOT PATTERN FILTERING. The actlize headers emit a fixed set of complaints the real hgcc does
+# not -- missing PPU intrinsics, host/device qualifiers, types the stubs do not model. Two earlier designs both failed:
+#   * filtering by FILE ("only count errors attributed to the source") is blind to template instantiation failures,
+#     because those report their `error:` against the library header and name the source only in the
+#     "note: ... requested here" chain. That is how run_cfg<...,16,128,256,32,32,2> -- TM=16 with WM=32, so
+#     warpOnM = 0 and the collective builder returns `int` -- reached the box while this script said "parses clean".
+#   * filtering by PATTERN needs a list so loose it hides real errors, since the noise is large and generic
+#     ("type name is not allowed", "expected a type specifier").
+# So: record the noise ONCE per file into a baseline, and fail only on error signatures that are NEW.
 #
-# HOW. `nvcc -cuda` runs the front end only; inline PPU asm is an opaque string at this stage, so it parses.
-# CUTLASS_DEVICE degrades to host `inline` unless __HGGCCC__ is defined, which would put __syncthreads in host
-# code, so define it. The actlize headers then emit a fixed set of host/device-qualifier complaints that the real
-# hgcc does not -- those are library noise and are ignored. Only errors attributed to the SOURCE FILES count, and
-# one stub artefact is filtered: CUTLASS_PPU_CHECK's std::cerr << becomes ambiguous against the stub runtime.
-#
-# This is a SYNTAX gate, not a build. It cannot tell you the kernel is correct; it tells you the file parses.
+#   ./syntax_check.sh --baseline <files...>   record/refresh the accepted noise
+#   ./syntax_check.sh <files...>              fail on anything not in the baseline
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 STUB="$(cd "$(dirname "$0")/stub_inc" && pwd)"
 ACT="$(cd "$(dirname "$0")/../../../../third_party/actlize" && pwd)"
+BLDIR="$(cd "$(dirname "$0")" && pwd)/syntax_baseline"
+mkdir -p "$BLDIR"
+RECORD=0
+if [ "${1:-}" = "--baseline" ]; then RECORD=1; shift; fi
 FILES=${*:-"$SRC/test_fold_int2.cu"}
 rc=0
 for f in $FILES; do
   base=$(basename "$f")
-  out=$(nvcc -std=c++17 -D__HGGCCC__ -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
+  # signature = file:line + the message, with paths stripped so it is stable across checkouts
+  sig=$(nvcc -std=c++17 -D__HGGCCC__ -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
         -cuda -o /dev/null -x cu "$f" -Wno-deprecated-gpu-targets 2>&1 \
-        | grep -E "(^|/)${base}\([0-9]+\): error" \
-        | grep -v 'more than one operator "<<" matches')   # stub artefact, see header
-  if [ -n "$out" ]; then echo "$base: REAL ERRORS"; echo "$out" | head -10; rc=1
-  else echo "$base: parses clean (library-header noise and the << stub artefact ignored)"; fi
+        | grep ": error" | sed -E 's#^.*/([^/]+)#\1#' | sort -u)
+  bl="$BLDIR/$base.txt"
+  if [ "$RECORD" = 1 ]; then
+    printf '%s\n' "$sig" > "$bl"
+    echo "$base: baseline recorded ($(printf '%s\n' "$sig" | grep -c . ) accepted noise lines)"
+    continue
+  fi
+  if [ ! -f "$bl" ]; then echo "$base: NO BASELINE -- run --baseline once, then review it"; rc=1; continue; fi
+  new=$(comm -13 "$bl" <(printf '%s\n' "$sig"))
+  if [ -n "$new" ]; then
+    echo "$base: NEW ERRORS (not in baseline)"; printf '%s\n' "$new" | head -12; rc=1
+  else
+    echo "$base: clean ($(grep -c . "$bl") known-noise lines, 0 new)"
+  fi
 done
 exit $rc

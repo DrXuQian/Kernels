@@ -19,6 +19,19 @@ SRC="$(cd "$(dirname "$0")/.." && pwd)"
 FLAG=$(mktemp); GEN=$(mktemp --suffix=.cpp); BIN=$(mktemp)
 gated=$(grep -l 'if constexpr (fold::deliverable' "$SRC"/*.cu 2>/dev/null | wc -l)
 
+emit_warp() {  # tm tn wm wn kind -- the warp tiling must divide the block tile
+  printf '#include "%s/fold_traits.hpp"\n#include <cstdio>\nint main(){printf("%%d",fold::warp_shape_ok<%s,%s,%s,%s>?1:0);}\n' \
+    "$SRC" "$1" "$2" "$3" "$4" > "$GEN"
+  local ok=0
+  if g++ -std=c++17 "$GEN" -o "$BIN" 2>/dev/null; then ok=$("$BIN"); fi
+  if [ "$ok" = 1 ]; then
+    printf "  %-16s TM=%-4s TN=%-4s w%sx%-4s OK\n" "$5" "$1" "$2" "$3" "$4"
+  else
+    printf "  %-16s TM=%-4s TN=%-4s w%sx%-4s rejected -> HARD FAILURE (warpOnM/N would be 0)\n" "$5" "$1" "$2" "$3" "$4"
+    echo hardbad >> "$FLAG"
+  fi
+}
+
 emit() {  # bits tn tk wm wn kind
   printf '#include "%s/fold_traits.hpp"\n#include <cstdio>\nint main(){printf("%%d",fold::deliverable<%s,%s,%s,%s,%s>?1:0);}\n' \
     "$SRC" "$1" "$2" "$3" "$4" "$5" > "$GEN"
@@ -55,6 +68,17 @@ while read -r TN TK WM WN E; do
   emit 1 "$TN" "$TK" "$WM" "$WN" "indirect:run_cfg"
 done < "$FLAG.w"
 
+# The warp-shape constraint. The front-end gate CANNOT see this class: the stub environment's own errors abort
+# template instantiation before a config is reached, so TM=16 with WM=32 reached the box reporting "parses clean".
+# It is pure arithmetic, so checking it needs no instantiation at all.
+grep -rhoE 'run_cfg<[^>]*>' "$SRC"/*.cu | tr -d ' ' \
+  | sed -E 's/run_cfg<[A-Za-z:_]+,([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)>/\1 \2 \4 \5/' \
+  | grep -E '^[0-9]' | sort -u > "$FLAG.s"
+while read -r TM TN WM WN; do
+  [ -n "${WN:-}" ] || continue
+  emit_warp "$TM" "$TN" "$WM" "$WN" "warp:run_cfg"
+done < "$FLAG.s"
+
 grep -rhoE 'filter_and_run<[^;]{0,200}' "$SRC"/*.cu | tr -d ' ' \
   | grep -oE '<[A-Za-z:_]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[A-Za-z_:0-9]+' \
   | sed -E 's/<[A-Za-z:_]+,[0-9]+,([0-9]+),([0-9]+),([0-9]+),([0-9]+),[0-9]+,(.*)/\1 \2 \3 \4 \5/' | sort -u > "$FLAG.e"
@@ -77,5 +101,5 @@ elif grep -q gatedbad "$FLAG" 2>/dev/null; then
 else
   echo "OK: every enumerated instantiation is deliverable."
 fi
-rm -f "$FLAG" "$FLAG.m" "$FLAG.e" "$FLAG.w" "$GEN" "$BIN"
+rm -f "$FLAG" "$FLAG.m" "$FLAG.e" "$FLAG.w" "$FLAG.s" "$GEN" "$BIN"
 exit $rc

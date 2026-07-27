@@ -130,6 +130,15 @@ struct FoldTraits {
 // equivalent condition. A dispatch ladder that instantiates every (TM,TN,TK) triple regardless of the runtime
 // choice will otherwise instantiate illegal ones and trip the static_assert -- which is what happened on the box
 // with int1 at TK=64 from CORR_DISPATCH(64,64,64). Gate and guard must be the SAME expression or they drift.
+// The warp tiling must divide the block tile, or get_tiled_mma degenerates (WarpOnM = blockM/warpM becomes 0) and
+// the collective builder returns `int`, which surfaces as "CollectiveEpilogue (aka int) cannot be used prior to ::"
+// deep inside gemm_universal_adapter.h. Pure arithmetic, so it is checkable without instantiating anything -- which
+// matters because the local front-end gate CANNOT see this class: the stub environment's own errors abort template
+// instantiation before a config is ever reached. TM=16 with WM=32 is the case that got to the box.
+template <int TM, int TN, int WM, int WN>
+inline constexpr bool warp_shape_ok = (WM > 0 && WN > 0 && TM % WM == 0 && TN % WN == 0
+                                       && TM / WM >= 1 && TN / WN >= 1 && (TM / WM) * (TN / WN) <= 16);
+
 template <int Bits, int TN, int TK, int WM, int WN>
 inline constexpr bool deliverable = (Bits <= 0 || Bits >= 8) ? true : ((16 * 8 / Bits) <= (WN * TK / 32));
 
