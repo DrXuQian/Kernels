@@ -527,7 +527,7 @@ diagnostic priced the scale copy at ~49.6 us out of 327 us (~15%) and the broadc
 
 If ScaleOnly moves a lot, the traffic model is incomplete and that is the interesting result — not a success.
 
-### Measured: correct on all three widths, and PERF-NEUTRAL. The diagnosis that motivated it was wrong.
+### Measured: a NO-OP in generated code. L27's premise confused cute's layout with codegen.
 
 | | ScaleOnly | ScaleZero | delta | previously recorded delta |
 |---|---|---|---|---|
@@ -590,3 +590,40 @@ same failure mode as the perf lambda that timed a different tile than it checked
 
 **Still hand-written:** the 2-plane converter (`MixGemm2Plane_uint2_uint1`) keeps its own `base` computation. That is
 task #8, and it is the one place where cute's layout algebra would genuinely simplify rather than merely verify.
+
+
+## Retraction: the scale broadcast is a no-op, and why
+
+With the actlize submodule confirmed fresh (`git submodule update` had silently been skipped on the first attempt,
+which is what the `PPU_SCALE_FRAGMENT_API` gate now prevents), acu still reports **identical registers** for
+`bc_only`/`bc_zero` against the materialised path. So the conclusion is (b): **the change does not alter generated
+code.**
+
+**The error was conceptual.** L27 said the replication was "materialised in registers", but that was a statement
+about the *cute layout*, not about codegen. The 32 half slots held only 8 distinct values, all in registers, in a
+fully unrolled loop, with the equalities provable — the compiler had already coalesced them. Likewise cute's
+`AutoFilter` reduced the copy to the destination's nullspace (32 iterations), and the compiler CSE'd those down to the
+8 distinct addresses. Nothing was left to save.
+
+acu corroborates independently: measured **186** registers where the old estimate was 176 and the new one 164 — *above
+both*. The scale fragment's contribution is buried under address arithmetic and pipeline temporaries, so a 12-register
+delta is not resolvable in that number at all.
+
+**What survives, and what does not:**
+
+| claim | status |
+|---|---|
+| "16–64× redundant smem requests" | already corrected to 4×; now **retracted entirely** — the compiler CSE'd it |
+| "4× fewer scale registers" | **retracted as a codegen claim**; true only of the cute layout |
+| "correct on all three widths" | needs re-running: the earlier `bad=0` was on the stale submodule |
+| the zero delta tracks `gs` (+49.5 → +81.9 us) | **stands** — measured twice, and it is a per-reload LATENCY cost, which no amount of narrowing addresses |
+| task #9's register argument | **unaffected**, and for a concrete reason: B's 128 fragment values are all DISTINCT, so the compiler cannot coalesce them the way it coalesced the replicated scale |
+
+The broadcast is **kept but relabelled**: it is the cute-correct construction, it costs nothing, and
+`scale_frag_cosize()` plus the API gate are useful on their own. It is not a performance change and the record should
+not read as though it might become one.
+
+**The generalisable lesson.** A cute layout describes what the *program* asks for. Whether the hardware does it is a
+codegen question, and for register-resident, fully-unrolled, provably-equal values the compiler usually wins first.
+Before optimising a cute-level redundancy, check whether it survives to the ISA — which for this toolchain means acu,
+because actlize's cute cannot be compiled for device under nvcc to read the PTX.
