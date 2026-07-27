@@ -63,38 +63,61 @@ For the int1 converter's 16 pairs (pair `t` carries codes `t` and `t+16`, which 
 This is why **#5 was a real prerequisite, not hygiene**: against the old hand-written offset table there is nothing
 to gate on.
 
-## STATUS: the chunked path is written, and the "assumptions" turned out to be derivable
+## STATUS: CORRECT ON HARDWARE. bad=0/131072 with the varying-scale probe.
 
-Behind `PPU_B_CHUNK` (default off; the default path is byte-identical and both harnesses parse clean without it).
+```
+[fold] ... TileShape=(64,128,64) warp=32x64 FoldF=4 | slots=128 delivery=128  [BITPACK]  [SVARY]
+  fold int1 TK=64 (64,128,64) w32x64 vs host codes x scale(g,n): bad=0/131072 MATCH
+```
 
-**A correction worth reading, because it was a process error.** The first version hardcoded `tCrB_load(_,_,Int<0>{})`
-in `transform_B_atom` and then added `static_assert(K_BLOCK_MAX == 1)` to protect that shortcut — which made a
-limitation of *my implementation* look like a property of the *design*. It is not. `tCrB_load` has **one slot per copy
-step** (the copy writes `tCrB_copy_view(_,_,k_block_next)` while the conversion reads `(_,_,k_block)`), so deferring
-the conversion into the mma loop cannot see overwritten codes, and "convert inside the loop instead of all at once"
-works for **any** `K_BLOCK_MAX`. Fixed: `k_block` and `NChunk` are passed in.
+Behind `PPU_B_CHUNK` (default off; the default path is byte-identical, and chunking is gated to 1-bit so int2/int4
+take the unchanged path even with the flag on).
 
-And `CPY_K` never needed probing either — it is `slots / delivery` in fp16 units:
+### Three bugs, all found by DECODING the printed values, none by reading the code
 
-| | slots | delivery | `K_BLOCK_MAX` | k-atoms per copy step |
-|---|---|---|---|---|
-| int1 | 128 | 128 | **1** | 4 |
-| int2 | 128 | 64 | 2 | 2 |
-| int4 | 128 | 32 | 4 | 1 |
+**1. 576 compile errors.** `transform_B_atom` called the int1 emitter unconditionally, so with the flag on it was
+instantiated for `uint2b_t`. Gated now on `sizeof_bits<RealInternalElementB>::value == 1`, and every branch became
+`if constexpr` instead of `#if` — with `#if` the other branch is never type-checked, which is how it reached the box.
 
-int1 at the target shape has `delivery == slots`, so one copy fills the whole fragment — `K_BLOCK_MAX = 1` is
-arithmetic, not an assumption. Note int4 lands at 1 k-atom per copy step, i.e. `NChunk = 1`: nothing to chunk, which
-is correct since its B is already only 16 registers.
+**2. `bad=85545`.** Decoding each mismatching output against the probe's own
+`scale(g,n) = 1 + (1/16)*((5n+3g) mod 13)` gave **g = 2 for every line** where g = 0 was correct. One smem stage is
+`Scale_TileK = 2` groups, so it was a stage off-by-one, not a permutation. Cause: with `K_BLOCK_MAX == 1` the
+`++smem_pipe_read` block fires **every** iteration and sits **before** the mma loop, so a per-atom transform placed in
+that loop reads an already-advanced stage. Fixed by capturing `b_consume_stage` before the advance.
 
-The only constraint left is the emitter's own: 128 outputs must split evenly into `NChunk` chunks.
+**3. `bad=57976`.** The pattern was `MMA_N` atom 0 correct and atoms 1–3 wrong — the signature of a wrong `MMA_N`
+stride. Printing the layout (`l34_fragment_layout.cu`):
 
-`PPU_MMA_PROBE=1` is kept as a cheap confirmation of the derivation on hardware, but it is no longer load-bearing:
+```
+tCrB_mma : ((2,2,2), MMA_N, MMA_K) : ((1,2,4), 32, 8)
+```
+
+**`MMA_N` stride 32, `MMA_K` stride 8** — not the compact `(8, 32)` I had assumed. So `e = val + 32n + 8k` and
+`e/32 == n_atom`, meaning the code was chunking by **N** while telling `cute::gemm` the buffer was one k-atom of
+`(val, MMA_N)`. Corrected to `keep = ((e/8) % MMA_K) == Chunk`, `at = (val + 8*n_atom)/2`.
+
+**The lesson is not the arithmetic.** `l32` had *verified* its split — correctly, of the wrong model. A harness that
+confirms a wrong assumption is worse than no harness, because it reads as evidence. What was missing was ever
+*printing* the layout being reasoned about. `l34` now does.
+
+### What remains: the acu register check
+
+Correctness is settled; the open question is whether the saving reaches the ISA.
 
 ```bash
-PPU_DEFS=PPU_MMA_PROBE=1 TARGET=test_fold_int2 ./build.sh
-FOLD_SVARY=1 FOLD_BITS=1 FOLD_TK=64 FOLD_BITPACK=1 $D/test_fold_int2 256 512 32
-# expect: [mma probe] K_BLOCK_MAX(CPY_K)=1  K_ATOM_PER_COPY=4  MMA_K(tCrB_mma)=4  MMA_N=4  Scale_TileK=2
+D=/sim/eec/shared/junfu.qx/Kernels/third_party/actlize/build_w4a16_compare/examples/99_kernels_w4a16_compare
+A=/sim/eec/shared/junfu.qx/asight/bin/acu
+PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_width_acu ./build.sh
+ACU_ONE=1 $A --set full -f -o chunk $D/test_width_acu 1 2048 4096 4096 32
 ```
+
+| `Registers Per Thread` | verdict |
+|---|---|
+| falls into the **128** bucket (from 186), `warps/CU` reads **32** | the saving is real — restore the B copy/mma overlap and measure MFU |
+| unchanged | the compiler was already staggering `tCrB_mma`'s live ranges across k-atoms. **Revert and stop** — do not spend another round |
+
+B's 128 values are all *distinct*, so the compiler cannot coalesce them the way it coalesced the replicated scale
+(which is why the scale broadcast measured as a no-op). But it can still reorder, and that is the untested assumption.
 
 ## Where I stopped originally, and the first blocker
 
