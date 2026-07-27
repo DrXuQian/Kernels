@@ -59,29 +59,32 @@ static bool check(const char* tag) {
 // NChunk emit() calls the kept lines must partition the unchunked set exactly -- no line emitted twice, none dropped.
 // Counting it, not arguing it.
 static bool no_duplicate_work() {
-  constexpr int CPW = 32, NPAIR = 16, NCH = 4, kPer = 128 / NCH;
-  int emitted[NPAIR][4] = {};                 // how many times line (t, v) is emitted across all chunks
-  long straddle = 0;
-  for (int v = 0; v < 4; ++v)
-    for (int t = 0; t < NPAIR; ++t) {
-      // the two codes this line writes
-      const int lo = MixGemmEmit<1>::index(t, v), hi = MixGemmEmit<1>::index(t + 16, v);
-      if (hi != lo + 1) { printf("      line (t%2d,v%d): high lane is not lo+1 (%d vs %d)\n", t, v, hi, lo + 1); ++straddle; }
-      if (lo / kPer != hi / kPer) { printf("      line (t%2d,v%d) STRADDLES chunks %d and %d\n", t, v, lo/kPer, hi/kPer); ++straddle; }
-      for (int c = 0; c < NCH; ++c) if (lo / kPer == c) ++emitted[t][v];   // exactly the keep() predicate
+  // AGAINST THE MEASURED LAYOUT. tCrB_mma is ((2,2,2),MMA_N,MMA_K):((1,2,4),32,8), so e = val + 32*n + 8*k and
+  // e/32 == n_atom, NOT k_atom. The first version of this function used e/32 as "the chunk" and called it a k-atom;
+  // the arithmetic was right and the INTERPRETATION was wrong, which is worse than a wrong number because it reads as
+  // verified. cute::gemm wants (val, MMA_N) at fixed k, so the chunk is a k-atom:
+  //     keep = ((e/8) % MMA_K) == Chunk        at = ((e%8) + 8*(e/(8*MMA_K)))/2
+  constexpr int MMA_K = 4, NPAIR = 16;
+  int emitted[NPAIR][4] = {}; long straddle = 0; bool shape_ok = true;
+  for (int c = 0; c < MMA_K; ++c) {
+    int hit[16] = {}, lines = 0;
+    for (int v = 0; v < 4; ++v) for (int t = 0; t < NPAIR; ++t) {
+      const int e = MixGemmEmit<1>::index(t, v), e2 = MixGemmEmit<1>::index(t + 16, v);
+      if (((e / 8) % MMA_K) != c) continue;
+      ++lines; ++emitted[t][v];
+      if (e2 != e + 1 || ((e2 / 8) % MMA_K) != c) ++straddle;
+      const int at = ((e % 8) + 8 * (e / (8 * MMA_K))) / 2;
+      if (at < 0 || at >= 16) shape_ok = false; else ++hit[at];
     }
-  long once = 0, twice = 0, never = 0;
-  for (int t = 0; t < NPAIR; ++t) for (int v = 0; v < 4; ++v)
-    (emitted[t][v] == 1) ? ++once : (emitted[t][v] > 1 ? ++twice : ++never);
-  printf("  int1 emission lines: %ld emitted exactly once, %ld more than once, %ld never | %ld straddling pair(s) %s\n",
-         once, twice, never, straddle,
-         (twice == 0 && never == 0 && straddle == 0) ? "<-- EXACT PARTITION, zero duplicated work" : "<-- DUPLICATED or LOST");
-  // and the arithmetic reason the pair never straddles: with bit4 = 0 the low-lane index is EVEN, and every other
-  // weight (2, 8, 16, 32, 64, 4) is even too, so lo % kPer <= kPer-2 and lo+1 stays in the same chunk.
-  long odd = 0;
-  for (int v = 0; v < 4; ++v) for (int t = 0; t < NPAIR; ++t) if (MixGemmEmit<1>::index(t, v) % 2) ++odd;
-  printf("  low-lane indices that are ODD: %ld (must be 0 -- that is WHY no pair can straddle a chunk edge)\n", odd);
-  return twice == 0 && never == 0 && straddle == 0 && odd == 0;
+    int once = 0; for (int i = 0; i < 16; ++i) if (hit[i] == 1) ++once;
+    if (lines != 16 || once != 16) shape_ok = false;
+    printf("  chunk %d: %2d lines, %2d/16 h2 slots written exactly once\n", c, lines, once);
+  }
+  long once = 0, other = 0;
+  for (int t = 0; t < NPAIR; ++t) for (int v = 0; v < 4; ++v) (emitted[t][v] == 1) ? ++once : ++other;
+  printf("  across chunks: %ld lines exactly once, %ld otherwise | %ld straddling  %s\n", once, other, straddle,
+         (shape_ok && other == 0 && straddle == 0) ? "<-- EXACT PARTITION, zero duplicated work" : "<-- BROKEN");
+  return shape_ok && other == 0 && straddle == 0;
 }
 
 int main() {
