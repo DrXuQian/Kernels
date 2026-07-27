@@ -34,6 +34,7 @@
 //                                                          same-shape same-occupancy control
 //          ACU_LADDER=1 ./test_width_acu 4                 walk int4's home tile -> int1's tile, ONE variable per
 //                                                          rung, to localise its unexplained 10-point drop
+//          ACU_LADDER=1 ACU_RUNG=n ACU_ONE=1               ONE rung, ONE launch -- the acu form
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -169,20 +170,24 @@ int main(int argc, char** argv) {
   // Rungs 1-3 have WN=32 so slots=64: legal for int4 (deliv 32) and int2 (64) but NOT int1 (128), hence the
   // if constexpr gate rather than a comment saying "int1 skips these".
   if (getenv("ACU_LADDER")) {
-    std::printf("\n== LADDER: one variable per rung, int4 home -> int1's tile (rungs 1-3 need WN=32, illegal for int1)\n");
+    // ACU_RUNG=n runs ONLY rung n, so ACU_ONE=1 ACU_RUNG=n is a single clean launch for acu. Without it,
+    // ACU_ONE + the full ladder would emit five launches and acu would have nothing to attribute.
+    const int only = getenv("ACU_RUNG") ? atoi(getenv("ACU_RUNG")) : 0;
+    std::printf("\n== LADDER: one variable per rung, int4 home -> int1's tile (rungs 1-3 need WN=32, illegal for int1)%s\n",
+                only ? "  [single rung]" : "");
     auto ladder = [&](auto tag) {
       constexpr int Bt = decltype(tag)::value;
       using QE = std::conditional_t<Bt == 1, cutlass::uint1b_t,
                  std::conditional_t<Bt == 2, cutlass::uint2b_t, cutlass::int4b_t>>;
       if constexpr (fold::deliverable<Bt, 64, 64, 32, 32>) {
-        run_rung<Bt, 64,  64, 64, 32, 32, 3, QE>(gs, zero, "rung 1: int4 HOME (55.9% measured)");
-        run_rung<Bt, 64,  64, 64, 32, 32, 2, QE>(gs, zero, "rung 2: stages 3 -> 2");
-        run_rung<Bt, 64, 128, 64, 32, 32, 2, QE>(gs, zero, "rung 3: TN 64 -> 128");
-      } else {
+        if (!only || only == 1) run_rung<Bt, 64,  64, 64, 32, 32, 3, QE>(gs, zero, "rung 1: int4 HOME (55.9% measured)");
+        if (!only || only == 2) run_rung<Bt, 64,  64, 64, 32, 32, 2, QE>(gs, zero, "rung 2: stages 3 -> 2");
+        if (!only || only == 3) run_rung<Bt, 64, 128, 64, 32, 32, 2, QE>(gs, zero, "rung 3: TN 64 -> 128");
+      } else if (only <= 3) {
         std::printf("  int%d: rungs 1-3 skipped -- slots=64 < delivery=%d (over-delivery)\n", Bt, 16 * 8 / Bt);
       }
-      run_rung<Bt, 64, 128, 64, 32, 64, 2, QE>(gs, zero, "rung 4: WN 32 -> 64");
-      run_rung<Bt, 32, 128, 64, 32, 64, 2, QE>(gs, zero, "rung 5: TM 64 -> 32  = int1's tile (45.9% measured)");
+      if (!only || only == 4) run_rung<Bt, 64, 128, 64, 32, 64, 2, QE>(gs, zero, "rung 4: WN 32 -> 64");
+      if (!only || only == 5) run_rung<Bt, 32, 128, 64, 32, 64, 2, QE>(gs, zero, "rung 5: TM 64 -> 32  = int1's tile (45.9% measured)");
     };
     switch (bits) {
       case 1: ladder(std::integral_constant<int,1>{}); break;
