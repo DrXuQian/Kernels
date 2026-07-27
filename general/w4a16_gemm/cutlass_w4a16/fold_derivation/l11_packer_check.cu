@@ -45,8 +45,10 @@ int main(){
                         make_layout(Shape<Int<TN>,Int<TK>>{}, Stride<Int<TK>,_1>{}));
   auto frag = Mma{}.get_thread_slice(0).partition_fragment_B(sB);
   const int NS = int(size(frag));
-  std::vector<int> pi(NS,-1);
-  for (int f=0;f<NS;++f){ int o=frag.layout()(f); if(o>=0&&o<NS) pi[o]=f; }
+  // pi = frag.layout()^-1, and cute HAS this: right_inverse(Layout). It used to be a hand-rolled loop here (and in
+  // seven sibling files); l30_should_have_been_cute.cu verifies the two agree on three shapes including int4's
+  // production one. Worth replacing beyond tidiness: l20 is the file scheduled to become the production offline.
+  auto pi = right_inverse(frag.layout());
   auto l3=[](int j,int v){ int b0=j&1,b1=(j>>1)&1,b2=(j>>2)&1,c=(j>>3)&1,d=(j>>4)&1;
     return 64*(v%2)+4*(v/2)+2*b0+8*b1+16*b2+32*c+d; };
   int bad=0, shown=0;
@@ -56,7 +58,7 @@ int main(){
     for (int v=0;v<4;++v){
       const int row=16*warp_n+(v/2)*8+lane/4, wd=(v%2)*4+lane%4;
       for (int j=0;j<CPW;++j){
-        auto c=part(pi[l3(j,v)]);
+        auto c=part(pi(l3(j,v)));
         const int gt=id[((size_t)row*W_ROW+wd)*CPW+j];
         if (int(get<0>(c))!=gt/KK || int(get<1>(c))!=gt%KK){ ++bad;
           if (shown<5){ printf("    MISMATCH row%2d w%d bit%2d: chain(n%3d,k%2d) packer(n%3d,k%2d)\n",

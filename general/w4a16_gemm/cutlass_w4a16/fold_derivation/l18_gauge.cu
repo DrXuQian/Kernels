@@ -39,15 +39,17 @@ int main(){
     auto sB=make_tensor(make_smem_ptr((cutlass::half_t*)nullptr),
                         make_layout(Shape<Int<TN>,Int<TK>>{},Stride<Int<TK>,_1>{}));
     auto frag=Mma{}.get_thread_slice(0).partition_fragment_B(sB);
-    const int NS=int(size(frag)); std::vector<int> pi(NS,-1);
-    for(int f=0;f<NS;++f){int o=frag.layout()(f); if(o>=0&&o<NS) pi[o]=f;}
+    const int NS=int(size(frag));  // pi = frag.layout()^-1, and cute HAS this: right_inverse(Layout). It used to be a hand-rolled loop here (and in
+  // seven sibling files); l30_should_have_been_cute.cu verifies the two agree on three shapes including int4's
+  // production one. Worth replacing beyond tidiness: l20 is the file scheduled to become the production offline.
+    auto pi = right_inverse(frag.layout());
     int bad=0,tot=0;
     for(int t=0;t<32*2;++t){
       const int lane=t%32, warp_n=t/32;
       auto part=Mma{}.get_thread_slice(t).partition_B(make_identity_tensor(make_shape(Int<TN>{},Int<TK>{})));
       for(int v=0;v<4;++v) for(int h=0;h<2;++h){
         const int flat=v*2+h; if(flat>=NS) continue;
-        auto c=part(pi[flat]);
+        auto c=part(pi(flat));
         // what partition_B says: (n,k) -> word index n*8 + k/2, half k%2
         const int pb_word = (int(get<0>(c)) - warp_n*16)*8 + int(get<1>(c))/2;
         const int pb_half = int(get<1>(c))%2;
@@ -65,8 +67,10 @@ int main(){
     auto sB=make_tensor(make_smem_ptr((cutlass::half_t*)nullptr),
                         make_layout(Shape<Int<TN>,Int<TK>>{},Stride<Int<TK>,_1>{}));
     auto frag=Mma{}.get_thread_slice(0).partition_fragment_B(sB);
-    const int NS=int(size(frag)); std::vector<int> pi(NS,-1);
-    for(int f=0;f<NS;++f){int o=frag.layout()(f); if(o>=0&&o<NS) pi[o]=f;}
+    const int NS=int(size(frag));  // pi = frag.layout()^-1, and cute HAS this: right_inverse(Layout). It used to be a hand-rolled loop here (and in
+  // seven sibling files); l30_should_have_been_cute.cu verifies the two agree on three shapes including int4's
+  // production one. Worth replacing beyond tidiness: l20 is the file scheduled to become the production offline.
+    auto pi = right_inverse(frag.layout());
     int naive=0, withemit=0, tot=0;
     for(int t=0;t<32*4;++t){
       const int lane=t%32;
@@ -77,7 +81,7 @@ int main(){
         // (b) WITH the emission model
         const int flat_emit=cutlass::MixGemmEmit<Bits>::index(j,v);
         ++tot;
-        if(flat_naive<NS && flat_emit<NS && pi[flat_naive]!=pi[flat_emit]) ++naive;
+        if(flat_naive<NS && flat_emit<NS && pi(flat_naive)!=pi(flat_emit)) ++naive;
         if(flat_emit>=NS) ++withemit;
       }
     }

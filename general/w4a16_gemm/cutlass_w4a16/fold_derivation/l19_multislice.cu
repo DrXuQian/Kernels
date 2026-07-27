@@ -53,8 +53,10 @@ static void probe(const char* tag) {
                         make_layout(Shape<Int<TN>,Int<TK>>{}, Stride<Int<TK>,_1>{}));
   auto frag = Mma{}.get_thread_slice(0).partition_fragment_B(sB);
   const int NS = int(size(frag));
-  std::vector<int> pi(NS, -1);
-  for (int f = 0; f < NS; ++f) { const int o = frag.layout()(f); if (o >= 0 && o < NS) pi[o] = f; }
+  // pi = frag.layout()^-1, and cute HAS this: right_inverse(Layout). It used to be a hand-rolled loop here (and in
+  // seven sibling files); l30_should_have_been_cute.cu verifies the two agree on three shapes including int4's
+  // production one. Worth replacing beyond tidiness: l20 is the file scheduled to become the production offline.
+  auto pi = right_inverse(frag.layout());
   const int NINST = NS / 8;
   printf("  %-18s fp16 TN=%3d TK=%3d w%dx%d | %d slice(s), %d row-block(s), frag=%d -> %d instance(s)\n",
          tag, TN, TK, WM, WN, NSLICE, NROWBLK, NS, NINST);
@@ -88,7 +90,7 @@ static void probe(const char* tag) {
             for (int h = 0; h < HPW; ++h) {
               const int flat = i * 8 + v * HPW + h;
               if (flat < 0 || flat >= NS) continue;
-              auto c = part(pi[flat]);
+              auto c = part(pi(flat));
               const int n_have = rblk * RPI + 16 * warp_n + row;
               const int k_have = slice * SLICE_HALF + word_in_row * HPW + h;
               ++tot;

@@ -66,14 +66,16 @@ static bool f1(const char* tag, int NN, int KK) {
                         make_layout(Shape<Int<TN>,Int<TK>>{}, Stride<Int<TK>,_1>{}));
   auto frag = Mma{}.get_thread_slice(0).partition_fragment_B(sB);
   const int NS = int(size(frag));
-  std::vector<int> pi(NS,-1);
-  for (int f=0; f<NS; ++f) { const int o = frag.layout()(f); if (o>=0 && o<NS) pi[o]=f; }
+  // pi = frag.layout()^-1, and cute HAS this: right_inverse(Layout). It used to be a hand-rolled loop here (and in
+  // seven sibling files); l30_should_have_been_cute.cu verifies the two agree on three shapes including int4's
+  // production one. Worth replacing beyond tidiness: l20 is the file scheduled to become the production offline.
+  auto pi = right_inverse(frag.layout());
 
   // CHECK THE HYPOTHESIS FIRST: which n does each fragment half demand?
   { auto part = Mma{}.get_thread_slice(0).partition_B(make_identity_tensor(make_shape(Int<TN>{},Int<TK>{})));
     for (int i = 0; i < NINST; ++i) {
       std::set<int> ns;
-      for (int e = i*VEC; e < (i+1)*VEC; ++e) ns.insert(int(get<0>(part(pi[e]))));
+      for (int e = i*VEC; e < (i+1)*VEC; ++e) ns.insert(int(get<0>(part(pi(e)))));
       printf("      fragment half %d (flat %3d..%3d) demands n in {", i, i*VEC, (i+1)*VEC-1);
       int c = 0; for (int n : ns) { if (c++ < 6) printf("%d,", n); }
       printf("%s}  -> expected rows [%d,%d)\n", ns.size()>6?"..":"", i*RPI, (i+1)*RPI);
@@ -115,7 +117,7 @@ static bool f1(const char* tag, int NN, int KK) {
                                 : (Bits==2) ? l3_int2(jj, v) : l3_int1(jj, v);
               const int flat = i*VEC + e_local;
               if (flat < 0 || flat >= NS) continue;
-              auto c = part(pi[flat]);
+              auto c = part(pi(flat));
               const int n_exp = tn*TN + int(get<0>(c)), k_exp = ki*TK + int(get<1>(c));
               const size_t off = ((size_t)(ki/RPS)*NN + tn*TN + row)*kCon + (ki%RPS)*AiuElem + wd*CPW + jj;
               ++tot;

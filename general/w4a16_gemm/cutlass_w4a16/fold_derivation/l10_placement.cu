@@ -56,9 +56,8 @@ static std::vector<Cell> chain_map(bool verbose) {
   const int NS = int(size(frag));
 
   // pi = frag.layout()^-1 : flat offset (where the converter writes) -> fragment logical index
-  std::vector<int> pi(NS, -1);
-  for (int f = 0; f < NS; ++f) { const int off = frag.layout()(f); if (off >= 0 && off < NS) pi[off] = f; }
-  for (int e = 0; e < NS; ++e) if (pi[e] < 0) { printf("      pi is not onto -- abort\n"); return {}; }
+  // cute's right_inverse, not a hand-rolled loop (l30 verifies they agree).
+  auto pi = right_inverse(frag.layout());
 
   auto l3 = [](int j, int v) {
     const int b0=j&1,b1=(j>>1)&1,b2=(j>>2)&1,c=(j>>3)&1,d=(j>>4)&1;
@@ -73,13 +72,13 @@ static std::vector<Cell> chain_map(bool verbose) {
       const int row = 16 * warp_n + (v / 2) * 8 + lane / 4;
       const int wd  = (v % 2) * 4 + lane % 4;
       for (int j = 0; j < CPW; ++j) {
-        auto c = part(pi[l3(j, v)]);
+        auto c = part(pi(l3(j, v)));
         phys[((size_t)row * W_ROW + wd) * CPW + j] = Cell{int(get<0>(c)), int(get<1>(c))};
       }
     }
   }
   if (verbose) { printf("      fragment "); print(frag.layout()); printf("   pi basis: ");
-                 for (int b = 0; (1<<b) < NS; ++b) printf("bit%d->%d ", b, pi[1<<b]); printf("\n"); }
+                 for (int b = 0; (1<<b) < NS; ++b) printf("bit%d->%d ", b, pi(1<<b)); printf("\n"); }
   return phys;
 }
 

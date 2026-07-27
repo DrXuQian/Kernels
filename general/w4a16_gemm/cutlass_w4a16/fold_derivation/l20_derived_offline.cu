@@ -51,8 +51,10 @@ static std::vector<int> tile_map() {
                         make_layout(Shape<Int<TN>,Int<TK>>{}, Stride<Int<TK>,_1>{}));
   auto frag = Mma{}.get_thread_slice(0).partition_fragment_B(sB);
   const int NS = int(size(frag));
-  std::vector<int> pi(NS,-1);
-  for (int f=0; f<NS; ++f) { const int o = frag.layout()(f); if (o>=0 && o<NS) pi[o]=f; }
+  // pi = frag.layout()^-1, and cute HAS this: right_inverse(Layout). It used to be a hand-rolled loop here (and in
+  // seven sibling files); l30_should_have_been_cute.cu verifies the two agree on three shapes including int4's
+  // production one. Worth replacing beyond tidiness: l20 is the file scheduled to become the production offline.
+  auto pi = right_inverse(frag.layout());
 
   std::vector<int> m((size_t)Ng*8*CPW, -1);
   for (int t = 0; t < 32*WOM*WON; ++t) {
@@ -66,7 +68,7 @@ static std::vector<int> tile_map() {
           const int e = cutlass::MixGemmEmit<Bits>::index(j, v);
           const int flat = inst*VEC + e;
           if (flat < 0 || flat >= NS) continue;
-          auto c = part(pi[flat]);
+          auto c = part(pi(flat));
           m[((size_t)row*8 + wd)*CPW + j] = int(get<0>(c))*TK + int(get<1>(c));
         }
       }
