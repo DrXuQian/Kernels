@@ -3,27 +3,39 @@
 // WHY A SEPARATE FILE. test_fold_int2.cu is the verified correctness harness; a sweep needs many extra kernel
 // instantiations and would slow its build for everyone. Nothing here is on the correctness path.
 //
-// WHAT THE SWEEP FOUND (20 configs, ScaleOnly gs=32, 42.0% -> 50.2%). Three knobs, in the priority order the data
-// forces -- see the three-tier model in fold_traits.hpp:
-//     1. register budget -- over ~256 estimated regs/thread the config spills and collapses (TK=256: 23.0%)
-//     2. cvt/mma = 128/WM -- converter amortisation, and the DOMINANT term. It separated all 20 points with no
-//        overlap: cvt/mma=4 gave 40.9-50.2%, cvt/mma=8 gave 31.9-39.8%, and no amount of occupancy crossed the gap
-//     3. occupancy (stages, smem) -- orders configs within one cvt/mma group, and is worth ~4-8 points there
-// The second one is the correction: two rounds were spent on occupancy and on a register-count prescription that
-// measured 10.3 points WORSE than the config it was meant to beat. Those rows are kept in the sweep as evidence.
+// WHAT THE SWEEP FOUND (20 configs, 42.0% -> 50.2%), and it took three attempts to state it correctly. Two
+// INDEPENDENT factors, measured over 25 points across all three widths (this sweep plus the int4/int2/int1 ladders in
+// test_width_acu) -- full derivation in fold_traits.hpp and fold_derivation/README.md:
+//
+//                        cvt/mma = 4              cvt/mma = 8
+//     warps/CU >= 32     mean 52.1%  n=6          mean 39.1%  n=6     (-13.0)
+//     warps/CU <= 16     mean 46.1%  n=16         mean 32.0%  n=2     (-20.1)
+//                             (-6.0)
+//
+//   cvt/mma = 128/WM   converter amortisation. Separates with NO overlap in either row: a real ~13-point cliff.
+//   warps/CU           occupancy, and it MUST include the register limit -- acu showed shared memory allowing 10
+//                      blocks where registers allowed 4, and registers are billed rounded up to a POWER OF TWO, so
+//                      129 costs as much as 256. Overlaps at cvt/mma=4, so ~6 points of mean shift, not a cliff.
+//
+// The two earlier stories looked contradictory because each varied only one axis: this sweep's high-warp configs are
+// all WM=16 (cvt/mma=8), so warps/CU appeared to HURT, while the ladder's are WM=32, so it appeared to HELP. The
+// REFUTED w16x64 rows below are kept as the evidence for the cvt/mma axis, and the TEST amort=4 row as the evidence
+// that pushing cvt/mma below 4 buys +0.3 points.
 //
 // THE WEIGHT BUFFER DEPENDS ON (Bits, TN, TK) ONLY -- it is WN-INVARIANT, verified byte-for-byte in
 // fold_derivation/l20_derived_offline.cu at WN=32 and WN=64. So configs sharing a TK share a buffer, and the sweep
 // regroups by TK instead of rebuilding per config. TK=64 is the exception: it needs the bit-granular packer, so it
 // gets its own buffer from nfold_place_bits_int1_tk64.
 //
-// THE ZERO DIAGNOSTIC (FOLD_ZDIAG=1). ScaleZero costs 51-107us and I do not know whether that is the extra smem
-// COPY per reload or the extra TRANSFORM per atom -- the two scale differently (reloads = K/gs, transforms = K/16),
-// and the obvious fix differs completely: interleaving sS/sZ in smem helps only the copy, fusing multiplies+plus
-// into one f16x2 FMA helps only the transform. Timing ScaleOnly against ScaleZero at two group sizes separates them,
-// so this measures before anything gets built. (A previous fused-FMA attempt regressed 52.3% -> 33.5% because it
-// replaced a vectorized cute::transform with a scalar fp16->float->fp16 loop; the idea was never tested, only that
-// implementation.)
+// THE ZERO DIAGNOSTIC (FOLD_ZDIAG=1), and its ANSWER -- which was not one of the two options it offered. The split
+// was "if the zero cost tracks gs it is the COPY (reloads = K/gs); if it is flat in gs it is the TRANSFORM
+// (= K/16)". The cost does track gs (+49.5us at gs=32, +81.9us at gs=16 at TK=128) -- and then the stride-0 scale
+// broadcast cut the reload's smem requests to a QUARTER and changed nothing at all: delta +49.50 vs +49.6 recorded,
+// +81.94 vs +83.0. So a third quantity also tracks gs: the per-reload smem round-trip LATENCY, which depends on the
+// NUMBER of reloads and not on how wide each one is. Consistent with the kernel being latency-bound at cvt/mma=4.
+// The remedy is an EARLIER reload (prefetch the next group's scale), not a narrower one, and not the fused FMA
+// either -- that attempt regressed 52.3% -> 33.5% by replacing a vectorized cute::transform with a scalar
+// fp16->float->fp16 loop.
 //
 //   Build: TARGET=test_int1_sweep ./build.sh ; run: ./<bin> [N] [K] [gs]
 //   FOLD_ZDIAG=1 adds the ScaleOnly/ScaleZero pairs at both group sizes.
@@ -143,8 +155,19 @@ int main(int argc, char** argv) {
   PK = argc > 2 ? atoi(argv[2]) : 4096;
   const int gs = argc > 3 ? atoi(argv[3]) : 32;
   PM = argc > 4 ? atoi(argv[4]) : 2048;
-  std::printf("int1 sweep  M=%d N=%d K=%d gs=%d   (buffer depends on (TN,TK) only -- WN-invariant, see l20)\n\n",
-              PM, PN, PK, gs);
+  // Which scale-fragment path this binary was BUILT with, printed at RUN time. A build-time message() is useless
+  // here: build.sh redirects cmake's stdout to cmake.log, so an A/B could silently compare two identical binaries
+  // and the operator would have no way to notice. regs_per_thread is gated on the same macro, so the number moves
+  // with the path and is a second, independent witness.
+#if defined(PPU_SCALE_BCAST) && (PPU_SCALE_BCAST == 0)
+  const char* scale_path = "MATERIALISED (old path, PPU_SCALE_BCAST=0)";
+#else
+  const char* scale_path = "stride-0 BROADCAST (default)";
+#endif
+  std::printf("int1 sweep  M=%d N=%d K=%d gs=%d   (buffer depends on (TN,TK) only -- WN-invariant, see l20)\n"
+              "  scale fragment: %s   -> regs at (32,128,64) w32x64 = %d ScaleOnly / %d ScaleZero\n\n",
+              PM, PN, PK, gs, scale_path,
+              fold::regs_per_thread<32,128,64,32,64,false>, fold::regs_per_thread<32,128,64,32,64,true>);
   Buf b; make_buffers(b, gs);
 
   std::printf("== TK=128 group (shipped offline). A: vary TM at fixed TK. D: WN is free -- same buffer.\n");

@@ -70,6 +70,13 @@ cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" \
   -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" -DBENCH_QUANT="$QUANT" -DTSK="$TSK" \
   -DPPU_EXTRA_DEFS="${PPU_DEFS:-}" \
   >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
+# cmake's stdout is redirected above, so its message(STATUS ...) never reaches the terminal. Surface the extra
+# defines here instead -- telling someone to "check that the line appeared" when it cannot appear is worse than
+# not printing it at all.
+if [ -n "${PPU_DEFS:-}" ]; then
+  echo "PPU_DEFS applied: $PPU_DEFS"
+  grep -F "PPU_EXTRA_DEFS ->" cmake.log || echo "  WARNING: cmake did not report PPU_EXTRA_DEFS -- the defines did NOT reach the build"
+fi
 TARGET="${TARGET:-bench_cutlass_w4a16}"
 make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log
 
