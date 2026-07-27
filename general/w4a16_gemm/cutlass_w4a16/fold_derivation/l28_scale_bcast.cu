@@ -56,6 +56,38 @@ static bool probe(const char* tag) {
   auto frag_copy = make_fragment_like<cutlass::half_t>(sl0);
   auto frag_mma  = make_fragment_like<cutlass::half_t>(
                      Mma{}.get_thread_slice(0).partition_fragment_B(sS(_,_,Int<0>{})));
+  // Q1b -- is the fix a ONE-WORD change? partition_fragment_B is make_fragment_like(partition_B(...)) but on the
+  // COMPACT shape, dropping the source's strides; partition_B keeps them, including the zeros the k modes get from
+  // sS's extent-1 mode. If make_fragment_like(partition_B(...)) already lands at ne, the collective edit is just
+  // partition_fragment_B -> partition_B. The catch (L21) is that partition_B on a K-extent-1 tensor was measured to
+  // index OUT OF BOUNDS, which would mean some mode has a NON-zero stride and the replication survives.
+  auto pB_raw    = Mma{}.get_thread_slice(0).partition_B(sS(_,_,Int<0>{}));
+  auto frag_raw  = make_fragment_like<cutlass::half_t>(pB_raw);
+  const int reg_raw = int(cosize(frag_raw.layout()));
+  printf("      Q1b partition_B (strides kept): "); print(pB_raw.layout()); printf("\n");
+  printf("      Q1b make_fragment_like of it -> %d reg (ne=%d) %s\n", reg_raw, int(size(filter_zeros(sl0.layout()))),
+         reg_raw == int(size(filter_zeros(sl0.layout())))
+           ? "<-- ONE-WORD FIX: partition_fragment_B -> partition_B"
+           : "<-- replication survives, and cute's own comment says why");
+  // WHY it survives, straight out of layout.hpp: make_fragment_like "generates the 0th mode with LayoutLeft
+  // (PRESERVING STRIDE-0s) regardless of the reference layout" -- mode 0 only. So the two k val-bits keep their
+  // zeros and MMA_K does NOT. That single materialised mode IS the 4x.
+  printf("      Q1c frag_like(pB): "); print(make_fragment_like(pB_raw.layout())); printf("\n");
+  // THE FIX, and it hardcodes no bit position: inherit mode 0 from make_fragment_like (which already preserves the
+  // val-mode zeros) and put MMA_K's zero back. Scale is k-invariant by definition, so MMA_K is stride 0 by meaning,
+  // not by measurement.
+  // Naive patch FAILS: make_fragment_like's compact_order follows the REFERENCE strides, and MMA_K's reference
+  // stride is 0, so it sorts MMA_K ahead of MMA_N and hands MMA_N a non-compact 8. Zeroing mode 2 alone leaves
+  // cosize 26. Filter first so MMA_K is extent 1 during compaction, THEN put its zero back:
+  auto fl = make_fragment_like(pB_raw.layout());
+  auto naive = make_layout(pB_raw.shape(), make_stride(stride<0>(fl), stride<1>(fl), _0{}));
+  auto fz  = make_fragment_like(filter_zeros(pB_raw.layout()));
+  auto bcast = make_layout(pB_raw.shape(), make_stride(stride<0>(fz), stride<1>(fz), _0{}));
+  const int ne0 = int(size(filter_zeros(sl0.layout())));
+  printf("      Q1c naive patch  : "); print(naive);   printf("  -> cosize %2d reg  (compaction followed MMA_K first)\n",
+         int(cosize(naive)));
+  printf("      Q1c filter+patch : "); print(bcast); printf("  -> cosize %2d reg (ne=%d) %s\n",
+         int(cosize(bcast)), ne0, int(cosize(bcast)) == ne0 ? "<-- MINIMAL" : "<-- WRONG SIZE");
   const int n_slot = int(size(sl0));
   const int ne_src = int(size(filter_zeros(sl0.layout())));
   const int reg_copy = int(cosize(frag_copy.layout())), reg_mma = int(cosize(frag_mma.layout()));
@@ -89,6 +121,25 @@ static bool probe(const char* tag) {
   const int nmodes = __builtin_popcount(nmode_mask);
   printf("      => %d of 3 val bits move N (mask 0x%x); minimal mma-shaped scale fragment = %d * MMA_N reg\n",
          nmodes, nmode_mask, 1 << nmodes);
+
+  // Q4 -- THE LAST THING THAT COULD FAIL ON THE BOX. The collective feeds the fragment through
+  //     tCrS_copy_view = smem_thr_copy_S.retile_D(tCrS);   copy(tiled, tCsS(_,_,0,sk), tCrS_copy_view(_,_,0));
+  // so retile_D must accept a tensor whose MMA_K stride is 0, and the retiled view must still cover the copy's shape.
+  // Nothing above tests that: l28 up to here only checked the layout in isolation. If retile_D rejects it the build
+  // breaks; if it silently mis-maps, the scales are wrong and only the box would say so.
+  {
+    auto tCrS_bc   = make_tensor<cutlass::half_t>(bcast);
+    auto view      = thr0.retile_D(tCrS_bc);
+    auto dst_slice = view(_,_,Int<0>{});
+    auto src_slice = thr0.partition_S(sS)(_,_,Int<0>{},Int<0>{});
+    printf("      Q4 retile_D accepted. view "); print(view.layout()); printf("\n");
+    printf("         copy shapes: src %d vs dst %d %s | dst distinguishes %d reg (ne=%d) %s\n",
+           int(size(src_slice)), int(size(dst_slice)),
+           int(size(src_slice)) == int(size(dst_slice)) ? "MATCH" : "<-- MISMATCH, copy ill-formed",
+           int(cosize(dst_slice.layout())), ne_src,
+           int(cosize(dst_slice.layout())) <= ne_src ? "<-- copy visits ne registers" : "<-- still over-visits");
+    if (int(size(src_slice)) != int(size(dst_slice))) return false;
+  }
 
   // Q3, stated so it depends on NO index ordering. The minimal layout makes several mma slots share one
   // register; it is correct iff the equivalence classes it induces on slots are EXACTLY the classes induced by n.
