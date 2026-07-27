@@ -59,9 +59,16 @@ int main(int argc, char** argv) {
   const int ftm = getenv("FOLD_TM") ? atoi(getenv("FOLD_TM")) : (fbits == 1 ? 32 : 64);
   const int ftk = getenv("FOLD_TK") ? atoi(getenv("FOLD_TK")) : (fbits == 1 ? 128 : 64);
   const int ftn = getenv("FOLD_TN") ? atoi(getenv("FOLD_TN")) : (fbits == 1 ? 128 : 64);
-  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  TileShape=(%d,%d,%d) FoldF=%d | slots=%d delivery=%d\n",
-              M, N, gs, fbits, ftm, ftn, ftk, (32 * 8 / fbits) / ftk,
-              8 * (ftn / 32) * (ftk / 16), 16 * 8 / fbits);
+  // FOLD_BITPACK dispatches at (64,128,64) with a 32x64 warp tile, so the banner must say so -- printing the
+  // env-derived shape instead is how a run can look like it measured one tile while measuring another.
+  const bool bitpack_ = getenv("FOLD_BITPACK") != nullptr;
+  const int dtm = bitpack_ ? 64 : ftm, dtn = bitpack_ ? 128 : ftn, dtk = bitpack_ ? 64 : ftk;
+  const int dwn = bitpack_ ? 64 : 32;
+  // slots = WN*TK/32, MEASURED against partition_B on the builder's real TiledMma (fold_derivation/l5_slots.cu).
+  // The old form here was 8*(TN/32)*(TK/16) = TN*TK/64, which is only right when TN == 2*WN.
+  std::printf("[fold] M=K=%d N=%d gs=%d bits=%d  TileShape=(%d,%d,%d) warp=%dx%d FoldF=%d | slots=%d delivery=%d%s\n",
+              M, N, gs, fbits, dtm, dtn, dtk, 32, dwn, (32 * 8 / fbits) / dtk,
+              dwn * dtk / 32, 16 * 8 / fbits, bitpack_ ? "  [BITPACK]" : "");
 
   // q2 codes, transposed to [N][K] and packed 4/byte, then the OFFLINE FOLD (FoldTK=64) in preprocess.
   // LABELLED input (argv[4]): make the weight code SPELL OUT its own source index, so a wrong fold reads back as a
@@ -109,7 +116,7 @@ int main(int argc, char** argv) {
   // wants TWO logical columns inside each 32-bit word), so skip the five relayout steps and write the folded
   // buffer directly from the DERIVED map -- fold_derivation/l10_placement.cu, which regresses to 0/16384 against
   // the shipped offline on the TK=128 config before generating this one.
-  const bool bitpack = getenv("FOLD_BITPACK") != nullptr;
+  const bool bitpack = bitpack_;
   if (bitpack) {
     if (fbits != 1 || ftk != 64 || ftn != 128) {
       std::printf("  FOLD_BITPACK is derived for int1 TN=128 TK=64 only (got int%d TN=%d TK=%d)\n", fbits, ftn, ftk);
@@ -336,6 +343,17 @@ int main(int argc, char** argv) {
       // int1: TK is pinned at 128 (TK*Bits >= 128, see fold_derivation/). ftm picks between the two legal
       // tiles, exactly as the correctness ladder does -- these branches used to hardcode 64,128,64, which is
       // the F=4 shape the decode proved broken, so the printed MFU came from a DIFFERENT tile than the bad=0.
+      // FOLD_BITPACK must be dispatched at WN=64 here too. Without this branch the correctness check runs the
+      // bitpack config and the perf number comes from (32,128,128) at WN=32 -- the same cross-config mismatch that
+      // invalidated the int1 numbers in the first place, reintroduced in the very fix for it.
+      else if (bitpack && scale_only)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 128, 64, 32, 64, 3, uint1_t>(
+            pA.get(), pB1.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
+      else if (bitpack)
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 128, 64, 32, 64, 3, uint1_t>(
+            pA.get(), pB1.get(), pS.get(), pZ.get(), ppD.get(), psD.get(), pgM.get(),
+            PM, PN, PK, 1, gs, psd.get(), ps.data(), pOf.get(), pws.get(), pwsb, nullptr);
       else if (fbits == 1 && ftm == 32 && scale_only)
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 3, uint1_t>(
             pA.get(), pB1.get(), pS.get(), nullptr, ppD.get(), psD.get(), pgM.get(),
@@ -364,6 +382,7 @@ int main(int argc, char** argv) {
       run(); CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
       std::printf("  [acu] one launch: %s %s gs=%d\n",
                   use_i4 ? (ftk == 128 ? "int4 (64,64,128)" : "int4 (64,64,64)")
+                       : bitpack ? "int1 (64,128,64) w32x64"
                        : (fbits == 1 ? (ftm == 32 ? "int1 (32,128,128)" : "int1 (64,64,128)")
                                      : (ftk == 128 ? "int2 (64,64,128)" : "int2 (64,64,64)")),
                   scale_only ? "ScaleOnly" : "ScaleZero", gs);
@@ -378,6 +397,7 @@ int main(int argc, char** argv) {
     const double us = (double)ms * 1e3 / 30, tf = 2.0*PM*PN*PK / (us*1e-6) / 1e12;
     std::printf("  [fold perf] %-17s %-9s M=%d N=%d K=%d gs=%d : %8.2f us | %6.1f TFLOP/s (%4.1f%% MFU)\n",
                 use_i4 ? (ftk == 128 ? "int4 (64,64,128)" : "int4 (64,64,64)")
+                       : bitpack ? "int1 (64,128,64) w32x64"
                        : (fbits == 1 ? (ftm == 32 ? "int1 (32,128,128)" : "int1 (64,64,128)")
                                      : (ftk == 128 ? "int2 (64,64,128)" : "int2 (64,64,64)")),
                 scale_only ? "ScaleOnly" : "ScaleZero",
