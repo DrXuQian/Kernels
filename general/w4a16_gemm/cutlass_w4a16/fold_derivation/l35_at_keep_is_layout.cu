@@ -17,18 +17,18 @@
 //   nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l35_at_keep_is_layout.cu -o l35 && ./l35
 #include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
 #include <cstdio>
-using cutlass::MixGemmEmit; using cutlass::MixGemmInt1Emit;
+using cutlass::MixGemmEmit; using cutlass::MixGemmChunkEmit;
 int main(){
   constexpr int MMA_K=4, NPAIR=16; long bad=0;
   for (int c=0;c<MMA_K;++c) for (int v=0;v<4;++v) for (int t=0;t<NPAIR;++t) {
     const int e=MixGemmEmit<1>::index(t,v);
-    const bool hk = ((e/8)%MMA_K)==c, ck = MixGemmInt1Emit<0,4>::keep(t,v) && c==0 ? true : false;
+    const bool hk = ((e/8)%MMA_K)==c, ck = MixGemmChunkEmit<1, 0,4>::keep(t,v) && c==0 ? true : false;
     // compare per-chunk via the templated keep
     bool ck2=false; int ca=-1;
-    if (c==0){ck2=MixGemmInt1Emit<0,4>::keep(t,v); ca=MixGemmInt1Emit<0,4>::at(t,v);}
-    if (c==1){ck2=MixGemmInt1Emit<1,4>::keep(t,v); ca=MixGemmInt1Emit<1,4>::at(t,v);}
-    if (c==2){ck2=MixGemmInt1Emit<2,4>::keep(t,v); ca=MixGemmInt1Emit<2,4>::at(t,v);}
-    if (c==3){ck2=MixGemmInt1Emit<3,4>::keep(t,v); ca=MixGemmInt1Emit<3,4>::at(t,v);}
+    if (c==0){ck2=MixGemmChunkEmit<1, 0,4>::keep(t,v); ca=MixGemmChunkEmit<1, 0,4>::at(t,v);}
+    if (c==1){ck2=MixGemmChunkEmit<1, 1,4>::keep(t,v); ca=MixGemmChunkEmit<1, 1,4>::at(t,v);}
+    if (c==2){ck2=MixGemmChunkEmit<1, 2,4>::keep(t,v); ca=MixGemmChunkEmit<1, 2,4>::at(t,v);}
+    if (c==3){ck2=MixGemmChunkEmit<1, 3,4>::keep(t,v); ca=MixGemmChunkEmit<1, 3,4>::at(t,v);}
     const int ha = ((e%8)+8*(e/(8*MMA_K)))/2;
     if (ck2!=hk || (hk && ca!=ha)) { ++bad; if(bad<=4) printf("  MISMATCH c%d t%2d v%d: keep %d/%d at %d/%d\n",c,t,v,ck2,hk,ca,ha); }
   }
