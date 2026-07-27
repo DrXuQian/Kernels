@@ -64,7 +64,14 @@ int main(int argc, char** argv) {
   // Declared up here, not next to the buffers: the BANNER prints it and the golden further down uses it, and the
   // banner comes first. (The local syntax gate caught this after the first placement compiled only for the golden.)
   const bool svary = getenv("FOLD_SVARY") != nullptr;
-  auto sc_at = [](int g, int n) { return 1.f + 0.0625f * (float)((n + g) & 7); };
+  // PERIOD 13, NOT 8, AND THAT IS THE WHOLE POINT. My first pattern was 1 + (1/16)*((n+g)&7) -- period 8 in n --
+  // while the displacements a broken broadcast can actually produce are 8 (the val mode's n-bit) and 32 (MMA_N).
+  // Both are multiples of 8, so that pattern gave the SAME scale after a misassignment and the probe was blind to
+  // exactly the errors it existed to catch. It reported bad=0 on the box, which proved nothing.
+  // 13 is coprime to 8/16/32, so the minimum |delta| is 0.0625 at offset 8, 0.125 at 16 and 0.25 at 32 -- all above
+  // the 0.02 tolerance. Values are 1.0 .. 1.75 in steps of 1/16, exact in fp16. g carries a coefficient too, so a
+  // scale-GROUP misassignment shows up as well.
+  auto sc_at = [](int g, int n) { return 1.f + 0.0625f * (float)((5 * n + 3 * g) % 13); };
   const bool bitpack_ = getenv("FOLD_BITPACK") != nullptr;
   const int dtm = bitpack_ ? 64 : ftm, dtn = bitpack_ ? 128 : ftn, dtk = bitpack_ ? 64 : ftk;
   const int dwn = bitpack_ ? 64 : 32;
@@ -302,7 +309,12 @@ int main(int argc, char** argv) {
           label_mode == 2 ? "   (got = the k-field the kernel actually read)" : ""); ++shown; }
     }
   }
-  std::printf("  fold int2 TK=64 vs host codes: bad=%d/%d %s\n", bad, M*N, bad == 0 ? "MATCH" : "MISMATCH");
+  // Say WHICH width and tile actually ran. The literal "int2 TK=64" here printed for every configuration, including
+  // the int1 BITPACK run at (64,128,64) -- the same class of "the log does not name what ran" problem that
+  // invalidated a round of MFU numbers, just in the correctness line instead of the perf line.
+  std::printf("  fold int%d TK=%d (%d,%d,%d) w32x%d vs host %s: bad=%d/%d %s\n",
+              fbits, dtk, dtm, dtn, dtk, dwn, svary ? "codes x scale(g,n)" : "codes",
+              bad, M*N, bad == 0 ? "MATCH" : "MISMATCH");
 
   // PERF (only meaningful once correct): the whole point of the fold is A-smem = TileM*TK*2 at TK=64 instead of 128,
   // i.e. int2 should move from its TK=128 ceiling (37.1% gs=32 / 30.9% gs=16) toward int4@TK64's measured 55.8%/53.1%.
