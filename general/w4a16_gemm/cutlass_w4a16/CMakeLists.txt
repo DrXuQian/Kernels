@@ -229,3 +229,13 @@ cutlass_example_add_executable(
   test_w2a16_real.cu
 )
 target_compile_options(test_w2a16_real PRIVATE -w)
+
+# WIDTH ISOLATION for acu: int1/int2/int4 at ONE shared tile config, so bit width is the only variable. int1's best
+# (50.2%) and int4's production config (55.9%) run different tiles, and every model says the gap should NOT be width
+# (same cvt/mma, same regs, HBM favours int1, and the fold makes the B smem bank pattern identical by construction).
+#   Build: TARGET=test_width_acu ./build.sh ; run: ./<bin> [bits] [M] [N] [K] [gs] ; ACU_ONE=1 for a single launch
+cutlass_example_add_executable(
+  test_width_acu
+  test_width_acu.cu
+)
+target_compile_options(test_width_acu PRIVATE -w)
