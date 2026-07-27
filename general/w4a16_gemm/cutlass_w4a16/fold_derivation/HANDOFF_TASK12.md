@@ -31,6 +31,36 @@ written once per chunk, nothing straddles. **No high-plane predicate is needed**
 `MixGemmChunkEmit<2, Chunk, NChunk>::keep/at` verbatim. That is what makes this a small change rather than a fourth
 hand-derived index map.
 
+## Two corrections found before writing any code
+
+**(a) Why `TK=256` came back bit-identical, chunked and unchunked. Not a skipped branch inside the fold collective --
+the fold collective is not selected at all.** `moe_grouped_ppu.cuh` picks the schedule from
+`MOEG_FOLD = 32/(TK*Bits/8)`, and wraps in `KernelAiuFold` only when `MOEG_FOLD > 1`. int1 at `TK >= 256` already has a
+32 B contiguous K-run, so `MOEG_FOLD == 1` and the plain `KernelAiuMultistageMixedInputFinegrained*` schedule is used.
+`PPU_B_CHUNK` exists ONLY in `ppu_mma_aiu_fold.hpp`, so it cannot apply: the A/B compared the same non-fold kernel
+twice. Nothing to fix in the chunk code. To chunk int1 at `TK=256` on the single-plane path the chunking has to go into
+the non-fold collective too -- which is the same work as this task, since the 2-plane collective is also non-fold.
+
+**(b) `FragL = decltype(tCrB_mma.layout())` -- what step 1 below used to say -- is NOT valid here, and the fold path
+cannot see the difference.** `l39_2plane_frag.cu`: every fold-path config has `MMA_N == MMA_K == 4`, so the fragment's
+`MMA_N` stride 32 is simultaneously `8*MMA_K` and `8*MMA_N` and **no fold measurement distinguishes k-inner from
+k-outer**. At the 2-plane's locked `TK=256` the fragment is `((2,2,2),2,16):((1,2,4),128,8)`: `MMA_N` stride 128,
+`MMA_K` stride 8, so one copy step's atoms span two n-groups 128 apart and `size(FragLayout)` is 256 against int2's
+`kOut = 64`. `MixGemmChunkEmit`'s `static_assert(size(FragLayout) == kOut)` therefore rejects it, correctly: the
+emission index space is ONE DELIVERY, not the whole fragment.
+
+What the emission space actually is cannot be settled offline -- this collective's `tiled_mma` carries the builder's
+`PermutationM/N`, and `tCrB_load` is partitioned through the **int8 `m16n16k32`** atom, not the fp16 `k16` one (hence
+`CPY_K = 2` for the low plane at `TK=256`, and `P2_DIV = 2`). A `PPU_MMA_PROBE=1` block in the 2-plane collective now
+prints `tCrB_mma`, `tCrB_load`, `tCrB_copy_view`, `tCrB2_load` and `cvt_in`, plus the `MMA_N` stride beside `8*MMA_K`
+and `8*MMA_N`. **Run that first** -- the same "let the kernel report its own indices" ladder that settled the
+single-plane gate after three wrong guesses. Note the existing 2-plane convert is numerically CORRECT (Q3 all MATCH),
+so if `cvt_in`'s mode-1 stride disagrees with `tCrB_mma`'s `MMA_N` stride, the wrong object is my model, not the code.
+
+```
+PPU_DEFS=PPU_MMA_PROBE=1 TARGET=test_q3_bconcat_bench ./build.sh && ./test_q3_bconcat_bench 2048 4096 4096 16 2>&1 | head -30
+```
+
 ## Recipe
 
 1. **`fast_numeric_conversion_for_mix_gemm.h`, `MixGemm2Plane_uint2_uint1`.** Add
