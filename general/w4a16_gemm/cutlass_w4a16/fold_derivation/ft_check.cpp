@@ -38,10 +38,18 @@ int main(){
   // int4's bound is 8x looser, so amort=4 IS reachable there -- the untried lever on the shipped path.
   static_assert(deliverable<4,64,32,64,32> && regs_ok<64,64,32,64,32> && regs_per_thread<64,64,32,64,32> == 116,
                 "int4 (64,64,32) w64x32 must be legal at amort=4");
-  printf("  int1 amort=4 : %d regs, legal shapes exist but all over budget -> capped at amort=2\n",
+  printf("  int1 amort=4 : %d regs, legal shapes exist but all over 256 -> capped at amort=2\n",
          regs_per_thread<64,128,64,64,64>);
-  printf("  int4 amort=4 : (64,64,32) w64x32 = %d regs, deliverable -> REACHABLE, untried\n",
+  printf("  int4 amort=4 : (64,64,32) w64x32 = %d regs, deliverable -> reachable\n",
          regs_per_thread<64,64,32,64,32>);
+  // ...and MEASURED to be worth nothing. w64x64 s2 (the only int1 shape at cvt/mma=2) ran at 272 regs and scored
+  // 48.7% against its cvt/mma=4 / 176-reg peer's 48.4% at the SAME blk=13. So the cap above is harmless and the
+  // int4 lever is retracted; cvt_per_mma_target records where the return actually stops.
+  static_assert(cvt_per_mma_target == 4, "the B convert path stops binding at cvt/mma=4; below that is +0.3 points");
+  printf("  BUT MEASURED: cvt/mma=2 buys +0.3 points over cvt/mma=4 at equal blk -> target is %d, not lower;\n",
+         cvt_per_mma_target);
+  printf("               the amort=2 cap is harmless and the int4 amort=4 lever is RETRACTED.\n");
+  printf("  and 272 regs cost nothing at equal blk (288 -> -2.6, 320 -> -19.9), so the knee is above 272, not 256.\n");
   printf("\nall compiled.\n");
   return 0;
 }

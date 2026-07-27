@@ -184,20 +184,36 @@ inline constexpr bool regs_ok = regs_per_thread<TM, TN, TK, WM, WN, Zero> <= 256
 // quantised-B analogue of arithmetic intensity, at the register file rather than at HBM -- and it is why a
 // prescription that bought registers by cutting WM was exactly backwards.
 //
-// SO THE MODEL IS THREE-TIER, in priority order:
-//     1. regs > 256          -> spills, collapses      (23.0% / 39.0% / 5.8% / 4.5%)
-//     2. maximise WM/16      -> converter amortisation (the 39.8 / 40.9 cliff)
-//     3. then maximise blocks                          (orders within a WM group)
+// cvt/mma IS A THRESHOLD, NOT A RATE -- and the register cliff is not at 256. Both corrections come from ONE
+// measurement: w64x64, the only int1 shape that reaches cvt/mma=2, run against its cvt/mma=4 peer at EQUAL blk.
+//     (64,128,64) w32x64 s2   cvt/mma=4  regs=176  blk=13  ->  48.4%
+//     (64,128,64) w64x64 s2   cvt/mma=2  regs=272  blk=13  ->  48.7%
+// Halving the converter work AND spending 96 extra registers nets +0.3 points. So:
 //
-// int1 IS STRUCTURALLY CAPPED AT amort=2. Reaching amort=4 needs WM=64, and under the delivery bound WN*TK >= 4096
-// the register minimum over the whole legal space is 272: with WN*TK fixed the B+scale terms are constant at 80 and
-// 2*WN + TK is minimised at TK=2*WN, giving TK=64/WN=32 or TK=128/WN=32 -- both 272 > 256. int4's bound is 8x
-// looser (WN*TK >= 1024), so amort=4 is reachable there at (64,64,32) w64x32 = 116 regs, against the 55.9%
-// production config's amort=2. That is an untried lever on the SHIPPED int4 path.
+//   (a) cvt/mma=8 is throughput-bound on the B convert path, and cvt/mma<=4 is not. The signature is occupancy
+//       sensitivity, measured over the same ~5x blk span at regs<=176, TK<=128:
+//           cvt/mma=8 : blk  8 -> 32   MFU 38.4 - 39.8%   spread 1.4 points   FLAT -- more blocks do nothing
+//           cvt/mma=4 : blk  4 -> 23   MFU 40.8 - 50.2%   spread 9.4 points   blocks ARE the lever
+//       A flat response to 4x the occupancy is what a throughput ceiling looks like. Once past it, cutting cvt/mma
+//       further buys nothing, which is why WM=64 gains +0.3 and not another 10 points.
+//
+//   (b) the register penalty is GRADED and its knee is above 272, not at 256. Against a same-blk 176-reg peer:
+//           272 regs -> +0.3 points (nothing)      288 regs -> -2.6      320 regs -> -19.9
+//       So 256 was a guess that happened to sit below the real knee. Treat >288 as the danger zone.
+//
+// THE PRESCRIPTION, and int1's measured optimum is exactly it: get cvt/mma to 4 (WM >= 32), stay under ~288 regs,
+// then maximise blocks -> w32x64 s2 at TK=64.
+//
+// RETRACTED: "int1 is capped at amort=2, and int4 (64,64,32) w64x32 is an untried lever." The cap is real (WM=64
+// needs 272 regs at every shape legal under WN*TK >= 4096; asserted in ft_check) but it is HARMLESS, because
+// cvt/mma=2 is worth +0.3 points. int4's production config is already at cvt/mma=4, so pushing it to 2 has nothing
+// to gain either -- do not spend a box run on it.
 template <int WM>
 inline constexpr int amort = WM / 16;                 // mma instructions each B fragment element feeds
 template <int WM>
 inline constexpr int cvt_per_mma = 128 / WM;          // B elements converted per mma instruction issued
+// Below this the B convert path stops being the constraint; above it, occupancy cannot compensate.
+inline constexpr int cvt_per_mma_target = 4;
 
 template <int Bits, int TN, int TK, int WM, int WN>
 inline constexpr bool deliverable = (Bits <= 0 || Bits >= 8) ? true : ((16 * 8 / Bits) <= (WN * TK / 32));

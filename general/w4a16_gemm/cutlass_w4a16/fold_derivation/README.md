@@ -282,16 +282,46 @@ Each B fragment feeds `WM/16` mma instructions down M, so `WM/16` is the convert
 means every converted element feeds exactly one mma. This is the quantised-B analogue of arithmetic intensity, at
 the register file rather than at HBM — and it is why buying registers by cutting `WM` was exactly backwards.
 
-So the model is **three-tier**, in priority order: (1) stay under 256 regs, (2) maximise `WM/16`, (3) then maximise
-`blocks`. `l26` prints `cvt/mma` for all 20 measured points; it is 4.00 for every `WM=32` row and 8.00 for every
-`WM=16` row.
+### `cvt/mma` is a threshold, not a rate — and the register knee is not at 256
 
-**int1 is structurally capped at `amort=2`.** Reaching `amort=4` needs `WM=64`, and under the delivery bound
-`WN*TK >= 4096` the register minimum over the whole legal space is 272: with `WN*TK` fixed the B and scale terms are
-constant at 80, and `2*WN + TK` is minimised at `TK = 2*WN`, giving `TK=64/WN=64` or `TK=128/WN=32` — both 272 > 256.
-`ft_check.cpp` asserts this. int4's bound is 8× looser (`WN*TK >= 1024`), so `amort=4` **is** reachable there at
-`(64,64,32) w64x32` = 116 regs, against the 55.9% production config's `amort=2`. That is an untried lever on the
-shipped int4 path.
+The prediction from the model above was that `w64x64` (`cvt/mma=2`, the only int1 shape that reaches it) would
+collapse on its 272 estimated registers. It ran, and the result corrects the model twice over:
+
+| config | cvt/mma | regs | blk | measured |
+|---|---|---|---|---|
+| `(64,128,64) w32x64 s2` | 4 | 176 | 13 | 48.4% |
+| `(64,128,64) w64x64 s2` | **2** | **272** | 13 | **48.7%** |
+
+Half the converter work *plus* 96 extra registers, at identical occupancy, nets **+0.3 points**.
+
+**(a) `cvt/mma=8` is throughput-bound on the B convert path; `cvt/mma<=4` is not.** The signature is occupancy
+sensitivity, over the same ~5× `blk` span at `regs<=176`, `TK<=128`:
+
+| | `blk` span | MFU | spread |
+|---|---|---|---|
+| `cvt/mma=8` | 8 → 32 (4×) | 38.4 – 39.8% | **1.4 pts — flat** |
+| `cvt/mma=4` | 4 → 23 (5.8×) | 40.8 – 50.2% | 9.4 pts |
+
+A flat response to 4× the occupancy is what a throughput ceiling looks like. Once past it, there is nothing left for
+a smaller `cvt/mma` to recover — which is why `WM=64` returns +0.3 and not another 10 points.
+
+**(b) the register penalty is graded, and its knee sits above 272.** Against a same-`blk` 176-reg peer:
+
+| regs | cost |
+|---|---|
+| 272 | +0.3 (nothing) |
+| 288 | −2.6 |
+| 320 | −19.9 |
+
+256 was a guess that happened to land below the real knee. Treat >288 as the danger zone.
+
+**Prescription:** reach `cvt/mma=4` (`WM >= 32`), stay under ~288 regs, then maximise `blocks`. int1's measured
+optimum `w32x64 s2` at `TK=64` is exactly that.
+
+**Retracted:** *"int1 is capped at `amort=2`, and int4 `(64,64,32) w64x32` is an untried lever."* The cap is real —
+`WM=64` needs 272 regs at every shape legal under `WN*TK >= 4096`, asserted in `ft_check.cpp` — but it is
+**harmless**, because `cvt/mma=2` is worth +0.3 points. int4's production config is already at `cvt/mma=4`, so there
+is nothing to gain there either. Do not spend a box run on it.
 
 ## Step 2 was going to interleave `sS`/`sZ`. It should not be built (`l27_scale_contiguity.cu`)
 

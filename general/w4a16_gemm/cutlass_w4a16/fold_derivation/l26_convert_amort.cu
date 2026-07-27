@@ -22,6 +22,10 @@
 // This is the quantised-B analogue of arithmetic intensity, at the register level rather than at HBM, and it is
 // why a prescription that minimised registers by cutting WM was exactly backwards.
 //
+// BUT IT IS A THRESHOLD, NOT A RATE -- see the decisive point at the bottom of main(). Pushing cvt/mma from 4 to 2
+// (w64x64, the only int1 shape that reaches it) is worth +0.3 points at equal blk. cvt/mma=8 is throughput-bound
+// and flat in occupancy; cvt/mma=4 is latency-bound and occupancy is the lever; below 4 there is nothing left.
+//
 //   nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l26_convert_amort.cu -o l26 && ./l26
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
@@ -79,9 +83,21 @@ int main() {
   count<32,128,128,32,64>(39.0);  count<32,128,256,32,32>(23.0);
   printf("\n  cvt/mma is 8.00 for every WM=16 row and 4.00 for every WM=32 row -- WN and TK cancel exactly,\n");
   printf("  and the 39.8/40.9 gap between the groups is where that factor of 2 shows up.\n");
-  printf("\n  == would WM=64 be better still (amort 4)? the register budget answers\n");
-  count<64,128, 64,64,64>(0.0);
-  printf("  272 regs > 256, so WM=64 spills at WN=64/TK=64. WM=32 is the largest amortisation the budget allows,\n");
-  printf("  and int1's delivery bound pins WN>=64 at TK=64, so w32x64 is FORCED -- which is the measured optimum.\n");
+  printf("\n  == THE DECISIVE POINT, and it corrects the two claims above. w64x64 is the only int1 shape at\n");
+  printf("     cvt/mma=2, and it ran -- 272 regs did NOT collapse:\n");
+  count<64,128, 64,64,64>(48.7);
+  printf("     against its cvt/mma=4 peer at the SAME blk=13:\n");
+  count<64,128, 64,32,64>(48.4);
+  printf("\n  Half the converter work plus 96 extra registers = +0.3 points. So cvt/mma is a THRESHOLD, not a rate,\n");
+  printf("  and the register knee is above 272 rather than at 256. The signature is occupancy sensitivity, over the\n");
+  printf("  same ~5x blk span at regs<=176 and TK<=128:\n\n");
+  printf("      cvt/mma=8 : blk  8 -> 32   MFU 38.4 - 39.8%%   spread 1.4 pts   FLAT -- throughput-bound on B cvt\n");
+  printf("      cvt/mma=4 : blk  4 -> 23   MFU 40.8 - 50.2%%   spread 9.4 pts   latency-bound -- blocks are the lever\n");
+  printf("\n  A flat response to 4x the occupancy is what a throughput ceiling looks like; once past it there is\n");
+  printf("  nothing left for a smaller cvt/mma to recover. Register penalty, vs a same-blk 176-reg peer:\n");
+  printf("      272 -> +0.3 (nothing)      288 -> -2.6      320 -> -19.9\n");
+  printf("\n  PRESCRIPTION: reach cvt/mma=4 (WM>=32), stay under ~288 regs, then maximise blocks. int1's measured\n");
+  printf("  optimum w32x64 s2 at TK=64 is exactly that, so its amort=2 cap is harmless -- and the int4 amort=4\n");
+  printf("  lever proposed off the earlier model is RETRACTED, since int4 is already at cvt/mma=4.\n");
   return 0;
 }
