@@ -29,6 +29,35 @@
 // the code rather than inferred, and it is the only quantitative claim here that a box run should be asked to
 // confirm.
 //
+// CORRECTION 3 -- MEASURED ON ppu001, AND IT OVERTURNED MY MODEL. I predicted that halving TK would halve the
+// scale cost, because SK = TK/gs halves. Wrong, and the reason is one line of algebra I should have done first:
+//
+//     total reloads over the whole K  =  (K/TK) * SK  =  (K/TK) * (TK/gs)  =  K/gs      -- INDEPENDENT of TK
+//     reloads per mma atom            =  1/APG        =  16/gs                          -- also independent of TK
+//
+// Halving TK halves the reloads per k-iteration and doubles the number of iterations. Net zero. TK is not a lever on
+// the scale path at all.
+//
+// int1, M=2048 N=K=4096, MFU:
+//                        TK=128 (WN=32)   TK=64 (WN=64)
+//     ScaleOnly gs=32        42.0             46.4        +4.4
+//     ScaleOnly gs=16        37.3             38.9        +1.6
+//     ScaleZero gs=32        36.4             41.2        +4.8
+//     ScaleZero gs=16        30.4             31.2        +0.8
+//
+// The gs=32 gain is real but comes from OCCUPANCY (blocks 8 -> 9) and a smaller A tile per stage, not from scale. And
+// the gs=16 penalty got WORSE in absolute time at the smaller TK: +57.7us against +41.8us for ScaleOnly, +106.8
+// against +73.8 for ScaleZero. At gs=16, APG = gs/16 = 1 means every mma atom triggers a reload, and TK=64 leaves
+// only 4 atoms per iteration to hide it behind where TK=128 has 8. Fewer atoms, worse overlap.
+//
+// SO, CORRECTED: for the scale path a LARGER TK is better, the opposite of what I claimed. The two levers that
+// remain are
+//   1. cheaper per reload -- sS and sZ are separate smem tensors and the FINE branch issues two copies from the same
+//      group index. Interleaving them into one tensor with a trailing extent-2 mode makes it one copy of twice the
+//      width. Zero costs 51-107us here, i.e. up to 20% of runtime at TK=64/gs=16, so this is the biggest single item.
+//   2. better hiding -- more mma atoms per scale group, or issuing the reload earlier in the iteration.
+// And for int1 at gs=16 specifically, TK=128 plus the zero interleave is the more promising combination, not TK=64.
+//
 //   nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include l21_scalezero_shapes.cu -o l21 && ./l21
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
