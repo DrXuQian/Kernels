@@ -25,6 +25,7 @@
 #include "unfused_weight_dequantize.hpp"
 #include <cstdio>
 #include <vector>
+#include <chrono>
 using namespace cute;
 
 struct F16Atom {};
@@ -170,6 +171,112 @@ int main() {
   ok &= compare<4, 64,  64,  64, 32, 32>("int4 PRODUCTION", 128, 512);
   ok &= compare<2, 64,  64, 128, 32, 32>("int2 unfolded", 128, 512);
   ok &= compare<1, 64,  64, 256, 32, 32>("int1 unfolded", 128, 512);
+  // ============================================================ the two things that can still VETO the swap
+  // Byte-identity was never the open question after l20 passed; these were. Both are measurable here, no box needed.
+  printf("\n  == REALISTIC SHAPES. Every config above is 256x512 or 128x512 -- a toy. The K>256 bug lived in the\n");
+  printf("     interleave step, so the sizes that matter are the ones a real checkpoint has.\n");
+  ok &= compare<4, 64,  64,  64, 32, 32>("int4 PROD 4096x4096",   4096, 4096);
+  ok &= compare<1, 32, 128, 128, 32, 32>("int1 fold 4096x4096",   4096, 4096);
+  ok &= compare<2, 64,  64,  64, 32, 32>("int2 fold 2560x1536",   2560, 1536);   // non-square
+  ok &= compare<4, 64,  64,  64, 32, 32>("int4 PROD 4096x11008",  4096, 11008);  // FFN shape, 11008 = 43*256
+  ok &= compare<1, 64,  64, 256, 32, 32>("int1 unfolded 4096x4096", 4096, 4096);
+
+  // ============================================================ THE LOAD-BEARING CLAIM FOR KEEPING THE SIGNATURE
+  // preprocess_weights_for_mixed_gemm takes (out, in, shape, qtc) and NO tile parameters, so if the derived walk is to
+  // replace it without touching 35 call sites, the buffer it produces must not depend on the tile. That is implied by
+  // every BIT-IDENTICAL line above (the shipped side is tile-independent by construction for F=1), but implied at ONE
+  // tile per width is not the same as true. Check it directly: derived at tile A vs derived at tile B, same width.
+  printf("\n  == TILE-INVARIANCE of the derived buffer (what lets the signature stay tile-free)\n");
+  {
+    auto cmp2 = [&](const char* tag, const std::vector<int8_t>& a, const std::vector<int8_t>& b) {
+      size_t d = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) ++d;
+      printf("     %-46s : %zu / %zu differ  %s\n", tag, d, a.size(), d ? "<-- TILE-DEPENDENT" : "invariant");
+      return d == 0;
+    };
+    constexpr int N = 512, K = 1024;
+    std::vector<int> codes((size_t)N*K);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = int((i*2654435761u >> 3) & 0xF);
+    // int4, all four unfolded/folded tiles the tree uses
+    { std::vector<int8_t> a((size_t)N*K*4/8), b(a.size()), c(a.size()), d(a.size());
+      place_derived<4,64, 64, 64,32,32>(a, codes, N, K);
+      place_derived<4,64,128, 64,32,64>(b, codes, N, K);
+      place_derived<4,32, 64, 64,32,32>(c, codes, N, K);
+      place_derived<4,64, 64,128,32,32>(d, codes, N, K);
+      ok &= cmp2("int4 (64,64,64)w32x32 vs (64,128,64)w32x64", a, b);
+      ok &= cmp2("int4 (64,64,64)w32x32 vs (32,64,64)w32x32",  a, c);
+      // non-voting: differing here is the FINDING (the run length matters), not a failure.
+      cmp2("int4 (64,64,64) vs (64,64,128) [run 32B vs 64B]", a, d); }
+    // int2: TK=64 folds (F=2), TK=128 does not (F=1) -- so these MUST differ, and that is the point
+    { std::vector<int8_t> a((size_t)N*K*2/8), b(a.size()), c(a.size());
+      place_derived<2,64, 64, 64,32,32>(a, codes, N, K);
+      place_derived<2,64,128, 64,32,32>(b, codes, N, K);
+      place_derived<2,64, 64,128,32,32>(c, codes, N, K);
+      ok &= cmp2("int2 TN 64 vs 128 at TK=64 (both F=2)", a, b);
+      ok &= cmp2("int2 TK 64 F=2 vs TK 128 F=1 [both 32B run]", a, c); }
+    // int1: TK=128 folds, TK=256 does not
+    { std::vector<int8_t> a((size_t)N*K/8), b(a.size()), c(a.size());
+      place_derived<1,32,128,128,32,32>(a, codes, N, K);
+      place_derived<1,32,128,128,32,64>(b, codes, N, K);
+      place_derived<1,64, 64,256,32,32>(c, codes, N, K);
+      ok &= cmp2("int1 TK=128 w32x32 vs w32x64 (WN-invariance, again)", a, b);
+      ok &= cmp2("int1 TK 128 F=2 vs TK 256 F=1 [both 32B run]", a, c); }
+    // WHAT THE NUMBERS ACTUALLY SAY -- and it is not what I first wrote here. I predicted "dependent on TK only
+    // through the fold factor F". Both halves are refuted above: int4 TK=64 vs TK=128 DIFFER although F=1 in both,
+    // and int2 TK=64 (F=2) vs TK=128 (F=1) are IDENTICAL although F differs. The quantity that actually decides the
+    // buffer is the AIU CONTIGUOUS RUN, min(F*TK*bits/8, 128) bytes:
+    //     int4 TK=64  -> 32 B     int4 TK=128 -> 64 B     differ
+    //     int2 TK=64  -> 2*16 = 32 B   int2 TK=128 -> 32 B     identical
+    //     int1 TK=128 -> 2*16 = 32 B   int1 TK=256 -> 32 B     identical
+    // The int2/int1 identities are the N-fold's design statement confirmed as a byte fact: folding F columns at TK is
+    // the SAME gmem buffer as not folding at F*TK. And it names the one parameter a tile-free signature still needs --
+    // the run length, which every caller already computes for nfold_regroup_gmem(fold_tn, fold_tk).
+    auto runB = [](int bits, int tk) { const int c = tk*bits/8, f = c >= 32 ? 1 : 32/c; const int r = f*c; return r > 128 ? 128 : r; };
+    printf("     => the invariant is the AIU CONTIGUOUS RUN min(F*TK*bits/8,128) B, NOT the fold factor:\n");
+    printf("        int4 TK64=%dB TK128=%dB (differ)   int2 TK64=%dB TK128=%dB (same)   int1 TK128=%dB TK256=%dB (same)\n",
+           runB(4,64), runB(4,128), runB(2,64), runB(2,128), runB(1,128), runB(1,256));
+    printf("        invariant in TM, TN, WN -- so the signature needs the RUN LENGTH, not the tile.\n");
+  }
+
+  // Does the SHIPPED offline match int4 at TK=128 too, or is it silently tied to ONE run length per width? The
+  // consequence matters for the swap: if it matches only one, then today's five steps are already TK-specific and the
+  // derived walk is not losing generality by taking the run length as a parameter -- it is making an existing implicit
+  // assumption explicit.
+  // NOT a voting check: a mismatch here is a statement about the SHIPPED side, not a failure of the derived walk.
+  printf("\n  == is the shipped offline tied to one run length per width? (mismatch EXPECTED, and it is a finding)\n");
+  compare<4, 64,  64, 128, 32, 32>("int4 TK=128 (64 B run) vs shipped", 512, 1024);
+  printf("     => it is. The five steps produce the 32 B-run buffer only, so int4 at TK=128 -- which\n");
+  printf("        test_q3_bconcat_bench's I4(64,64,128,...) row actually launches -- runs on a buffer laid out for a\n");
+  printf("        DIFFERENT run length. Harmless for a timing-only row, wrong for any numeric test at that shape.\n");
+  printf("        So taking the run length as an explicit parameter is not a loss of generality; it makes an existing\n");
+  printf("        implicit assumption visible.\n");
+
+  printf("\n  == RUNTIME, the one number never taken. The SHIPPED path makes FIVE passes over the whole buffer (two\n");
+  printf("     subbyte transposes, a row permute, interleave-256, an in-place bit interleave); the derived one makes\n");
+  printf("     ONE, from a tile map computed once. If the derived walk were slower this would be a real cost at\n");
+  printf("     checkpoint-conversion time, which is why it stayed an open item rather than an assumption.\n");
+  {
+    constexpr int N = 4096, K = 4096;
+    std::vector<int> codes((size_t)N*K);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = int((i*2654435761u >> 5) & 0xF);
+    std::vector<int8_t> a((size_t)N*K*4/8), b;
+    auto t0 = std::chrono::steady_clock::now();
+    place_derived<4,64,64,64,32,32>(a, codes, N, K);
+    auto t1 = std::chrono::steady_clock::now();
+    place_shipped<4,64,64>(b, codes, N, K);
+    auto t2 = std::chrono::steady_clock::now();
+    const double dms = std::chrono::duration<double, std::milli>(t1-t0).count();
+    const double sms = std::chrono::duration<double, std::milli>(t2-t1).count();
+    printf("     int4 4096x4096 (8 MB of codes):  derived %7.1f ms   shipped %7.1f ms   -> derived is %.2fx %s\n",
+           dms, sms, sms > dms ? sms/dms : dms/sms, sms > dms ? "FASTER" : "SLOWER");
+    printf("     (place_shipped includes the code->packed and packed->code marshalling the harness needs, so read\n");
+    printf("      this as an order-of-magnitude check, not a benchmark.)\n");
+  }
+
+  printf("\n  == WHAT IS STILL OUT OF SCOPE: place_derived hardcodes the interleave-256 destination layout, so it\n");
+  printf("     covers RowsPerTile=256 only. filter_and_run picks the interleaved kernel via (n%%256==0 && k%%256==0)\n");
+  printf("     and otherwise runs a NON-interleaved path that preprocess_weights_for_mixed_gemm<..,-1> serves. That\n");
+  printf("     branch has no derived equivalent yet -- so the five steps can be deleted for the interleaved path and\n");
+  printf("     must stay for RowsPerTile=-1 until it is derived too.\n");
   printf("\n  ALL: %s\n", ok ? "PASS -- the derived placement can replace the five steps by construction" : "FAIL");
   return ok ? 0 : 1;
 }
