@@ -20,6 +20,7 @@
 #include "cute/atom/mma_traits_ppu0015.hpp"
 #include "cutlass/numeric_types.h"
 #include "../unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"   // the DELETED five steps, kept gate-side so "bit-identical" is not a tautology
 #include "../xplane_offline.hpp"
 #include <cstdio>
 #include <vector>
@@ -43,7 +44,7 @@ static bool write_side(const char* tag, int N, int K) {
     for (size_t i = 0; i < (size_t)N * K; ++i)
       packed[i / 4] |= int8_t((((int)(i >> b) & 1) & 3) << (2 * (i % 4)));
     std::vector<int8_t> ship(NB);
-    preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N},
+    legacy::preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N},
                                       QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
     std::vector<int8_t> f(NB);
     nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K, (size_t)N}, TN, TK, Bits);
@@ -86,7 +87,7 @@ static bool write_side(const char* tag, int N, int K) {
       const size_t i = (size_t)n * K + k; packed[i / 4] |= int8_t((q[(size_t)k * N + n] & 3) << (2 * (i % 4)));
     }
     std::vector<int8_t> ship(NB), f(NB), drv(NB);
-    preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N},
+    legacy::preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N},
                                                   QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
     nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K, (size_t)N}, TN, TK, Bits);
     xplane::place_derived<Bits, TM, TN, TK, WM, WN, F>(drv.data(), q, N, K);
@@ -128,7 +129,7 @@ static bool unfolded(const char* tag, int N, int K) {
     packed[i / EPB] |= int8_t((qb[(size_t)k * N + n] & ((1 << Bits) - 1)) << (Bits * (i % EPB)));
   }
   std::vector<int8_t> ship(NB), drv(NB);
-  preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N}, QTC);
+  legacy::preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N}, QTC);
   xplane::place_derived<Bits, TM, TN, TK, WM, WN, 1>(drv.data(), q, N, K);
   size_t d = 0; for (size_t i = 0; i < NB; ++i) if (drv[i] != ship[i]) ++d;
   printf("  %-40s %dx%d : %zu / %zu bytes differ  %s\n", tag, N, K, d, NB,
@@ -150,6 +151,53 @@ int main() {
   const bool uall = u1 && u2 && u3 && u4 && u5;
   printf("  => %s\n", uall ? "place_from_map covers BOTH walks -> the five steps can be deleted"
                             : "the unfolded walk is not yet equivalent -- keep the five steps");
+
+  // TILE-INVARIANCE. Deleting the five steps means preprocess_weights_for_mixed_gemm must produce the unfolded
+  // placement WITHOUT knowing the kernel tile -- so a shim has to pick a representative (TN,TK). That is only sound if
+  // the unfolded map really is tile-invariant. Swept here rather than assumed, because the whole deletion rests on it.
+  printf("\n  tile-invariance of the UNFOLDED placement (all must be BIT-IDENTICAL):\n");
+  int inv_bad = 0;
+  auto sweep = [&](bool r) { if (!r) ++inv_bad; };
+  sweep(unfolded<2, 32,  64, 128, 32, 32, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2 TM32 (32, 64,128) w32x32", 256, 512));
+  sweep(unfolded<2, 64, 128, 128, 32, 32, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2      (64,128,128) w32x32", 256, 512));
+  sweep(unfolded<2, 64, 128, 128, 32, 64, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2      (64,128,128) w32x64", 256, 512));
+  sweep(unfolded<2, 64, 256, 256, 64, 64, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2      (64,256,256) w64x64", 256, 512));
+  sweep(unfolded<2,128, 128, 128, 64, 64, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2 TM128(128,128,128) w64x64", 512, 512));
+  sweep(unfolded<1, 64,  64, 256, 32, 32, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY>("int1      (64, 64,256) w32x32", 256, 512));
+  sweep(unfolded<1, 64, 128, 256, 64, 64, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY>("int1      (64,128,256) w64x64", 256, 512));
+  sweep(unfolded<4, 64,  64, 128, 32, 32, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY, 1>("int4      (64, 64,128) w32x32", 256, 512));
+  sweep(unfolded<4, 64, 128,  64, 32, 32, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY, 1>("int4      (64,128, 64) w32x32", 256, 512));
+  sweep(unfolded<4, 64, 128, 128, 64, 64, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY, 1>("int4      (64,128,128) w64x64", 256, 512));
+  sweep(unfolded<4, 64, 256, 256, 64, 64, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY, 1>("int4      (64,256,256) w64x64", 512,1024));
+  printf("  => %s\n", inv_bad ? "NOT tile-invariant -- a representative tile is UNSOUND"
+                               : "tile-invariant across TM/TN/TK/WM/WN and 3 widths -> a representative tile is sound");
+
+  // THE PRODUCTION PATH. Everything above exercises place_derived with an explicit tile; the shipped
+  // preprocess_weights_for_mixed_gemm now picks a REPRESENTATIVE tile from (N, K, Bits) instead. That choice is the
+  // thing 39 call sites actually run, so gate it directly against legacy rather than inferring it from the sweep.
+  printf("\n  the production shim (representative tile) vs legacy, per width and shape:\n");
+  int shim_bad = 0;
+  auto shim = [&](const char* tag, QuantTypeClass qtc, int Bits, int N, int K) {
+    const size_t NB = (size_t)N * K * Bits / 8;
+    const int EPB = 8 / Bits, MASK = (1 << Bits) - 1;
+    std::vector<int8_t> in(NB);
+    for (size_t i = 0; i < NB; ++i) in[i] = int8_t((i * 2654435761u >> 9) & 0xff);
+    std::vector<int8_t> ref(NB), got(NB);
+    legacy::preprocess_weights_for_mixed_gemm<false,256,0>(ref.data(), in.data(), {(size_t)K, (size_t)N}, qtc);
+    preprocess_weights_for_mixed_gemm      <false,256,0>(got.data(), in.data(), {(size_t)K, (size_t)N}, qtc);
+    size_t d = 0; for (size_t i = 0; i < NB; ++i) if (ref[i] != got[i]) ++d;
+    (void)EPB; (void)MASK;
+    printf("  %-40s %dx%d : %zu / %zu bytes differ  %s\n", tag, N, K, d, NB, d ? "<-- SHIM WRONG" : "<-- BIT-IDENTICAL");
+    if (d) ++shim_bad;
+  };
+  shim("int2  N=256 K=256", QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, 2,  256,  256);
+  shim("int2  N=512 K=1024", QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, 2, 512, 1024);
+  shim("int1  N=256 K=512", QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, 1,  256,  512);
+  shim("int1  N=128 K=256", QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, 1,  128,  256);
+  shim("int4  N=256 K=512", QuantTypeClass::PACKED_INT4_WEIGHT_ONLY, 4,  256,  512);
+  shim("int4  N=1024 K=1024", QuantTypeClass::PACKED_INT4_WEIGHT_ONLY, 4, 1024, 1024);
+  printf("  => %s\n", shim_bad ? "the shim is NOT a drop-in -- restore the five steps"
+                                : "the shim is a byte-exact drop-in for all 39 call sites");
 
   printf("\n  verdict: shipping %s ; rung 5 @K=256 %s ; rung 5 @K=512 %s\n",
          a ? "clean" : "DIRTY", b ? "clean" : "DIRTY", c ? "clean" : "DIRTY");

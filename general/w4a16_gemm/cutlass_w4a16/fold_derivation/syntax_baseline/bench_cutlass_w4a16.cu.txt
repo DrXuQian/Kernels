@@ -1,0 +1,5 @@
+1 bench_cutlass_w4a16.cu(): error: identifier "hggcDeviceProp" is undefined
+2 bench_cutlass_w4a16.cu(): error: identifier "hggcGetDeviceProperties" is undefined
+2 bench_cutlass_w4a16.cu(): error: invalid narrowing conversion from "int" to "unsigned long"
+2 tensor_compare.h(): error: identifier "hggcOccupancyMaxPotentialBlockSize" is undefined
+2 tensor_foreach.h(): error: identifier "hggcOccupancyMaxPotentialBlockSize" is undefined

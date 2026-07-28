@@ -145,6 +145,7 @@ inline void place_from_map(int8_t* out, const std::vector<int>& m, const std::ve
   const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F;                       // F > 1
   constexpr int kCon = 256, contig = F * TK * Bits / 8, AiuByte = contig > 128 ? 128 : contig;
   constexpr int AiuElem = AiuByte * 8 / Bits, RPS = kCon / AiuElem;                          // F == 1
+  static_assert(F > 1 || RPS >= 1, "unfolded: a K-tile's 32B run exceeds the 256-element interleave -- no such config ships");
   std::fill(out, out + (size_t)N * K * Bits / 8, int8_t(0));
   for (int tn = 0; tn < N / TN; ++tn)
     for (int ki = 0; ki < K / TK; ++ki)
