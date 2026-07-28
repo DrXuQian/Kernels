@@ -355,3 +355,65 @@ B-concat / int4 = 1.21x at gs=32 and **1.12x at gs=16** -- a 3-bit two-plane GEM
 
 w64x32 elsewhere: int1 at TK=128 improves to 219.70 / 62.6% but does not beat TK=64's 215.23; the three B-concat TK=128
 rows do not beat TK=64 either, so the TK=64 winner stands.
+
+---
+
+# Q6 (int4+int2) and Q5 (int4+int1) -- implemented, locally gated, awaiting the box
+
+Q3/Q6/Q5 are now ONE object, `MixGemm2Plane<LowBits, HiBits, Chunk, NChunk, Rebase, FragLayout>`. Q3's names are
+aliases, so nothing downstream changed, and the builder and `moe_grouped_ppu.cuh` needed no change at all -- both already
+derive their fold factors from the plane element widths.
+
+```
+kPairs     = 16/LowBits                                     half2 pairs per low vreg
+kVregRatio = LowBits/HiBits                                 high/low vreg ratio inside ONE delivery
+hshift(T,V)= HiBits * (T + kPairs * (V % kVregRatio))        where the high plane's bits sit
+hi vreg    = kVregRatio * (V / kVregRatio)
+at_plain   = MixGemmEmit<LowBits>::index(T,V) / 2            the destination is the LOW plane's own emission
+```
+
+At (2,1) this reproduces Q3's shipped `8*(V&1)+T` and `2*(V>>1)` exactly, and Q3's hand-written `AtLayout` turns out to
+have been `MixGemmEmit<2>::index/2` all along.
+
+**int4 was never a different scheme -- only a bias.** `MixGemmChunkEmit`'s mask and mul already matched; only `add`
+needed `-(2^(10-bpos) + Bias)`, i.e. `0x8000 | ((25-bpos)<<10) | (Bias ? 1<<(bpos+3) : 0)`, which emits exactly the
+0xE408 / 0xD480 the shipped int4 converter hardcodes.
+
+**The int4 bias is a uniform offset.** With low = q & 15 and high = q >> 4 the converter emits `q - 8` for EVERY q, no
+wrapping, so the caller folds `+8*dl` into the zero point. Q3 needed none of this because int2 carries no bias. The
+offline must write `q & 15` through `place_derived` DIRECTLY -- the shim's +8 exists to reproduce the legacy pipeline.
+
+**Two quantities were both called P2_DIV, and separating them cost a round.** `PDcopy = DL1/DL2` is the COPY STEP ratio
+(drives `kb` and `base`); `VR = LowBits/HiBits` is the VREG ratio inside one delivery (drives `v2` and `j2`). They
+coincide only when neither plane folds -- both are 2 for Q3 at Block_K=256 -- so the first version of the generalisation
+left exactly that row passing while every other Q3 row changed. That reads like a subtle regression and is actually two
+things sharing a name. The converter's member is now `kVregRatio`.
+
+**Q6 and Q5 are structurally simpler than Q3.** int4's contiguous run is already 32 B at Block_K >= 64, so the LOW plane
+never folds (F1 = 1, interleave-256 walk) and only the high plane does. Delivery bounds: low int4 needs WN >= 1024/TK,
+Q6's int2 high WN >= 2048/TK (32 at TK=64, so **w64x32 is legal** -- the shape worth +7 to +9 points on the single-plane
+sweeps), Q5's int1 high WN >= 4096/TK (64 at TK=64).
+
+Local gates, all green before anything reached the box:
+
+* `l65` five checks: int4's two constants, `at_plain == MixGemmEmit/2`, `hshift` and `hvreg` reproduce Q3's, and the
+  pairing is a bijection for all three formats.
+* `l66` the arithmetic EMULATED on the host -- `lop3` with immLut 0xEA is `(a&b)|c`, `ppu.fma.rtte.f16x2` is a half2 FMA
+  -- requiring `lo + 2^LowBits*hi` for every (t,v,lane) of all three formats, plus Q3 identical to the old members for
+  Chunk -1..7. Q6 and Q5 have no working reference anywhere, so this is the only local source of correctness for them.
+* `l67` `tile_map_hi`: Q3 byte-identical to the original int1-only body at four configurations, Q6 and Q5 complete
+  bijections at seven.
+* The compile gate was VERIFIED rather than assumed: planting `static_assert(kLowBits == 99)` in the mainloop makes
+  `test_q65_bconcat_real` report 72 errors, so the collective really is instantiated for every configuration.
+
+## Box commands
+
+```
+PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q65_bconcat_real  ./build.sh && $BIN/test_q65_bconcat_real
+PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q3_bconcat_real   ./build.sh && $BIN/test_q3_bconcat_real
+PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q3_bconcat_bench  ./build.sh && $BIN/test_q3_bconcat_bench 2048 4096 4096 16
+```
+
+`test_q65_bconcat_real` is synthetic with the FULL code range and a double-precision CPU golden: 5 Q6 configurations and
+4 Q5. Q3's own test must still MATCH -- everything about Q3 is required to be byte-identical, and l66/l67 check that
+locally, so a Q3 regression there would mean a plumbing change the local gates cannot see.
