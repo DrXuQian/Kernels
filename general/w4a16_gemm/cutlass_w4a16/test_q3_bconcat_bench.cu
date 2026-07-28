@@ -27,7 +27,7 @@ using QM      = moe_grouped_ppu::QuantMode;
 
 static int M, N, K, gs = 16, scale_k;
 
-template <int EPB, QuantTypeClass QTC>
+template <int EPB, QuantTypeClass QTC, int FoldTN = 0, int FoldTK = 0>
 static std::vector<int8_t> pack_plane(const std::vector<uint8_t>& q) {
   std::vector<int> qT((size_t)K * N);
   for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n * K + k] = q[(size_t)k * N + n];
@@ -40,6 +40,17 @@ static std::vector<int8_t> pack_plane(const std::vector<uint8_t>& q) {
   }
   std::vector<int8_t> out(packed.size());
   preprocess_weights_for_mixed_gemm<false, 256>(out.data(), packed.data(), {(size_t)K, (size_t)N}, QTC);
+  // PER-PLANE N-FOLD: a plane whose contiguous run at this TileShape.K is under the AIU's 32 B minimum must be folded
+  // in N, and each plane folds by its OWN factor -- that is the whole point of the change. FoldTK == 0 means "this
+  // config does not fold", which reproduces the previous buffer byte for byte.
+  if (FoldTK > 0) {
+    const int contig = FoldTK * BITS / 8, F = contig >= 32 ? 1 : 32 / contig;
+    if (F > 1) {
+      std::vector<int8_t> f(out.size());
+      nfold_regroup_gmem(f.data(), out.data(), {(size_t)K, (size_t)N}, FoldTN, FoldTK, BITS);
+      out.swap(f);
+    }
+  }
   return out;
 }
 
@@ -48,6 +59,7 @@ static cutlass::DeviceAllocation<half_t>  *dA, *dSc, *dZr, *dD, *dDhi;
 static cutlass::DeviceAllocation<uint2_t> *dBlo;
 static cutlass::DeviceAllocation<int4_t>  *dB4;
 static cutlass::DeviceAllocation<uint1_t> *dBhi;
+static cutlass::DeviceAllocation<uint1_t> *dBhi128;   // int1 folded F=2 for Block_K=128 (per-plane fold)
 static cutlass::DeviceAllocation<GS>       *shpd;
 static cutlass::DeviceAllocation<half_t*>  *pd, *pd2;
 static cutlass::DeviceAllocation<DStride>  *sd;
@@ -82,6 +94,16 @@ static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; st
       dA->get(), dBlo->get(), dSc->get(), dZr->get(), pd->get(), sd->get(), gm->get(), \
       M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr, dBhi->get()); }, 30); \
   report("BC " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S, u); upd(bBC, #TM "x" #TN ":" #TK " s" #S, u); } while (0)
+
+// PER-PLANE FOLD: Block_K=128 is now reachable -- int2 keeps F=1 (32 B run) while int1 folds F=2. That halves A-smem
+// against TK=256 (the whole reason B-concat sat at 12.5% occupancy) and needs a SEPARATELY FOLDED high plane, hence
+// dBhi128 rather than dBhi.
+#define BC128(TM,TN,TK,WM,WN,S) do { \
+  double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,uint2_t,uint1_t>( \
+      dA->get(), dBlo->get(), dSc->get(), dZr->get(), pd->get(), sd->get(), gm->get(), \
+      M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr, dBhi128->get()); }, 30); \
+  report("BC " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " [per-plane fold]", u); \
+  upd(bBC, #TM "x" #TN ":" #TK " s" #S " fold", u); } while (0)
 
 #define I2(TM,TN,TK,WM,WN,S) do { \
   double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,uint2_t>( \
@@ -129,10 +151,13 @@ int main(int argc, char** argv) {
   auto B4 = pack_plane<2, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY>(q4);
   cutlass::DeviceAllocation<int4_t> B4_((size_t)K*N); B4_.copy_from_host(reinterpret_cast<int4_t const*>(B4.data()));
   cutlass::DeviceAllocation<uint1_t> Bhi_((size_t)K*N);
+  auto Bhi128 = pack_plane<8, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, 128, 128>(high);   // int1 F=2 at Block_K=128
+  cutlass::DeviceAllocation<uint1_t> Bhi128_((size_t)K*N);
   { std::vector<half_t> a((size_t)M*K, half_t(0.01f)), s((size_t)scale_k*N, half_t(0.05f)), z((size_t)scale_k*N, half_t(-0.2f));
     A_.copy_from_host(a.data()); S_.copy_from_host(s.data()); Z_.copy_from_host(z.data()); }
   Blo_.copy_from_host(reinterpret_cast<uint2_t const*>(Blo.data()));
   Bhi_.copy_from_host(reinterpret_cast<uint1_t const*>(Bhi.data()));
+  Bhi128_.copy_from_host(reinterpret_cast<uint1_t const*>(Bhi128.data()));
 
   std::vector<GS> shp(1, cute::make_shape(M, N, K));
   cutlass::DeviceAllocation<GS> shpd_(1); shpd_.copy_from_host(shp.data());
@@ -147,7 +172,7 @@ int main(int argc, char** argv) {
   wsb = (size_t)cutlass::ceil_div(M,16)*cutlass::ceil_div(N,64)*64;
   cutlass::DeviceAllocation<char> ws_(wsb);
 
-  dA=&A_; dSc=&S_; dZr=&Z_; dD=&D_; dDhi=&Dh_; dBlo=&Blo_; dBhi=&Bhi_; dB4=&B4_; shpd=&shpd_;
+  dA=&A_; dSc=&S_; dZr=&Z_; dD=&D_; dDhi=&Dh_; dBlo=&Blo_; dBhi=&Bhi_; dBhi128=&Bhi128_; dB4=&B4_; shpd=&shpd_;
   pd=&pd_; pd2=&pd2_; sd=&sd_; gm=&gm_; offdev=&off_; ws=&ws_; shpv=&shp;
 
   Best bBC{"",1e18}, bI2{"",1e18}, bI1{"",1e18}, bI4{"",1e18};
@@ -162,6 +187,14 @@ int main(int argc, char** argv) {
   BC(16,128,256,16,32,3);  // very small M
   BC(16,64,256,16,32,3);   // TileM=16 min, keep A-smem floor
   BC(16,256,256,16,32,3);  // TileM=16 + widest N: tiny A-smem, big tile area (best occ/reuse trade)
+
+  std::printf("  --- B-concat with PER-PLANE FOLD (Block_K 128: int2 F=1, int1 F=2 -- A-smem halved) ---\n");
+  BC128(64, 64,128,32,32,3);
+  BC128(64, 64,128,32,32,2);
+  BC128(32,128,128,32,32,3);
+  BC128(64,128,128,32,64,3);
+  BC128(32, 64,128,32,32,3);
+  BC128(16,128,128,16,32,3);
 
   std::printf("  --- int2 single-plane sweep (TK may be 128) ---\n");
   I2(64,64,128,32,32,3);

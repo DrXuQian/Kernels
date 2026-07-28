@@ -152,7 +152,23 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
     { {}, (ElementC const**)nullptr, StrideC{}, ptr_D, stride_D },
     hw
   };
-  if constexpr (!std::is_void_v<PlaneB2>) { args.mainloop.ptr_B2 = B2; }
+  if constexpr (!std::is_void_v<PlaneB2>) {
+    args.mainloop.ptr_B2 = B2;
+    // PER-PLANE N-FOLD. Plane 2 is the SPARSER plane, so at the same Block_K its contiguous run is 2x/4x smaller and
+    // may fall under the AIU's 32 B minimum -- that, not anything about the mma, is what pinned the 2-plane path to
+    // Block_K >= 256 (the only K where int2 and int1 both reach 32 B unfolded). The builder folds plane 2 the extra
+    // amount it needs; the matching PHYSICAL gmem walk is (N/P2Fold) rows x (K*P2Fold) codes, so its row pitch is NOT
+    // plane 1's. Reusing dB here is correct only when P2Fold == 1, which is why dB2 is flagged rather than always set.
+    constexpr int P2_BITS   = cutlass::sizeof_bits<std::conditional_t<std::is_void_v<PlaneB2>,
+                                                                     cutlass::half_t, PlaneB2>>::value;
+    constexpr int P2_CONTIG = MOEG_RUN_B * P2_BITS / MOEG_BITS;      // bytes after plane 1's fold
+    constexpr int P2_FOLD   = P2_CONTIG >= 32 ? 1 : 32 / P2_CONTIG;
+    if constexpr (P2_FOLD > 1) {
+      args.mainloop.dB2 = cutlass::make_cute_packed_stride(
+          StrideB{}, cute::make_shape(n / P2_FOLD, k * P2_FOLD, L));
+      args.mainloop.dB2_valid = true;
+    }
+  }
   args.group_M = group_M;
   // O(1) decode hint: if every expert has the SAME #m-tiles (ceil(M_e/TM)), the kernel uses blockIdx.z (no scan).
   // MOEG_FORCE3D (diagnostic): force the 3D Mmax grid + blockIdx.z decode even for ragged (small experts idle)
