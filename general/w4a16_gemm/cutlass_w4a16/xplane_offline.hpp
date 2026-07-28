@@ -129,53 +129,74 @@ inline std::vector<int> plane_map() {
 // F1 is plane 1's OWN fold factor. It was hardcoded to 1, which is fine at Block_K 128 and 256 (int2's run is already
 // >= 32 B there) but wrong at Block_K=64, where int2 folds by 2 as well -- DL1 = (TK*2/8)/32 evaluated to 16/32 = 0 and
 // took the whole map with it. With F1 threaded through, plane 1's physical row is (TN/F1, F1*TK*2/8) and DL1 is 1 again.
-template <int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
-inline std::vector<int> tile_map_int1() {
+// THE HIGH PLANE'S MAP, composed from the low plane's, for ANY (low, high) width pair -- Q3 = int2+int1,
+// Q6 = int4+int2, Q5 = int4+int1. Everything that used to be int1-specific is now driven by the two widths:
+//     kPairs  = 16/LowBits    half2 pairs per low vreg      (int2 8, int4 4)
+//     hstride = 16/HiBits     high codes between the two half2 lanes  (int1 16, int2 8)
+//     P2_DIV                  taken from the real fragments, and equal to LowBits/HiBits when both planes are unfolded
+// and the converter's pairing is the same closed form the converter itself uses, gated against Q3's shipped constants in
+// fold_derivation/l65. Q3's map is required to come out byte-identical (l67).
+template <int LowBits, int HiBits, int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
+inline std::vector<int> tile_map_hi() {
   using namespace cute;
   constexpr int InstM = 16, warpM = (WM > InstM) ? WM : InstM, warpN = (WN > 16) ? WN : 16;
   constexpr int WOM = TM / warpM, WON = TN / warpN, RPI = WON * 16;
-  constexpr int CPW1 = 16, CPW2 = 32, Ng1 = TN / F1, Ng2 = TN / F2;
-  constexpr int DL1 = (F1 * TK * 2 / 8) / 32, DL2 = (F2 * TK / 8) / 32;
+  constexpr int CPW1 = 32 / LowBits, CPW2 = 32 / HiBits, Ng1 = TN / F1, Ng2 = TN / F2;
+  constexpr int DL1 = (F1 * TK * LowBits / 8) / 32, DL2 = (F2 * TK * HiBits / 8) / 32;
   constexpr int NI1 = Ng1 / RPI, NI2 = Ng2 / RPI;
   static_assert(DL1 >= 1 && DL2 >= 1, "each plane's physical row must be a whole number of 32 B deliveries");
-  constexpr int P2_DIV = (DL1 / DL2) ? (DL1 / DL2) : 1;
-  // (c) the converter's cross-plane pairing, read off its own _E2 lines (l37) and expressed as layouts:
-  //   LoCodeL : (lt, half)            -> the LOW crumb's code index within plane 1's 16-code word
-  //   HiCodeL : (lt, v&1, half)       -> the HIGH bit's code index within plane 2's 32-code word
-  using LoCodeL = Layout<Shape<_8, _2>,     Stride<_1, _8>>;
-  using HiCodeL = Layout<Shape<_8, _2, _2>, Stride<_1, _8, _16>>;
+  // TWO DIFFERENT RATIOS, and conflating them is what broke the first version of this generalisation. They coincide at
+  // Block_K=256 (both 2 for Q3), which is exactly the configuration that passed while every other Q3 row changed.
+  //   PDcopy = DL1/DL2        COPY STEP ratio: how many low k_blocks share one high copy step. Drives `kb` and `base`.
+  //   VR     = LowBits/HiBits VREG ratio INSIDE one delivery: both planes deliver 4 vregs, but the high plane's hold
+  //                           32/HiBits codes against the low plane's 32/LowBits, so one low delivery consumes only
+  //                           4*HiBits/LowBits of the high vregs and they sit VR apart. Drives v2 and j2.
+  // The old int1-only body used DL1/DL2 for the first and a hardcoded 2 for the second -- and 2 is VR for Q3, which is
+  // why it was right.
+  constexpr int PDcopy = (DL1 / DL2) ? (DL1 / DL2) : 1;
+  constexpr int VR     = LowBits / HiBits;
+  constexpr int kPairs = 16 / LowBits, hstride = 16 / HiBits;
+  // (c) the converter's cross-plane pairing, as layouts rather than index algebra:
+  //   LoCodeL : (lt, half)                -> the LOW crumb's code index within a low word
+  //   HiCodeL : (lt, v % VR, half)        -> the HIGH code index within a high word
+  // What the old int1-only form hid: its `(lt % 4) + 4 * (lt / 4)` is the IDENTITY on lt in [0,8) -- an expression that
+  // looks like a permutation and is not.
+  using LoCodeL = Layout<Shape<Int<kPairs>, _2>,                Stride<_1, Int<kPairs>>>;
+  using HiCodeL = Layout<Shape<Int<kPairs>, Int<VR>, _2>,       Stride<_1, Int<kPairs>, Int<hstride>>>;
 
-  using CTV1 = CubeTV<2, TM, TN, TK, WM, WN, F1>;
-  using CTV2 = CubeTV<1, TM, TN, TK, WM, WN, F2>;
-  const auto m1 = plane_map<2, TM, TN, TK, WM, WN, F1>();
+  using CTV1 = CubeTV<LowBits, TM, TN, TK, WM, WN, F1>;
+  using CTV2 = CubeTV<HiBits,  TM, TN, TK, WM, WN, F2>;
+  const auto m1 = plane_map<LowBits, TM, TN, TK, WM, WN, F1>();
   std::vector<int> m((size_t)Ng2 * DL2 * 8 * CPW2, -1);
   for (int t = 0; t < 32 * WOM * WON; ++t) {
-    const int lane = t % 32, w = t / 32, warp_n = w / WOM;
+    const int lane = t % 32, w = t / 32;
     for (int ii = 0; ii < NI1; ++ii)
-      for (int kb = 0; kb < P2_DIV; ++kb)
+      for (int kb = 0; kb < PDcopy; ++kb)
         for (int v = 0; v < 4; ++v)
-          for (int lt = 0; lt < 8; ++lt)
+          for (int lt = 0; lt < kPairs; ++lt)
             for (int half = 0; half < 2; ++half) {
-              // (c) THE PAIRING IS TWO LAYOUTS, not index algebra. Worth noting what the old form hid: the low
-              // plane's `(lt % 4) + 4 * (lt / 4)` is the IDENTITY on lt in [0,8) -- an expression that looks like a
-              // permutation and is not. As layouts the domains are explicit and they compose with everything else.
               const int j1 = int(LoCodeL{}(lt, half));
               const int row1 = CTV1::base_row(w, ii) + CTV1::cube_row(lane, v), wd1 = CTV1::cube_wd(lane, v, kb % DL1);
               if (row1 >= Ng1) continue;
               const int e1 = m1[(((size_t)row1 * DL1 + kb % DL1) * 8 + wd1) * CPW1 + j1];
               if (e1 < 0) continue;
-              const int base = (kb % P2_DIV) + P2_DIV * (ii / (NI2 ? NI2 : 1));
-              const int v2 = base + 2 * (v >> 1), j2 = int(HiCodeL{}(lt, v & 1, half));
+              const int base = (kb % PDcopy) + PDcopy * (ii / (NI2 ? NI2 : 1));
+              // the high vregs one low delivery consumes sit VR apart -- the same rule the converter's hi[VR*(V/VR)] uses
+              const int v2 = base + VR * (v / VR), j2 = int(HiCodeL{}(lt, v % VR, half));
               if (v2 >= 4) continue;
               const int inst2 = (NI2 > 1) ? (ii % NI2) : 0;
               const int row2 = CTV2::base_row(w, inst2) + CTV2::cube_row(lane, v2),
-                        wd2 = CTV2::cube_wd(lane, v2, (kb / P2_DIV) % DL2);
+                        wd2 = CTV2::cube_wd(lane, v2, (kb / PDcopy) % DL2);
               if (row2 >= Ng2) continue;
-              m[(((size_t)row2 * DL2 + (kb / P2_DIV) % DL2) * 8 + wd2) * CPW2 + j2] = e1;
+              m[(((size_t)row2 * DL2 + (kb / PDcopy) % DL2) * 8 + wd2) * CPW2 + j2] = e1;
             }
   }
   return m;
 }
+
+// Q3's name, so nothing downstream changes.
+template <int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
+inline std::vector<int> tile_map_int1() { return tile_map_hi<2, 1, TM, TN, TK, WM, WN, F2, F1>(); }
 
 // BIT-GRANULAR writer, shared by both planes. `q_kn` is the raw [K][N] plane, one code per byte, as the caller reads
 // it from the checkpoint -- NOT a preprocessed buffer. Destination addressing is l20's F>1 (plane-major) branch.
@@ -243,10 +264,17 @@ inline void place_derived(int8_t* out, const std::vector<uint8_t>& q_kn, int N, 
   place_from_map<Bits, TM, TN, TK, WM, WN, F>(out, plane_map<Bits, TM, TN, TK, WM, WN, F>(), q_kn, N, K);
 }
 
-// The high plane, from the CROSS-PLANE map.
+// The high plane, from the CROSS-PLANE map, for any width pair.
+template <int LowBits, int HiBits, int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
+inline void place_hi(int8_t* out, const std::vector<uint8_t>& high_kn, int N, int K) {
+  place_from_map<HiBits, TM, TN, TK, WM, WN, F2>(
+      out, tile_map_hi<LowBits, HiBits, TM, TN, TK, WM, WN, F2, F1>(), high_kn, N, K);
+}
+
+// Q3's name.
 template <int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
 inline void place_int1(int8_t* out, const std::vector<uint8_t>& high_kn, int N, int K) {
-  place_from_map<1, TM, TN, TK, WM, WN, F2>(out, tile_map_int1<TM, TN, TK, WM, WN, F2, F1>(), high_kn, N, K);
+  place_hi<2, 1, TM, TN, TK, WM, WN, F2, F1>(out, high_kn, N, K);
 }
 
 } // namespace xplane
