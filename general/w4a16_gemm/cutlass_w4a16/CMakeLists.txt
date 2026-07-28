@@ -16,6 +16,20 @@ if(PPU_EXTRA_DEFS)
   message(STATUS "PPU_EXTRA_DEFS -> device ${_PPU_EXTRA_DEV} / host ${_PPU_EXTRA_HOST}")
 endif()
 
+# EVERY target gets them, via a wrapper -- NOT by listing targets. The previous code attached _PPU_EXTRA_DEV to three
+# targets by hand while the comment above claimed "every target defined below", and the two are not the same thing:
+#   PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q3_bconcat_bench ./build.sh
+# configured cleanly, printed "PPU_DEFS applied: PPU_B_CHUNK=1", printed no warning (cmake DID receive it), and built a
+# binary without the macro -- because test_q3_bconcat_bench was not one of the three. The perf run that followed
+# compared a binary against ITSELF and reported "no change", which is indistinguishable from "the change does nothing".
+# Enumerating call sites is what made that possible, so the fix must not enumerate.
+function(ppu_w4a16_executable NAME)
+  cmake_parse_arguments(A "" "" "DEV_COMPILE_FLAGS" ${ARGN})
+  cutlass_example_add_executable(${NAME} ${A_UNPARSED_ARGUMENTS}
+      DEV_COMPILE_FLAGS ${A_DEV_COMPILE_FLAGS} ${_PPU_EXTRA_DEV})
+  target_compile_definitions(${NAME} PRIVATE ${_PPU_EXTRA_HOST})
+endfunction()
+
 # CMakeLists for the actlize-side W4A16 comparison bench. This is NOT built by the marlin Makefile -- actlize
 # uses a different toolchain (hgcc device compiler + the PPU SDK's hggc runtime, driven by
 # third_party/actlize/cmake/PPUToolchain.cmake), not the bare nvcc our marlin kernels build with.
@@ -48,7 +62,7 @@ endif()
 set(_W4A16_DEFS
   -DTILE_M=${TILE_M} -DTILE_N=${TILE_N} -DWARP_M=${WARP_M} -DWARP_N=${WARP_N} -DSTAGES=${STAGES} ${_QUANT_DEFS})
 
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   bench_cutlass_w4a16
   bench_cutlass_w4a16.cu
   DEV_COMPILE_FLAGS ${_W4A16_DEFS}
@@ -67,28 +81,28 @@ target_compile_options(bench_cutlass_w4a16 PRIVATE -w)
 # dequant+cublas is deliberately NOT here: cublas drags cuda_fp16 whose __half2 clashes with the hggc headers
 # hgcc auto-includes, and our fast dequant is cuda-only device code that cannot link with hgcc device .o. It
 # lives on the nvcc side instead: ../marlin_ppu dequant_cublas.
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_fpA_intB_ppu
   test_fpA_intB_ppu.cu
 )
 target_compile_options(test_fpA_intB_ppu PRIVATE -w)
 
 # STEP 1 of MoE W4A16: batched (uniform m_per_expert) mixed-input GEMM. Build: TARGET=test_moe_gemm_ppu ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_moe_gemm_ppu
   test_moe_gemm_ppu.cu
 )
 target_compile_options(test_moe_gemm_ppu PRIVATE -w)
 
 # STEP 2a of MoE W4A16: grouped mixed-input via GroupScheduler. Build: TARGET=test_moe_grouped_ppu ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_moe_grouped_ppu
   test_moe_grouped_ppu.cu
 )
 target_compile_options(test_moe_grouped_ppu PRIVATE -w)
 
 # STEP 2b correctness gate: multi-expert/ragged grouping vs grouped-L=1 oracle. TARGET=test_moe_grouped_verify ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_moe_grouped_verify
   test_moe_grouped_verify.cu
 )
@@ -96,7 +110,7 @@ target_compile_options(test_moe_grouped_verify PRIVATE -w)
 
 # ROUTING PROBE: MOEG_PROBE=1 makes the grouped kernel write (expert+1) instead of the GEMM, to decode which
 # D-plane each expert's tiles land in. TARGET=test_moe_grouped_probe ./build.sh ; run: MOEG_PROBE=1 <bin>
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_moe_grouped_probe
   test_moe_grouped_probe.cu
 )
@@ -104,7 +118,7 @@ target_compile_options(test_moe_grouped_probe PRIVATE -w)
 
 # DATA-SLICE probe: controlled per-expert data (B/scale/A each varied in turn) to pin WHICH input the collective
 # fails to slice by l_coord. TARGET=test_moe_grouped_dataslice ./build.sh ; run: <bin> (MOEG_PROBE unset)
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_moe_grouped_dataslice
   test_moe_grouped_dataslice.cu
 )
@@ -113,7 +127,7 @@ target_compile_options(test_moe_grouped_dataslice PRIVATE -w)
 # REAL-WEIGHT gate: loads a .bin (real Qwen3.5 GPTQ / Q4_K expert weights from real_weight/dump_real_weights.py),
 # runs the grouped kernel, compares vs the Python native golden. TARGET=test_moe_grouped_real ./build.sh
 #   run: <bin> real_weight/real_gptq_gate_L0.bin   (or the Q4_K .bin)
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_moe_grouped_real
   test_moe_grouped_real.cu
 )
@@ -121,7 +135,7 @@ target_compile_options(test_moe_grouped_real PRIVATE -w)
 
 # W2A16 (uint2b_t) single-expert correctness driver: synthetic Q2 -> pack 4 uint2/byte -> preprocess PACKED_INT2
 # -> filter_and_run<...,uint2b_t> vs host dequant golden. Build: TARGET=test_w2a16_grouped ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_w2a16_grouped
   test_w2a16_grouped.cu
 )
@@ -129,14 +143,14 @@ target_compile_options(test_w2a16_grouped PRIVATE -w)
 
 # W2A16 LAYOUT DIAGNOSTIC: identity A + decodable W=(k%4)+10*(n%4) to read the int2 layout permutation (mod 4)
 # on a MISMATCH. Build: TARGET=test_w2a16_diag ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_w2a16_diag
   test_w2a16_diag.cu
 )
 target_compile_options(test_w2a16_diag PRIVATE -w)
 
 # W1A16 LAYOUT DIAGNOSTIC: identity A + random q1/scale/zero, uint1b_t (8/byte, PACKED_INT1). Build: TARGET=test_w1a16_diag ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_w1a16_diag
   test_w1a16_diag.cu
 )
@@ -144,7 +158,7 @@ target_compile_options(test_w1a16_diag PRIVATE -w)
 
 # W1A16 MULTI-EXPERT + RAGGED grouped gate: grouped-L vs grouped-L=1 oracle (contiguous ptr-array D), uint1b_t,
 # TK=256, int1's winner tile 32x128. Build: TARGET=test_w1a16_grouped ./build.sh ; run: ./<bin> [L] [Mb] [ragged] [gs]
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_w1a16_grouped
   test_w1a16_grouped.cu
 )
@@ -153,7 +167,7 @@ target_compile_options(test_w1a16_grouped PRIVATE -w)
 # Q3_K BIT-PLANE CONCAT on REAL GGUF weights: int2(low2, zero=-4dl) + int1(high1, scale=4dl) summed vs the native
 # Q3_K golden. Validates int1 AND int2 on real bits AND the A-concat at once. Bin from real_weight/dump_q3_concat.py.
 #   Build: TARGET=test_q3_concat_real ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_q3_concat_real
   test_q3_concat_real.cu
 )
@@ -161,7 +175,7 @@ target_compile_options(test_q3_concat_real PRIVATE -w)
 
 # Q3_K B-CONCAT: ONE GEMM with TWO B bit planes (dedicated 2-plane mainloop), vs the native Q3_K golden.
 #   Build: TARGET=test_q3_bconcat_real ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_q3_bconcat_real
   test_q3_bconcat_real.cu
 )
@@ -171,7 +185,7 @@ target_compile_options(test_q3_bconcat_real PRIVATE -w)
 # (n,k) each consumed bit came from. Rungs 0/1/2 separate mantissa PLACEMENT from bit PERMUTATION; rung 3 decodes
 # the permutation. Same technique that cracked the int2 sigma_n bug (sim layouts are NOT trustworthy here).
 #   Build: TARGET=test_q3_bconcat_probe ./build.sh ; run: ./<bin> [N] [K]
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_q3_bconcat_probe
   test_q3_bconcat_probe.cu
 )
@@ -180,7 +194,7 @@ target_compile_options(test_q3_bconcat_probe PRIVATE -w)
 # Q3_K B-CONCAT ABLATION on the REAL .bin: runs the 2-plane kernel on the real numbers with a HOST golden recomputed
 # per ablation (real low+high / high=0 / low=0 / synthetic A) to localize a bug the synthetic probe cannot reproduce.
 #   Build: TARGET=test_q3_bconcat_ablate ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_q3_bconcat_ablate
   test_q3_bconcat_ablate.cu
 )
@@ -188,7 +202,7 @@ target_compile_options(test_q3_bconcat_ablate PRIVATE -w)
 
 # Q3_K B-CONCAT vs A-CONCAT speed: synthetic large shape, interleaved same-session A/B timing (us/MFU/HBM).
 #   Build: TARGET=test_q3_bconcat_bench ./build.sh ; run: ./<bin> [M] [N] [K]
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_q3_bconcat_bench
   test_q3_bconcat_bench.cu
 )
@@ -197,7 +211,7 @@ target_compile_options(test_q3_bconcat_bench PRIVATE -w)
 # GROUPED int1 (vs int2 ref) single-plane PERF verification: matches the validated test_w1a16_grouped call
 # (FinegrainedScaleOnly, PACKED_INT1, 32x128:256:s3) but timed + acu-able. Isolates whether grouped int1 is genuinely
 # ~10x the dense record or a harness artifact.  Build: TARGET=test_grouped_int1_perf ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_grouped_int1_perf
   test_grouped_int1_perf.cu
 )
@@ -207,12 +221,10 @@ target_compile_options(test_grouped_int1_perf PRIVATE -w)
 # the validated int2@TK128 swzl/converter). Target geometry is int4@TK64 (measured 55.8% gs=32 / 53.1% gs=16) vs
 # int2@TK128's 37.1%/30.9%. A=identity/scale=1/zero=0 so D == the weight code (controlled-input check).
 #   Build: TARGET=test_fold_int2 ./build.sh ; run: ./<bin> [N] [K] [gs]
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_fold_int2
   test_fold_int2.cu
-  DEV_COMPILE_FLAGS ${_PPU_EXTRA_DEV}
 )
-target_compile_definitions(test_fold_int2 PRIVATE ${_PPU_EXTRA_HOST})
 target_compile_options(test_fold_int2 PRIVATE -w)
 
 # int1 tile sweep, kept OUT of test_fold_int2 so the verified correctness harness does not pay for the extra
@@ -220,17 +232,15 @@ target_compile_options(test_fold_int2 PRIVATE -w)
 # and reload hiding (atoms per iteration = TK/16) -- plus FOLD_ZDIAG=1, which separates whether the ScaleZero cost is
 # the per-reload smem copy or the per-atom transform. Those two want completely different fixes.
 #   Build: TARGET=test_int1_sweep ./build.sh ; run: ./<bin> [N] [K] [gs] [M]
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_int1_sweep
   test_int1_sweep.cu
-  DEV_COMPILE_FLAGS ${_PPU_EXTRA_DEV}
 )
-target_compile_definitions(test_int1_sweep PRIVATE ${_PPU_EXTRA_HOST})
 target_compile_options(test_int1_sweep PRIVATE -w)
 
 # Ground-truth ppu ldmatrix.swzl probe (standalone, no cutlass): dumps smem-word -> (lane,reg) map to derive
 # the int2 interleave. Build: TARGET=swzl_ldmatrix_probe ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   swzl_ldmatrix_probe
   swzl_ldmatrix_probe.cu
 )
@@ -238,7 +248,7 @@ target_compile_options(swzl_ldmatrix_probe PRIVATE -w)
 
 # INT4 REFERENCE diag: same params as test_w2a16_diag but int4b_t, so the W2DBG cute-layout print for the
 # KNOWN-GOOD int4 path can be compared line-by-line vs int2. Build: TARGET=test_w4a16_diag ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_w4a16_diag
   test_w4a16_diag.cu
 )
@@ -246,7 +256,7 @@ target_compile_options(test_w4a16_diag PRIVATE -w)
 
 # W2A16 REAL-WEIGHT gate: reads a real Q2_K slice .bin (real_weight/real_q2k_ffn_gate_L0.bin, from
 # dump_real_weights.py on the 3B ffn_gate) + native golden; runs W2A16 at gs=16. TARGET=test_w2a16_real ./build.sh
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_w2a16_real
   test_w2a16_real.cu
 )
@@ -256,10 +266,8 @@ target_compile_options(test_w2a16_real PRIVATE -w)
 # (50.2%) and int4's production config (55.9%) run different tiles, and every model says the gap should NOT be width
 # (same cvt/mma, same regs, HBM favours int1, and the fold makes the B smem bank pattern identical by construction).
 #   Build: TARGET=test_width_acu ./build.sh ; run: ./<bin> [bits] [M] [N] [K] [gs] ; ACU_ONE=1 for a single launch
-cutlass_example_add_executable(
+ppu_w4a16_executable(
   test_width_acu
   test_width_acu.cu
-  DEV_COMPILE_FLAGS ${_PPU_EXTRA_DEV}
 )
-target_compile_definitions(test_width_acu PRIVATE ${_PPU_EXTRA_HOST})
 target_compile_options(test_width_acu PRIVATE -w)

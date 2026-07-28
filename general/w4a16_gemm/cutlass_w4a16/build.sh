@@ -80,6 +80,22 @@ fi
 TARGET="${TARGET:-bench_cutlass_w4a16}"
 make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log
 
+# CMAKE RECEIVING THE DEFINES IS NOT THE SAME AS THIS TARGET GETTING THEM, and the difference is invisible in a perf
+# number. The defines used to be attached to three targets by hand, so
+#   PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q3_bconcat_bench ./build.sh
+# configured cleanly, printed "PPU_DEFS applied", printed no warning, and produced a binary WITHOUT the macro. The run
+# that followed compared a binary against itself and read as "the change does nothing". So check the compile line.
+if [ -n "${PPU_DEFS:-}" ]; then
+  for _d in $PPU_DEFS; do
+    if grep -qF -- "-D$_d" make.log; then
+      echo "PPU_DEFS verified on the compile line: -D$_d"
+    else
+      echo "  WARNING: -D$_d is NOT on $TARGET's compile line -- THIS BUILD DOES NOT HAVE IT."
+      echo "           Any A/B against it is a binary compared with itself. (make.log had no -D$_d.)"
+    fi
+  done
+fi
+
 BIN="$(find "$BUILD" -name "$TARGET" -type f -perm -u+x | head -1)"
 echo
 echo "built: $BIN"
