@@ -57,5 +57,15 @@ for f in $FILES; do
   else
     echo "$base: clean ($(grep -c . "$bl") known-noise lines, 0 new)"
   fi
+  # THE BLIND SPOT, STATED OUT LOUD. The stubs make ppu_mma_builder.inl fail ("expected a type specifier"), so the
+  # CollectiveMma it would have produced is never instantiated locally -- and every error DOWNSTREAM of it is
+  # invisible here. A folded 2-plane gB2 cut with the unfolded TileShape sailed through as "clean" and then failed on
+  # the box with cute/algorithm/copy.hpp's `size<1>(src) == size<1>(dst)`. "clean" means "no NEW front-end error",
+  # NOT "the collective type-checks". Layout-consistency questions belong in an l4x harness that builds the types
+  # directly; this gate cannot answer them.
+  if grep -q "ppu_mma_builder.inl" "$bl" 2>/dev/null; then
+    echo "  NOTE: the builder fails under the stubs, so nothing downstream of CollectiveMma was instantiated."
+    echo "        Mainloop layout/partition mismatches CANNOT be caught here -- use a fold_derivation harness."
+  fi
 done
 exit $rc

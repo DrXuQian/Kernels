@@ -79,6 +79,26 @@ static void probe(const char* tag) {
   printf("   P2_DIV = CPY_K1/CPY_K2 = %d/%d = %s\n", c1, c2,
          (c2 && c1 % c2 == 0) ? (c1/c2 == 1 ? "1  (1:1 -- SIMPLER than today's 2)" : "int") : "NOT INTEGRAL <-- blocker");
 
+  // THE CHECK THAT WOULD HAVE CAUGHT THE BOX FAILURE. A folded plane's gmem tensor is PHYSICALLY (N/F, K*F), so the
+  // per-CTA gmem tile must be cut with the FOLDED tiler; cutting it with TileShape gives a (TN, TK) gmem tile against
+  // a (TN/F, F*TK) smem tile and cute/algorithm/copy.hpp's `size<1>(src) == size<1>(dst)` fires. That is pure shape
+  // arithmetic -- no copy atom needed to see it -- and syntax_check.sh structurally cannot: the stubs make the builder
+  // fail, so nothing downstream of CollectiveMma is instantiated locally and the whole mainloop is invisible to it.
+  {
+    struct Tile2 { int n, k; };
+    auto smem  = [](int TNv, int TKv, int F) { return Tile2{TNv / F, F * TKv}; };
+    auto gmemTileShape = Tile2{TN, TK};                       // local_tile(mB2_nk, TileShape{}, ...)  <-- the bug
+    auto gmemFolded    = Tile2{TN / F2, F2 * TK};             // local_tile(mB2_nk, FoldTilerB2{}, ...) <-- the fix
+    auto s1 = smem(TN, TK, F1), s2 = smem(TN, TK, F2);
+    printf("   gmem/smem tile agreement: plane1 smem(%d,%d) vs gmem(%d,%d) %s | plane2 smem(%d,%d) vs "
+           "TileShape(%d,%d) %s , folded(%d,%d) %s\n",
+           s1.n, s1.k, TN / F1, F1 * TK, (s1.n == TN / F1 && s1.k == F1 * TK) ? "OK" : "MISMATCH",
+           s2.n, s2.k, gmemTileShape.n, gmemTileShape.k,
+           (s2.n == gmemTileShape.n && s2.k == gmemTileShape.k) ? "OK" : "MISMATCH <-- copy.hpp static_assert",
+           gmemFolded.n, gmemFolded.k,
+           (s2.n == gmemFolded.n && s2.k == gmemFolded.k) ? "OK" : "MISMATCH");
+  }
+
   // delivery bound per plane: slots = WN*TK/32 codes must cover one 16 B delivery = 128/bits codes
   for (int p = 0; p < 2; ++p) {
     const int b = p ? Bits2 : Bits1, slots = WN*TK/32, deliv = 128/b;
