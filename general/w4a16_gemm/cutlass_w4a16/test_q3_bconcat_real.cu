@@ -159,6 +159,49 @@ int main(int argc, char** argv) {
   ++rung_no;                                                                                         \
 } while (0)
 
+  // ---------------------------------------------------------------- CONTROLLED-INPUT PROBE
+  // PROBE=hi / PROBE=lo reads the COLUMN PERMUTATION straight off the hardware, which is what is left once the ladder
+  // has narrowed to one rung whose remaining variables (TK, F1, F2) cannot be separated by configuration -- TK decides
+  // both fold factors. Same instrument that cracked the int2 N-half pairing bug.
+  //
+  //   scale = 1, zero = 0, one plane all-zero, the other set to high[k][n] = delta(k, n), and A[m][k] = k. Then
+  //       D[m][n] = sum_k A[m][k] * (low + 4*high) * s = MULT * sigma(n)
+  //   so D[0][n]/MULT is literally "which column's bit column n actually received". A correct map prints n. Any other
+  //   value IS the permutation, read directly, no derivation.
+  if (const char* pr = std::getenv("PROBE")) {
+    const bool hi_mode = (pr[0] == 'h');
+    const int MULT = hi_mode ? 4 : 1;
+    std::printf("  [PROBE=%s] rung-5 config (64,128,64) w64x64 F1=2 F2=4 -- D[0][n]/%d should equal n\n",
+                hi_mode ? "hi" : "lo", MULT);
+    std::vector<uint8_t> plo((size_t)K*N, 0), phi((size_t)K*N, 0);
+    for (int n = 0; n < N && n < K; ++n) (hi_mode ? phi : plo)[(size_t)n * N + n] = 1;   // delta(k, n)
+    { std::vector<half_t> a((size_t)M*K), s1((size_t)scale_k*N, half_t(1.f)), z0((size_t)scale_k*N, half_t(0.f));
+      for (int m = 0; m < M; ++m) for (int k = 0; k < K; ++k) a[(size_t)m*K + k] = half_t(float(k));
+      dA.copy_from_host(a.data()); dSc.copy_from_host(s1.data()); dZr.copy_from_host(z0.data()); }
+    auto blo_ = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, 128, 64>(plo, K, N);
+    cutlass::DeviceAllocation<cutlass::uint2b_t> dblo_((size_t)K*N);
+    dblo_.copy_from_host(reinterpret_cast<cutlass::uint2b_t const*>(blo_.data()));
+    std::vector<int8_t> bhi_((size_t)K * N / 8);
+    xplane::place_int1<64, 128, 64, 64, 64, 4, 2>(bhi_.data(), phi, N, K);
+    cutlass::DeviceAllocation<cutlass::uint1b_t> dbhi_((size_t)K*N);
+    dbhi_.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(bhi_.data()));
+    CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 128, 64, 64, 64, 3,
+                                    cutlass::uint2b_t, cutlass::uint1b_t>(
+        dA.get(), dblo_.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
+        M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr, dbhi_.get());
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    std::vector<half_t> h((size_t)M*N); dD.copy_to_host(h.data());
+    int wrong = 0;
+    for (int n = 0; n < N; ++n) {
+      const int got = int(std::lround(double(float(h[(size_t)0*N + n])) / MULT));
+      if (got != n) { if (wrong < 24) std::printf("    n=%3d -> %4d   (delta %+d)\n", n, got, got - n); ++wrong; }
+    }
+    std::printf("  => %d / %d columns permuted%s\n", wrong, N,
+                wrong ? "  <-- the deltas above ARE the map error" : "  (this plane's column map is correct)");
+    return wrong == 0 ? 0 : 1;
+  }
+
   int rung_no = 1, first_bad = -1;
   RUNG("1 (64, 64,128) w32x32 F1=1 F2=2  BASE", 64,  64, 128, 32, 32, 3, 1, 2);
   RUNG("2 (64,128,128) w32x32   TN 64->128 ", 64, 128, 128, 32, 32, 3, 1, 2);
