@@ -181,6 +181,16 @@ ppu_w4a16_executable(
 )
 target_compile_options(test_q3_bconcat_real PRIVATE -w)
 
+# Q6 (int4+int2) and Q5 (int4+int1) B-CONCAT on the SAME 2-plane mainloop, synthetic full code range vs a CPU golden.
+# The converter and the offline are one closed form over (LowBits, HiBits), gated locally in fold_derivation/l65-l67;
+# what this exercises is the plumbing -- builder fold factors, gmem strides, the scale path -- which no local gate reaches.
+#   Build: TARGET=test_q65_bconcat_real ./build.sh   (PPU_DEFS=PPU_B_CHUNK=1 for the chunked path)
+ppu_w4a16_executable(
+  test_q65_bconcat_real
+  test_q65_bconcat_real.cu
+)
+target_compile_options(test_q65_bconcat_real PRIVATE -w)
+
 # B-CONCAT CONTROLLED-INPUT PROBE: A=identity + scale=1/zero=0 + index-labelled bit planes, so D reads back WHICH
 # (n,k) each consumed bit came from. Rungs 0/1/2 separate mantissa PLACEMENT from bit PERMUTATION; rung 3 decodes
 # the permutation. Same technique that cracked the int2 sigma_n bug (sim layouts are NOT trustworthy here).

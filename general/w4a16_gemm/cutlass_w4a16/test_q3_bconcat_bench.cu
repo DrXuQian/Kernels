@@ -15,6 +15,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "unfused_weight_dequantize.hpp"
+#include "xplane_offline.hpp"
 #include "moe_grouped_ppu.cuh"
 
 using half_t  = cutlass::half_t;
@@ -111,6 +112,23 @@ static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; st
 
 // int2 alone WITH its own fold, so Block_K=64 is reachable for the single-plane reference too. Without this the
 // "int2 best" line is a TK=128 number and the concat overhead is measured against the wrong ceiling.
+// Q6 = int4 + int2 and Q5 = int4 + int1 on the SAME 2-plane mainloop. int4's contiguous run is already 32 B at TK=64,
+// so the LOW plane never folds (F1=1) and only the high plane does -- structurally simpler than Q3, where both fold at
+// Block_K=64. Delivery bounds: Q6's int2 high needs WN >= 2048/TK (32 at TK=64, so w64x32 is legal here), Q5's int1 high
+// needs WN >= 4096/TK (64 at TK=64). The low plane is written by place_derived DIRECTLY with q & 15 -- the shim's +8 is
+// for reproducing the legacy pipeline, and here int4's -8 is absorbed by the zero point.
+#define Q65(NAME,BEST,HIB,HIELEM,TM,TN,TK,WM,WN,S,F2) do { \
+  std::vector<int8_t> blo_((size_t)K*N/2), bhi_((size_t)K*N*(HIB)/8); \
+  xplane::place_derived<4,TM,TN,TK,WM,WN,1>(blo_.data(), q65lo, N, K); \
+  xplane::place_hi<4,HIB,TM,TN,TK,WM,WN,F2,1>(bhi_.data(), q65hi##HIB, N, K); \
+  cutlass::DeviceAllocation<int4_t> b1_((size_t)K*N); b1_.copy_from_host(reinterpret_cast<int4_t const*>(blo_.data())); \
+  cutlass::DeviceAllocation<HIELEM> b2_((size_t)K*N); b2_.copy_from_host(reinterpret_cast<HIELEM const*>(bhi_.data())); \
+  double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,int4_t,HIELEM>( \
+      dA->get(), b1_.get(), dSc->get(), dZr->get(), pd->get(), sd->get(), gm->get(), \
+      M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr, b2_.get()); }, 30); \
+  report(NAME " " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " [F2=" #F2 "]", u); \
+  upd(BEST, #TM "x" #TN ":" #TK " s" #S " F2=" #F2, u); } while (0)
+
 #define I2F(TM,TN,TK,WM,WN,S,F) do { \
   std::vector<int8_t> b_((size_t)K*N/4); \
   xplane::place_derived<2,TM,TN,TK,WM,WN,F>(b_.data(), low, N, K); \
@@ -180,6 +198,15 @@ int main(int argc, char** argv) {
                                     D_((size_t)M*N), Dh_((size_t)M*N);
   cutlass::DeviceAllocation<uint2_t> Blo_((size_t)K*N);
   std::vector<uint8_t> q4((size_t)K*N); for (size_t i=0;i<q4.size();++i) q4[i]=(uint8_t)(i%16);
+  // Q6/Q5 planes: low = q & 15 for BOTH (int4), high = q >> 4 with 2 bits for Q6 and 1 for Q5. Full code range, so the
+  // top plane is actually exercised rather than sitting at zero.
+  std::vector<uint8_t> q65lo((size_t)K*N), q65hi2((size_t)K*N), q65hi1((size_t)K*N);
+  for (size_t i = 0; i < q65lo.size(); ++i) {
+    const int q6 = int((i * 2654435761u >> 5) % 64u), q5 = int((i * 2654435761u >> 5) % 32u);
+    q65lo[i]  = uint8_t(q6 & 15);          // the int4 low plane is shared by both rows below
+    q65hi2[i] = uint8_t(q6 >> 4);
+    q65hi1[i] = uint8_t(q5 >> 4);
+  }
   auto B4 = pack_plane<2, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY>(q4);
   cutlass::DeviceAllocation<int4_t> B4_((size_t)K*N); B4_.copy_from_host(reinterpret_cast<int4_t const*>(B4.data()));
   cutlass::DeviceAllocation<uint1_t> Bhi_((size_t)K*N);
@@ -204,7 +231,7 @@ int main(int argc, char** argv) {
   dA=&A_; dSc=&S_; dZr=&Z_; dD=&D_; dDhi=&Dh_; dBlo=&Blo_; dBhi=&Bhi_; dB4=&B4_; shpd=&shpd_;
   pd=&pd_; pd2=&pd2_; sd=&sd_; gm=&gm_; offdev=&off_; ws=&ws_; shpv=&shp;
 
-  Best bBC{"",1e18}, bI2{"",1e18}, bI1{"",1e18}, bI4{"",1e18};
+  Best bBC{"",1e18}, bI2{"",1e18}, bI1{"",1e18}, bI4{"",1e18}, bQ6{"",1e18}, bQ5{"",1e18};
 
   std::printf("  --- B-concat sweep (TK locked 256; smaller TileM / fewer stages cut A-smem to lift occupancy) ---\n");
   BC(64,64,256,32,32,3);   // baseline (acu: 12.5% occ, shared-limited)
@@ -324,11 +351,27 @@ int main(int argc, char** argv) {
   I1F(64,128,128,64,32,2,2);
   I1F(128,128,128,64,32,3,2);
 
+  std::printf("  --- Q6 = int4 + int2 (one GEMM, 6-bit in memory) ---\n");
+  Q65("q6", bQ6, 2, uint2_t, 64,128,128,32,32,3,1);
+  Q65("q6", bQ6, 2, uint2_t, 64,128,128,64,32,3,1);
+  Q65("q6", bQ6, 2, uint2_t, 64,128, 64,64,32,3,2);
+  Q65("q6", bQ6, 2, uint2_t, 64,128, 64,64,32,2,2);
+  Q65("q6", bQ6, 2, uint2_t, 64,128, 64,64,64,2,2);
+  Q65("q6", bQ6, 2, uint2_t,128,128, 64,64,32,3,2);
+  std::printf("  --- Q5 = int4 + int1 (one GEMM, 5-bit in memory) ---\n");
+  Q65("q5", bQ5, 1, uint1_t, 64,128,256,32,32,3,1);
+  Q65("q5", bQ5, 1, uint1_t, 64,128,128,32,32,3,2);
+  Q65("q5", bQ5, 1, uint1_t, 64,128,128,64,32,3,2);
+  Q65("q5", bQ5, 1, uint1_t, 64,128, 64,64,64,2,4);
+  Q65("q5", bQ5, 1, uint1_t,128,128, 64,64,64,2,4);
+
   std::printf("  ================= VERDICT =================\n");
   std::printf("  B-concat  best: %-16s %8.2f us\n", bBC.tag, bBC.us);
   std::printf("  int2      best: %-16s %8.2f us\n", bI2.tag, bI2.us);
   std::printf("  int1      best: %-16s %8.2f us\n", bI1.tag, bI1.us);
   std::printf("  int4 CEIL best: %-16s %8.2f us  <- fold target; int2/int1-fold ceiling\n", bI4.tag, bI4.us);
+  std::printf("  Q6 (int4+int2)  best: %-16s %8.2f us   vs int4 alone %.2fx\n", bQ6.tag, bQ6.us, bQ6.us / bI4.us);
+  std::printf("  Q5 (int4+int1)  best: %-16s %8.2f us   vs int4 alone %.2fx\n", bQ5.tag, bQ5.us, bQ5.us / bI4.us);
   double A = bI2.us + bI1.us;
   std::printf("  A-concat (best int2 + best int1, the honest sum): %8.2f us\n", A);
   std::printf("  => B-concat / A-concat = %.2fx  (%s)\n", bBC.us / A,
