@@ -36,7 +36,7 @@ template <class T> static std::vector<T> rd(FILE* f, size_t n) {
 }
 
 // transpose q [K][N] -> [N][K], pack ELTS_PER_BYTE per byte, run the offline preprocess for that plane's format
-template <int ELTS_PER_BYTE, QuantTypeClass QTC>
+template <int ELTS_PER_BYTE, QuantTypeClass QTC, int FoldTN = 0, int FoldTK = 0>
 static std::vector<int8_t> pack_plane(const std::vector<uint8_t>& q, int K, int N) {
   std::vector<int> qT((size_t)K * N);
   for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) qT[(size_t)n * K + k] = q[(size_t)k * N + n];
@@ -49,6 +49,16 @@ static std::vector<int8_t> pack_plane(const std::vector<uint8_t>& q, int K, int 
   }
   std::vector<int8_t> out(packed.size());
   preprocess_weights_for_mixed_gemm<false, 256>(out.data(), packed.data(), {(size_t)K, (size_t)N}, QTC);
+  // PER-PLANE N-FOLD: fold this plane iff ITS contiguous run at FoldTK is under the AIU's 32 B minimum. FoldTK == 0
+  // means "no fold", byte-identical to what shipped -- which is what keeps the Block_K=256 run below a true control.
+  if (FoldTK > 0) {
+    const int contig = FoldTK * BITS / 8, F = contig >= 32 ? 1 : 32 / contig;
+    if (F > 1) {
+      std::vector<int8_t> f(out.size());
+      nfold_regroup_gmem(f.data(), out.data(), {(size_t)K, (size_t)N}, FoldTN, FoldTK, BITS);
+      out.swap(f);
+    }
+  }
   return out;
 }
 
@@ -104,6 +114,39 @@ int main(int argc, char** argv) {
       M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr,
       dBhi.get());
   CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+
+  auto check = [&](const char* tag) {
+    std::vector<half_t> h((size_t)M*N); dD.copy_to_host(h.data());
+    const half_t* g = reinterpret_cast<const half_t*>(gold_h.data());
+    int b_ = 0; double mr = 0;
+    for (size_t i = 0; i < (size_t)M * N; ++i) {
+      double got = (double)float(h[i]), exp = (double)float(g[i]);
+      double rel = std::abs(got - exp) / (std::abs(exp) + 1e-3);
+      if (rel > mr) mr = rel;
+      if (std::abs(got - exp) > 2e-2 + 6e-2 * std::abs(exp)) ++b_;
+    }
+    std::printf("  %-38s bad=%d/%d max_rel=%.3e %s\n", tag, b_, M * N, mr, b_ == 0 ? "MATCH" : "MISMATCH");
+    return b_ == 0;
+  };
+  bool ok256 = check("Block_K=256 (unfolded, CONTROL)");
+
+  // PER-PLANE N-FOLD, the actual new path: at Block_K=128 int2 keeps F=1 (32 B run) while int1 folds F=2, so the high
+  // plane needs its OWN folded buffer. A MATCH at Block_K=256 only says the change did not disturb the old path.
+  {
+    auto BhiF = pack_plane<8, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, 64, 128>(high1, K, N);
+    cutlass::DeviceAllocation<cutlass::uint1b_t> dBhiF((size_t)K*N);
+    dBhiF.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(BhiF.data()));
+    CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3,
+                                    cutlass::uint2b_t, cutlass::uint1b_t>(
+        dA.get(), dBlo.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
+        M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr,
+        dBhiF.get());
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    bool ok128 = check("Block_K=128 (int2 F=1, int1 F=2)  NEW");
+    std::printf("  => per-plane fold: %s\n", (ok256 && ok128) ? "BOTH MATCH"
+                : ok256 ? "control OK, FOLDED PATH WRONG" : "control itself broke -- look there first");
+  }
 
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
   const half_t* gold = reinterpret_cast<const half_t*>(gold_h.data());
