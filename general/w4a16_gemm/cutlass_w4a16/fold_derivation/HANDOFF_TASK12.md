@@ -158,3 +158,34 @@ disturb the unfolded path. Only the `BC128` rows are new.
    composition is the correct one -- the two gates converge there).
 5. **Q6 converter** (`int4 + int2`). Needs NO fold at all: at Block_K=128 both planes are F=1. It is the only format
    where B-concat and A-concat can both run at their best shape, so it gives the clean verdict on which wins.
+
+## OPEN: plane 2's gmem tile rank (box build, 2plane.hpp:808)
+
+```
+error: no matching function for call to object of type Tensor<..., Layout<((32,256),1,1,1,int), ...>>
+    copy_aiu(gmem_tiled_copy_B2, tB2gB2(_,_,_,k_iter_crd), tB2sB2(_,_,_,smem_pipe_write), warp_idx);
+```
+
+`tB2gB2` has FIVE modes where the slice passes four. Diagnosis: in the interleaved branch `mB2_nk` is
+`(N2, (kCon=256, K2/kCon))` — K is a NESTED mode — and `local_tile` divides it by the tiler's K.
+
+* plane 1 at `TK=128`: `128 < kCon`, so `(256, K/256)` splits into `(128, 2, K/256)` and the rest carries **two** modes
+* plane 2 at `F2*TK = 256`: **exactly `kCon`**, so the rest carries **one**
+
+The two planes therefore disagree in rank, and the `(_,_,_,k)` slice is hardcoded for plane 1's. `P2Fold == 1` keeps
+them equal, which is why nothing showed before.
+
+Candidate fixes, in order of preference:
+1. Slice plane 2 rank-agnostically — derive the number of leading `_` from `rank(tB2gB2)` instead of hardcoding, e.g.
+   take the last mode by `tB2gB2(repeat<rank(tB2gB2)-1>(_), k_iter_crd)` (check cute's spelling).
+2. Give plane 2 a tiler K that does NOT coincide with `kCon`, so both planes split the nested mode the same way. This
+   trades a compile error for a silently different gmem walk — only do it if 1 is impossible.
+3. Flatten/coalesce plane 2's K mode before `local_tile` so the rest is always rank 1.
+
+Check the single-plane fold collective first: `int1 @ TK=64, F=4` also lands on `FoldF*TKe == 256 == kCon`, so it has
+already solved this exact case — mirror whatever it does rather than inventing a fourth answer.
+
+**Local gates cannot see this.** The stub makes `ppu_mma_builder.inl` fail, so nothing downstream of `CollectiveMma`
+instantiates and the whole mainloop is invisible to `syntax_check.sh` (it now says so out loud). l42's shape check
+catches tile-EXTENT mismatches but not tile-RANK ones; extending it to compare `rank(local_tile(...))` per plane is
+the cheap way to close that too.
