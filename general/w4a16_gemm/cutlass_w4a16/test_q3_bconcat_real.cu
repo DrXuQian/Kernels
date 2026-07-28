@@ -148,8 +148,33 @@ int main(int argc, char** argv) {
         dBhiF.get());
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
     bool ok128 = check("Block_K=128 (int2 F=1, int1 F=2)  NEW");
-    std::printf("  => per-plane fold: %s\n", (ok256 && ok128) ? "BOTH MATCH"
-                : ok256 ? "control OK, FOLDED PATH WRONG" : "control itself broke -- look there first");
+
+    // STAGE 2, Block_K=64: BOTH planes fold (int2 F=2, int1 F=4) and WN must be 64 -- int1's delivery bound is
+    // WN*TK*bits >= 4096. This is the geometry where cvt/mma = 128/WM = 2, the optimum of the first (ceiling) factor,
+    // and it is the same shared mma fragment ((2,2,2),4,4):((1,2,4),32,8) that the single-plane int1 config reaching
+    // 63.7% uses. Low plane folds through nfold_regroup_gmem (whole-word, valid at F=2 and gated in l52); high plane
+    // through the cross-plane generator, whose composition is a complete bijection here (l54).
+    bool ok64 = false;
+    {
+      auto BloF = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, 128, 64>(low2, K, N);
+      cutlass::DeviceAllocation<cutlass::uint2b_t> dBloF((size_t)K*N);
+      dBloF.copy_from_host(reinterpret_cast<cutlass::uint2b_t const*>(BloF.data()));
+      std::vector<int8_t> BhiF64((size_t)K * N / 8);
+      xplane::place_int1<64, 128, 64, 64, 64, 4, 2>(BhiF64.data(), high1, N, K);
+      cutlass::DeviceAllocation<cutlass::uint1b_t> dBhiF64((size_t)K*N);
+      dBhiF64.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(BhiF64.data()));
+      CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));
+      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 128, 64, 64, 64, 2,
+                                      cutlass::uint2b_t, cutlass::uint1b_t>(
+          dA.get(), dBloF.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
+          M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr,
+          dBhiF64.get());
+      CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+      ok64 = check("Block_K=64  (int2 F=2, int1 F=4)  STAGE2");
+    }
+
+    std::printf("  => per-plane fold: 128 %s, 64 %s%s\n", ok128 ? "MATCH" : "WRONG", ok64 ? "MATCH" : "WRONG",
+                ok256 ? "" : "  (and the CONTROL broke -- look there first)");
   }
 
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());

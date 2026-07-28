@@ -42,8 +42,12 @@ inline std::vector<int> plane_map() {
   constexpr int CPW = 32 / Bits, Ng = TN / F, RPI = WON * 16, VEC = 4 * 32 / Bits;
   constexpr int DL = (F * TK * Bits / 8) / 32;
   static_assert(DL >= 1 && DL * 8 * CPW == F * TK, "row must be a whole number of 32B deliveries");
+  // MmaPermK follows the builder: FoldF > 0 ? TileShape.K : 32*8/bits (ppu_mma_builder.inl). Hardcoding the non-fold
+  // rule silently broke a FOLDED plane -- at Block_K=64 with F=2 the composition covered only 4160 of 8192 logical
+  // elements instead of being a bijection.
+  constexpr int MmaPermK = (F > 1) ? TK : (32 * 8 / Bits);
   using Mma = TiledMMA<MMA_Atom<FInst>, Layout<Shape<Int<WOM>, Int<WON>, _1>>,
-                       Tile<Int<WOM*16>, Int<WON*16>, Int<32 * 8 / Bits>>>;
+                       Tile<Int<WOM*16>, Int<WON*16>, Int<MmaPermK>>>;
   auto sB = make_tensor(make_smem_ptr((cutlass::half_t*)nullptr),
                         make_layout(Shape<Int<TN>, Int<TK>>{}, Stride<Int<TK>, _1>{}));
   auto frag = Mma{}.get_thread_slice(0).partition_fragment_B(sB);
@@ -75,17 +79,21 @@ inline std::vector<int> plane_map() {
 // hi_vreg0 = kb % P2_DIV, vregs 1 and 3 are never read at all and HALF the tile's high bits cannot arrive -- no
 // placement repairs that. Changing only the index (and not the placement) measured WORSE on the box than changing
 // neither: 15010 -> 29666 bad of 32768. They are one change.
-template <int TM, int TN, int TK, int WM, int WN, int F2>
+// F1 is plane 1's OWN fold factor. It was hardcoded to 1, which is fine at Block_K 128 and 256 (int2's run is already
+// >= 32 B there) but wrong at Block_K=64, where int2 folds by 2 as well -- DL1 = (TK*2/8)/32 evaluated to 16/32 = 0 and
+// took the whole map with it. With F1 threaded through, plane 1's physical row is (TN/F1, F1*TK*2/8) and DL1 is 1 again.
+template <int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
 inline std::vector<int> tile_map_int1() {
   using namespace cute;
   constexpr int InstM = 16, warpM = (WM > InstM) ? WM : InstM, warpN = (WN > 16) ? WN : 16;
   constexpr int WOM = TM / warpM, WON = TN / warpN, RPI = WON * 16;
-  constexpr int CPW1 = 16, CPW2 = 32, Ng1 = TN, Ng2 = TN / F2;
-  constexpr int DL1 = (TK * 2 / 8) / 32, DL2 = (F2 * TK / 8) / 32;
+  constexpr int CPW1 = 16, CPW2 = 32, Ng1 = TN / F1, Ng2 = TN / F2;
+  constexpr int DL1 = (F1 * TK * 2 / 8) / 32, DL2 = (F2 * TK / 8) / 32;
   constexpr int NI1 = Ng1 / RPI, NI2 = Ng2 / RPI;
-  constexpr int P2_DIV = (DL1 && DL2) ? (DL1 / DL2 ? DL1 / DL2 : 1) : 1;
+  static_assert(DL1 >= 1 && DL2 >= 1, "each plane's physical row must be a whole number of 32 B deliveries");
+  constexpr int P2_DIV = (DL1 / DL2) ? (DL1 / DL2) : 1;
 
-  const auto m1 = plane_map<2, TM, TN, TK, WM, WN, 1>();
+  const auto m1 = plane_map<2, TM, TN, TK, WM, WN, F1>();
   std::vector<int> m((size_t)Ng2 * DL2 * 8 * CPW2, -1);
   for (int t = 0; t < 32 * WOM * WON; ++t) {
     const int lane = t % 32, w = t / 32, warp_n = w / WOM;
@@ -113,12 +121,12 @@ inline std::vector<int> tile_map_int1() {
 
 // Write the folded high-plane buffer. `high_kn` is the raw [K][N] high plane, one code per byte, as the caller reads
 // it from the checkpoint -- NOT a preprocessed buffer. Destination addressing is l20's F>1 (plane-major) branch.
-template <int TM, int TN, int TK, int WM, int WN, int F2>
+template <int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
 inline void place_int1(int8_t* out, const std::vector<uint8_t>& high_kn, int N, int K) {
   constexpr int CPW = 32, R2 = TN / F2, DL = (F2 * TK / 8) / 32;
   static_assert(DL == 1, "the buffer walk below assumes one delivery per folded row");
   const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F2;
-  const auto m = tile_map_int1<TM, TN, TK, WM, WN, F2>();
+  const auto m = tile_map_int1<TM, TN, TK, WM, WN, F2, F1>();
   std::fill(out, out + (size_t)N * K / 8, int8_t(0));
   for (int tn = 0; tn < N / TN; ++tn)
     for (int ki = 0; ki < K / TK; ++ki)
