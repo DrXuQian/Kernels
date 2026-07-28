@@ -326,3 +326,32 @@ So `PROBE=lo` / `PROBE=hi` is a two-way discriminator with a stated prior, not a
 
 `D[0][n]/MULT` prints the permutation itself, with no model in between — which is the only way to break an assumption
 the model and the code hold in common.
+
+---
+
+# Measured state after chunking + w64x32, at BOTH group sizes
+
+`test_q3_bconcat_bench 2048 4096 4096 <gs>`, PPU_B_CHUNK=1, PEAK 500 TFLOP/s, L=1 dense.
+
+| | gs=16 (Q3_K's real granularity) | gs=32 | cost of gs=16 |
+|---|---|---|---|
+| B-concat (int3) | **262.19 us / 52.4%** | 255.47 / 53.8% | **+2.6%** |
+| int2            | 247.90 | 233.76 / 58.8% | +6.0% |
+| int1            | 224.62 | 215.23 / 63.9% | +4.4% |
+| int4            | 234.16 | **211.33 / 65.0%** | +10.8% |
+
+**gs=16 costs Q3 only 2.6%.** APG = gs/16 = 1 there, i.e. a scale reload from smem at every mma atom, and it is nearly
+free -- so #11 (prefetch the next group's scale) and #18 (fold the dequant constants into one hfma2) are worth at most
+2.6% on the shipping path and drop in priority. int4 pays the most (10.8%), which fits: it is the most mma-dense and
+does the least conversion, so the reload is relatively most visible.
+
+**"int4 is no longer the ceiling" was WRONG and is retracted.** It was merely untuned. With its own w64x32 row it goes
+243.54 -> **211.33 us / 65.0% MFU**, +8.6 points, and is again the fastest of the four. The error was comparing against
+a reference I had not tuned on the same grid -- the same shape as this session's other mistakes: trusting a quantity I
+had not read off the thing itself.
+
+So, tuned, at gs=32: int4 211.33 (65.0%) < int1 215.23 (63.9%) < int2 233.76 (58.8%) < B-concat 255.47 (53.8%).
+B-concat / int4 = 1.21x at gs=32 and **1.12x at gs=16** -- a 3-bit two-plane GEMM for 12% over a single 4-bit GEMM.
+
+w64x32 elsewhere: int1 at TK=128 improves to 219.70 / 62.6% but does not beat TK=64's 215.23; the three B-concat TK=128
+rows do not beat TK=64 either, so the TK=64 winner stands.
