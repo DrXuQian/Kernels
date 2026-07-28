@@ -248,3 +248,40 @@ hi chunk   = cvt_hi(_, ii % MMA_N2)
 uint32 off = (k_block % P2_DIV) + P2_DIV * (ii / MMA_N2)
 ```
 `P2_DIV == 1 && MMA_N2 == MMA_N1` reproduces the shipped expression exactly, so the unfolded path is untouched.
+
+---
+
+# Block_K=64 (Stage 2) — root cause found, and it makes #12 a CORRECTNESS prerequisite
+
+Box: `Block_K=256` bad=0 (control), `128` bad=0, **`64` bad=13689/32768**.
+
+`l55_write_side.cu` — the side no earlier derivation modelled: where the CONVERTED fp16 is written.
+`transform_B_kblock` aliases `tCrB_mma`'s registers through the LOAD fragment's layout:
+
+```cpp
+cvt_out = make_tensor(tCrB_mma(_,_,kb*K_ATOM_PER_COPY).data(), cvt_in.layout());
+```
+
+Valid only while `cvt_in`'s mode-1 stride equals `tCrB_mma`'s `MMA_N` stride. Measured, with the two
+working configs as controls:
+
+| config | tCrB_mma | cvt_in | |
+|---|---|---|---|
+| TK=256 unfolded | MMA_N=2 stride 128 | mode1=2 stride 128 | MATCH (bad=0) |
+| TK=128 unfolded | MMA_N=2 stride 64 | mode1=2 stride 64 | MATCH (bad=0) |
+| **TK=64 F1=2** | **MMA_N=4 stride 32** | **mode1=2 stride 64** | **MISMATCH (bad=13689)** |
+
+Folding plane 1 puts `tCrB_mma` on the fold-in-N LOGICAL view: `MMA_N` doubles and its stride halves,
+while `cvt_in` stays physical. The flat write then scatters into the wrong registers. The collective's
+own comment warns about exactly this ("Write through the TENSOR ... NOT through a linear pointer") — it
+does use a tensor, but with the wrong layout.
+
+**The fix is #12.** `tCrB_one = make_fragment_like(tCrB_mma(_,_,Int<0>{}))` is a COMPACT single-atom
+buffer, so a flat write into it is valid by construction, and the mma consumes `tCrB_one` directly. So
+chunked B conversion is not a perf lever at Block_K=64 — it is required for the path to be correct at
+all. Do #12 before measuring Stage 2.
+
+Note the chunk gate must be re-derived for this shape: at `Block_K=64` `tCrB_mma` is
+`((2,2,2),4,4):((1,2,4),32,8)`, the FOLD family, where `MixGemmChunkEmit`'s `right_inverse` composition
+is the correct gate — not l41's `at_plain/4`, which was derived at the non-fold `MmaPermK`. l42 already
+showed the two converge there.
