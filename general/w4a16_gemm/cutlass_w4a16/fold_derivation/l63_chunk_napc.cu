@@ -131,12 +131,63 @@ static bool gate(const char* tag) {
         }
       }
 
+  // (e) THE HIGH-PLANE SOURCE INDEX, for BOTH paths. l63 originally checked only where outputs GO; the defect that
+  // followed was where inputs COME FROM. The chunked transform_B_atom kept the shipped
+  //     hi = cvt_hi(_, ii) + (k_block % P2_DIV)
+  // while the unchunked path had been fixed for the per-plane fold to
+  //     hi = cvt_hi(_, ii % N2) + (k_block % P2_DIV) + P2_DIV * (ii / N2)
+  // With a folded plane 2, P2_DIV == 1, so the old form makes every ii read vregs {0,2} and never touch {1,3}: half the
+  // tile's high bits cannot arrive and no placement repairs it. On the box that was bad ~= 15000/32768 (~46%) on every
+  // folded rung while the Block_K=256 control passed, because P2_DIV is 2 there and the old form happens to be right.
+  //
+  // Gated as COVERAGE: over all (k_block, ii, v) the converter reads high vreg (base + 2*(v>>1)) of N-slot (ii % N2),
+  // and that must hit every (slot, vreg) of plane 2 exactly once. Both formulas are evaluated so the harness reproduces
+  // the bug as well as the fix -- a gate that only passes tells you less than one that also fails on demand.
+  // PER-PLANE fold, from the rule, not from a relation between the planes. I first wrote Ng2 = TN/(F1*2) -- "plane 2
+  // always folds twice as hard" -- which holds at Block_K 128 (F1=1,F2=2) and 64 (F1=2,F2=4) but NOT at 256, where both
+  // are 1. That made the harness report the FIXED formula broken at the one configuration the box says is correct.
+  // Fourth time this session that a hardcoded relation in a harness produced a false verdict.
+  constexpr int P2Contig = TK * 1 / 8, F2 = (P2Contig >= 32) ? 1 : (32 / P2Contig);
+  constexpr int BK2 = F2 * TK, Ng2 = TN / F2, RowB2 = BK2 * 1 / 8;
+  using OB2 = AiuOp<1, BK2>;
+  using AtomB2 = Copy_Atom<PPU0010_TSM_LD_SWZL<int8_t, (Ng2 > 0 ? Ng2 : 1), OB2::AiuElem / 8, true, false, OB2::InstNum>, int8_t>;
+  (void)sizeof(AtomB2);
+  auto tCrB2_load = MmaS8{}.get_thread_slice(0).partition_fragment_B(
+      make_tensor(make_smem_ptr((int8_t*)nullptr),
+                  make_layout(make_shape(Int<(Ng2 > 0 ? Ng2 : 1)>{}, Int<RowB2>{}), make_stride(Int<RowB2>{}, _1{}))));
+  const int CPY_K2 = int(size<2>(tCrB2_load));
+  const int P2_DIV = (CPY_K2 > 0 && CPY_K / CPY_K2 > 0) ? CPY_K / CPY_K2 : 1;
+  const int N2 = int(size<1>(tCrB2_load));
+  const int VREGS = int(size<0>(tCrB2_load)) * 8 / 32;                     // int8 elems -> int1 codes -> vregs
+  int bad_src_fixed = 0, bad_src_old = 0;
+  for (int pass = 0; pass < 2; ++pass) {
+    // The space is (N-slot, vreg), NOT (N-slot, vreg, k_block). For a given (kb, ii) the four v values yield only TWO
+    // distinct vregs -- base and base+2, since the converter indexes hi[base + 2*(v>>1)] -- and the other two belong to
+    // the OTHER k_block. Including kb as a dimension double-counts it and reported the shipped, box-correct Block_K=256
+    // configuration as under-covered. Fifth harness-side false verdict; the pattern is always the same, a relation I
+    // wrote down instead of reading off the thing itself.
+    std::vector<int> hit((size_t)N2 * VREGS, 0);
+    for (int kb = 0; kb < CPY_K; ++kb)
+      for (int ii = 0; ii < CPY_N; ++ii)
+        for (int v = 0; v < 4; ++v) {
+          const int slot = pass ? (ii % N2) : ii;
+          const int base = pass ? ((kb % P2_DIV) + P2_DIV * (ii / N2)) : (kb % P2_DIV);
+          const int vr   = base + 2 * (v >> 1);
+          if (slot < 0 || slot >= N2 || vr < 0 || vr >= VREGS) { if (pass) ++bad_src_fixed; else ++bad_src_old; continue; }
+          ++hit[(size_t)slot * VREGS + vr];
+        }
+    int unused = 0; for (size_t i = 0; i < hit.size(); ++i) if (hit[i] == 0) ++unused;
+    if (pass) bad_src_fixed += unused; else bad_src_old += unused;
+  }
+  printf("  %-32s plane2: F2=%d N2=%d VREGS=%d P2_DIV=%d | high-source coverage: OLD %s(%d unreached)  FIXED %s(%d)\n",
+         "", F2, N2, VREGS, P2_DIV, bad_src_old ? "BROKEN " : "ok ", bad_src_old, bad_src_fixed ? "BROKEN " : "ok ", bad_src_fixed);
+
   printf("  %-32s MMA_N=%d MMA_K=%d CPY_N=%d CPY_K=%d KAPC=%d NAPC=%d kAtoms=%d S1=%d\n",
          tag, MMA_N, MMA_K, CPY_N, CPY_K, KAPC, NAPC, kAtoms, S1);
   printf("  %-32s Chunk formula %s | partition %s | rebase %s | dest vs unchunked %s\n", "",
          bad_formula ? "WRONG" : "ok", bad_partition ? "NOT a partition" : "exact",
          bad_rebase ? "WRONG" : "ok", bad_dest ? "DIFFERS <-- do not ship" : "IDENTICAL");
-  return !(bad_formula || bad_partition || bad_rebase || bad_dest);
+  return !(bad_formula || bad_partition || bad_rebase || bad_dest || bad_src_fixed);
 }
 
 int main() {
