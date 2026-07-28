@@ -1,3 +1,17 @@
+// ***** RETRACTED (l47). The conclusion below -- "the two planes disagree on thread->column, the data a thread needs
+// ***** is in another thread's registers" -- is WRONG, and the error is in this file's premise, not its arithmetic.
+// ***** It labels each plane's PHYSICAL row as a logical N column (n = f + F*g). That identification holds only if the
+// ***** offline is the identity, and it is not: the offline permutes. So both sides were physical rows dressed up as
+// ***** logical, and the comparison was meaningless.
+// *****
+// ***** What actually settled it: l47 emits the buffer and diffs it against the shipped offline. At F2=1 the derived
+// ***** cross-plane buffer is BIT-IDENTICAL to what runs today (0/16384, 0/65536) -- so the generator is right -- and
+// ***** at F2=2 it is ALSO bit-identical to plane 2's own single-plane rule. The offline was never wrong. The defect
+// ***** behind bad=15010/32768 is kernel-side: cvt_hi(_, ii) is out of range once the fold drops plane 2 to MMA_N=1.
+// *****
+// ***** Kept for the method, not the claim: derive, then GATE THE DERIVATION AGAINST SOMETHING THAT ALREADY WORKS.
+// ***** A self-consistency check (T2) cannot catch a wrong premise shared by both sides of the comparison.
+//
 // L44 -- which LOGICAL N columns each plane's vregs carry once plane 2 is folded, and therefore what the converter's
 // high-plane offset must become. The box says bad=15010/32768 on the Block_K=128 folded path while the unfolded
 // control is bad=0, so the gmem/smem plumbing is right and the cross-plane REGISTER correspondence is not.
