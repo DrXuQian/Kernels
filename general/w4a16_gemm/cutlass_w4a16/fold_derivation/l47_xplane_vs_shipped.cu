@@ -48,7 +48,12 @@ int main() {
   bool c2 = check<64, 64,256,32,32, 1>("F2=1 (64,64,256) larger", 512, 1024);
   printf("\n  FOLDED: no shipped equivalent exists -- printed to show HOW MUCH it differs from plane 2's own rule,\n");
   printf("  which is the buffer that measured bad=15010/32768 on the box\n");
-  check<64, 64,128,32,32, 2>("F2=2 (64,64,128) vs single-plane rule", 256, 512);
+  // THE REAL TEST'S SHAPE. K=256 is 2 k-tiles, not 4 -- if place_int1's walk depends on K/TK the equality can hold at
+  // one and not the other, and the box runs K=256. That difference is the only thing left that distinguishes the run
+  // which measured 29666 from what the composition predicts.
+  check<64, 64,128,32,32, 2>("F2=2 (64,64,128) K=512", 256, 512);
+  check<64, 64,128,32,32, 2>("F2=2 (64,64,128) K=256  <-- the box's shape", 256, 256);
+  check<64, 64,128,32,32, 2>("F2=2 (64,64,128) K=128", 256, 128);
   printf("\n  verdict: %s\n", (c && c2) ? "generator validated on the control"
                                         : "generator does NOT reproduce the shipped buffer -- do not trust the folded map");
   return 0;
