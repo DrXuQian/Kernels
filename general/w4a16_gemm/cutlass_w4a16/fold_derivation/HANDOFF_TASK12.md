@@ -117,9 +117,20 @@ logical mma view, and a re-derived chunk gate (l41's `at_plain/4` is valid only 
 
 ## What to measure
 
+`build.sh` does `rm -rf` on its build dir and emits to
+`$ACTLIZE/build_w4a16_compare/examples/99_kernels_w4a16_compare/<target>` — it is NOT in the source dir, and the
+script's closing `built: ...` line prints the full path. **Two builds write the same path, so the second overwrites
+the first**: any A/B must copy the binary aside in between. (An acu capture of "the best config" that came back at
+~50% instead of 63.7% is what this footgun looks like.)
+
 ```
-TARGET=test_q3_bconcat_real ./build.sh && ./test_q3_bconcat_real            # numerics FIRST
-TARGET=test_q3_bconcat_bench ./build.sh && ./test_q3_bconcat_bench 2048 4096 4096 16
+BIN=/sim/eec/shared/junfu.qx/Kernels/third_party/actlize/build_w4a16_compare/examples/99_kernels_w4a16_compare
+TARGET=test_q3_bconcat_real  ./build.sh && $BIN/test_q3_bconcat_real                 # numerics FIRST
+TARGET=test_q3_bconcat_bench ./build.sh && $BIN/test_q3_bconcat_bench 2048 4096 4096 16
+
+# A/B against the chunked build -- copy aside, or the second build eats the first
+TARGET=test_q3_bconcat_bench ./build.sh && cp $BIN/test_q3_bconcat_bench /tmp/bench_plain
+PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q3_bconcat_bench ./build.sh && cp $BIN/test_q3_bconcat_bench /tmp/bench_chunk
 ```
 
 The TK=256 `BC` rows must reproduce their previous numbers exactly — they are the control that the change did not
