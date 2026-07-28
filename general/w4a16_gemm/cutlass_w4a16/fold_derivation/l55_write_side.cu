@@ -1,3 +1,15 @@
+// ***** RETRACTED. The criterion below is WRONG, and so is the conclusion it produced ("chunked B conversion is a
+// ***** correctness prerequisite at Block_K=64"). What the flat write actually needs is only that it cover tCrB_mma
+// ***** BIJECTIVELY, and it does: at Block_K=64 the fragment is ((2,2,2),4,4):((1,2,4),32,8), so ii=0 writes memory
+// ***** offsets [0,64) = atoms (n=0..1, k=0..3) and ii=1 writes [64,128) = (n=2..3, k=0..3) -- each exactly once. And
+// ***** plane_map's `flat = inst*VEC + e` walks the SAME memory offsets, with pi = right_inverse(frag.layout()) already
+// ***** accounting for the folded layout. Requiring cvt_in's mode-1 stride to EQUAL tCrB_mma's MMA_N stride was a
+// ***** condition I invented; nothing needs it.
+// *****
+// ***** Fifth wrong derivation in this line of work, and the same root cause as the other four: a criterion asserted
+// ***** rather than gated. The Block_K=64 failure moved THREE variables at once (TN, WN, TK-with-fold), so the next
+// ***** step is a numeric LADDER, one variable per rung -- see test_q3_bconcat_real. Kept for the retraction.
+//
 // L55 -- the side my composition never modelled: where the CONVERTED fp16 is written.
 //
 // transform_B_kblock does  cvt_out = make_tensor(tCrB_mma(_,_,kb*K_ATOM).data(), cvt_in.layout())  -- it aliases

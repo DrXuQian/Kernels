@@ -131,52 +131,48 @@ int main(int argc, char** argv) {
   };
   bool ok256 = check("Block_K=256 (unfolded, CONTROL)");
 
-  // PER-PLANE N-FOLD, the actual new path: at Block_K=128 int2 keeps F=1 (32 B run) while int1 folds F=2, so the high
-  // plane needs its OWN folded buffer. A MATCH at Block_K=256 only says the change did not disturb the old path.
-  {
-    // xplane::place_int1 was tried here and is BYTE-IDENTICAL to this (l47), so the offline was never the defect --
-    // pack_plane's fold is already the buffer the kernel reads. Kept as the plain form; the derived generator lives in
-    // xplane_offline.hpp for Q5/Q6, validated against the shipped buffer at F2=1.
-    auto BhiF = pack_plane<8, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, 64, 128>(high1, K, N);
-    cutlass::DeviceAllocation<cutlass::uint1b_t> dBhiF((size_t)K*N);
-    dBhiF.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(BhiF.data()));
-    CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));
-    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3,
-                                    cutlass::uint2b_t, cutlass::uint1b_t>(
-        dA.get(), dBlo.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
-        M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr,
-        dBhiF.get());
-    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-    bool ok128 = check("Block_K=128 (int2 F=1, int1 F=2)  NEW");
+  // A LADDER, one variable per rung. The Block_K=64 attempt moved THREE at once (TN 64->128, WN 32->64, TK 128->64
+  // with both planes folding) and came back bad=13689/32768, which localises nothing. The composition check cannot
+  // separate them either: it DEFINES the high plane's placement, so testing the pairing against it is circular. A
+  // numeric ladder does separate them, in one box round -- the same technique that localised int4's unexplained
+  // 10-point drop.
+  //
+  // Every rung drives the high plane through xplane::place_int1, which is byte-identical to pack_plane's fold at
+  // F1=1/F2=2 (l47, l53 at both K=512 and the box's K=256). So rung 1 is the known-MATCH configuration and also
+  // double-checks that byte-identity on the box; if rung 1 breaks, place_int1 is the problem and nothing else matters.
+#define RUNG(TAG, TMv, TNv, TKv, WMv, WNv, Sv, F1v, F2v) do {                                        \
+  auto blo_ = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, TNv, ((F1v) > 1 ? (TKv) : 0)>(  \
+      low2, K, N);                                                                                   \
+  cutlass::DeviceAllocation<cutlass::uint2b_t> dblo_((size_t)K*N);                                   \
+  dblo_.copy_from_host(reinterpret_cast<cutlass::uint2b_t const*>(blo_.data()));                     \
+  std::vector<int8_t> bhi_((size_t)K * N / 8);                                                       \
+  xplane::place_int1<TMv, TNv, TKv, WMv, WNv, F2v, F1v>(bhi_.data(), high1, N, K);                   \
+  cutlass::DeviceAllocation<cutlass::uint1b_t> dbhi_((size_t)K*N);                                   \
+  dbhi_.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(bhi_.data()));                     \
+  CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));                        \
+  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMv, TNv, TKv, WMv, WNv, Sv,             \
+                                  cutlass::uint2b_t, cutlass::uint1b_t>(                             \
+      dA.get(), dblo_.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                     \
+      M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr, dbhi_.get());    \
+  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());                                                        \
+  if (!check(TAG)) { if (first_bad < 0) first_bad = rung_no; }                                       \
+  ++rung_no;                                                                                         \
+} while (0)
 
-    // STAGE 2, Block_K=64: BOTH planes fold (int2 F=2, int1 F=4) and WN must be 64 -- int1's delivery bound is
-    // WN*TK*bits >= 4096. This is the geometry where cvt/mma = 128/WM = 2, the optimum of the first (ceiling) factor,
-    // and it is the same shared mma fragment ((2,2,2),4,4):((1,2,4),32,8) that the single-plane int1 config reaching
-    // 63.7% uses. Low plane folds through nfold_regroup_gmem (whole-word, valid at F=2 and gated in l52); high plane
-    // through the cross-plane generator, whose composition is a complete bijection here (l54).
-    bool ok64 = false;
-    {
-      auto BloF = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, 128, 64>(low2, K, N);
-      cutlass::DeviceAllocation<cutlass::uint2b_t> dBloF((size_t)K*N);
-      dBloF.copy_from_host(reinterpret_cast<cutlass::uint2b_t const*>(BloF.data()));
-      std::vector<int8_t> BhiF64((size_t)K * N / 8);
-      xplane::place_int1<64, 128, 64, 64, 64, 4, 2>(BhiF64.data(), high1, N, K);
-      cutlass::DeviceAllocation<cutlass::uint1b_t> dBhiF64((size_t)K*N);
-      dBhiF64.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(BhiF64.data()));
-      CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));
-      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 128, 64, 64, 64, 2,
-                                      cutlass::uint2b_t, cutlass::uint1b_t>(
-          dA.get(), dBloF.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),
-          M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr,
-          dBhiF64.get());
-      CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-      ok64 = check("Block_K=64  (int2 F=2, int1 F=4)  STAGE2");
-    }
+  int rung_no = 1, first_bad = -1;
+  RUNG("1 (64, 64,128) w32x32 F1=1 F2=2  BASE", 64,  64, 128, 32, 32, 3, 1, 2);
+  RUNG("2 (64,128,128) w32x32   TN 64->128 ", 64, 128, 128, 32, 32, 3, 1, 2);
+  RUNG("3 (64,128,128) w32x64   WN 32->64  ", 64, 128, 128, 32, 64, 3, 1, 2);
+  RUNG("4 (64,128,128) w64x64   WM 32->64  ", 64, 128, 128, 64, 64, 3, 1, 2);
+  RUNG("5 (64,128, 64) w64x64   TK 128->64, F1=2 F2=4", 64, 128, 64, 64, 64, 3, 2, 4);
+#undef RUNG
+  std::printf("  => control %s; ladder: %s\n", ok256 ? "OK" : "BROKEN (look there first)",
+              first_bad < 0 ? "all rungs MATCH" :
+              first_bad == 1 ? "rung 1 already wrong -- place_int1 or the base config, not the ladder" :
+                               "first failure at rung -- the variable that rung introduces is the cause");
+  if (first_bad > 1) std::printf("     first failing rung: %d\n", first_bad);
 
-    std::printf("  => per-plane fold: 128 %s, 64 %s%s\n", ok128 ? "MATCH" : "WRONG", ok64 ? "MATCH" : "WRONG",
-                ok256 ? "" : "  (and the CONTROL broke -- look there first)");
-  }
-
+  // dD still holds the LAST rung's output, so the per-element dump below shows that rung's error shape.
   std::vector<half_t> hD((size_t)M*N); dD.copy_to_host(hD.data());
   const half_t* gold = reinterpret_cast<const half_t*>(gold_h.data());
   int bad = 0, shown = 0; double maxrel = 0;
@@ -186,7 +182,7 @@ int main(int argc, char** argv) {
     if (rel > maxrel) maxrel = rel;
     if (std::abs(got - exp) > 2e-2 + 6e-2 * std::abs(exp)) ++bad;
   }
-  std::printf("  B-concat (1 GEMM) vs native Q3_K golden: bad=%d/%d max_rel=%.3e %s\n",
+  std::printf("  last rung (%d) vs native Q3_K golden: bad=%d/%d max_rel=%.3e %s\n", rung_no - 1,
               bad, M * N, maxrel, bad == 0 ? "MATCH" : "MISMATCH");
   // On MISMATCH the SHAPE of the error localizes it: a whole-K shift or a low/high N-half swap points at the
   // plane-2 swzl lane delivery (the one thing the local xplane.py check could not cover); a per-element factor of
