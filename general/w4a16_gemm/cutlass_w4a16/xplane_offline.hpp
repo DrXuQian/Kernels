@@ -139,24 +139,33 @@ inline std::vector<int> tile_map_int1() {
 template <int Bits, int TM, int TN, int TK, int WM, int WN, int F>
 inline void place_from_map(int8_t* out, const std::vector<int>& m, const std::vector<uint8_t>& q_kn, int N, int K) {
   constexpr int CPW = 32 / Bits, R = TN / F, DL = (F * TK * Bits / 8) / 32, MASK = (1 << Bits) - 1;
-  static_assert(DL == 1, "the buffer walk below assumes one delivery per folded row");
-  const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F;
+  static_assert(DL >= 1, "a physical row must be a whole number of 32 B deliveries");
+  // Two destination walks, l20's two branches. F > 1 is plane-major: super-tile kb becomes a separate plane of N/F
+  // rows. F == 1 is the interleave-256 one, which is what preprocess_weights_for_mixed_gemm's five steps produce.
+  const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F;                       // F > 1
+  constexpr int kCon = 256, contig = F * TK * Bits / 8, AiuByte = contig > 128 ? 128 : contig;
+  constexpr int AiuElem = AiuByte * 8 / Bits, RPS = kCon / AiuElem;                          // F == 1
   std::fill(out, out + (size_t)N * K * Bits / 8, int8_t(0));
   for (int tn = 0; tn < N / TN; ++tn)
     for (int ki = 0; ki < K / TK; ++ki)
       for (int row = 0; row < R; ++row)
-        for (int wd = 0; wd < 8; ++wd)
-          for (int j = 0; j < CPW; ++j) {
-            const int loc = m[((size_t)row * 8 + wd) * CPW + j];
-            if (loc < 0) continue;
-            const int n = tn * TN + loc / TK, k = ki * TK + loc % TK;
-            const int v = q_kn[(size_t)k * N + n] & MASK;          // q_kn is [K][N]
-            if (!v) continue;
-            const int kb = ki / RUNS, tt = ki % RUNS;
-            const size_t bit0 = (size_t)((((size_t)kb * nrow + (size_t)tn * R + row) * W_ROW_OFF + tt * 8 + wd) * CPW + j) * Bits;
-            for (int b = 0; b < Bits; ++b)
-              if ((v >> b) & 1) out[(bit0 + b) / 8] |= int8_t(1 << ((bit0 + b) % 8));
-          }
+        for (int dl = 0; dl < DL; ++dl)
+          for (int wd = 0; wd < 8; ++wd)
+            for (int j = 0; j < CPW; ++j) {
+              const int loc = m[(((size_t)row * DL + dl) * 8 + wd) * CPW + j];
+              if (loc < 0) continue;
+              const int n = tn * TN + loc / TK, k = ki * TK + loc % TK;
+              const int v = q_kn[(size_t)k * N + n] & MASK;          // q_kn is [K][N]
+              if (!v) continue;
+              size_t code;
+              if (F > 1) { const int kb = ki / RUNS, tt = ki % RUNS;
+                           code = (((size_t)kb * nrow + (size_t)tn * R + row) * W_ROW_OFF + tt * 8 + wd) * CPW + j; }
+              else       { code = ((size_t)(ki / RPS) * N + (size_t)tn * TN + row) * kCon
+                                  + (size_t)(ki % RPS) * AiuElem + (size_t)(dl * 8 + wd) * CPW + j; }
+              const size_t bit0 = code * Bits;
+              for (int b = 0; b < Bits; ++b)
+                if ((v >> b) & 1) out[(bit0 + b) / 8] |= int8_t(1 << ((bit0 + b) % 8));
+            }
 }
 
 // One plane on its own, from its own derived map. This is what plane 1 needs once cols_per_word > 1.

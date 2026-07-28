@@ -652,6 +652,12 @@ void subbyte_transpose(int8_t*                    transposed_quantized_tensor,
 // output and only MOVE whole 16-code words.
 // BITS-parameterised: int2 uses F=2 / 16 codes per uint32, int1 uses F=4 / 32 codes. Everything else in the
 // derivation is bit-width agnostic (it only moves whole uint32 words, preserving the pipeline's crumb order).
+// LANDMINE, kept only until its remaining WN=32 callers move to xplane::place_derived. This moves whole uint32
+// words, so each word carries ONE logical column -- correct only while cols_per_word == 1, i.e. warp N extent 32. At
+// WN=64 the fragment wants TWO columns per word and no whole-word move can express it; line 676 additionally groups
+// the folded columns STRIDED (n = g + f*Ng) where the kernel's SmemLayoutB_MmaView groups them ADJACENT
+// (n = f + P1Fold*g). Both defects were invisible until (64,128,64) w64x64 F=2, which measured 32768/65536 slots
+// misplaced (fold_derivation/l61) and half the output columns off by +32 on hardware.
 inline void nfold_regroup_gmem(int8_t* out, const int8_t* in_std,
                                const std::vector<size_t>& shape, int fold_tn, int fold_tk, int bits)
 {
@@ -744,10 +750,6 @@ inline void nfold_place_bits_int1_tk64(int8_t* out, const int8_t* in_nk, size_t 
         out[dst_bit / 8] |= int8_t(1 << (dst_bit % 8));
       }
 }
-
-inline void nfold_regroup_gmem_int2(int8_t* out, const int8_t* in_std,
-                                    const std::vector<size_t>& shape, int fold_tn, int fold_tk)
-{ nfold_regroup_gmem(out, in_std, shape, fold_tn, fold_tk, /*bits=*/2); }
 
 // nfold_column_pairs_ppu USED TO LIVE HERE and has been deleted. It was dead code (nothing called it) whose
 // comments carried a DISPROVEN derivation -- that the pipeline interleaves several N columns inside one vreg

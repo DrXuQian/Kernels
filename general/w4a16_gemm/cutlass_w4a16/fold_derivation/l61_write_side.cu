@@ -107,11 +107,50 @@ static bool write_side(const char* tag, int N, int K) {
   return bad == 0;
 }
 
+// The UNFOLDED walk, gated against the full five-step pipeline (subbyte_transpose -> permute_B_rows ->
+// add_bias_and_interleave -> interleave_column_major_ppu, no fold). If place_derived reproduces it byte for byte then
+// the five steps have no remaining reason to exist -- this is the gate task #4 was waiting on.
+template <int Bits, int TM, int TN, int TK, int WM, int WN, QuantTypeClass QTC, int BIAS = 0>
+static bool unfolded(const char* tag, int N, int K) {
+  const size_t NB = (size_t)N * K * Bits / 8;
+  // place_derived is POSITIONAL; the value encoding is the caller's business. int4's preprocess adds +8 (signed ->
+  // unsigned) while int2/int1 explicitly do not, so a raw comparison against the int4 pipeline differs in EVERY byte
+  // for a reason that has nothing to do with layout. BIAS feeds the same encoding in.
+  std::vector<uint8_t> q((size_t)K * N), qb((size_t)K * N);
+  for (size_t i = 0; i < q.size(); ++i) {
+    q[i]  = uint8_t((i * 2654435761u >> 11) & ((1 << Bits) - 1));
+    qb[i] = uint8_t((int(q[i]) - (BIAS ? (1 << (Bits - 1)) : 0)) & ((1 << Bits) - 1));   // what the pipeline is fed
+  }
+  const int EPB = 8 / Bits;
+  std::vector<int8_t> packed(NB, 0);
+  for (int k = 0; k < K; ++k) for (int n = 0; n < N; ++n) {
+    const size_t i = (size_t)n * K + k;
+    packed[i / EPB] |= int8_t((qb[(size_t)k * N + n] & ((1 << Bits) - 1)) << (Bits * (i % EPB)));
+  }
+  std::vector<int8_t> ship(NB), drv(NB);
+  preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N}, QTC);
+  xplane::place_derived<Bits, TM, TN, TK, WM, WN, 1>(drv.data(), q, N, K);
+  size_t d = 0; for (size_t i = 0; i < NB; ++i) if (drv[i] != ship[i]) ++d;
+  printf("  %-40s %dx%d : %zu / %zu bytes differ  %s\n", tag, N, K, d, NB,
+         d ? "<-- the five steps are NOT reproduced" : "<-- BIT-IDENTICAL, the five steps are redundant");
+  return d == 0;
+}
+
 int main() {
   printf("L61 -- plane 1's WRITE path at the failing test's own parameters\n\n");
   bool a = write_side<64,  64,  64, 32, 32, 2>("int2 shipping (64,64,64) w32x32   BOX ok", 256, 256);
   bool b = write_side<64, 128,  64, 64, 64, 2>("rung 5 plane 1 (64,128,64) w64x64 BOX bad", 256, 256);
   bool c = write_side<64, 128,  64, 64, 64, 2>("rung 5 plane 1, l52's N/K         l52 ok", 256, 512);
+  printf("\n  and the UNFOLDED walk against the whole five-step pipeline:\n");
+  bool u1 = unfolded<2, 64,  64, 128, 32, 32, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2 (64, 64,128) w32x32 F=1  DL=1", 256, 512);
+  bool u2 = unfolded<2, 64,  64, 256, 32, 32, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2 (64, 64,256) w32x32 F=1  DL=2", 256, 512);
+  bool u3 = unfolded<2, 64, 128, 128, 64, 64, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY>("int2 (64,128,128) w64x64 F=1  rung 4", 256, 256);
+  bool u4 = unfolded<1, 64, 128, 256, 32, 32, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY>("int1 (64,128,256) w32x32 F=1", 256, 512);
+  bool u5 = unfolded<4, 64, 128, 128, 32, 32, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY, 1>("int4 (64,128,128) w32x32 F=1 +bias", 256, 512);
+  const bool uall = u1 && u2 && u3 && u4 && u5;
+  printf("  => %s\n", uall ? "place_from_map covers BOTH walks -> the five steps can be deleted"
+                            : "the unfolded walk is not yet equivalent -- keep the five steps");
+
   printf("\n  verdict: shipping %s ; rung 5 @K=256 %s ; rung 5 @K=512 %s\n",
          a ? "clean" : "DIRTY", b ? "clean" : "DIRTY", c ? "clean" : "DIRTY");
   return (a && b && c) ? 0 : 1;
