@@ -182,12 +182,56 @@ static bool gate(const char* tag) {
   printf("  %-32s plane2: F2=%d N2=%d VREGS=%d P2_DIV=%d | high-source coverage: OLD %s(%d unreached)  FIXED %s(%d)\n",
          "", F2, N2, VREGS, P2_DIV, bad_src_old ? "BROKEN " : "ok ", bad_src_old, bad_src_fixed ? "BROKEN " : "ok ", bad_src_fixed);
 
+  // (f) THE CUTE FORM, gated against the hand-written one BEFORE changing the collective. MixGemmChunkEmit already
+  // does this for the single plane: two compositions over FragLayout, KaL(e) giving the k-atom (== the chunk) and AtL(e)
+  // the compact destination, with mode1 (n) stride size<0> and mode2 (k) stride 0. That means it handles NAPC > 1 for
+  // FREE -- which n-atom an output belongs to is something the fragment layout knows and no caller should compute.
+  //
+  // It cannot simply be called, because it indexes MixGemmEmit<2>::index(t,v) while the 2-plane converter has its own
+  // emission order (AtLayout, from the _E2 lines). So the composition is what gets shared, not the emission. Modelled
+  // here over the DELIVERY view of tCrB_mma -- shape (mode0, NAPC, KAPC), strides taken from tCrB_mma itself rather
+  // than written down -- and required to reproduce the hand-written (chunk, destination) pair exactly.
+  int bad_cute = 0;
+  {
+    auto fl = tCrB_mma.layout();
+    auto delivery = make_layout(make_shape (shape<0>(fl), Int<2>{}, Int<4>{}),      // NAPC/KAPC for the target config
+                                make_stride(stride<0>(fl), stride<1>(fl), stride<2>(fl)));
+    auto delivery1 = make_layout(make_shape (shape<0>(fl), Int<1>{}, Int<8>{}),     // the NAPC == 1 shape
+                                 make_stride(stride<0>(fl), stride<1>(fl), stride<2>(fl)));
+    auto check_one = [&](auto dl) {
+      if (int(size(dl)) != 64) return -1;                                          // must be exactly one delivery
+      auto atl = composition(make_layout(shape(dl), make_stride(stride<0>(dl), Int<size<0>(dl)>{}, _0{})),
+                             right_inverse(dl));
+      auto kal = composition(make_layout(shape(dl), make_stride(repeat_like(stride<0>(dl), _0{}), _0{}, _1{})),
+                             right_inverse(dl));
+      int bad = 0;
+      for (int t = 0; t < 8; ++t)
+        for (int v = 0; v < 4; ++v) {
+          const int e = 2 * Cvt::at_plain(t, v);                                   // half2 slot -> fp16 index
+          const int cute_ka = int(kal(e)), cute_at = int(atl(e)) / 2;
+          // the hand-written pair, from (e) above: chunk = at_plain/4 = ka + KAPC*n_local, position = at_plain % 4,
+          // destination atom within the delivery = n_local, so the compact half2 is 4*n_local + at_plain%4
+          const int sp = Cvt::at_plain(t, v);
+          const int n_local = (2 * sp) / (8 * MMA_K), ka = ((2 * sp) / 8) % MMA_K;
+          const int hand_ka = ka % KAPC, hand_at = 4 * n_local + sp % 4;
+          if (cute_ka != hand_ka || cute_at != hand_at) ++bad;
+        }
+      return bad;
+    };
+    const int r2 = (NAPC == 2) ? check_one(delivery) : 0;
+    const int r1 = (NAPC == 1) ? check_one(delivery1) : 0;
+    bad_cute = (r2 < 0 || r1 < 0) ? 999 : (r2 + r1);
+    printf("  %-32s cute (KaL/AtL over the delivery view) vs hand-written: %s\n", "",
+           bad_cute == 999 ? "delivery view is not 64 outputs -- shape wrong"
+                           : (bad_cute ? "DIFFERS <-- do not refactor yet" : "IDENTICAL -- safe to delete the arithmetic"));
+  }
+
   printf("  %-32s MMA_N=%d MMA_K=%d CPY_N=%d CPY_K=%d KAPC=%d NAPC=%d kAtoms=%d S1=%d\n",
          tag, MMA_N, MMA_K, CPY_N, CPY_K, KAPC, NAPC, kAtoms, S1);
   printf("  %-32s Chunk formula %s | partition %s | rebase %s | dest vs unchunked %s\n", "",
          bad_formula ? "WRONG" : "ok", bad_partition ? "NOT a partition" : "exact",
          bad_rebase ? "WRONG" : "ok", bad_dest ? "DIFFERS <-- do not ship" : "IDENTICAL");
-  return !(bad_formula || bad_partition || bad_rebase || bad_dest || bad_src_fixed);
+  return !(bad_formula || bad_partition || bad_rebase || bad_dest || bad_src_fixed || bad_cute);
 }
 
 int main() {
