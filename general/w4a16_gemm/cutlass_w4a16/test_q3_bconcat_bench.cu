@@ -59,7 +59,6 @@ static cutlass::DeviceAllocation<half_t>  *dA, *dSc, *dZr, *dD, *dDhi;
 static cutlass::DeviceAllocation<uint2_t> *dBlo;
 static cutlass::DeviceAllocation<int4_t>  *dB4;
 static cutlass::DeviceAllocation<uint1_t> *dBhi;
-static cutlass::DeviceAllocation<uint1_t> *dBhi128;   // int1 folded F=2 for Block_K=128 (per-plane fold)
 static cutlass::DeviceAllocation<GS>       *shpd;
 static cutlass::DeviceAllocation<half_t*>  *pd, *pd2;
 static cutlass::DeviceAllocation<DStride>  *sd;
@@ -95,15 +94,25 @@ static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; st
       M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr, dBhi->get()); }, 30); \
   report("BC " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S, u); upd(bBC, #TM "x" #TN ":" #TK " s" #S, u); } while (0)
 
-// PER-PLANE FOLD: Block_K=128 is now reachable -- int2 keeps F=1 (32 B run) while int1 folds F=2. That halves A-smem
-// against TK=256 (the whole reason B-concat sat at 12.5% occupancy) and needs a SEPARATELY FOLDED high plane, hence
-// dBhi128 rather than dBhi.
-#define BC128(TM,TN,TK,WM,WN,S) do { \
+// PER-PLANE FOLD, both planes from the DERIVED map (xplane), per configuration. Two reasons this is not the old
+// pack_plane pair:
+//   * the high plane must use the CROSS-PLANE map. The bench used to pack it with the single-plane rule, which is the
+//     buffer the hi_vreg0 finding says is wrong; it went unnoticed because a bench only reads the clock. Timing is
+//     unaffected, but a row that looks validated and is not is worse than no row.
+//   * plane 1 folds too once Block_K drops to 64 (int2 F=2, int1 F=4), and the whole-word packer cannot express
+//     cols_per_word > 1 at WN=64 -- that was the rung-5 defect.
+// Both buffers are rebuilt per row because the map depends on the tile. Host-side, outside the timed region.
+#define BCF(TM,TN,TK,WM,WN,S,F1,F2) do { \
+  std::vector<int8_t> blo_((size_t)K*N/4), bhi_((size_t)K*N/8); \
+  xplane::place_derived<2,TM,TN,TK,WM,WN,F1>(blo_.data(), low, N, K); \
+  xplane::place_int1<TM,TN,TK,WM,WN,F2,F1>(bhi_.data(), high, N, K); \
+  cutlass::DeviceAllocation<uint2_t> b1_((size_t)K*N); b1_.copy_from_host(reinterpret_cast<uint2_t const*>(blo_.data())); \
+  cutlass::DeviceAllocation<uint1_t> b2_((size_t)K*N); b2_.copy_from_host(reinterpret_cast<uint1_t const*>(bhi_.data())); \
   double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,uint2_t,uint1_t>( \
-      dA->get(), dBlo->get(), dSc->get(), dZr->get(), pd->get(), sd->get(), gm->get(), \
-      M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr, dBhi128->get()); }, 30); \
-  report("BC " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " [per-plane fold]", u); \
-  upd(bBC, #TM "x" #TN ":" #TK " s" #S " fold", u); } while (0)
+      dA->get(), b1_.get(), dSc->get(), dZr->get(), pd->get(), sd->get(), gm->get(), \
+      M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr, b2_.get()); }, 30); \
+  report("BC " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " [F1=" #F1 " F2=" #F2 "]", u); \
+  upd(bBC, #TM "x" #TN ":" #TK " s" #S " F" #F1 #F2, u); } while (0)
 
 #define I2(TM,TN,TK,WM,WN,S) do { \
   double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,uint2_t>( \
@@ -151,13 +160,10 @@ int main(int argc, char** argv) {
   auto B4 = pack_plane<2, QuantTypeClass::PACKED_INT4_WEIGHT_ONLY>(q4);
   cutlass::DeviceAllocation<int4_t> B4_((size_t)K*N); B4_.copy_from_host(reinterpret_cast<int4_t const*>(B4.data()));
   cutlass::DeviceAllocation<uint1_t> Bhi_((size_t)K*N);
-  auto Bhi128 = pack_plane<8, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, 128, 128>(high);   // int1 F=2 at Block_K=128
-  cutlass::DeviceAllocation<uint1_t> Bhi128_((size_t)K*N);
   { std::vector<half_t> a((size_t)M*K, half_t(0.01f)), s((size_t)scale_k*N, half_t(0.05f)), z((size_t)scale_k*N, half_t(-0.2f));
     A_.copy_from_host(a.data()); S_.copy_from_host(s.data()); Z_.copy_from_host(z.data()); }
   Blo_.copy_from_host(reinterpret_cast<uint2_t const*>(Blo.data()));
   Bhi_.copy_from_host(reinterpret_cast<uint1_t const*>(Bhi.data()));
-  Bhi128_.copy_from_host(reinterpret_cast<uint1_t const*>(Bhi128.data()));
 
   std::vector<GS> shp(1, cute::make_shape(M, N, K));
   cutlass::DeviceAllocation<GS> shpd_(1); shpd_.copy_from_host(shp.data());
@@ -172,7 +178,7 @@ int main(int argc, char** argv) {
   wsb = (size_t)cutlass::ceil_div(M,16)*cutlass::ceil_div(N,64)*64;
   cutlass::DeviceAllocation<char> ws_(wsb);
 
-  dA=&A_; dSc=&S_; dZr=&Z_; dD=&D_; dDhi=&Dh_; dBlo=&Blo_; dBhi=&Bhi_; dBhi128=&Bhi128_; dB4=&B4_; shpd=&shpd_;
+  dA=&A_; dSc=&S_; dZr=&Z_; dD=&D_; dDhi=&Dh_; dBlo=&Blo_; dBhi=&Bhi_; dB4=&B4_; shpd=&shpd_;
   pd=&pd_; pd2=&pd2_; sd=&sd_; gm=&gm_; offdev=&off_; ws=&ws_; shpv=&shp;
 
   Best bBC{"",1e18}, bI2{"",1e18}, bI1{"",1e18}, bI4{"",1e18};
@@ -189,12 +195,23 @@ int main(int argc, char** argv) {
   BC(16,256,256,16,32,3);  // TileM=16 + widest N: tiny A-smem, big tile area (best occ/reuse trade)
 
   std::printf("  --- B-concat with PER-PLANE FOLD (Block_K 128: int2 F=1, int1 F=2 -- A-smem halved) ---\n");
-  BC128(64, 64,128,32,32,3);
-  BC128(64, 64,128,32,32,2);
-  BC128(32,128,128,32,32,3);
-  BC128(64,128,128,32,64,3);
-  BC128(32, 64,128,32,32,3);
-  BC128(16,128,128,16,32,3);
+  // Block_K=128: int2 needs no fold (32 B run), int1 folds by 2.
+  BCF(64, 64,128,32,32,3,1,2);
+  BCF(64, 64,128,32,32,2,1,2);
+  BCF(32,128,128,32,32,3,1,2);
+  BCF(64,128,128,32,64,3,1,2);
+  BCF(32, 64,128,32,32,3,1,2);
+  BCF(16,128,128,16,32,3,1,2);
+  // Block_K=64: BOTH planes fold (int2 F=2, int1 F=4). int1's over-delivery bound is delivery <= WN*TK/32, i.e.
+  // 128 <= WN*64/32, so WN=64 is FORCED here -- w32x* cannot run at this Block_K. A-smem is TM*TK*2 = TM*128 B per
+  // stage, a quarter of TK=256's, which is the whole point: TileM and stages are the levers that were unaffordable.
+  BCF(64,128, 64,64,64,3,2,4);
+  BCF(64,128, 64,64,64,2,2,4);
+  BCF(64,128, 64,32,64,3,2,4);
+  BCF(32,128, 64,32,64,3,2,4);
+  BCF(128,128,64,64,64,3,2,4);
+  BCF(64,256, 64,64,64,3,2,4);
+  BCF(128,256,64,64,64,2,2,4);
 
   std::printf("  --- int2 single-plane sweep (TK may be 128) ---\n");
   I2(64,64,128,32,32,3);
