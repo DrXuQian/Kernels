@@ -114,6 +114,18 @@ static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; st
   report("BC " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " [F1=" #F1 " F2=" #F2 "]", u); \
   upd(bBC, #TM "x" #TN ":" #TK " s" #S " F" #F1 #F2, u); } while (0)
 
+// int2 alone WITH its own fold, so Block_K=64 is reachable for the single-plane reference too. Without this the
+// "int2 best" line is a TK=128 number and the concat overhead is measured against the wrong ceiling.
+#define I2F(TM,TN,TK,WM,WN,S,F) do { \
+  std::vector<int8_t> b_((size_t)K*N/4); \
+  xplane::place_derived<2,TM,TN,TK,WM,WN,F>(b_.data(), low, N, K); \
+  cutlass::DeviceAllocation<uint2_t> bb_((size_t)K*N); bb_.copy_from_host(reinterpret_cast<uint2_t const*>(b_.data())); \
+  double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,uint2_t>( \
+      dA->get(), bb_.get(), dSc->get(), dZr->get(), pd->get(), sd->get(), gm->get(), \
+      M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr); }, 30); \
+  report("i2 " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " [F=" #F "]", u); \
+  upd(bI2, #TM "x" #TN ":" #TK " s" #S " F" #F, u); } while (0)
+
 #define I2(TM,TN,TK,WM,WN,S) do { \
   double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TM,TN,TK,WM,WN,S,uint2_t>( \
       dA->get(), dBlo->get(), dSc->get(), dZr->get(), pd->get(), sd->get(), gm->get(), \
@@ -131,6 +143,22 @@ static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; st
       dA->get(), dB4->get(), dSc->get(), nullptr, pd->get(), sd->get(), gm->get(), \
       M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr); }, 30); \
   report("i4 " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S, u); upd(bI4, #TM "x" #TN ":" #TK " s" #S, u); } while (0)
+
+// int1 alone WITH its own fold. The "TK must be 256" note on the i1 sweep below is STALE for the same reason the
+// B-concat one was: per-plane fold reaches Block_K 128 (F=2) and 64 (F=4). It matters a lot here -- the recorded int1
+// optimum is (64,128,64) w64x64 s2 at 215.62 us / 63.7% MFU, i.e. TK=64, so a TK=256-only sweep reports 26.7% and
+// understates the single-plane ceiling by 2.4x. Two caveats when comparing against 63.7%: that number was measured at
+// gs=32 (this bench defaults to gs=16, which forces FINE) and WITH the chunked B conversion, which the 2-plane path
+// does not have yet (task #12).
+#define I1F(TM,TN,TK,WM,WN,S,F) do { \
+  std::vector<int8_t> b_((size_t)K*N/8); \
+  xplane::place_derived<1,TM,TN,TK,WM,WN,F>(b_.data(), high, N, K); \
+  cutlass::DeviceAllocation<uint1_t> bb_((size_t)K*N); bb_.copy_from_host(reinterpret_cast<uint1_t const*>(b_.data())); \
+  double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly,TM,TN,TK,WM,WN,S,uint1_t>( \
+      dA->get(), bb_.get(), dSc->get(), nullptr, pd2->get(), sd->get(), gm->get(), \
+      M,N,K,1,gs, shpd->get(), shpv->data(), offdev->get(), ws->get(), wsb, nullptr); }, 30); \
+  report("i1 " #TM "x" #TN ":" #TK " w" #WM "x" #WN " s" #S " (ScaleOnly) [F=" #F "]", u); \
+  upd(bI1, #TM "x" #TN ":" #TK " s" #S " F" #F, u); } while (0)
 
 #define I1(TM,TN,TK,WM,WN,S) do { \
   double u = time_it([&]{ moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly,TM,TN,TK,WM,WN,S,uint1_t>( \
@@ -212,13 +240,26 @@ int main(int argc, char** argv) {
   BCF(128,128,64,64,64,3,2,4);
   BCF(64,256, 64,64,64,3,2,4);
   BCF(128,256,64,64,64,2,2,4);
+  // STAGES IS THE DOMINANT LEVER HERE, and the first sweep only sampled s2 once: (64,128,64) w64x64 went 551.04 us
+  // (24.9%) at s3 and 377.33 us (36.4%) at s2 -- 1.46x from stages alone, while every other Block_K=64 row ran s3 and
+  // landed in a flat ~425 us band. So give each geometry its s2, and probe s4 in case the curve turns again.
+  BCF(64,128, 64,32,64,2,2,4);
+  BCF(32,128, 64,32,64,2,2,4);
+  BCF(128,128,64,64,64,2,2,4);
+  BCF(64,256, 64,64,64,2,2,4);
+  BCF(64,128, 64,64,64,4,2,4);
+  BCF(32,128, 64,32,64,4,2,4);
 
-  std::printf("  --- int2 single-plane sweep (TK may be 128) ---\n");
+  std::printf("  --- int2 single-plane sweep (TK 128, then FOLDED 64) ---\n");
   I2(64,64,128,32,32,3);
   I2(64,64,128,32,32,4);
   I2(32,64,128,32,32,3);
   I2(64,128,128,32,64,3);
   I2(32,128,128,32,32,3);
+  I2F(64, 64, 64,32,32,3,2);
+  I2F(64, 64, 64,32,32,2,2);
+  I2F(32,128, 64,32,32,3,2);
+  I2F(64,128, 64,64,64,2,2);
 
   std::printf("  --- int4 CEILING ref (TK64 = fold's target geometry; TK128 = int4's own TK sensitivity) ---\n");
   I4(64,64,64,32,32,3);    // int4 native winner: TM64 TK64, A-smem 8KB, ~50% occ -- the ceiling
@@ -227,7 +268,7 @@ int main(int argc, char** argv) {
   I4(64,64,128,32,32,3);   // int4 @ TK128 (bigger A-smem) -> if slower, small TK helps int4 too
   I4(64,64,64,32,32,4);
 
-  std::printf("  --- int1 single-plane sweep (TK must be 256) ---\n");
+  std::printf("  --- int1 single-plane sweep (TK 256 unfolded, then FOLDED 128/64) ---\n");
   I1(32,128,256,32,32,3);
   I1(64,64,256,32,32,3);
   I1(32,64,256,32,32,3);
@@ -235,6 +276,15 @@ int main(int argc, char** argv) {
   I1(16,128,256,16,32,3);
   I1(16,64,256,16,32,3);    // TileM=16 min
   I1(16,256,256,16,32,3);   // TileM=16 + widest N
+  // FOLDED int1 -- the geometries the recorded 63.7% actually used. int1's over-delivery bound is 128 <= WN*TK/32, so
+  // TK=64 forces WN=64 and TK=128 allows WN=32.
+  I1F(64,128, 64,64,64,2,4);          // the recorded optimum's tile and stage count
+  I1F(64,128, 64,64,64,3,4);
+  I1F(32,128, 64,32,64,2,4);
+  I1F(128,128,64,64,64,2,4);
+  I1F(64,128,128,32,32,3,2);
+  I1F(32,128,128,32,32,3,2);
+  I1F(32,128,128,32,32,2,2);
 
   std::printf("  ================= VERDICT =================\n");
   std::printf("  B-concat  best: %-16s %8.2f us\n", bBC.tag, bBC.us);
