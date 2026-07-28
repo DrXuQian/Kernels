@@ -99,6 +99,35 @@ static void probe(const char* tag) {
            (s2.n == gmemFolded.n && s2.k == gmemFolded.k) ? "OK" : "MISMATCH");
   }
 
+  // TILE **RANK**, not just extent. The box failed a second time at 2plane.hpp:808 with tB2gB2 having FIVE modes where
+  // the slice passes four. local_tile on the interleaved-branch counting tensor -- whose K is a NESTED mode
+  // (kCon, K/kCon) -- produces a rest whose rank depends on how the tiler's K divides kCon. Both planes must land on
+  // the SAME rank or the hardcoded (_,_,_,k) slice is wrong for one of them. This is pure cute: no copy atom, no
+  // builder, so it is answerable here even though syntax_check.sh structurally cannot see the mainloop at all.
+  {
+    constexpr int kCon = 256;
+    auto counting = [&](int Nphys, int Kphys) {
+      return make_counting_tensor(make_layout(
+          make_shape(Nphys, make_shape(Int<kCon>{}, Kphys / kCon)),
+          make_stride(ScaledBasis<_1,1>{}, make_stride(ScaledBasis<_1,0>{}, ScaledBasis<int,1>{Nphys}))));
+    };
+    auto rank_of = [&](int Nphys, int Kphys, int tileN, int tileK) {
+      // the k coordinate is `_` in the real call (take<0,3>(blk_coord_mnkl) keeps the k ITERATION mode, which is what
+      // the (_,_,_,k_iter_crd) slice later consumes). Passing a concrete 0 collapses it and reports rank 2 -- my first
+      // attempt did exactly that and "verified" a model that could not fail.
+      auto g = local_tile(counting(Nphys, Kphys),
+                          make_shape(Int<TM>{}, tileN, tileK), make_coord(0, 0, _), Step<X,_1,_1>{});
+      return int(rank(g.layout()));
+    };
+    const int N = 256, K = 256;                       // the real-weight test's shape
+    const int r1 = rank_of(N / F1, K * F1, TN / F1, F1 * TK);
+    const int r2 = rank_of(N / F2, K * F2, TN / F2, F2 * TK);
+    printf("   local_tile RANK: plane1 gB rank=%d (tileK=%d vs kCon=%d)  plane2 gB2 rank=%d (tileK=%d)  %s\n",
+           r1, F1 * TK, kCon, r2, F2 * TK,
+           r1 == r2 ? "equal -- the (_,_,_,k) slice fits both"
+                    : "DIFFER <-- the hardcoded 4-mode slice is wrong for one plane (2plane.hpp:808)");
+  }
+
   // delivery bound per plane: slots = WN*TK/32 codes must cover one 16 B delivery = 128/bits codes
   for (int p = 0; p < 2; ++p) {
     const int b = p ? Bits2 : Bits1, slots = WN*TK/32, deliv = 128/b;
