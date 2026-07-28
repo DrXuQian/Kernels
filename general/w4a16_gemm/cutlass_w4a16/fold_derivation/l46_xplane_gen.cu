@@ -92,48 +92,69 @@ static bool gen(const char* tag, std::vector<int>* out_T2 = nullptr) {
   return ok;
 }
 
-// Emit plane 2's whole buffer from the derived tile map, using the SAME interleave-256 addressing place_derived uses,
-// and diff it against the shipped offline. Consistency (l46 above) only says no placement is ruled out; THIS is what
-// says the generator is right, because at F2=1 it must reproduce the buffer that is running correctly today.
+// ---------------------------------------------------------------- the tile map, in l20's frame
+// l20's tile_map assumes 8*CPW == TK -- exactly ONE delivery per physical row per k-tile. int1 -> TK=256,
+// int2 -> 128, int4 -> 64. The FOLDED plane 2 satisfies it (B2*8 = 256 codes/row, CPW=32, 8 words), which is why the
+// frame transfers; the shipping TK=256 config does NOT for plane 1 (int2 at 2 deliveries/row), so it cannot serve as
+// the control here. The available gate is T2 itself, built independently from partition_B in gen() above: the tile
+// map must reproduce it bit for bit.
+//
+// destination : plane 2's own swzl TV formula, l20's verbatim
+// source      : solve which converter line reads this bit, then take ITS low code's logical (n,k) from plane 1
 template <int TM, int TN, int TK, int WM, int WN, int F2>
-static bool emit_and_diff(const char* tag, int N, int K) {
+static bool tile_map_vs_T2(const char* tag) {
+  using SInst = PPU0015_16x16x32_S32S8S8S32_TN;
+  constexpr int InstM = 16, InstN = 16;
+  constexpr int warpM = (WM > InstM) ? WM : InstM, warpN = (WN > InstN) ? WN : InstN;
+  constexpr int WOM = TM / warpM, WON = TN / warpN;
+  using MmaS8 = TiledMMA<MMA_Atom<SInst>, Layout<Shape<Int<WOM>, Int<WON>, _1>>,
+                         Tile<Int<WOM*16>, Int<WON*16>, _32>>;
+  constexpr int R1 = TN, B1 = TK * 2 / 8, R2 = TN / F2, B2 = F2 * TK / 8;
+  constexpr int CPW2 = 32, RPI = WON * 16;
+  static_assert(8 * CPW2 == F2 * TK, "plane 2 must be one delivery per row for l20's frame");
+
   std::vector<int> T2;
   if (!gen<TM,TN,TK,WM,WN,F2>("(map)", &T2)) return false;
-  constexpr int Bits = 1, CPW = 32 / Bits, R2 = TN / F2, B2 = F2 * TK * Bits / 8;
-  const int kCon = 256, AiuByte = B2 > 128 ? 128 : B2, AiuElem = AiuByte * 8 / Bits, RPS = kCon / AiuElem;
-  const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F2;
 
-  std::vector<int> codes((size_t)N * K);
-  for (size_t i = 0; i < codes.size(); ++i) codes[i] = int((i * 2654435761u >> 7) & 1);
-  std::vector<int8_t> derived((size_t)N * K / 8, 0), shipped;
-  for (int tn = 0; tn < N / TN; ++tn)
-    for (int ki = 0; ki < K / TK; ++ki)
-      for (int row = 0; row < R2; ++row)
-        for (int cc = 0; cc < B2 * 8; ++cc) {
-          const int loc = T2[(size_t)row * B2 * 8 + cc];
-          if (loc < 0) continue;
-          const int n = tn * TN + loc / TK, k = ki * TK + loc % TK;
-          if (!(codes[(size_t)n * K + k] & 1)) continue;
-          const int wd = cc / CPW, j = cc % CPW;
-          size_t bitpos;
-          if (F2 > 1) { const int kb = ki / RUNS, t = ki % RUNS;
-                        bitpos = (size_t)((((size_t)kb * nrow + (size_t)tn * R2 + row) * W_ROW_OFF + t * 8 + wd) * CPW + j); }
-          else        { bitpos = (size_t)(((size_t)(ki / RPS) * N + (size_t)tn * TN + row) * kCon
-                                          + (ki % RPS) * AiuElem + wd * CPW + j); }
-          derived[bitpos / 8] |= int8_t(1 << (bitpos % 8));
+  auto p1t = MmaS8{}.get_thread_slice(0).partition_B(make_identity_tensor(make_shape(Int<R1>{}, Int<B1>{})));
+  auto p2t = MmaS8{}.get_thread_slice(0).partition_B(make_identity_tensor(make_shape(Int<R2>{}, Int<B2>{})));
+  const int N1 = int(size<1>(p1t.layout())), KB1 = int(size<2>(p1t.layout()));
+  const int N2 = int(size<1>(p2t.layout())), KB2 = int(size<2>(p2t.layout()));
+  const int P2_DIV = KB1 / KB2;
+
+  std::vector<int> m2((size_t)R2 * 8 * CPW2, -1);
+  long bad = 0, filled = 0;
+  for (int t = 0; t < 32 * WOM * WON; ++t) {
+    const int lane = t % 32, w = t / 32, warp_n = w / WOM;
+    auto p1 = MmaS8{}.get_thread_slice(t).partition_B(make_identity_tensor(make_shape(Int<R1>{}, Int<B1>{})));
+    for (int inst2 = 0; inst2 < R2 / RPI; ++inst2)
+      for (int v2 = 0; v2 < 4; ++v2) {
+        const int row = inst2 * RPI + 16 * warp_n + (v2 / 2) * 8 + lane / 4;
+        const int wd  = (v2 % 2) * 4 + lane % 4;
+        for (int j2 = 0; j2 < CPW2; ++j2) {
+          // which converter line reads plane-2 vreg v2, bit j2?
+          //   v2 = hi_vreg0 + 2*(v1>>1),  hi_vreg0 = (kb % P2_DIV) + P2_DIV*(ii / N2)
+          //   j2 = 8*(v1&1) + lt + 16*half
+          const int half = j2 / 16, r = j2 % 16, v1 = 2 * (v2 >> 1) + r / 8, lt = r % 8;
+          const int odd = v2 & 1;                       // carries kb-parity (P2_DIV=2) or ii (P2_DIV=1)
+          const int ii  = (P2_DIV == 1) ? odd : inst2;
+          const int kb  = (P2_DIV == 1) ? 0   : odd;
+          if (ii >= N1 || kb >= KB1) continue;
+          const int j1 = (lt % 4) + 4 * (lt / 4) + 8 * half;      // plane-1 code within vreg v1
+          auto c1 = p1((16 * v1 + j1) / 4, ii, kb);
+          const int elem = int(get<0>(c1)) * TK + int(get<1>(c1)) * 4 + ((16 * v1 + j1) % 4);
+          const size_t at = ((size_t)row * 8 + wd) * CPW2 + j2;
+          if (m2[at] >= 0 && m2[at] != elem) ++bad; else if (m2[at] < 0) ++filled;
+          m2[at] = elem;
         }
-  { std::vector<int8_t> packed((size_t)N * K / 8, 0);
-    for (size_t i = 0; i < (size_t)N * K; ++i) if (codes[i] & 1) packed[i / 8] |= int8_t(1 << (i % 8));
-    // the caller packs qT[n*K+k]; codes above are already in that order
-    shipped.assign(packed.size(), 0);
-    preprocess_weights_for_mixed_gemm<false, 256, 0>(shipped.data(), packed.data(),
-        {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY);
-    if (F2 > 1) { std::vector<int8_t> f(shipped.size());
-                  nfold_regroup_gmem(f.data(), shipped.data(), {(size_t)K,(size_t)N}, TN, TK, 1); shipped.swap(f); } }
-  size_t d = 0; for (size_t i = 0; i < derived.size(); ++i) if (derived[i] != shipped[i]) ++d;
-  printf("  %-30s %dx%d : %zu / %zu bytes differ  %s\n", tag, N, K, d, derived.size(),
-         d ? "<-- DIFFERS from the shipped offline" : "<-- BIT-IDENTICAL");
-  return d == 0;
+      }
+  }
+  long differ = 0, unset = 0;
+  for (size_t i2 = 0; i2 < m2.size(); ++i2) { if (m2[i2] < 0) ++unset; else if (m2[i2] != T2[i2]) ++differ; }
+  printf("  %-28s tile-map vs T2: %ld / %zu differ, %ld unset, %ld self-conflicts  %s\n",
+         tag, differ, m2.size(), unset, bad,
+         (!differ && !unset && !bad) ? "<-- AGREE" : "<-- construction is wrong");
+  return !differ && !unset && !bad;
 }
 
 int main() {
@@ -143,10 +164,11 @@ int main() {
   printf("\n  the folded shapes\n");
   bool a = gen<64, 64,128,32,32, 2>("Q3 (64,64,128) F2=2");
   bool b = gen<32,128,128,32,32, 2>("Q3 (32,128,128) F2=2");
-  printf("\n  and the check that makes it trustworthy: at F2=1 the derived buffer must EQUAL the shipped one\n");
-  bool d = emit_and_diff<64, 64,256,32,32, 1>("control F2=1 vs shipped", 256, 512);
+  printf("\n  the tile map in l20's frame, gated on T2 (built independently, from partition_B)\n");
+  bool d = tile_map_vs_T2<64, 64,128,32,32, 2>("Q3 (64,64,128) F2=2");
+  d = tile_map_vs_T2<32,128,128,32,32, 2>("Q3 (32,128,128) F2=2") && d;
   printf("\n  verdict: %s\n",
-         (c && a && b && d) ? "generator validated on the control -- the folded map can be trusted"
+         (c && a && b && d) ? "tile map agrees with T2 -- ready to emit the buffer"
                        : "at least one shape is inconsistent; the kernel-side indexing assumed at the top is the suspect");
   return 0;
 }
