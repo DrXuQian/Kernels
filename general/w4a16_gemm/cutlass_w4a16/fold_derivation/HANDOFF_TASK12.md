@@ -96,3 +96,54 @@ registers, a saving of 56 — the same saving that moved the standalone `(32,128
 It will **not** help if the 2-plane config's `cvt/mma` is 8 (i.e. `WM=16`): that axis is a throughput ceiling and
 freeing registers underneath it measured **−0.5 … +1.0** across six standalone rows. Check `WM >= 32` first — if the
 shipping 2-plane config runs `WM=16`, this whole task is worth nothing and should be dropped rather than measured.
+
+---
+
+# Per-plane N-fold (landed, UNTESTED on the box)
+
+`Block_K` for the 2-plane path is no longer pinned to 256. Three pieces:
+
+* **builder** `ppu_mma_builder.inl` — `DefaultOperandB2` gets `(Block_N/P2Fold, P2Fold*Block_K)`; `P2Fold` is the extra
+  fold plane 2 needs on top of plane 1's.
+* **collective** `ppu_mma_aiu_mixed_input_2plane.hpp` — `SmemLayoutB2` physical `(TN/P2Fold, P2Fold*TK, Stages)`,
+  `P2Fold` read off the atom; `load_init_B2` folds shape AND stride in both branches; new `dB2`/`dB2_valid`.
+* **caller** `moe_grouped_ppu.cuh` — builds `dB2` from `(n/P2_FOLD, k*P2_FOLD, L)` when `P2_FOLD > 1`.
+* **bench** `test_q3_bconcat_bench.cu` — `pack_plane<..., FoldTN, FoldTK>` folds a plane when its run is under 32 B;
+  six `BC128` rows beside the TK=256 sweep, which is unchanged and acts as the control.
+
+`MmaPermK` needed NO change at Block_K=128: the non-fold rule gives `32*8/2 = 128 == TileShape.K`, so both rules
+coincide there. **At Block_K=64 they do not** — that is Stage 2 and it also needs plane 1 to fold (F1=2), the shared
+logical mma view, and a re-derived chunk gate (l41's `at_plain/4` is valid only at the non-fold `MmaPermK`).
+
+## What to measure
+
+```
+TARGET=test_q3_bconcat_real ./build.sh && ./test_q3_bconcat_real            # numerics FIRST
+TARGET=test_q3_bconcat_bench ./build.sh && ./test_q3_bconcat_bench 2048 4096 4096 16
+```
+
+The TK=256 `BC` rows must reproduce their previous numbers exactly — they are the control that the change did not
+disturb the unfolded path. Only the `BC128` rows are new.
+
+## Deferred, in order
+
+1. **A-concat with fold** — the bench's single-plane `i1`/`i2` rows run UNFOLDED, so they are forced to their unfolded
+   minimum `TK` (int2 128, int1 256) and measure 30.9% / 26.7% against records of 53.2% / 63.7%. int4 is the built-in
+   control: its home `TK=64` is legal unfolded and it measures 53.2% against a record of 55.9%, the 2.7 points being
+   gs=16. **So the bench's "B-concat wins 1.16x" verdict is invalid** — extrapolating the folded records gives
+   A-concat ~474 us against B-concat's 823. Fix by giving `i1`/`i2` the same `pack_plane` fold treatment.
+2. **Fuse (-1024, zero-point, 2^-b) into one (s', b') pair.** `w = h_raw*s' + b'` with `s' = s*2^-b`,
+   `b' = z - 1024*s'`. Kills the per-atom `hmul2` and `hadd2` and the whole zero fragment: 4 ops/half2 -> 2 for
+   ScaleZero, 3 -> 2 for ScaleOnly. Cost: `s'` varies with the slot's compile-time `b`, so the live count is
+   (distinct b per chunk) x MMA_N -- **2** for int2, to be derived for int1. Register-neutral for ScaleZero
+   (b' replaces zero), +1 register for ScaleOnly.
+3. **Sign-magnitude encoding** (int1 plane = sign, int2 = magnitude). Merge becomes one XOR on bit15/31 AFTER the bias
+   is removed -- order is load-bearing. The real win is that the low plane then uses the EXISTING validated
+   single-plane int2 converter and `MixGemm2Plane_uint2_uint1` disappears. Generalises to Q5, **not** to Q6 (2-bit high
+   plane is not a sign). **Hard constraint: symmetric +-0..3 is 7 values; Q3_K is 3-bit with a -4 centre, and -4 has no
+   sign-magnitude representation.** So this is our own W3A16 format, not bit-exact GGUF Q3_K.
+4. **Stage 2, Block_K=64** (F1=2, F2=4, WN must be 64). Needs plane 1's fold, the shared logical mma view, the fold
+   `MmaPermK`, and the chunk gate re-derived onto the fold family (where `MixGemmChunkEmit`'s `right_inverse`
+   composition is the correct one -- the two gates converge there).
+5. **Q6 converter** (`int4 + int2`). Needs NO fold at all: at Block_K=128 both planes are F=1. It is the only format
+   where B-concat and A-concat can both run at their best shape, so it gives the clean verdict on which wins.
