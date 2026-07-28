@@ -141,8 +141,16 @@ int main(int argc, char** argv) {
   // F1=1/F2=2 (l47, l53 at both K=512 and the box's K=256). So rung 1 is the known-MATCH configuration and also
   // double-checks that byte-identity on the box; if rung 1 breaks, place_int1 is the problem and nothing else matters.
 #define RUNG(TAG, TMv, TNv, TKv, WMv, WNv, Sv, F1v, F2v) do {                                        \
-  auto blo_ = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, TNv, ((F1v) > 1 ? (TKv) : 0)>(  \
-      low2, K, N);                                                                                   \
+  /* PLANE 1: once cols_per_word > 1 (WN=64) the whole-word packer cannot express the fragment, and it also    \
+     groups the folded columns strided while the kernel's MmaView groups them adjacent. So drive plane 1 off the  \
+     SAME derived map plane 2 already uses. Byte-identical to the whole-word packer wherever that one is          \
+     box-validated -- gated in fold_derivation/l61. */                                                           \
+  std::vector<int8_t> blo_((size_t)K * N / 4);                                                        \
+  if constexpr ((F1v) > 1) {                                                                          \
+    xplane::place_derived<2, TMv, TNv, TKv, WMv, WNv, F1v>(blo_.data(), low2, N, K);                  \
+  } else {                                                                                            \
+    blo_ = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, TNv, 0>(low2, K, N);                \
+  }                                                                                                   \
   cutlass::DeviceAllocation<cutlass::uint2b_t> dblo_((size_t)K*N);                                   \
   dblo_.copy_from_host(reinterpret_cast<cutlass::uint2b_t const*>(blo_.data()));                     \
   std::vector<int8_t> bhi_((size_t)K * N / 8);                                                       \
@@ -178,7 +186,8 @@ int main(int argc, char** argv) {
     { std::vector<half_t> a((size_t)M*K), s1((size_t)scale_k*N, half_t(1.f)), z0((size_t)scale_k*N, half_t(0.f));
       for (int m = 0; m < M; ++m) for (int k = 0; k < K; ++k) a[(size_t)m*K + k] = half_t(float(k));
       dA.copy_from_host(a.data()); dSc.copy_from_host(s1.data()); dZr.copy_from_host(z0.data()); }
-    auto blo_ = pack_plane<4, QuantTypeClass::PACKED_INT2_WEIGHT_ONLY, 128, 64>(plo, K, N);
+    std::vector<int8_t> blo_((size_t)K * N / 4);
+    xplane::place_derived<2, 64, 128, 64, 64, 64, 2>(blo_.data(), plo, N, K);
     cutlass::DeviceAllocation<cutlass::uint2b_t> dblo_((size_t)K*N);
     dblo_.copy_from_host(reinterpret_cast<cutlass::uint2b_t const*>(blo_.data()));
     std::vector<int8_t> bhi_((size_t)K * N / 8);

@@ -21,6 +21,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/mma_traits_ppu0015.hpp"
@@ -119,28 +120,55 @@ inline std::vector<int> tile_map_int1() {
   return m;
 }
 
-// Write the folded high-plane buffer. `high_kn` is the raw [K][N] high plane, one code per byte, as the caller reads
+// BIT-GRANULAR writer, shared by both planes. `q_kn` is the raw [K][N] plane, one code per byte, as the caller reads
 // it from the checkpoint -- NOT a preprocessed buffer. Destination addressing is l20's F>1 (plane-major) branch.
-template <int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
-inline void place_int1(int8_t* out, const std::vector<uint8_t>& high_kn, int N, int K) {
-  constexpr int CPW = 32, R2 = TN / F2, DL = (F2 * TK / 8) / 32;
+//
+// WHY A BIT-GRANULAR WRITER IS REQUIRED, and not merely tidier. nfold_regroup_gmem moves whole uint32 words, so every
+// word it emits holds ONE logical column -- which is what the mma wants only while cols_per_word == 1. That holds for
+// every 32x32 warp tile, and it is why the whole-word packer passed the box at int2's shipping (64,64,64) w32x32 F=2.
+// At WN=64 the fragment asks for TWO logical columns inside each word and a whole-word move CANNOT express it; on top
+// of that nfold_regroup_gmem groups the folded columns STRIDED (n = g + f*Ng, its line 676) while the kernel's
+// SmemLayoutB_MmaView groups them ADJACENT (n = f + P1Fold*g), so the two disagree about which columns even share a
+// physical row. Measured: 32768 of 65536 slots misplaced at (64,128,64) w64x64 F=2, sigma = "n -> n+32 for half the
+// columns" -- bit for bit the permutation the hardware probe printed (fold_derivation/l61).
+//
+// l52 called that same configuration BIT-IDENTICAL. Its probe value was (i * 2654435761u >> 5) & 3 and the
+// displacement is i += 32*K = 2^14; (M << 14) has 14 low zero bits, so it can neither change bits 5-6 nor carry into
+// them -- the misplaced codes are EQUAL and the buffers compare identical. A probe whose period aliases the
+// displacement proves nothing. l61 labels each element by the bits of its own index instead, which cannot alias.
+template <int Bits, int TM, int TN, int TK, int WM, int WN, int F>
+inline void place_from_map(int8_t* out, const std::vector<int>& m, const std::vector<uint8_t>& q_kn, int N, int K) {
+  constexpr int CPW = 32 / Bits, R = TN / F, DL = (F * TK * Bits / 8) / 32, MASK = (1 << Bits) - 1;
   static_assert(DL == 1, "the buffer walk below assumes one delivery per folded row");
-  const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F2;
-  const auto m = tile_map_int1<TM, TN, TK, WM, WN, F2, F1>();
-  std::fill(out, out + (size_t)N * K / 8, int8_t(0));
+  const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F;
+  std::fill(out, out + (size_t)N * K * Bits / 8, int8_t(0));
   for (int tn = 0; tn < N / TN; ++tn)
     for (int ki = 0; ki < K / TK; ++ki)
-      for (int row = 0; row < R2; ++row)
+      for (int row = 0; row < R; ++row)
         for (int wd = 0; wd < 8; ++wd)
           for (int j = 0; j < CPW; ++j) {
             const int loc = m[((size_t)row * 8 + wd) * CPW + j];
             if (loc < 0) continue;
             const int n = tn * TN + loc / TK, k = ki * TK + loc % TK;
-            if (!(high_kn[(size_t)k * N + n] & 1)) continue;       // high_kn is [K][N]
+            const int v = q_kn[(size_t)k * N + n] & MASK;          // q_kn is [K][N]
+            if (!v) continue;
             const int kb = ki / RUNS, tt = ki % RUNS;
-            const size_t bit = (size_t)((((size_t)kb * nrow + (size_t)tn * R2 + row) * W_ROW_OFF + tt * 8 + wd) * CPW + j);
-            out[bit / 8] |= int8_t(1 << (bit % 8));
+            const size_t bit0 = (size_t)((((size_t)kb * nrow + (size_t)tn * R + row) * W_ROW_OFF + tt * 8 + wd) * CPW + j) * Bits;
+            for (int b = 0; b < Bits; ++b)
+              if ((v >> b) & 1) out[(bit0 + b) / 8] |= int8_t(1 << ((bit0 + b) % 8));
           }
+}
+
+// One plane on its own, from its own derived map. This is what plane 1 needs once cols_per_word > 1.
+template <int Bits, int TM, int TN, int TK, int WM, int WN, int F>
+inline void place_derived(int8_t* out, const std::vector<uint8_t>& q_kn, int N, int K) {
+  place_from_map<Bits, TM, TN, TK, WM, WN, F>(out, plane_map<Bits, TM, TN, TK, WM, WN, F>(), q_kn, N, K);
+}
+
+// The high plane, from the CROSS-PLANE map.
+template <int TM, int TN, int TK, int WM, int WN, int F2, int F1 = 1>
+inline void place_int1(int8_t* out, const std::vector<uint8_t>& high_kn, int N, int K) {
+  place_from_map<1, TM, TN, TK, WM, WN, F2>(out, tile_map_int1<TM, TN, TK, WM, WN, F2, F1>(), high_kn, N, K);
 }
 
 } // namespace xplane
