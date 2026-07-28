@@ -260,6 +260,27 @@ int main(int argc, char** argv) {
   I2F(64, 64, 64,32,32,2,2);
   I2F(32,128, 64,32,32,3,2);
   I2F(64,128, 64,64,64,2,2);
+  // w64x32 -- THE WARP SHAPE THE SWEEP NEVER HAD, and the only one where int2 gets chunking AND cvt/mma = 2 at once.
+  //
+  // MMA_N = TN / PermN = TN / ((TN/warpN)*16) = warpN / 16, so it depends ONLY on warpN -- TN and TM are free. Chunking
+  // needs 8*MMA_N*MMA_K == kOut = 64, i.e. MMA_N == 2 at TK=64, i.e. warpN == 32. That is a constraint on WN alone, NOT
+  // on tile size, so w64x32 buys chunking, cvt/mma = 128/WM = 2, AND a 128x128 tile simultaneously.
+  //
+  // Why that matters here: int2's best row (64,64,64) w32x32 is SLOWER than the two-plane B-concat's (128,128,64)
+  // w64x64, which is not a paradox -- B-concat merges the planes in the converter, so its mma count is identical and
+  // only its HBM traffic and ALU are larger. At M=2048 N=K=4096, A is re-read N/TN times and B M/TM times:
+  //     int2 (64,64,64)     A 64x16.78MB = 1074MB + B 32x4.19MB = 134MB  ~= 1208 MB
+  //     int3 (128,128,64)   A 32x16.78MB =  537MB + B 16x6.29MB = 101MB  ~=  638 MB
+  // so the two-plane kernel moves 1.89x FEWER bytes despite carrying an extra bit plane. int2 was never tile-limited --
+  // it was warp-shape-limited: every swept row is w32x32 (chunking on but cvt/mma = 4, where freeing registers under a
+  // throughput ceiling measured ~0) or w64x64 (cvt/mma = 2 but MMA_N = 4, so the predicate turns chunking OFF, which is
+  // why that row is both 418 us and unchunked).
+  I2F(64, 64, 64,64,32,3,2);
+  I2F(64, 64, 64,64,32,2,2);
+  I2F(64,128, 64,64,32,3,2);
+  I2F(64,128, 64,64,32,2,2);
+  I2F(128,64, 64,64,32,3,2);
+  I2F(128,128,64,64,32,3,2);
 
   std::printf("  --- int4 CEILING ref (TK64 = fold's target geometry; TK128 = int4's own TK sensitivity) ---\n");
   I4(64,64,64,32,32,3);    // int4 native winner: TM64 TK64, A-smem 8KB, ~50% occ -- the ceiling
