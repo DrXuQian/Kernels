@@ -285,3 +285,44 @@ Note the chunk gate must be re-derived for this shape: at `Block_K=64` `tCrB_mma
 `((2,2,2),4,4):((1,2,4),32,8)`, the FOLD family, where `MixGemmChunkEmit`'s `right_inverse` composition
 is the correct gate — not l41's `at_plain/4`, which was derived at the non-fold `MmaPermK`. l42 already
 showed the two converge there.
+
+---
+
+# Rung 5 (Block_K=64): the launch-geometry class is swept clean
+
+Rungs 1-4 are `bad=0` after capping the scale copy's thread extent. Rung 5 is the second, independent defect.
+
+**The whole launch-geometry class audited, rung 4 (passes) vs rung 5 (fails)** — the class that produced the rung-4
+bug, so worth sweeping rather than sampling:
+
+| quantity | rung 4 | rung 5 | |
+|---|---|---|---|
+| warps / threads per CTA | 2 / 64 | 2 / 64 | unchanged |
+| `aiu_warp_group_thread_idx = warp_idx*32` | {0,32} | {0,32} | unchanged |
+| scale copy `ThrH*ThrW` vs threads | 64 <= 64 | 64 <= 64 | both fixed |
+| `P2_DIV = CPY_K1/CPY_K2` | 1 | 1 | unchanged |
+| kernel `N2_` vs model `NI2` | 2 = 2 | 1 = 1 | agree |
+| kernel `NumIter` vs model `NI1` | 4 = 4 | 2 = 2 | agree |
+| `stride1` (cvt_in mode-1) | 64 | 64 | unchanged |
+| swzl `CUBE_H` plane1/plane2 | 128 / 64 | 64 / 32 | both have working precedents (single-plane int2 F=2 is 32, int1 F=4 is 32) |
+| `cvt_out` flat write covering `tCrB_mma` | [0,256) bijective | [0,128) bijective | both correct |
+
+Nothing in this class changes its relationship to the launch geometry between the two rungs.
+
+**What is left cannot be settled locally, and precisely why.** Everything remaining is a place where the model and the
+code share an assumption, so the reference and the subject come from the same derivation. l56's closed loop over the B
+path is clean at rung 5, and l58 pins `plane_map` at **F=4** against `nfold_place_bits_int1_tk64` — the offline the
+63.7% single-plane int1 config actually runs — byte for byte.
+
+**The one link with no hardware-level reference at all:** plane 1's offline at `F1=2` with `TN=128 / WN=64`. int2's F=2
+has only ever run at `(64,64,64) w32x32` (the 53.2% config); int1's F=4 has only run at `(64,128,64) w64x64`. The
+combination "int2 folded AND TN=128/WN=64" has never executed on hardware.
+
+So `PROBE=lo` / `PROBE=hi` is a two-way discriminator with a stated prior, not a fallback:
+
+* `PROBE=lo` dirty -> plane 1's F1=2 offline at TN=128/WN=64 (the unreferenced link above)
+* `PROBE=hi` dirty -> plane 2's cross-plane composition (`tile_map_int1`'s F2=4 branch)
+* both dirty with the SAME deltas -> the physical->logical relation both planes share
+
+`D[0][n]/MULT` prints the permutation itself, with no model in between — which is the only way to break an assumption
+the model and the code hold in common.
