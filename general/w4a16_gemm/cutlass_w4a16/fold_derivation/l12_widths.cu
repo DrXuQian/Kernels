@@ -21,6 +21,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/numeric_types.h"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
 #include <cstdio>
 #include <vector>
@@ -131,7 +132,7 @@ static std::vector<int> truth(int NN, int KK) {
     }
     std::vector<int8_t> pre(nbytes), fold(nbytes);
     preprocess_weights_for_mixed_gemm<false, 256, 0>(pre.data(), packed.data(), {(size_t)KK, (size_t)NN}, qtc);
-    nfold_regroup_gmem(fold.data(), pre.data(), {(size_t)KK, (size_t)NN}, TN, TK, Bits);
+    legacy::nfold_regroup_gmem(fold.data(), pre.data(), {(size_t)KK, (size_t)NN}, TN, TK, Bits);
     for (size_t c = 0; c < id.size(); ++c) {
       const size_t bitpos = c * Bits;
       if ((fold[bitpos / 8] >> (bitpos % 8)) & 1) id[c] |= (1 << b);

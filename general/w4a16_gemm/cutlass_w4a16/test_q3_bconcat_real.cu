@@ -52,14 +52,9 @@ static std::vector<int8_t> pack_plane(const std::vector<uint8_t>& q, int K, int 
   preprocess_weights_for_mixed_gemm<false, 256>(out.data(), packed.data(), {(size_t)K, (size_t)N}, QTC);
   // PER-PLANE N-FOLD: fold this plane iff ITS contiguous run at FoldTK is under the AIU's 32 B minimum. FoldTK == 0
   // means "no fold", byte-identical to what shipped -- which is what keeps the Block_K=256 run below a true control.
-  if (FoldTK > 0) {
-    const int contig = FoldTK * BITS / 8, F = contig >= 32 ? 1 : 32 / contig;
-    if (F > 1) {
-      std::vector<int8_t> f(out.size());
-      nfold_regroup_gmem(f.data(), out.data(), {(size_t)K, (size_t)N}, FoldTN, FoldTK, BITS);
-      out.swap(f);
-    }
-  }
+  // (f) THE FOLD BRANCH IS GONE. Every call passes FoldTK = 0 -- folded planes are built by xplane::place_derived /
+  // place_int1 inside the row macros, per configuration, because the map depends on the tile. What is left here is the
+  // unfolded path, which the derived preprocess_weights_for_mixed_gemm covers on its own.
   return out;
 }
 

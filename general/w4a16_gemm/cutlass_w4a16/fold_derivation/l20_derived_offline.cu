@@ -23,6 +23,7 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include <cstdio>
 #include <vector>
 #include <chrono>
@@ -150,7 +151,7 @@ static void place_shipped(std::vector<int8_t>& out, const std::vector<int>& code
   std::vector<int8_t> pre(packed.size());
   preprocess_weights_for_mixed_gemm<false,RowsPerTile,0>(pre.data(), packed.data(), {(size_t)K,(size_t)N}, qtc);
   if (F > 1) { std::vector<int8_t> f(pre.size());
-               nfold_regroup_gmem(f.data(), pre.data(), {(size_t)K,(size_t)N}, TN, TK, Bits); pre.swap(f); }
+               legacy::nfold_regroup_gmem(f.data(), pre.data(), {(size_t)K,(size_t)N}, TN, TK, Bits); pre.swap(f); }
   out = pre;
 }
 
@@ -270,7 +271,7 @@ int main() {
     //     int1 TK=128 -> 2*16 = 32 B   int1 TK=256 -> 32 B     identical
     // The int2/int1 identities are the N-fold's design statement confirmed as a byte fact: folding F columns at TK is
     // the SAME gmem buffer as not folding at F*TK. And it names the one parameter a tile-free signature still needs --
-    // the run length, which every caller already computes for nfold_regroup_gmem(fold_tn, fold_tk).
+    // the run length, which every caller already computes for legacy::nfold_regroup_gmem(fold_tn, fold_tk).
     auto runB = [](int bits, int tk) { const int c = tk*bits/8, f = c >= 32 ? 1 : 32/c; const int r = f*c; return r > 128 ? 128 : r; };
     printf("     => the invariant is the AIU CONTIGUOUS RUN min(F*TK*bits/8,128) B, NOT the fold factor:\n");
     printf("        int4 TK64=%dB TK128=%dB (differ)   int2 TK64=%dB TK128=%dB (same)   int1 TK128=%dB TK256=%dB (same)\n",

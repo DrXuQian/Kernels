@@ -50,6 +50,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "unfused_weight_dequantize.hpp"
+#include "xplane_offline.hpp"
 #include "moe_grouped_ppu.cuh"
 
 // If this fails, the actlize SUBMODULE on the box is stale: the Kernels gitlink moved but `git submodule update` did
@@ -158,23 +159,18 @@ static void run_cfg(Buf& b, int gs, const char* note) {
               us, 100.0 * tf * 1e12 / 500.0e12, note);
 }
 
-// upload the weight buffer for a given TK. TK=64 needs the bit-granular packer; the rest use the shipped offline.
-template <int TN, int TK>
+// upload the weight buffer for a given TK. ONE derived call covers every TK: place_derived walks the fold destination
+// when F > 1 and the interleave-256 one when F == 1, so the old two-branch form -- bit-granular packer for TK=64,
+// preprocess+nfold_regroup_gmem otherwise -- collapses. WN is a parameter because int1's delivery bound is WN >= 64 at
+// TK=64 and WN >= 32 at TK >= 128, and the map depends on it; passing 32 for a TK=64 buffer produced a buffer for a
+// configuration that cannot run. Byte-identical to the old path on every TK here (fold_derivation/l64).
+template <int TN, int TK, int WN>
 static void upload_weights(Buf& b) {
-  const size_t bytes = (size_t)PK * PN / 8;
-  std::vector<int8_t> nk(bytes, 0), out(bytes, 0);
-  for (size_t i = 0; i < (size_t)PK * PN; ++i)             // row-major (n,k), pseudo-random 1-bit codes
-    if ((i * 2654435761u >> 7) & 1) nk[i / 8] |= int8_t(1 << (i % 8));
-  if (TK == 64) {
-    nfold_place_bits_int1_tk64(out.data(), nk.data(), PN, PK, TN, TK);
-  } else {
-    // nk is already the [N][K] one-code-per-bit packing preprocess expects, so it goes in directly.
-    preprocess_weights_for_mixed_gemm<false, 256, 0>(out.data(), nk.data(),
-        {(size_t)PK, (size_t)PN}, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY);
-    constexpr int contig = TK / 8, F = contig >= 32 ? 1 : 32 / contig;
-    if (F > 1) { std::vector<int8_t> f(bytes);
-                 nfold_regroup_gmem(f.data(), out.data(), {(size_t)PK, (size_t)PN}, TN, TK, 1); out.swap(f); }
-  }
+  constexpr int contig = TK / 8, F = contig >= 32 ? 1 : 32 / contig;
+  std::vector<uint8_t> q((size_t)PK * PN);                       // [K][N], one code per byte
+  for (size_t i = 0; i < q.size(); ++i) q[i] = uint8_t((i * 2654435761u >> 7) & 1);
+  std::vector<int8_t> out((size_t)PK * PN / 8, 0);
+  xplane::place_derived<1, 64, TN, TK, 32, WN, F>(out.data(), q, PN, PK);
   b.B.copy_from_host(reinterpret_cast<uint1_t const*>(out.data()));
 }
 
@@ -188,7 +184,7 @@ int main(int argc, char** argv) {
   Buf b; make_buffers(b, gs);
 
   std::printf("== TK=128 group (shipped offline). A: vary TM at fixed TK. D: WN is free -- same buffer.\n");
-  upload_weights<128, 128>(b);
+  upload_weights<128, 128, 32>(b);
   run_cfg<QM::FinegrainedScaleOnly, 16, 128, 128, 16, 32, 3>(b, gs, "A: TM=16");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 3>(b, gs, "A: TM=32  <- measured 42.0% at gs=32");
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 128, 32, 32, 3>(b, gs, "A: TM=64");
@@ -198,13 +194,13 @@ int main(int argc, char** argv) {
   run_cfg<QM::FinegrainedScaleOnly, 16, 128, 128, 16, 32, 2>(b, gs, "A+C: TM=16 s2");
 
   std::printf("\n== TK=256 group (shipped offline, F=1). B: most atoms per iteration = best hiding.\n");
-  upload_weights<128, 256>(b);
+  upload_weights<128, 256, 32>(b);
   run_cfg<QM::FinegrainedScaleOnly, 16, 128, 256, 16, 32, 2>(b, gs, "B: TK=256 TM=16 s2");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 256, 32, 32, 2>(b, gs, "B: TK=256 TM=32 s2");
   run_cfg<QM::FinegrainedScaleOnly, 16, 128, 256, 16, 32, 3>(b, gs, "B: TK=256 TM=16 s3");
 
   std::printf("\n== TK=64 group (bit-granular packer, WN>=64 required by the delivery bound).\n");
-  upload_weights<128, 64>(b);
+  upload_weights<128, 64, 64>(b);
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 64, 32, 64, 3>(b, gs, "measured 46.4% at gs=32");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 3>(b, gs, "B: TM=32");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 2>(b, gs, "B+C: TM=32 s2   <- 50.1% measured, best so far");
@@ -230,7 +226,7 @@ int main(int argc, char** argv) {
   // stages=2 was the single biggest knob at TK=128 (42.0 -> 46.5), so finish exploring it there. This needs the
   // TK=128 buffer back, so it is re-uploaded rather than run against the TK=64 one.
   std::printf("\n== back to TK=128 to finish the stages=2 line\n");
-  upload_weights<128, 128>(b);
+  upload_weights<128, 128, 32>(b);
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 128, 32, 32, 2>(b, gs, "TK=128 TM=64 s2");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 16, 32, 2>(b, gs, "TK=128 w16x32 s2");
 
@@ -250,15 +246,15 @@ int main(int argc, char** argv) {
   // keep() are layout compositions over tCrB_mma's own layout, so they follow MMA_N/MMA_K without code changes --
   // which is the point of having made them derived rather than hand-typed.
   std::printf("\n== CHUNK GROUP (PPU_B_CHUNK). B regs 4*MMA_N*MMA_K -> 4*MMA_N, so the saving grows with TK.\n");
-  upload_weights<128, 128>(b);
+  upload_weights<128, 128, 32>(b);
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 2>(b, gs, "CHUNK: est 162->106, bucket 256->128 (BOUNDARY)");
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 128, 32, 32, 2>(b, gs, "CHUNK: est 162->106, warps/CU 16->32");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 3>(b, gs, "CHUNK: same at s3");
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 64, 3>(b, gs, "CHUNK: est 260->148, bucket 512->256");
-  upload_weights<128, 256>(b);
+  upload_weights<128, 256, 32>(b);
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 256, 32, 32, 2>(b, gs, "CHUNK: was 23.0% (512 bucket) -> 256");
   run_cfg<QM::FinegrainedScaleOnly, 64, 128, 256, 32, 32, 2>(b, gs, "CHUNK: TK=256 TM=64");
-  upload_weights<128, 64>(b);
+  upload_weights<128, 64, 64>(b);
   run_cfg<QM::FinegrainedScaleOnly, 32, 128, 64, 32, 64, 2>(b, gs, "CHUNK control: TK=64 should NOT cross (138>128)");
 
   if (getenv("FOLD_ZDIAG")) {
@@ -266,10 +262,10 @@ int main(int argc, char** argv) {
     std::printf("   (interleave sS/sZ); if it is flat in gs it is the TRANSFORM (fuse multiplies+plus into one FMA).\n");
     for (int g : {32, 16}) {
       Buf bz; make_buffers(bz, g);
-      upload_weights<128, 128>(bz);
+      upload_weights<128, 128, 32>(bz);
       run_cfg<QM::FinegrainedScaleOnly, 32, 128, 128, 32, 32, 3>(bz, g, "ScaleOnly TK=128");
       run_cfg<QM::FinegrainedScaleZero, 32, 128, 128, 32, 32, 3>(bz, g, "ScaleZero TK=128");
-      upload_weights<128, 256>(bz);
+      upload_weights<128, 256, 32>(bz);
       run_cfg<QM::FinegrainedScaleOnly, 32, 128, 256, 32, 32, 2>(bz, g, "ScaleOnly TK=256 (2x transforms/iter)");
       run_cfg<QM::FinegrainedScaleZero, 32, 128, 256, 32, 32, 2>(bz, g, "ScaleZero TK=256 (2x transforms/iter)");
     }

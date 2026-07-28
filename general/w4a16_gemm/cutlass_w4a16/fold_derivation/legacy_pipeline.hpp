@@ -520,4 +520,133 @@ void preprocess_weights_for_mixed_gemm(int8_t*                    preprocessed_q
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }
 
+// ------------------------------------------------------------------------------------------------------------------
+// (f) THE TWO N-FOLD PACKERS, moved out of the production header. Same standing as the five steps above: kept only so
+// the gates have a reference that is not the derived walk itself. nfold_regroup_gmem moves whole uint32 words, correct
+// only while cols_per_word == 1 (warp N extent 32); xplane::place_derived replaces both and is byte-identical on every
+// configuration the old callers used (l64). Do not fix anything here -- a reference that drifts is not a reference.
+// ------------------------------------------------------------------------------------------------------------------
+// Placement VERIFIED bijective and consistent with the fragment split in scratchpad/nfold_p11.cpp.
+// N-FOLD offline placement, derived from the KERNEL'S OWN gmem address arithmetic (not from a guessed arrangement).
+// Read straight out of the fold collective's load_init_B (interleaved-256 branch) + AiuDesc::init:
+//     folded mB layout : shape (N/F, (kCon, K*F/kCon)), stride (kCon, (1, kCon*(N/F)))
+//     AIU descriptor   : dim_h = N/F, dim_w = kCon, cube_h = Ng, cube_w = AiuContElemSize
+//     gB tiler         : N steps by Ng, K steps by F*TK
+// => the buffer is (N/F) PHYSICAL ROWS, each kCon elements contiguous, and within a row each F*TK-element run holds
+//    F logical N columns x TK k each. Output block [n0, n0+TN) reads physical rows [n0/F, n0/F + Ng).
+// Everything above is pure layout arithmetic from source -- no hardware unknown -- which is why this replaces the
+// previous five guessed arrangements (each of which measured 72-75%, i.e. random, because the global arrangement
+// disagreed with this walk regardless of the within-run placement).
+// The WITHIN-run element order keeps the standard pipeline's crumb order, so run this on the standard preprocess
+// output and only MOVE whole 16-code words.
+// BITS-parameterised: int2 uses F=2 / 16 codes per uint32, int1 uses F=4 / 32 codes. Everything else in the
+// derivation is bit-width agnostic (it only moves whole uint32 words, preserving the pipeline's crumb order).
+// LANDMINE, kept only until its remaining WN=32 callers move to xplane::place_derived. This moves whole uint32
+// words, so each word carries ONE logical column -- correct only while cols_per_word == 1, i.e. warp N extent 32. At
+// WN=64 the fragment wants TWO columns per word and no whole-word move can express it; line 676 additionally groups
+// the folded columns STRIDED (n = g + f*Ng) where the kernel's SmemLayoutB_MmaView groups them ADJACENT
+// (n = f + P1Fold*g). Both defects were invisible until (64,128,64) w64x64 F=2, which measured 32768/65536 slots
+// misplaced (fold_derivation/l61) and half the output columns off by +32 on hardware.
+inline void nfold_regroup_gmem(int8_t* out, const int8_t* in_std,
+                               const std::vector<size_t>& shape, int fold_tn, int fold_tk, int bits)
+{
+    const size_t K = shape.size() == 2 ? shape[0] : shape[1];
+    const size_t N = shape.size() == 2 ? shape[1] : shape[2];
+    const int    F   = (32 * 8 / bits) / fold_tk;   // columns needed to fill the 32B run (int2@64 -> 2, int1@64 -> 4)
+    const int    CPW = 32 / bits;                   // codes per uint32 word (int2 -> 16, int1 -> 32)
+    const int    Ng  = fold_tn / F;
+    const int    kCon = 256;
+    const int    WPK = fold_tk / CPW;           // words per (n, K-tile)
+    const int    W_ROW = kCon / CPW;            // words per physical row segment (kCon elements)
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(in_std);
+    uint32_t*       dst = reinterpret_cast<uint32_t*>(out);
+    const size_t nrow = N / F, nkb = (K * F) / kCon;
+    for (size_t r = 0; r < nrow; ++r)                       // physical row
+      for (size_t kb = 0; kb < nkb; ++kb)                   // super-tile along folded K
+        for (int t = 0; t < kCon / (F * fold_tk); ++t)      // K-tiles inside this super-tile
+          for (int f = 0; f < F; ++f)
+            for (int w = 0; w < WPK; ++w) {
+              // which logical (n, K-tile) supplies this word
+              const size_t tile_n0 = (r / Ng) * fold_tn;                     // output block this row serves
+              const size_t n_log   = tile_n0 + (r % Ng) + (size_t)f * Ng;    // partner column is n + Ng
+              const size_t ktile   = (kb * (kCon / (F * fold_tk)) + t);      // which fold_tk block along K
+              // BUG FIXED HERE. This used to be  n_log * WPN + ktile * WPK + w,  i.e. it read the
+              // interleave-256 output as if it were n-major with row pitch WPN = K/CPW. It is not:
+              // interleave_column_major_tensor_ppu writes  dst[nt*(vrpt*N) + c*vrpt + ti]  with nt = vr/vrpt,
+              // ti = vr%vrpt, vrpt = 256/CPW -- the k-SUPERTILE is the outer index, not n. The two coincide only
+              // when nvr == vrpt, i.e. K == 256, exactly one supertile. Every box run of the fold used the
+              // harness default 256x256, so the mistake never showed: at K=512 the old form fetched
+              // (n=0, k=256) where (n=64, k=0) was wanted -- measured in fold_derivation/l13_wholebuffer.cu,
+              // which is a whole-buffer regression rather than the single-tile ones that missed it.
+              const size_t vrpt   = 256 / CPW;                               // uint32 vecs per column per supertile
+              const size_t vr     = ktile * WPK + w;                         // vec index within column n_log
+              const size_t src_w  = (vr / vrpt) * (vrpt * N) + n_log * vrpt + (vr % vrpt);
+              // destination: row r, element offset within row = t*(F*fold_tk) + f*fold_tk (+ w*16)
+              // destination = PLANE-major: stride (kCon, (1, kCon*(N/F))) makes super-tile kb a separate plane of
+              // (N/F) rows, so kb selects the plane and r indexes rows inside it. (Verified locally: 4096/4096 words
+              // written, zero collisions, zero out-of-range.)
+              const size_t dst_w = kb * (nrow * (size_t)W_ROW)
+                                 + r * (size_t)W_ROW
+                                 + (size_t)t * (F * WPK) + (size_t)f * WPK + w;
+              dst[dst_w] = src[src_w];
+            }
+}
+
+// BIT-GRANULAR fold placement. Writes the folded gmem buffer DIRECTLY from the row-major (n,k) codes -- it does
+// not run the five relayout steps, because the placement it needs is not "five steps then a whole-word regroup".
+//
+// WHY A NEW PACKER AT ALL. nfold_regroup_gmem moves whole uint32s, so every word it produces holds ONE logical
+// column. That is exactly what the mma wants while cols_per_word == 1, which holds for every configuration with a
+// 32x32 warp tile. But over-delivery (delivery <= slots, slots = WN*TK/32) forbids int1 below TK=128 at WN=32, and
+// the only escape is a wider warp N extent. At WN=64 the fragment asks for TWO columns inside each word, and a
+// whole-word move cannot express that.
+//
+// WHERE THE FORMULA COMES FROM. Derived, not probed: fold_derivation/l10_placement.cu composes the swzl delivery
+// (L2), the converter's emission order (L3), pi = partition_fragment_B(...).layout()^-1 (L8), and cute's
+// partition_B (L4), then fits a GF(2)-affine form and verifies it over every position. The same chain regresses to
+// 0/16384 against the REAL preprocess_weights_for_mixed_gemm + nfold_regroup_gmem on the box-verified
+// int1 (32,128,128) config, which is what makes it trustworthy for a config the shipped offline has never seen.
+//
+// int1, TN=128, TK=64, WN=64  (F=4, Ng=32, 8 words per row, 32 bits per word):
+//     n = row + 64*(wd>>2) + 32*((j>>3)&1)
+//     k = 2*(wd&3) + 8*(j&7) + (j>>4)
+// inverted, which is what this function walks:
+//     row = n & 31
+//     wd  = ((k >> 1) & 3) | (((n >> 6) & 1) << 2)
+//     j   = ((k >> 3) & 7) | (((n >> 5) & 1) << 3) | ((k & 1) << 4)
+// Compared with the TK=128 form, the single change is that j's bit 3 moves from k += 64 to n += 32: TK halving
+// frees a k bit and F doubling needs an n bit. That migration IS the second column inside each word.
+//
+// `in_nk` is row-major (n, k) one code per bit, exactly as the caller packs `qT`. NOT the preprocess output.
+inline void nfold_place_bits_int1_tk64(int8_t* out, const int8_t* in_nk, size_t N, size_t K,
+                                       int fold_tn = 128, int fold_tk = 64)
+{
+    const int F = 4, Ng = fold_tn / F, W_ROW = 8, CPW = 32;
+    assert(fold_tn == 128 && fold_tk == 64 && "derived for this shape only -- re-run l10_placement for others");
+    assert(N % fold_tn == 0 && K % fold_tk == 0 && "shape must tile");
+    const size_t nrow_total = N / F;
+    std::fill(out, out + (N * K / 8), int8_t(0));
+    for (size_t n = 0; n < N; ++n)
+      for (size_t k = 0; k < K; ++k) {
+        const size_t src_bit = n * K + k;
+        if (!((in_nk[src_bit / 8] >> (src_bit % 8)) & 1)) continue;
+        const size_t tile_n = n / fold_tn, kb = k / fold_tk;
+        const int    nl = int(n % fold_tn), kl = int(k % fold_tk);
+        const int    row = nl & (Ng - 1);
+        const int    wd  = ((kl >> 1) & 3) | (((nl >> 6) & 1) << 2);
+        const int    j   = ((kl >> 3) & 7) | (((nl >> 5) & 1) << 3) | ((kl & 1) << 4);
+        const size_t dst_bit = ((kb * nrow_total + tile_n * Ng + row) * W_ROW + wd) * CPW + j;
+        out[dst_bit / 8] |= int8_t(1 << (dst_bit % 8));
+      }
+}
+
+// nfold_column_pairs_ppu USED TO LIVE HERE and has been deleted. It was dead code (nothing called it) whose
+// comments carried a DISPROVEN derivation -- that the pipeline interleaves several N columns inside one vreg
+// "at crumb level". fold_derivation/l7_groundtruth.cu measures the shipped pipeline as SINGLE-column per
+// 32-bit word, and l13 confirms it across int1/int2/int4. Keeping a wrong explanation next to working code
+// is not free: I independently re-derived the same wrong placement in l6 and believed it BECAUSE it matched
+// this comment. The working placement is nfold_regroup_gmem (whole-uint32) and, for cols_per_word > 1,
+// nfold_place_bits_int1_tk64 (bit-granular, generated by l10 from the verified chain).
+
+
 } // namespace legacy

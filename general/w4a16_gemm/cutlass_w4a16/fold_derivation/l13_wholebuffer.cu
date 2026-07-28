@@ -19,6 +19,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/numeric_types.h"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include <cstdio>
 #include <vector>
 #include <set>
@@ -99,7 +100,7 @@ static bool whole(const char* tag, int NN, int KK) {
     }
     std::vector<int8_t> pre(nbytes), fold(nbytes);
     preprocess_weights_for_mixed_gemm<false,256,0>(pre.data(), packed.data(), {(size_t)KK,(size_t)NN}, qtc);
-    nfold_regroup_gmem(fold.data(), pre.data(), {(size_t)KK,(size_t)NN}, TN, TK, Bits);
+    legacy::nfold_regroup_gmem(fold.data(), pre.data(), {(size_t)KK,(size_t)NN}, TN, TK, Bits);
     for (size_t c = 0; c < ncodes; ++c) { const size_t bp = c*Bits;
       if ((fold[bp/8] >> (bp%8)) & 1) id[c] |= (1 << b); }
   }
@@ -160,7 +161,7 @@ int main() {
     for (int b = 0; b < nbit; ++b) {
       std::vector<int8_t> in(nbytes,0), out(nbytes,0);
       for (size_t i = 0; i < ncodes; ++i) if ((i>>b)&1) in[i/8] |= int8_t(1<<(i%8));
-      nfold_place_bits_int1_tk64(out.data(), in.data(), NN, KK, TN, TK);
+      legacy::nfold_place_bits_int1_tk64(out.data(), in.data(), NN, KK, TN, TK);
       for (size_t p = 0; p < ncodes; ++p) if ((out[p/8]>>(p%8))&1) id[p] |= (1<<b);
     }
     std::set<int> uq(id.begin(), id.end());

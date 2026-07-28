@@ -9,6 +9,7 @@
 // produces for the int1 plane today, byte for byte. If it does, the SAME generator at F2=2 is trustworthy.
 #include "cute/tensor.hpp"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include "xplane_offline.hpp"
 #include <cstdio>
 #include <vector>
@@ -30,7 +31,7 @@ static bool check(const char* tag, int N, int K) {
   preprocess_weights_for_mixed_gemm<false, 256, 0>(shipped.data(), packed.data(),
       {(size_t)K, (size_t)N}, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY);
   if (F2 > 1) { std::vector<int8_t> f(shipped.size());
-                nfold_regroup_gmem(f.data(), shipped.data(), {(size_t)K,(size_t)N}, TN, TK, 1); shipped.swap(f); }
+                legacy::nfold_regroup_gmem(f.data(), shipped.data(), {(size_t)K,(size_t)N}, TN, TK, 1); shipped.swap(f); }
 
   size_t d = 0, nzD = 0, nzS = 0;
   for (size_t i = 0; i < derived.size(); ++i) { if (derived[i] != shipped[i]) ++d; if (derived[i]) ++nzD; if (shipped[i]) ++nzS; }

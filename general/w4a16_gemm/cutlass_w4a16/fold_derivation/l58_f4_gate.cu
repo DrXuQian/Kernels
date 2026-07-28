@@ -12,6 +12,7 @@
 //   nvcc -std=c++17 -Istub_inc -I../../../../third_party/actlize/include -I.. l58_f4_gate.cu -o l58 && ./l58
 #include "cute/tensor.hpp"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include "xplane_offline.hpp"
 #include <cstdio>
 #include <vector>
@@ -42,7 +43,7 @@ static bool check(const char* tag, int N, int K) {
   std::vector<int8_t> nk((size_t)N*K/8, 0);
   for (size_t i = 0; i < (size_t)N*K; ++i) if (codes[i]) nk[i/8] |= int8_t(1 << (i%8));
   std::vector<int8_t> b_((size_t)N*K/8, 0);
-  nfold_place_bits_int1_tk64(b_.data(), nk.data(), N, K, TN, TK);
+  legacy::nfold_place_bits_int1_tk64(b_.data(), nk.data(), N, K, TN, TK);
 
   size_t d = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] != b_[i]) ++d;
   printf("  %-34s %dx%d : %zu / %zu bytes differ  %s\n", tag, N, K, d, a.size(),
@@ -51,7 +52,7 @@ static bool check(const char* tag, int N, int K) {
 }
 
 int main() {
-  printf("L58 -- plane_map at F=4 vs nfold_place_bits_int1_tk64 (the 63.7% config's own offline)\n\n");
+  printf("L58 -- plane_map at F=4 vs legacy::nfold_place_bits_int1_tk64(the 63.7% config's own offline)\n\n");
   bool a = check<64,128,64,64,64,4>("int1 (64,128,64) w64x64 F=4", 256, 512);
   bool b = check<64,128,64,64,64,4>("int1 (64,128,64) w64x64 F=4", 256, 256);
   printf("\n  %s\n", (a&&b) ? "the TV formula and plane_map hold at F=4"

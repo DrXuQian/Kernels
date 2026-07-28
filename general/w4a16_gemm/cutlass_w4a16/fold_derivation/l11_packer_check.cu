@@ -9,6 +9,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/numeric_types.h"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include <cstdio>
 #include <vector>
 #include <set>
@@ -32,7 +33,7 @@ int main(){
     std::vector<int8_t> in(nbytes,0), out(nbytes,0);
     for (int n=0;n<NN;++n) for (int k=0;k<KK;++k){ size_t i=(size_t)n*KK+k;
       if ((i>>b)&1) in[i/8] |= int8_t(1<<(i%8)); }
-    nfold_place_bits_int1_tk64(out.data(), in.data(), NN, KK, TN, TK);
+    legacy::nfold_place_bits_int1_tk64(out.data(), in.data(), NN, KK, TN, TK);
     for (size_t p=0;p<nbytes*8;++p) if ((out[p/8]>>(p%8))&1) id[p] |= (1<<b);
   }
   std::set<int> uniq(id.begin(), id.end());

@@ -25,9 +25,55 @@
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/mma_traits_ppu0015.hpp"
+#include "cute/ppu_tensor_mix.hpp"
+#include "cute/arch/copy_ppu0010_aiu.hpp"
+#include "cute/atom/copy_traits_ppu0010_aiu.hpp"
 #include "cutlass/fast_numeric_conversion_for_mix_gemm.h"
 
 namespace xplane {
+
+// (a) THE swzl DELIVERY POSITION, FROM THE REAL OBJECTS. This was the one link in the whole chain that was never a cute
+// layout: l20 and plane_map both hand-wrote
+//     row = inst*RPI + 16*warp_n + (v/2)*8 + lane/4      wd = (v%2)*4 + lane%4      RPI = WON*16
+// and every offline buffer in this work flows through it, which makes it the most load-bearing expression here. It is
+// also the reason five rounds of debugging went to the wrong subsystem: it was the only plausible suspect, so it got
+// investigated repeatedly, and it was correct every time (fold_derivation/l59 finally proved it against the real
+// partition_S). Correct or not, an expression that has to be RE-VERIFIED to be trusted is worse than one that cannot be
+// wrong, so both halves now come from the objects that define them:
+//   cube base       make_tiled_copy_B(SmemCopyAtomB, tiled_mma_s8).get_thread_slice(warp*32).partition_S(identity)
+//   within a cube   Copy_Traits<PPU0010_TSM_LD_SWZL>::LogicalTV, the atom's own descriptive map
+// Byte-identity with the previous formula is required by l52 / l58 / l61 / l64, all of which gate against shipped or
+// box-validated buffers.
+template <int Bits, int TM, int TN, int TK, int WM, int WN, int F>
+struct CubeTV {
+  static constexpr int warpM = (WM > 16) ? WM : 16, warpN = (WN > 16) ? WN : 16;
+  static constexpr int WOM = TM / warpM, WON = TN / warpN;
+  static constexpr int BK = F * TK, Ng = TN / F, RowB = BK * Bits / 8;
+  static constexpr int AiuByte = RowB > 128 ? 128 : RowB;               // MixGemm_AIU_Operand's own arithmetic
+  static constexpr int AiuElem = AiuByte * 8 / Bits;
+  static constexpr int InstNum = BK / AiuElem;
+  using SInst = cute::PPU0015_16x16x32_S32S8S8S32_TN;
+  using MmaS8 = cute::TiledMMA<cute::MMA_Atom<SInst>,
+                               cute::Layout<cute::Shape<cute::Int<WOM>, cute::Int<WON>, cute::_1>>,
+                               cute::Tile<cute::Int<WOM*16>, cute::Int<WON*16>, cute::_32>>;
+  using Op    = cute::PPU0010_TSM_LD_SWZL<int8_t, Ng, AiuElem * Bits / 8, true, false, InstNum>;
+  using Tr    = cute::Copy_Traits<Op>;
+  static constexpr int WPR = Tr::LogicalWordsPerRow;                    // 32-bit words per cube row
+
+  static int base_row(int warp, int inst) {
+    auto id = cute::make_identity_tensor(cute::make_shape(cute::Int<Ng>{}, cute::Int<RowB>{}));
+    auto ts = cute::make_tiled_copy_B(cute::Copy_Atom<Op, int8_t>{}, MmaS8{})
+                  .get_thread_slice(warp * 32).partition_S(id);
+    return int(cute::get<0>(ts(0, inst, 0)));
+  }
+  static int word(int lane, int v, int dl) {
+    return int(typename Tr::LogicalTV{}(cute::make_coord(cute::make_coord(lane % 4, lane / 4),
+                                                         cute::make_coord(v % 2, v / 2), dl)));
+  }
+  static int cube_row(int lane, int v)         { return word(lane, v, 0) / WPR; }
+  static int cube_wd (int lane, int v, int dl) { return word(lane, v, dl) % WPR - dl * 8; }
+  static constexpr int insts() { return Ng / (WON * 16); }
+};
 
 // ONE plane's own map, l20's structure, generalised to DL deliveries per physical row. DL == 1 is l20 verbatim; DL
 // > 1 is needed for int2 at Block_K=256, which is the configuration that serves as the GATE (it runs correctly on the
@@ -43,10 +89,9 @@ inline std::vector<int> plane_map() {
   constexpr int CPW = 32 / Bits, Ng = TN / F, RPI = WON * 16, VEC = 4 * 32 / Bits;
   constexpr int DL = (F * TK * Bits / 8) / 32;
   static_assert(DL >= 1 && DL * 8 * CPW == F * TK, "row must be a whole number of 32B deliveries");
-  // MmaPermK follows the builder: FoldF > 0 ? TileShape.K : 32*8/bits (ppu_mma_builder.inl). Hardcoding the non-fold
-  // rule silently broke a FOLDED plane -- at Block_K=64 with F=2 the composition covered only 4160 of 8192 logical
-  // elements instead of being a bijection.
-  constexpr int MmaPermK = (F > 1) ? TK : (32 * 8 / Bits);
+  // (e) MmaPermK comes from the SHARED rule the builder uses, not a local restatement of it. The restatement is what
+  // silently broke a folded plane: at Block_K=64 with F=2 the composition covered 4160 of 8192 elements.
+  constexpr int MmaPermK = cutlass::MixGemmMmaPermK<Bits, TK, F>::value;
   using Mma = TiledMMA<MMA_Atom<FInst>, Layout<Shape<Int<WOM>, Int<WON>, _1>>,
                        Tile<Int<WOM*16>, Int<WON*16>, Int<MmaPermK>>>;
   auto sB = make_tensor(make_smem_ptr((cutlass::half_t*)nullptr),
@@ -55,13 +100,14 @@ inline std::vector<int> plane_map() {
   const int NS = int(size(frag));
   auto pi = right_inverse(frag.layout());
   std::vector<int> m((size_t)Ng * DL * 8 * CPW, -1);
+  using CTV = CubeTV<Bits, TM, TN, TK, WM, WN, F>;
   for (int t = 0; t < 32 * WOM * WON; ++t) {
-    const int lane = t % 32, w = t / 32, warp_n = w / WOM;
+    const int lane = t % 32, w = t / 32;
     auto part = Mma{}.get_thread_slice(t).partition_B(make_identity_tensor(make_shape(Int<TN>{}, Int<TK>{})));
     for (int dl = 0; dl < DL; ++dl)
       for (int inst = 0; inst < Ng / RPI; ++inst)
         for (int v = 0; v < 4; ++v) {
-          const int row = inst * RPI + 16 * warp_n + (v / 2) * 8 + lane / 4, wd = (v % 2) * 4 + lane % 4;
+          const int row = CTV::base_row(w, inst) + CTV::cube_row(lane, v), wd = CTV::cube_wd(lane, v, dl);
           for (int j = 0; j < CPW; ++j) {
             const int e = cutlass::MixGemmEmit<Bits>::index(j, v), flat = (inst * DL + dl) * VEC + e;
             if (flat < 0 || flat >= NS) continue;
@@ -93,7 +139,14 @@ inline std::vector<int> tile_map_int1() {
   constexpr int NI1 = Ng1 / RPI, NI2 = Ng2 / RPI;
   static_assert(DL1 >= 1 && DL2 >= 1, "each plane's physical row must be a whole number of 32 B deliveries");
   constexpr int P2_DIV = (DL1 / DL2) ? (DL1 / DL2) : 1;
+  // (c) the converter's cross-plane pairing, read off its own _E2 lines (l37) and expressed as layouts:
+  //   LoCodeL : (lt, half)            -> the LOW crumb's code index within plane 1's 16-code word
+  //   HiCodeL : (lt, v&1, half)       -> the HIGH bit's code index within plane 2's 32-code word
+  using LoCodeL = Layout<Shape<_8, _2>,     Stride<_1, _8>>;
+  using HiCodeL = Layout<Shape<_8, _2, _2>, Stride<_1, _8, _16>>;
 
+  using CTV1 = CubeTV<2, TM, TN, TK, WM, WN, F1>;
+  using CTV2 = CubeTV<1, TM, TN, TK, WM, WN, F2>;
   const auto m1 = plane_map<2, TM, TN, TK, WM, WN, F1>();
   std::vector<int> m((size_t)Ng2 * DL2 * 8 * CPW2, -1);
   for (int t = 0; t < 32 * WOM * WON; ++t) {
@@ -103,16 +156,20 @@ inline std::vector<int> tile_map_int1() {
         for (int v = 0; v < 4; ++v)
           for (int lt = 0; lt < 8; ++lt)
             for (int half = 0; half < 2; ++half) {
-              const int j1 = (lt % 4) + 4 * (lt / 4) + 8 * half;
-              const int row1 = ii * RPI + 16 * warp_n + (v / 2) * 8 + lane / 4, wd1 = (v % 2) * 4 + lane % 4;
+              // (c) THE PAIRING IS TWO LAYOUTS, not index algebra. Worth noting what the old form hid: the low
+              // plane's `(lt % 4) + 4 * (lt / 4)` is the IDENTITY on lt in [0,8) -- an expression that looks like a
+              // permutation and is not. As layouts the domains are explicit and they compose with everything else.
+              const int j1 = int(LoCodeL{}(lt, half));
+              const int row1 = CTV1::base_row(w, ii) + CTV1::cube_row(lane, v), wd1 = CTV1::cube_wd(lane, v, kb % DL1);
               if (row1 >= Ng1) continue;
               const int e1 = m1[(((size_t)row1 * DL1 + kb % DL1) * 8 + wd1) * CPW1 + j1];
               if (e1 < 0) continue;
               const int base = (kb % P2_DIV) + P2_DIV * (ii / (NI2 ? NI2 : 1));
-              const int v2 = base + 2 * (v >> 1), j2 = 8 * (v & 1) + lt + 16 * half;
+              const int v2 = base + 2 * (v >> 1), j2 = int(HiCodeL{}(lt, v & 1, half));
               if (v2 >= 4) continue;
               const int inst2 = (NI2 > 1) ? (ii % NI2) : 0;
-              const int row2 = inst2 * RPI + 16 * warp_n + (v2 / 2) * 8 + lane / 4, wd2 = (v2 % 2) * 4 + lane % 4;
+              const int row2 = CTV2::base_row(w, inst2) + CTV2::cube_row(lane, v2),
+                        wd2 = CTV2::cube_wd(lane, v2, (kb / P2_DIV) % DL2);
               if (row2 >= Ng2) continue;
               m[(((size_t)row2 * DL2 + (kb / P2_DIV) % DL2) * 8 + wd2) * CPW2 + j2] = e1;
             }
@@ -138,17 +195,30 @@ inline std::vector<int> tile_map_int1() {
 // displacement proves nothing. l61 labels each element by the bits of its own index instead, which cannot alias.
 template <int Bits, int TM, int TN, int TK, int WM, int WN, int F>
 inline void place_from_map(int8_t* out, const std::vector<int>& m, const std::vector<uint8_t>& q_kn, int N, int K) {
+  using namespace cute;
   constexpr int CPW = 32 / Bits, R = TN / F, DL = (F * TK * Bits / 8) / 32, MASK = (1 << Bits) - 1;
   static_assert(DL >= 1, "a physical row must be a whole number of 32 B deliveries");
-  // Two destination walks, l20's two branches. F > 1 is plane-major: super-tile kb becomes a separate plane of N/F
-  // rows. F == 1 is the interleave-256 one, which is what preprocess_weights_for_mixed_gemm's five steps produce.
+  // (b) THE DESTINATION IS A LAYOUT. l20's two branches used to be two hand-written address expressions inside the
+  // innermost loop; they are now one cute layout each, built once, over the coordinate tuple the walk enumerates. The
+  // F > 1 branch is plane-major -- super-tile kb becomes a separate plane of N/F rows -- and F == 1 is the
+  // interleave-256 one, which is what the deleted five-step pipeline produced.
   const int W_ROW_OFF = 256 / CPW, RUNS = W_ROW_OFF / 8, nrow = N / F;                       // F > 1
   constexpr int kCon = 256, contig = F * TK * Bits / 8, AiuByte = contig > 128 ? 128 : contig;
   constexpr int AiuElem = AiuByte * 8 / Bits, RPS = kCon / AiuElem;                          // F == 1
   static_assert(F > 1 || RPS >= 1, "unfolded: a K-tile's 32B run exceeds the 256-element interleave -- no such config ships");
+  const int NT = N / TN, KT = K / TK;
+  // (j, wd, row, tn, tt, kb) -> code index. N and K are runtime, so the strides are dynamic; the shape is not a
+  // Layout-of-constants but it is still ONE object rather than an expression per call.
+  auto dst_fold = make_layout(
+      make_shape (Int<CPW>{}, _8{}, Int<R>{}, NT, RUNS ? RUNS : 1, KT / (RUNS ? RUNS : 1)),
+      make_stride(_1{}, Int<CPW>{}, W_ROW_OFF * CPW, R * W_ROW_OFF * CPW, 8 * CPW, nrow * W_ROW_OFF * CPW));
+  // (j, wd, dl, ki_lo, row, tn, ki_hi) -> code index, with ki = ki_hi*RPS + ki_lo
+  auto dst_flat = make_layout(
+      make_shape (Int<CPW>{}, _8{}, Int<DL>{}, RPS ? RPS : 1, Int<R>{}, NT, KT / (RPS ? RPS : 1)),
+      make_stride(_1{}, Int<CPW>{}, 8 * CPW, AiuElem, kCon, TN * kCon, N * kCon));
   std::fill(out, out + (size_t)N * K * Bits / 8, int8_t(0));
-  for (int tn = 0; tn < N / TN; ++tn)
-    for (int ki = 0; ki < K / TK; ++ki)
+  for (int tn = 0; tn < NT; ++tn)
+    for (int ki = 0; ki < KT; ++ki)
       for (int row = 0; row < R; ++row)
         for (int dl = 0; dl < DL; ++dl)
           for (int wd = 0; wd < 8; ++wd)
@@ -158,11 +228,9 @@ inline void place_from_map(int8_t* out, const std::vector<int>& m, const std::ve
               const int n = tn * TN + loc / TK, k = ki * TK + loc % TK;
               const int v = q_kn[(size_t)k * N + n] & MASK;          // q_kn is [K][N]
               if (!v) continue;
-              size_t code;
-              if (F > 1) { const int kb = ki / RUNS, tt = ki % RUNS;
-                           code = (((size_t)kb * nrow + (size_t)tn * R + row) * W_ROW_OFF + tt * 8 + wd) * CPW + j; }
-              else       { code = ((size_t)(ki / RPS) * N + (size_t)tn * TN + row) * kCon
-                                  + (size_t)(ki % RPS) * AiuElem + (size_t)(dl * 8 + wd) * CPW + j; }
+              const size_t code = (F > 1)
+                  ? size_t(dst_fold(j, wd, row, tn, ki % (RUNS ? RUNS : 1), ki / (RUNS ? RUNS : 1)))
+                  : size_t(dst_flat(j, wd, dl, ki % (RPS ? RPS : 1), row, tn, ki / (RPS ? RPS : 1)));
               const size_t bit0 = code * Bits;
               for (int b = 0; b < Bits; ++b)
                 if ((v >> b) & 1) out[(bit0 + b) / 8] |= int8_t(1 << ((bit0 + b) % 8));

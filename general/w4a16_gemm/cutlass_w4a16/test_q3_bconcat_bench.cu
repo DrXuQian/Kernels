@@ -43,14 +43,9 @@ static std::vector<int8_t> pack_plane(const std::vector<uint8_t>& q) {
   // PER-PLANE N-FOLD: a plane whose contiguous run at this TileShape.K is under the AIU's 32 B minimum must be folded
   // in N, and each plane folds by its OWN factor -- that is the whole point of the change. FoldTK == 0 means "this
   // config does not fold", which reproduces the previous buffer byte for byte.
-  if (FoldTK > 0) {
-    const int contig = FoldTK * BITS / 8, F = contig >= 32 ? 1 : 32 / contig;
-    if (F > 1) {
-      std::vector<int8_t> f(out.size());
-      nfold_regroup_gmem(f.data(), out.data(), {(size_t)K, (size_t)N}, FoldTN, FoldTK, BITS);
-      out.swap(f);
-    }
-  }
+  // (f) THE FOLD BRANCH IS GONE. Every call passes FoldTK = 0 -- folded planes are built by xplane::place_derived /
+  // place_int1 inside the row macros, per configuration, because the map depends on the tile. What is left here is the
+  // unfolded path, which the derived preprocess_weights_for_mixed_gemm covers on its own.
   return out;
 }
 

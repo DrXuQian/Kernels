@@ -49,6 +49,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "unfused_weight_dequantize.hpp"
+#include "xplane_offline.hpp"
 #include "moe_grouped_ppu.cuh"
 
 // If this fails, the actlize SUBMODULE on the box is stale: the Kernels gitlink moved but `git submodule update` did
@@ -72,28 +73,23 @@ static_assert(fold::deliverable<4, TN, TK, WM, WN>, "shared config must be legal
 
 static int PM = 2048, PN = 4096, PK = 4096;
 
-// Build the weight buffer for a given width at TK=64. All three fold differently and each has its own validated
-// offline: int1 F=4 needs the bit-granular packer (whole-word moves cannot put two logical columns in one word),
-// int2 F=2 and int4 F=1 go through the shipped preprocess (+ regroup where it folds).
-template <int Bits, int TNp>
+// Build the weight buffer for a given width at TK=64. All three widths fold differently -- int1 F=4, int2 F=2, int4 F=1
+// -- and each used to need its own packer. One derived call now covers all of them. WNp is a parameter because the map
+// depends on the warp N extent and the rungs sweep w32x32 / w32x64 / w64x64.
+template <int Bits, int TNp, int WNp>
 static void pack_weights(std::vector<int8_t>& out) {
-  constexpr int EPB = 8 / Bits, MASK = (1 << Bits) - 1;
+  constexpr int MASK = (1 << Bits) - 1, EPB = 8 / Bits;
   constexpr int contig = TK * Bits / 8, F = contig >= 32 ? 1 : 32 / contig;
-  const size_t bytes = (size_t)PK * PN / EPB;
-  std::vector<int8_t> nk(bytes, 0);
-  for (size_t i = 0; i < (size_t)PK * PN; ++i)                       // row-major (n,k) codes
-    nk[i / EPB] |= int8_t((int((i * 2654435761u >> 7) & MASK)) << (Bits * (i % EPB)));
-  out.assign(bytes, 0);
-  if (Bits == 1 && TK == 64) {
-    nfold_place_bits_int1_tk64(out.data(), nk.data(), PN, PK, TNp, TK);
-  } else {
-    const auto qtc = Bits == 1 ? QuantTypeClass::PACKED_INT1_WEIGHT_ONLY
-                   : Bits == 2 ? QuantTypeClass::PACKED_INT2_WEIGHT_ONLY
-                               : QuantTypeClass::PACKED_INT4_WEIGHT_ONLY;
-    preprocess_weights_for_mixed_gemm<false, 256, 0>(out.data(), nk.data(), {(size_t)PK, (size_t)PN}, qtc);
-    if (F > 1) { std::vector<int8_t> f(bytes);
-                 nfold_regroup_gmem(f.data(), out.data(), {(size_t)PK, (size_t)PN}, TNp, TK, Bits); out.swap(f); }
+  // ONE derived call for every width and TK: place_derived covers the fold walk and the interleave-256 walk, so the
+  // bit-granular / preprocess+nfold split is gone. int4 needs the +8 the old preprocess applied, since a position map
+  // carries no value transform. Byte-identical to the old path at every (Bits, TN, TK) this harness uses (l64).
+  std::vector<uint8_t> q((size_t)PK * PN);                          // [K][N], one code per byte
+  for (size_t i = 0; i < q.size(); ++i) {
+    const int v = int((i * 2654435761u >> 7) & MASK);
+    q[i] = uint8_t(Bits == 4 ? ((v + 8) & MASK) : v);
   }
+  out.assign((size_t)PK * PN / EPB, 0);
+  xplane::place_derived<Bits, 64, TNp, TK, 32, WNp, F>(out.data(), q, PN, PK);
 }
 
 template <int Bits, int TMr, int TNr, int TKr, int WMr, int WNr, int ST, class QElem>
@@ -106,7 +102,7 @@ static void run_rung(int gs, bool zero, const char* note) {
   { std::vector<half_t> a((size_t)PM * PK, half_t(0.01f)), s((size_t)sk * PN, half_t(0.05f)),
                         z((size_t)sk * PN, half_t(0.f));
     A.copy_from_host(a.data()); S.copy_from_host(s.data()); Z.copy_from_host(z.data()); }
-  { std::vector<int8_t> w; pack_weights<Bits, TNr>(w);
+  { std::vector<int8_t> w; pack_weights<Bits, TNr, WNr>(w);
     B.copy_from_host(reinterpret_cast<QElem const*>(w.data())); }
 
   std::vector<GS> shp_h{cute::make_shape(PM, PN, PK)};

@@ -7,6 +7,7 @@
 // mispaired" means nothing, which would explain the contradiction with the box.
 #include "cute/tensor.hpp"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include "xplane_offline.hpp"
 #include <cstdio>
 #include <vector>
@@ -43,7 +44,7 @@ static bool check(const char* tag, int N, int K) {
   preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K,(size_t)N},
                                                  QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
   if (F > 1) { std::vector<int8_t> f(ship.size());
-               nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K,(size_t)N}, TN, TK, 2); ship.swap(f); }
+               legacy::nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K,(size_t)N}, TN, TK, 2); ship.swap(f); }
   size_t d = 0; for (size_t i = 0; i < ship.size(); ++i) if (derived[i] != ship[i]) ++d;
   printf("  %-28s %dx%d DL=%d : %zu / %zu bytes differ  %s\n", tag, N, K, DL, d, ship.size(),
          d ? "<-- plane 1's map is NOT the shipped one; the composition rests on it" : "<-- BIT-IDENTICAL");

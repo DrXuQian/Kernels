@@ -47,7 +47,7 @@ static bool write_side(const char* tag, int N, int K) {
     legacy::preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N},
                                       QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
     std::vector<int8_t> f(NB);
-    nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K, (size_t)N}, TN, TK, Bits);
+    legacy::nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K, (size_t)N}, TN, TK, Bits);
     for (size_t s = 0; s < NB * 4; ++s)
       got[s] |= ((f[s / 4] >> (2 * (s % 4))) & 1) << b;
   }
@@ -89,7 +89,7 @@ static bool write_side(const char* tag, int N, int K) {
     std::vector<int8_t> ship(NB), f(NB), drv(NB);
     legacy::preprocess_weights_for_mixed_gemm<false,256,0>(ship.data(), packed.data(), {(size_t)K, (size_t)N},
                                                   QuantTypeClass::PACKED_INT2_WEIGHT_ONLY);
-    nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K, (size_t)N}, TN, TK, Bits);
+    legacy::nfold_regroup_gmem(f.data(), ship.data(), {(size_t)K, (size_t)N}, TN, TK, Bits);
     xplane::place_derived<Bits, TM, TN, TK, WM, WN, F>(drv.data(), q, N, K);
     size_t d = 0; for (size_t i = 0; i < NB; ++i) if (drv[i] != f[i]) ++d;
     printf("      place_derived vs whole-word packer: %zu / %zu bytes differ  %s\n", d, NB,

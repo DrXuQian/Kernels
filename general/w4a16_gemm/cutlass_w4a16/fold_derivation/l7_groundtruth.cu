@@ -42,6 +42,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/numeric_types.h"
 #include "unfused_weight_dequantize.hpp"
+#include "legacy_pipeline.hpp"
 #include <cstdio>
 #include <vector>
 #include <map>
@@ -80,14 +81,14 @@ int main() {
     std::vector<int8_t> pre(nbytes), fold(nbytes);
     preprocess_weights_for_mixed_gemm<false, 256, 0>(
         pre.data(), packed.data(), {(size_t)KK, (size_t)NN}, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY);
-    nfold_regroup_gmem(fold.data(), pre.data(), {(size_t)KK, (size_t)NN}, TN, TK, Bits);
+    legacy::nfold_regroup_gmem(fold.data(), pre.data(), {(size_t)KK, (size_t)NN}, TN, TK, Bits);
     for (size_t p = 0; p < nbytes * 8; ++p)
       if ((fold[p / 8] >> (p % 8)) & 1) id[p] |= (1 << b);
   }
 
   // sanity: the recovered map must be a bijection
   std::set<int> uniq(id.begin(), id.end());
-  printf("GROUND TRUTH from the real preprocess + nfold_regroup_gmem  (N=%d K=%d, int1, TN=%d TK=%d F=%d)\n\n",
+  printf("GROUND TRUTH from the real preprocess + legacy::nfold_regroup_gmem(N=%d K=%d, int1, TN=%d TK=%d F=%d)\n\n",
          NN, KK, TN, TK, F);
   printf("  recovered %zu distinct logical ids over %zu bit positions -> %s\n\n",
          uniq.size(), nbytes * 8, uniq.size() == nbytes * 8 ? "bijection, map is trustworthy" : "NOT a bijection");

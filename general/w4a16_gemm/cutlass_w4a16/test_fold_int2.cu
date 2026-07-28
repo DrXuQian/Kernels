@@ -17,6 +17,12 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "unfused_weight_dequantize.hpp"
+// (f) THE LAST CONSUMER OF THE LEGACY PACKERS, deliberately. This harness picks ftn/ftk/fbits at RUNTIME (env plus a
+// runtime CORR_DISPATCH) while xplane::place_derived needs the tile as template arguments, so migrating it means a
+// runtime-to-compile-time dispatcher over shapes only this harness uses. It is a diagnostic, not a shipping path, so it
+// keeps the old packers -- but it must now NAME them `legacy::`, which is the point: reaching a landmine takes typing
+// the namespace. nfold_regroup_gmem is correct only while cols_per_word == 1, i.e. warp N extent 32.
+#include "fold_derivation/legacy_pipeline.hpp"
 #include "moe_grouped_ppu.cuh"
 
 // If this fails, the actlize SUBMODULE on the box is stale: the Kernels gitlink moved but `git submodule update` did
@@ -148,12 +154,12 @@ int main(int argc, char** argv) {
       const size_t i = (size_t)n * K + k;
       if (qT[(size_t)n * K + k] & 1) nk[i / 8] |= int8_t(1 << (i % 8));
     }
-    nfold_place_bits_int1_tk64(Bp.data(), nk.data(), N, K, ftn, ftk);
+    legacy::nfold_place_bits_int1_tk64(Bp.data(), nk.data(), N, K, ftn, ftk);
   } else {
     preprocess_weights_for_mixed_gemm<false, 256, 0>(Bp.data(), packed.data(), {(size_t)K, (size_t)N}, qtc);
     if (!getenv("NFOLD_STD")) {
       std::vector<int8_t> tmp(Bp.size());
-      nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, ftn, ftk, fbits);
+      legacy::nfold_regroup_gmem(tmp.data(), Bp.data(), {(size_t)K, (size_t)N}, ftn, ftk, fbits);
       Bp.swap(tmp);
     }
   }
@@ -259,7 +265,7 @@ int main(int argc, char** argv) {
       std::vector<int8_t> bp(pk.size());
       preprocess_weights_for_mixed_gemm<false, 256, 0>(bp.data(), pk.data(), {(size_t)K,(size_t)N}, qtc);
       if (!getenv("NFOLD_STD")) { std::vector<int8_t> tm(bp.size());
-        nfold_regroup_gmem(tm.data(), bp.data(), {(size_t)K,(size_t)N}, ftn, ftk, fbits); bp.swap(tm); }
+        legacy::nfold_regroup_gmem(tm.data(), bp.data(), {(size_t)K,(size_t)N}, ftn, ftk, fbits); bp.swap(tm); }
       if (fbits == 1) dB1.copy_from_host(reinterpret_cast<uint1_t const*>(bp.data()));
       else            dB.copy_from_host(reinterpret_cast<uint2_t const*>(bp.data()));
       if (ftm == 32) { if (ftk == 128) CORR_DISPATCH(32, 128, 128); else CORR_DISPATCH(32, 128, 64); }
