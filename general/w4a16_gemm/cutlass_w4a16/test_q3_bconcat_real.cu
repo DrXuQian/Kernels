@@ -134,12 +134,10 @@ int main(int argc, char** argv) {
   // PER-PLANE N-FOLD, the actual new path: at Block_K=128 int2 keeps F=1 (32 B run) while int1 folds F=2, so the high
   // plane needs its OWN folded buffer. A MATCH at Block_K=256 only says the change did not disturb the old path.
   {
-    // CROSS-PLANE placement, not plane 2's own single-plane rule. Once plane 2 folds (F2=2 at Block_K=128) the two
-    // planes disagree on thread->column, so the high bits have to be placed where the CONVERTER looks -- see
-    // xplane_offline.hpp. This is what pack_plane<...,64,128> got wrong: it applied int1's own fold and produced a
-    // buffer that is self-consistent but not the one this kernel reads (box: bad=15010/32768).
-    std::vector<int8_t> BhiF((size_t)K * N / 8);
-    xplane::place_int1<64, 64, 128, 32, 32, 2>(BhiF.data(), high1, N, K);
+    // xplane::place_int1 was tried here and is BYTE-IDENTICAL to this (l47), so the offline was never the defect --
+    // pack_plane's fold is already the buffer the kernel reads. Kept as the plain form; the derived generator lives in
+    // xplane_offline.hpp for Q5/Q6, validated against the shipped buffer at F2=1.
+    auto BhiF = pack_plane<8, QuantTypeClass::PACKED_INT1_WEIGHT_ONLY, 64, 128>(high1, K, N);
     cutlass::DeviceAllocation<cutlass::uint1b_t> dBhiF((size_t)K*N);
     dBhiF.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(BhiF.data()));
     CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));

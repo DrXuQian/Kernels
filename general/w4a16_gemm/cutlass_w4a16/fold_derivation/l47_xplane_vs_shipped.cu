@@ -32,9 +32,12 @@ static bool check(const char* tag, int N, int K) {
   if (F2 > 1) { std::vector<int8_t> f(shipped.size());
                 nfold_regroup_gmem(f.data(), shipped.data(), {(size_t)K,(size_t)N}, TN, TK, 1); shipped.swap(f); }
 
-  size_t d = 0; for (size_t i = 0; i < derived.size(); ++i) if (derived[i] != shipped[i]) ++d;
-  printf("  %-34s %dx%d : %zu / %zu bytes differ  %s\n", tag, N, K, d, derived.size(),
-         d ? "<-- DIFFERS" : "<-- BIT-IDENTICAL");
+  size_t d = 0, nzD = 0, nzS = 0;
+  for (size_t i = 0; i < derived.size(); ++i) { if (derived[i] != shipped[i]) ++d; if (derived[i]) ++nzD; if (shipped[i]) ++nzS; }
+  // nonzero counts on BOTH sides: two all-zero buffers also "agree", and l48 says the maps differ in 8160/8192
+  // entries, so an agreement here needs corroborating that anything was compared at all.
+  printf("  %-34s %dx%d : %zu / %zu differ | nonzero derived=%zu shipped=%zu  %s\n", tag, N, K, d, derived.size(),
+         nzD, nzS, d ? "<-- DIFFERS" : "<-- BIT-IDENTICAL");
   return d == 0;
 }
 
