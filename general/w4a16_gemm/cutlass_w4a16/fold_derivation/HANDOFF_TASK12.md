@@ -189,3 +189,62 @@ already solved this exact case — mirror whatever it does rather than inventing
 instantiates and the whole mainloop is invisible to `syntax_check.sh` (it now says so out loud). l42's shape check
 catches tile-EXTENT mismatches but not tile-RANK ones; extending it to compare `rank(local_tile(...))` per plane is
 the cheap way to close that too.
+
+---
+
+# Cross-plane offline for the folded plane 2 — state, and the exact next step
+
+## Established
+
+* **l44 — the root cause of `bad=15010/32768`.** With different fold factors the planes disagree on thread→column by
+  construction: the fold halves plane 2's physical row count and the mma maps threads to PHYSICAL rows. At
+  `(64,64,128) w32x32` thread 0 holds low codes for logical N `{0,8,32,40}` and high bits for `{0,1,16,17}` — the data
+  it needs is in another thread's registers. **No `hi_p` offset repairs this**; the guess
+  `hi_p = base + g(ii, F2)` was the wrong shape of answer. It also explains why the `TK=256` control is right: both
+  planes are `F=1` there and their thread→row maps coincide.
+* **l45/l46 — feasibility.** Counts balance and the target map `T2 : plane-2 physical bit → logical (n,k)` is
+  consistent (`conflicts=0`, `unclaimed=0`, multiplicity `== WOM`) at `(64,64,256) F2=1`, `(64,64,128) F2=2` and
+  `(32,128,128) F2=2`, under the converter's TRUE pairing (not slot order):
+  ```
+  line (t,v):  LOW  code 16*v + (t%4) + 4*(t/4) [+8]   of the 64-code chunk
+               HIGH bit  64*(v>>1) + 8*(v&1) + t [+16] of the 128-bit chunk
+  ```
+  So nothing is ruled out: a placement exists, and it lives OFFLINE — the kernel needs only the indexing noted below.
+* **Multiplicity is not a conflict.** B is split across the N warps only, so all `TM/WM` M-warps read the same B and
+  every element is legitimately demanded `WOM` times. Requiring 1 wrongly calls `(64,64,128)` infeasible.
+
+## NOT established — the buffer emitter is wrong
+
+`l46::emit_and_diff` produces a buffer that differs from the shipped one in **16384 of 16384 bytes** at the `F2=1`
+control, where it must be identical. The cause is structural, not a typo: **l20's `tile_map` does not take the
+destination address from `partition_B`.** It uses the explicit swzl TV formula
+
+```cpp
+row = inst*RPI + 16*warp_n + (v/2)*8 + lane/4;      wd = (v%2)*4 + lane%4;
+```
+
+and uses `part(pi(flat))` only to recover the LOGICAL `(n,k)`. l46 conflated the two. Adding `pi` to the
+`partition_B` lookup (tried) does not fix it, because the destination side is wrong to begin with.
+
+## Next step, concretely
+
+Mirror l20's structure exactly, with plane 2's own `Ng = TN/F2`, `CPW = 32`, `RPI = WON*16`, `VEC = 128`:
+
+1. **Destination**: `(row, wd, j)` from the swzl TV formula above — plane 2's, not plane 1's.
+2. **Which high bit that is**: within the delivered chunk, vreg `v`, code `j` → bit index `h = 32*v + j`.
+3. **Which line consumes it**: solve `h = hi_vreg0 + 2*(v'>>1)` for the vreg and `j = 8*(v'&1) + t + 16*half` for
+   `(v', t, half)`, with `hi_vreg0 = (kb % P2_DIV) + P2_DIV*(ii / MMA_N2)`.
+4. **The paired low code**: plane-1 chunk index `16*v' + (t%4) + 4*(t/4) + 8*half`, whose logical `(n,k)` comes from
+   plane 1's own `part(pi(flat))` chain.
+5. **Write** `m[(row*8 + wd)*CPW + j] = n_local*TK + k_local`, then run it through l20's buffer walk.
+
+**Gate it on the control.** `F2=1` must reproduce the shipped plane-2 buffer byte for byte before the `F2=2` map is
+trusted — that diff is what caught this, twice.
+
+## Kernel-side change this assumes
+
+```cpp
+hi chunk   = cvt_hi(_, ii % MMA_N2)
+uint32 off = (k_block % P2_DIV) + P2_DIV * (ii / MMA_N2)
+```
+`P2_DIV == 1 && MMA_N2 == MMA_N1` reproduces the shipped expression exactly, so the unfolded path is untouched.
