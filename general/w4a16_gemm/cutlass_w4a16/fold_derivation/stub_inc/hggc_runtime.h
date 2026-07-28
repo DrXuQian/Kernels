@@ -2,8 +2,13 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdarg>
-typedef int hggcError_t;
-enum { hggcSuccess = 0 };
+// A DISTINCT type, not `int`. cutlass/core_io.h defines operator<<(ostream&, hggcError_t); with the typedef to int
+// that overload competed with ostream::operator<<(int) and every `std::cerr << <some int>` in CUTLASS_PPU_CHECK became
+// ambiguous -- three "more than one operator <<" errors that I had misread as a template-parse artifact.
+enum class hggcError_t : int { hggcSuccess_ = 0 };
+inline constexpr hggcError_t hggcSuccess = hggcError_t::hggcSuccess_;
+inline bool operator==(hggcError_t a, int b) { return int(a) == b; }
+inline bool operator!=(hggcError_t a, int b) { return int(a) != b; }
 typedef struct CUstream_st* hggcStream_t;
 struct hggcLaunchAttributeValue { int x; };
 struct hggcLaunchAttribute { int id; hggcLaunchAttributeValue val; };
@@ -11,11 +16,11 @@ struct hggcLaunchConfig_t { int gridDim; int blockDim; size_t dynamicSmemBytes; 
 enum { hggcLaunchAttributeProgrammaticStreamSerialization = 1 };
 static inline const char* hggcGetErrorName(hggcError_t){ return ""; }
 static inline const char* hggcGetErrorString(hggcError_t){ return ""; }
-static inline hggcError_t hggcDeviceSynchronize(){ return 0; }
-static inline hggcError_t hggcGetLastError(){ return 0; }
-static inline hggcError_t hggcPeekAtLastError(){ return 0; }
-static inline hggcError_t hggcMemsetAsync(void*,int,size_t,hggcStream_t){ return 0; }
-template<typename... A> static inline hggcError_t hggcLaunchKernelEx(A...){ return 0; }
+static inline hggcError_t hggcDeviceSynchronize(){ return hggcSuccess; }
+static inline hggcError_t hggcGetLastError(){ return hggcSuccess; }
+static inline hggcError_t hggcPeekAtLastError(){ return hggcSuccess; }
+static inline hggcError_t hggcMemsetAsync(void*,int,size_t,hggcStream_t){ return hggcSuccess; }
+template<typename... A> static inline hggcError_t hggcLaunchKernelEx(A...){ return hggcSuccess; }
 
 // -- host-only stubs so unfused_weight_dequantize.hpp (via helper.h) compiles for the ground-truth extractor.
 //    Nothing here runs; l7_groundtruth.cu only calls the CPU relayout functions.
@@ -29,7 +34,8 @@ inline hggcError_t hggcEventElapsedTime(float* ms, hggcEvent_t, hggcEvent_t) { i
 // -- more host-only stubs, so `nvcc -cuda` can run the FRONT END on the harnesses locally. This is what turns
 //    "the box build finds my typos" into "a local check finds them" -- it caught `bad` used before declaration
 //    only after a round trip to ppu001, which was avoidable.
-enum { hggcErrorUnknown = 1, hggcErrorInvalidValue = 2 };
+inline constexpr hggcError_t hggcErrorUnknown      = hggcError_t(1);
+inline constexpr hggcError_t hggcErrorInvalidValue = hggcError_t(2);
 typedef int hggcMemcpyKind;
 enum { hggcMemcpyHostToDevice = 1, hggcMemcpyDeviceToHost = 2, hggcMemcpyDeviceToDevice = 3,
        hggcMemcpyHostToHost = 4, hggcMemcpyDefault = 5 };
@@ -58,5 +64,17 @@ inline hggcError_t hggcDeviceSetLimit(int, size_t) { return hggcSuccess; }
 inline hggcError_t hggcOccupancyMaxActiveBlocksPerMultiprocessor(int* n, const void*, int, size_t) {
   if (n) *n = 1; return hggcSuccess; }
 enum { HGGC_SUCCESS = 0 };
-inline void __ppu_barrier_arrive(int = 0) {}
-inline void __ppu_barrier_sync(int = 0) {}
+// VARIADIC on purpose. Fixed arity here silently amputates the local check: the real signatures take (id, threads[, x]),
+// so a 2- or 3-argument call failed with "too many arguments", the collective it lives in never instantiated, and
+// EVERY static error downstream of CollectiveMma became invisible locally. Two compile errors reached the box that
+// way (a folded gB2 cut with the unfolded TileShape, and plane 1's k coordinate fed to plane 2).
+template <class... Ts> inline void __ppu_barrier_arrive(Ts...) {}
+template <class... Ts> inline void __ppu_barrier_sync(Ts...) {}
+
+// -- driver-level symbols cutlass/workspace.h uses. Missing, they cost five errors and (worse) pushed the front end
+//    past its instantiation budget, which is how the whole mainloop stayed invisible locally.
+typedef int HGresult;
+inline HGresult hgMemsetD8Async (unsigned long long, unsigned char,  size_t, hggcStream_t = nullptr) { return HGGC_SUCCESS; }
+inline HGresult hgMemsetD16Async(unsigned long long, unsigned short, size_t, hggcStream_t = nullptr) { return HGGC_SUCCESS; }
+inline HGresult hgMemsetD32Async(unsigned long long, unsigned int,   size_t, hggcStream_t = nullptr) { return HGGC_SUCCESS; }
+inline HGresult hgGetErrorString(HGresult, const char** s) { if (s) *s = ""; return HGGC_SUCCESS; }

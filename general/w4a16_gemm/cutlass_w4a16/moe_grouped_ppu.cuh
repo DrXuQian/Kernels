@@ -99,6 +99,17 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // GroupProblemShape -> hits ppu_aiu_gemm_mixed_input_group.hpp's specialization.
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<GroupProblemShape, CollectiveMainloop, CollectiveEpilogue>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  // PPU_FORCE_INSTANTIATE: odr-use the kernel's operator() so the WHOLE collective -- mainloop included -- is
+  // instantiated by the front end. Without this the local nvcc gate parses the collective but never instantiates it,
+  // so every template-DEPENDENT error in the mainloop is invisible: a deliberate undefined symbol there is caught
+  // (non-dependent, checked at parse time) while a wrong copy coordinate is not. Two static errors reached the box
+  // behind exactly that gap. Costs nothing in a real build (the kernel is instantiated anyway) and is opt-in.
+#if defined(PPU_FORCE_INSTANTIATE) && (PPU_FORCE_INSTANTIATE != 0)
+  // Taking the address of the __global__ device_kernel<GemmKernel> odr-uses it, which instantiates op(params, smem)
+  // and with it the ENTIRE mainloop. (&GemmKernel::operator() does not: it is CUTLASS_DEVICE, and naming it from host
+  // code instantiates nothing.) device_kernel is what cutlass::kernel_launch would reference anyway.
+  { [[maybe_unused]] void const* _probe = (void const*) cutlass::device_kernel<GemmKernel>; }
+#endif
 
   using StrideA = typename GemmKernel::StrideA;  using StrideB = typename GemmKernel::StrideB;
   using StrideC = typename CollectiveEpilogue::StrideC;  using StrideD = typename CollectiveEpilogue::StrideD;

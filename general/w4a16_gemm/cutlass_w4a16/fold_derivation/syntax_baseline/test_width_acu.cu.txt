@@ -1,14 +1,1 @@
-1 copy_ppu.hpp(): error: calling a __device__ function("cute::cast_smem_ptr_to_uint(const void *)") from a __host__ __device__ function("copy") is not allowed
-1 gemm_configs.hpp(): error: expected a type specifier
-1 ppu_mma_builder.inl(): error: expected a type specifier
-1 ppu_tile_scheduler_stream_k.hpp(): error: more than one instance of constructor "dim3::dim3" matches the argument list:
-1 workspace.h(): error: identifier "HGresult" is undefined
-1 workspace.h(): error: identifier "hgGetErrorString" is undefined
-1 workspace.h(): error: identifier "hgMemsetD16Async" is undefined
-1 workspace.h(): error: identifier "hgMemsetD32Async" is undefined
-1 workspace.h(): error: identifier "hgMemsetD8Async" is undefined
-2 ppu_mma_aiu_multistage_batch_array_overlap_prologue.hpp(): error: type name is not allowed
-3 test_width_acu.cu(): error: more than one operator "<<" matches these operands:
-4 ppu_mma_aiu_multistage_with_scale.hpp(): error: too many arguments in function call
-5 copy_ppu.hpp(): error: calling a __device__ function("_ZN4cute21cast_smem_ptr_to_uintE1?") from a __host__ __device__ function("copy") is not allowed
-6 mma_ppu.h(): error: calling a __device__ function("_ZN48_INTERNAL_91569bff_17_test_width_acu_cu_8df4fcc37__hfma2E1?1?1?") from a __host__ __device__ function("operator()") is not allowed
+

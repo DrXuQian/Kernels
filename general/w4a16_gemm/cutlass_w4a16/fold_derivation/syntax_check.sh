@@ -40,9 +40,22 @@ for f in $FILES; do
   # 5 known ones), and a gate that cries wolf on every edit is a gate that stops being read -- which is how a real
   # error gets through. Dropping the line number costs the ability to distinguish two identical messages at
   # different lines; the count guard below covers that.
-  sig=$(nvcc -std=c++17 -D__HGGCCC__ $EXTRA_DEFS -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
+  # THE FLAGS MATTER MORE THAN THE SCRIPT. Without them the front end never instantiates the collective, so every
+  # template-DEPENDENT error in the mainloop is invisible and only parse-time typos are caught:
+  #   -arch=sm_80              without a real arch, __hfma2 is undeclared -> an error -> EDG stops instantiating
+  #   --expt-relaxed-constexpr nvcc-only restriction on constexpr host fns in device code; clang/hgcc allow it
+  #   -DPPU_FORCE_INSTANTIATE  odr-uses device_kernel<GemmKernel>, which pulls in the whole mainloop
+  # Verified: with these, a static_assert planted in the 2-plane mainloop fires 32 times; without them, 0.
+  #
+  # Two signatures are dropped as ENVIRONMENTAL, not filtered by pattern-guessing: cute::_ and cute::product report
+  # "undefined in device code" because CUTE_INLINE_CONSTANT resolves to `static constexpr` here while the box takes
+  # the `static const __device__` branch. They cannot mask a real error -- a real one has a different message.
+  sig=$(nvcc -std=c++17 -arch=sm_80 --expt-relaxed-constexpr -D__HGGCCC__ -DPPU_FORCE_INSTANTIATE=1 $EXTRA_DEFS \
+        -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
         -cuda -o /dev/null -x cu "$f" -Wno-deprecated-gpu-targets 2>&1 \
-        | grep ": error" | sed -E 's#^.*/([^/]+)#\1#; s#\(([0-9]+)\)#()#' | sort | uniq -c \
+        | grep ": error" | grep -v 'identifier "cute::_" is undefined in device code' \
+                         | grep -v 'identifier "cute::product" is undefined in device code' \
+        | sed -E 's#^.*/([^/]+)#\1#; s#\(([0-9]+)\)#()#' | sort | uniq -c \
         | sed -E 's/^ +//' | sort)
   bl="$BLDIR/$base.txt"
   if [ "$RECORD" = 1 ]; then
@@ -56,16 +69,6 @@ for f in $FILES; do
     echo "$base: NEW ERRORS (not in baseline)"; printf '%s\n' "$new" | head -12; rc=1
   else
     echo "$base: clean ($(grep -c . "$bl") known-noise lines, 0 new)"
-  fi
-  # THE BLIND SPOT, STATED OUT LOUD. The stubs make ppu_mma_builder.inl fail ("expected a type specifier"), so the
-  # CollectiveMma it would have produced is never instantiated locally -- and every error DOWNSTREAM of it is
-  # invisible here. A folded 2-plane gB2 cut with the unfolded TileShape sailed through as "clean" and then failed on
-  # the box with cute/algorithm/copy.hpp's `size<1>(src) == size<1>(dst)`. "clean" means "no NEW front-end error",
-  # NOT "the collective type-checks". Layout-consistency questions belong in an l4x harness that builds the types
-  # directly; this gate cannot answer them.
-  if grep -q "ppu_mma_builder.inl" "$bl" 2>/dev/null; then
-    echo "  NOTE: the builder fails under the stubs, so nothing downstream of CollectiveMma was instantiated."
-    echo "        Mainloop layout/partition mismatches CANNOT be caught here -- use a fold_derivation harness."
   fi
 done
 exit $rc
