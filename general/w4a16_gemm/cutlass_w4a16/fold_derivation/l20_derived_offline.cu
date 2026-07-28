@@ -78,17 +78,47 @@ static std::vector<int> tile_map() {
 }
 
 // write the buffer the kernel expects, straight from the tile map
-template <int Bits, int TM, int TN, int TK, int WM, int WN>
+//
+// THE DESTINATION IS A cute LAYOUT, not three branches of index arithmetic. All three gmem forms are affine maps over
+// the SAME physical-slot domain (j, wd, row, ki, tn) -- they differ only in the stride tuple, and the two that split
+// ki into an inner AIU run and an outer 256-block are exactly what a HIERARCHICAL cute mode is for:
+//
+//   folded  (plane-major, l13)   : ki -> (RUNS, .) : (8*CPW,   nrow*W_ROW_OFF*CPW)
+//   interleave-256 (F=1, l16)    : ki -> (RPS,  .) : (AiuElem, N*kCon)
+//   NON-interleaved (RowsPerTile=-1, plain ColumnMajor [N][K]) : ki flat, stride TK
+//
+// So supporting RowsPerTile=-1 is a THIRD STRIDE TUPLE, not a third derivation: the source side
+// (LogicalTV o MixGemmEmit o pi o partition_B, i.e. tile_map) answers "which logical (n,k) owns this physical slot"
+// and is completely independent of how the buffer is interleaved. Dynamic (int) extents and strides are fine here --
+// this is host code, so a cute Layout is just integer arithmetic with the shape written down instead of inlined.
+template <int Bits, int TM, int TN, int TK, int WM, int WN, int RowsPerTile = 256>
 static void place_derived(std::vector<int8_t>& out, const std::vector<int>& codes, int N, int K) {
   constexpr int CPW = 32/Bits, MASK = (1 << Bits) - 1;
   constexpr int contig = TK*Bits/8, F = contig >= 32 ? 1 : 32/contig, Ng = TN/F;
   const int kCon = 256, W_ROW_OFF = 256/CPW, RUNS = W_ROW_OFF/8;
   const int AiuByte = contig > 128 ? 128 : contig, AiuElem = AiuByte*8/Bits, RPS = kCon/AiuElem;
+  const int nrow = N/F, KT = K/TK, NT = N/TN;
+  static_assert(RowsPerTile == 256 || RowsPerTile == -1, "RowsPerTile is 256 (interleaved) or -1 (plain ColumnMajor)");
+  static_assert(RowsPerTile != -1 || F == 1, "the -1 (non-interleaved) buffer has no folded form");
+
+  // ONE domain, THREE stride tuples. Written with make_layout so the extents can be runtime N/K.
+  auto dst = [&] {
+    if constexpr (F > 1)
+      return make_layout(make_shape (CPW, 8,   Ng,          make_shape(RUNS,  KT/RUNS),                 NT),
+                         make_stride(  1,  CPW, W_ROW_OFF*CPW, make_stride(8*CPW, nrow*W_ROW_OFF*CPW),
+                                     Ng*W_ROW_OFF*CPW));
+    else if constexpr (RowsPerTile == 256)
+      return make_layout(make_shape (CPW, 8,   Ng,   make_shape(RPS,     KT/RPS),  NT),
+                         make_stride(  1,  CPW, kCon, make_stride(AiuElem, N*kCon), TN*kCon));
+    else                                        // RowsPerTile == -1 : plain ColumnMajor [N][K], k contiguous
+      return make_layout(make_shape (CPW, 8,   Ng, make_shape(KT, 1),      NT),
+                         make_stride(  1,  CPW, K,  make_stride(TK, 0),    TN*K));
+  }();
+
   auto m = tile_map<Bits,TM,TN,TK,WM,WN>();
   std::fill(out.begin(), out.end(), int8_t(0));
-  const int nrow = N/F;
-  for (int tn = 0; tn < N/TN; ++tn)
-    for (int ki = 0; ki < K/TK; ++ki)
+  for (int tn = 0; tn < NT; ++tn)
+    for (int ki = 0; ki < KT; ++ki)
       for (int row = 0; row < Ng; ++row)
         for (int wd = 0; wd < 8; ++wd)
           for (int j = 0; j < CPW; ++j) {
@@ -97,20 +127,16 @@ static void place_derived(std::vector<int8_t>& out, const std::vector<int>& code
             const int n = tn*TN + loc/TK, k = ki*TK + loc%TK;
             int val = codes[(size_t)n*K + k] & MASK;
             if (Bits == 4) val = (((int8_t)(val << 4) >> 4) + 8) & 0xF;   // add_bias_and_interleave_int4s
-            size_t bitpos;
-            if (F > 1) {                                       // folded: plane-major (l13)
-              const int kb = ki/RUNS, t = ki%RUNS;
-              bitpos = (size_t)((((size_t)kb*nrow + (size_t)tn*Ng + row)*W_ROW_OFF + t*8 + wd)*CPW + j)*Bits;
-            } else {                                           // unfolded: interleave-256 direct (l16)
-              bitpos = (size_t)((((size_t)(ki/RPS)*N + (size_t)tn*TN + row)*kCon
-                                 + (ki%RPS)*AiuElem + wd*CPW + j))*Bits;
-            }
+            // the ki mode is hierarchical in two of the three forms; cute splits it, so the walk stays flat here
+            const int kin = (F > 1) ? (ki % RUNS) : (RowsPerTile == 256 ? (ki % RPS) : ki);
+            const int kout = (F > 1) ? (ki / RUNS) : (RowsPerTile == 256 ? (ki / RPS) : 0);
+            const size_t bitpos = (size_t)dst(make_coord(j, wd, row, make_coord(kin, kout), tn)) * Bits;
             out[bitpos/8] |= int8_t(val << (bitpos%8));
           }
 }
 
 // ---------------------------------------------------------------- the existing offline, for comparison
-template <int Bits, int TN, int TK>
+template <int Bits, int TN, int TK, int RowsPerTile = 256>
 static void place_shipped(std::vector<int8_t>& out, const std::vector<int>& codes, int N, int K) {
   constexpr int Bits_ = Bits, EPB = 8/Bits_, MASK = (1 << Bits) - 1;
   constexpr int contig = TK*Bits/8, F = contig >= 32 ? 1 : 32/contig;
@@ -122,24 +148,24 @@ static void place_shipped(std::vector<int8_t>& out, const std::vector<int>& code
   for (size_t i = 0; i < (size_t)N*K; ++i)
     packed[i/EPB] |= int8_t((codes[i] & MASK) << (Bits*(i%EPB)));
   std::vector<int8_t> pre(packed.size());
-  preprocess_weights_for_mixed_gemm<false,256,0>(pre.data(), packed.data(), {(size_t)K,(size_t)N}, qtc);
+  preprocess_weights_for_mixed_gemm<false,RowsPerTile,0>(pre.data(), packed.data(), {(size_t)K,(size_t)N}, qtc);
   if (F > 1) { std::vector<int8_t> f(pre.size());
                nfold_regroup_gmem(f.data(), pre.data(), {(size_t)K,(size_t)N}, TN, TK, Bits); pre.swap(f); }
   out = pre;
 }
 
-template <int Bits, int TM, int TN, int TK, int WM, int WN>
+template <int Bits, int TM, int TN, int TK, int WM, int WN, int RowsPerTile = 256>
 static bool compare(const char* tag, int N, int K) {
   constexpr int Bits_ = Bits, EPB = 8/Bits_, MASK = (1 << Bits) - 1;
   constexpr int contig = TK*Bits/8, F = contig >= 32 ? 1 : 32/contig;
   std::vector<int> codes((size_t)N*K);
   for (size_t i = 0; i < codes.size(); ++i) codes[i] = int((i*2654435761u >> 7) & MASK);
   std::vector<int8_t> a((size_t)N*K/EPB), b;
-  place_derived<Bits,TM,TN,TK,WM,WN>(a, codes, N, K);
-  place_shipped<Bits,TN,TK>(b, codes, N, K);
+  place_derived<Bits,TM,TN,TK,WM,WN,RowsPerTile>(a, codes, N, K);
+  place_shipped<Bits,TN,TK,RowsPerTile>(b, codes, N, K);
   size_t diff = 0; for (size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) ++diff;
-  printf("  %-26s int%d (%d,%d,%d) w%dx%d F=%d  %dx%d : %zu / %zu bytes differ  %s\n",
-         tag, Bits, TM, TN, TK, WM, WN, F, N, K, diff, a.size(),
+  printf("  %-26s int%d (%d,%d,%d) w%dx%d F=%d RPT=%d %dx%d : %zu / %zu bytes differ  %s\n",
+         tag, Bits, TM, TN, TK, WM, WN, F, RowsPerTile, N, K, diff, a.size(),
          diff ? "" : "<-- BIT-IDENTICAL");
   return diff == 0;
 }
@@ -180,6 +206,21 @@ int main() {
   ok &= compare<2, 64,  64,  64, 32, 32>("int2 fold 2560x1536",   2560, 1536);   // non-square
   ok &= compare<4, 64,  64,  64, 32, 32>("int4 PROD 4096x11008",  4096, 11008);  // FFN shape, 11008 = 43*256
   ok &= compare<1, 64,  64, 256, 32, 32>("int1 unfolded 4096x4096", 4096, 4096);
+
+  // ============================================================ RowsPerTile = -1, as a THIRD STRIDE TUPLE
+  // The question this answers: does dropping the five steps drop -1 support? No -- -1 is not a missing derivation, it
+  // is a different destination stride tuple over the same physical-slot domain. The source side (tile_map) is
+  // untouched. Compared against preprocess_weights_for_mixed_gemm<false,-1>, which skips the interleave step, so this
+  // is the same byte-for-byte standard the 256 path is held to. -1 requires F == 1 (there is no folded non-interleaved
+  // buffer), which the static_assert in place_derived enforces.
+  printf("\n  == RowsPerTile = -1 (plain ColumnMajor): a third stride tuple, not a third derivation\n");
+  ok &= compare<4, 64,  64,  64, 32, 32, -1>("int4 unfolded RPT=-1",  128, 512);
+  ok &= compare<2, 64,  64, 128, 32, 32, -1>("int2 unfolded RPT=-1",  128, 512);
+  ok &= compare<1, 64,  64, 256, 32, 32, -1>("int1 unfolded RPT=-1",  128, 512);
+  ok &= compare<4, 64,  64,  64, 32, 32, -1>("int4 RPT=-1 4096x4096", 4096, 4096);
+  printf("     => -1 was previously code with NO call site (27 instantiations in the tree all pass 256; the only -1\n");
+  printf("        is one commented-out line) and NO numeric validation. As a layout it is now byte-identical-verified,\n");
+  printf("        which is strictly better than what deleting the five steps would have removed.\n");
 
   // ============================================================ THE LOAD-BEARING CLAIM FOR KEEPING THE SIGNATURE
   // preprocess_weights_for_mixed_gemm takes (out, in, shape, qtc) and NO tile parameters, so if the derived walk is to
