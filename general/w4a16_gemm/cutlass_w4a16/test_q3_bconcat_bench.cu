@@ -230,6 +230,12 @@ int main(int argc, char** argv) {
   BCF(64,128,128,32,64,3,1,2);
   BCF(32, 64,128,32,32,3,1,2);
   BCF(16,128,128,16,32,3,1,2);
+  // Same opening for the two-plane path: at TK=128 the int1 plane's bound is WN >= 32, so w64x32 is legal. Its TK=128
+  // rows are all w32x32 / w32x64, and w64x32 is worth +7 points on int2 -- whether that survives two planes is exactly
+  // the question. (At TK=64 it is illegal, so the current 252.72 us winner cannot be improved this way.)
+  BCF(64,128,128,64,32,3,1,2);
+  BCF(64,128,128,64,32,2,1,2);
+  BCF(128,128,128,64,32,3,1,2);
   // Block_K=64: BOTH planes fold (int2 F=2, int1 F=4). int1's over-delivery bound is delivery <= WN*TK/32, i.e.
   // 128 <= WN*64/32, so WN=64 is FORCED here -- w32x* cannot run at this Block_K. A-smem is TM*TK*2 = TM*128 B per
   // stage, a quarter of TK=256's, which is the whole point: TileM and stages are the levers that were unaffordable.
@@ -288,6 +294,16 @@ int main(int argc, char** argv) {
   I4(64,128,64,32,64,3);
   I4(64,64,128,32,32,3);   // int4 @ TK128 (bigger A-smem) -> if slower, small TK helps int4 too
   I4(64,64,64,32,32,4);
+  // w64x32 FOR int4 TOO -- and this is no longer a nicety. int2 at w64x32 measured 232.96 us / 59.0%, i.e. FASTER than
+  // int4's 243.54, so int4 is no longer a ceiling; it is just another format whose sweep is missing the same warp
+  // shape (every i4 row above is w32x32 or w32x64). Every "x% of the ceiling" statement rests on this reference, so it
+  // has to be tuned on the same grid before any of them mean anything. int4 does not chunk (the predicate covers 1 and
+  // 2 bits only), so this is purely the warp shape: cvt/mma = 128/WM = 2 instead of 4.
+  I4(64,64,64,64,32,3);
+  I4(64,64,64,64,32,2);
+  I4(64,128,64,64,32,3);
+  I4(128,64,64,64,32,3);
+  I4(64,64,128,64,32,3);
 
   std::printf("  --- int1 single-plane sweep (TK 256 unfolded, then FOLDED 128/64) ---\n");
   I1(32,128,256,32,32,3);
@@ -306,6 +322,12 @@ int main(int argc, char** argv) {
   I1F(64,128,128,32,32,3,2);
   I1F(32,128,128,32,32,3,2);
   I1F(32,128,128,32,32,2,2);
+  // int1 at TK=64 needs WN >= 64 (delivery 128 <= slots WN*TK/32), so w64x32 is illegal there -- but at TK=128 the bound
+  // is WN >= 32, so w64x32 IS legal and was never swept. Chunking stays on: MMA_N = warpN/16 = 2, MMA_K = 8, and
+  // 8*2*8 == kOut = 128 for int1.
+  I1F(64,128,128,64,32,3,2);
+  I1F(64,128,128,64,32,2,2);
+  I1F(128,128,128,64,32,3,2);
 
   std::printf("  ================= VERDICT =================\n");
   std::printf("  B-concat  best: %-16s %8.2f us\n", bBC.tag, bBC.us);
