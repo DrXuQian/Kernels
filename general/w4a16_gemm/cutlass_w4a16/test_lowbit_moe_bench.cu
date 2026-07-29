@@ -83,6 +83,7 @@ template <class F> static double time_it(F&& f, int iters) {
 struct Best { char tag[48]; double us; };
 static void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; std::snprintf(b.tag, 48, "%s", t); } }
 
+
 // THE TRAFFIC MODEL LIVES HERE, not in prose. I argued "not bandwidth-bound" from traffic computed by hand in a message;
 // that number changes with every shape and tile, so the tool has to produce it or the argument is unfalsifiable.
 //
@@ -257,8 +258,11 @@ int main(int argc, char** argv) {
   std::printf("\n  ================= VERDICT =================\n");
   std::printf("  two-plane best : %-40s %8.2f us\n", b2p.tag, b2p.us);
   std::printf("  single-plane   : %-40s %8.2f us\n", b1p.tag, b1p.us);
-  std::printf("  READ mt, msk AND %%HBM TOGETHER. Smallest mt winning => the weight-bound rule holds; least msk winning =>\n");
-  std::printf("  the dense reasoning carries over; and %%HBM decides whether either explanation is even available -- a\n");
-  std::printf("  winner at 15%% of HBM is not bandwidth-bound whatever its traffic, so the lever is occupancy.\n");
+  std::printf("  %%HBM is the COMPULSORY floor -- every byte crossing the bus at least once -- so it is conclusive: a low\n");
+  std::printf("  figure means the kernel is NOT bandwidth-bound whatever the re-reads do. noreuse is how much larger the\n");
+  std::printf("  per-CTA re-read count is, i.e. how much reuse the L2 must be supplying; it is a ratio, not a percentage,\n");
+  std::printf("  because the first version of this printed 116-181%% of HBM and a bound looser than the peak says nothing.\n");
+  std::printf("  Then read mt and msk: smallest mt winning => the weight-bound rule holds; least msk => the dense\n");
+  std::printf("  reasoning carries over; neither => the lever is occupancy and the next instrument is acu.\n");
   return 0;
 }
