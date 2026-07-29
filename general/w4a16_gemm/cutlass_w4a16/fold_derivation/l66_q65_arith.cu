@@ -44,7 +44,18 @@ static void emulate(uint32_t reg, uint32_t hreg, float& out_lo, float& out_hi) {
   using E = typename Cvt::E;
   const uint32_t src = (T / Cvt::kPerLevel) ? (reg >> 8) : reg;
   uint32_t x = (src & E::template mask<T>()) | 0x64006400u;                       // lop3, immLut 0xEA
-  x |= ((hreg >> Cvt::hshift(T, V)) & Cvt::himask()) << (E::template bpos<T>() + Cvt::kLowBitsPub);
+  // THE FUSED FORM the converter now emits: one shift, then lop3 with immLut 0xF8 == a | (b & c). Emulated here in the
+  // same two steps so the gate covers the fusion itself, not just the value it is supposed to reproduce.
+  {
+    constexpr int d = Cvt::template hshift_net<T, V>();
+    const uint32_t hs = (d >= 0) ? (hreg << (d >= 0 ? d : 0)) : (hreg >> (d < 0 ? -d : 0));
+    const uint32_t m2 = Cvt::himask() << Cvt::hdest(T);
+    x = x | (hs & m2);                                                            // lop3 0xF8
+    // and the UNFUSED form must agree bit for bit -- the shifts compose only if no bit crosses the half2 boundary
+    const uint32_t ref = ((hreg >> Cvt::hshift(T, V)) & Cvt::himask()) << Cvt::hdest(T);
+    const uint32_t alt = ((src & E::template mask<T>()) | 0x64006400u) | ref;
+    if (x != alt) { printf("      FUSION DIFFERS T=%d V=%d d=%d : fused %08x unfused %08x\n", T, V, d, x, alt); }
+  }
   const uint32_t mul = E::template mul<T>(), add = E::template add<T>();
   out_lo = h_lo(x) * h_lo(mul) + h_lo(add);
   out_hi = h_hi(x) * h_hi(mul) + h_hi(add);
