@@ -44,17 +44,16 @@ static void emulate(uint32_t reg, uint32_t hreg, float& out_lo, float& out_hi) {
   using E = typename Cvt::E;
   const uint32_t src = (T / Cvt::kPerLevel) ? (reg >> 8) : reg;
   uint32_t x = (src & E::template mask<T>()) | 0x64006400u;                       // lop3, immLut 0xEA
-  // THE FUSED FORM the converter now emits: one shift, then lop3 with immLut 0xF8 == a | (b & c). Emulated here in the
-  // same two steps so the gate covers the fusion itself, not just the value it is supposed to reproduce.
+  // The high-plane insert, emulated exactly as written. The explicit single-shift + lop3(0xF8) form was tried and
+  // REVERTED: nvcc -O3 emits byte-identical SASS for both (LOP3=4, SHIFT=2), so it was zero gain. The check that the
+  // two forms agree is kept, because it is what established the equivalence in the first place.
   {
-    constexpr int d = Cvt::template hshift_net<T, V>();
+    const uint32_t plain = ((hreg >> Cvt::hshift(T, V)) & Cvt::himask()) << (E::template bpos<T>() + Cvt::kLowBitsPub);
+    constexpr int d = (E::bpos_of(T) + Cvt::kLowBitsPub) - Cvt::hshift(T, V);
     const uint32_t hs = (d >= 0) ? (hreg << (d >= 0 ? d : 0)) : (hreg >> (d < 0 ? -d : 0));
-    const uint32_t m2 = Cvt::himask() << Cvt::hdest(T);
-    x = x | (hs & m2);                                                            // lop3 0xF8
-    // and the UNFUSED form must agree bit for bit -- the shifts compose only if no bit crosses the half2 boundary
-    const uint32_t ref = ((hreg >> Cvt::hshift(T, V)) & Cvt::himask()) << Cvt::hdest(T);
-    const uint32_t alt = ((src & E::template mask<T>()) | 0x64006400u) | ref;
-    if (x != alt) { printf("      FUSION DIFFERS T=%d V=%d d=%d : fused %08x unfused %08x\n", T, V, d, x, alt); }
+    const uint32_t fused = hs & (Cvt::himask() << (E::bpos_of(T) + Cvt::kLowBitsPub));
+    if (plain != fused) printf("      SHIFT COMPOSITION DIFFERS T=%d V=%d d=%d : %08x vs %08x\n", T, V, d, plain, fused);
+    x |= plain;
   }
   const uint32_t mul = E::template mul<T>(), add = E::template add<T>();
   out_lo = h_lo(x) * h_lo(mul) + h_lo(add);
