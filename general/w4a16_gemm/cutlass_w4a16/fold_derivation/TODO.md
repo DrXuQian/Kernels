@@ -210,6 +210,44 @@ grid warps but also doubles A-smem and takes masking from 15/16 to 31/32 -- so o
 free, and WarpN=16 is the MMA atom floor. That is why split-K is now the only remaining lever rather than one option among
 several.
 
+## split-K REFUTED on the dense ladder: raising grid warps through K costs 9x
+
+`test_fpA_intB_ppu 8 2048 2048 32` (m=8, the decode shape), int4, gs=32, scale-only. The ladder at `16x32x64/16x16/s2`:
+
+| spk | GB/s | grid warps/CU |
+|---|---|---|
+| 1 | 185 | 1.8 |
+| **2** | **214** | 3.6 |
+| 4 | 197 | 7.1 |
+| 8 | 129 | 14.2 |
+| 16 | 64 | 28.4 |
+| 32 | 24 | 56.9 |
+
+`16x64x64` is the same shape of curve (211 -> 22). And **on the configuration that actually wins, TileK=256, split-K is
+negative from S=2 onward**: `16x32x256` gives spk1 266 / spk2 251 / spk4 208 / spk8 129. Overall winner
+`16x64x256/16x16/s2/**spk1**` at 273 GB/s -- so **split-K's contribution to the real winner is zero**; the small gain at
+TileK=64/spk2 sits on a config already 30% behind.
+
+**Mechanism.** Serial split-K serialises the S slices of one (m,n) tile at the EPILOGUE through the semaphore, so the
+parallelism won in the mainloop is given back there; and every slice reads and writes the whole D tile, making
+`D traffic = S * 2 * M*N*2` -- 2 MB at S=32 against 2.1 MB of weights, i.e. the total traffic roughly doubles on top of a
+32-deep serial chain. A PARALLEL split-K (fp32 partials + reduction) pays the same in workspace traffic.
+
+**This kills the "TileK=128 + split-K S=4 -> 62% occupancy" plan**, and with it the grouped split-K specialization -- several
+hundred lines and multiple box rounds, cancelled by one dense measurement that needed no new kernel. That is why the cheap
+dense ladder was the right first step rather than writing the grouped kernel.
+
+**DO NOT OVER-GENERALISE THIS.** The ladder refutes *obtaining* warps through K-slicing, not occupancy as a lever. The
+grouped kernel's 14.2 warps/CU come from 8 INDEPENDENT experts with no epilogue serialisation; the dense ladder's 14.2 come
+from 8 slices of ONE tile, fully serialised. Those are different objects with the same warp count.
+
+**Where that leaves decode.** 20.74 us, 37.5% of the memory roof, 2.66x off it. Every tile/warp/stage knob together bought
+under 8%; TileK alone bought 21%; split-K is refuted. Within the grouped-GEMM structure decode is finished. Going further
+needs a different STRUCTURE -- B from gmem straight to registers with no smem staging, blocks partitioning N, no masked mma
+-- which is llama.cpp's `mul_mat_vec_q` shape and the one the PPU's own dense bf16 GEMV already runs at 82% of HBM. The
+recorded gap is that this GEMV covers dense FFN and attention but NOT MoE experts (`mul_mat_id`, 3D), and llama.cpp's answer
+to that same gap is one line: `channel_x = ids[channel_dst]`.
+
 ## Retracted
 
 **"Q3 is 20.7% slower than Q5 in MoE and 27% on dense, and it is the only format whose LOW plane also folds (F1=2) --
