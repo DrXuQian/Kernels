@@ -117,6 +117,43 @@ of F; and the delivery bound `WN*TK*bits >= 4096` does not contain F either. Ope
 `filter_and_run` plus relaxing `fold_traits.hpp`'s `contig_bytes*F == 32` to `>= 32`. Decide after the TK=32/128 halves,
 which already move F as a side effect.
 
+## DECODE batch=1: TileK is the only axis that moved, and the bus is still 3x from the roof
+
+8 active experts x 1 row of L=64, N=K=2048, gs=32, PPU_B_CHUNK=1, i4. Traffic at decode is LOCKED (mt == active), so %HBM is
+exact, not a bound.
+
+| config | us | %HBM | run | kit |
+|---|---|---|---|---|
+| `32x64:32 w32x32 s4` (the first measurement) | 32.15 | 24.8% | 32 B | 64 |
+| `16x32:32 w16x32 s4` (TileM=16, the smem-minimal corner) | 29.63 | 26.3% | 32 B | 64 |
+| **`16x64:256 w16x32 s2`** | **23.54** | **33.1%** | **128 B** | **8** |
+
+**Every tile / warp / stage knob together bought under 8%; TileK alone bought 21%.** Deep pipelines (s6/s8/s12) lost, TileN=32
+lost, TileM=16 won 7.8% and TileM=8 is not buildable (every MMA atom has M=16). The roofline time is
+21.55 MB / 2766 GB/s = 7.79 us, so 23.54 us is still **3.0x off the memory roof** on a shape whose AI is 3 FLOP/B against a
+ridge of 181 -- it is latency or transaction efficiency, not bandwidth.
+
+**TileK CONFOUNDS THE TWO CANDIDATES** and cannot separate them: 32 -> 256 takes the AIU contiguous run from 32 B to 128 B AND
+the k-iteration count from 64 to 8. **The one experiment that separates them is FoldF at fixed TileK.** i4 at TileK=32 has
+F_min = 2 (run 32 B); forcing F = 4 gives run 64 B with kit unchanged at 64. If that recovers about half the TileK=256 gain the
+mechanism is transaction size; if it recovers nothing, it is the iteration count.
+
+That is the `F > F_min` axis recorded earlier as untried, and it now has a purpose rather than being merely available. It needs
+a `FoldF` template parameter on `filter_and_run` (default 0 = keep the current derivation) and `fold_traits.hpp`'s
+`contig_bytes*F == 32` relaxed to `>= 32`. Both quantities that usually bind are indifferent to F:
+`b_smem = Ng*(F*TK*bits/8)` with `Ng = TN/F` is `TN*TK*bits/8`, and the delivery bound `WN*TK*bits >= 4096` does not contain F.
+
+Cheap intermediate while that is built: **TileK=128** (run 64 B, kit 16) as the midpoint of a 3-point curve. With the sweep
+narrowed to `MOE_FORMATS=i4 MOE_TM_LIST=16 MOE_WM_LIST=16 MOE_TN_LIST=64` plus `MOE_STAGES_2` that is one kernel.
+
+**COMPILE COST IS THE BINDING CONSTRAINT AT LARGE TileK, and it changes how these sweeps must be run.** On the box the
+expensive stages are LLVM `opt` and `llc`, single-threaded, minutes of CPU per kernel with ~700 MB RSS -- and only 2 ran
+concurrently during a 40-minute build, not the 192 the core count would allow. Compile cost scales with the unrolled mainloop,
+i.e. with `MMA_K = TK/16` (2 atoms at TileK=32, 16 at 256), so the product sweep that is affordable at TileK=32/64 is not at
+256. At minutes per kernel the budget is the KERNEL COUNT, not the unit count, and the right instrument is a few hand-picked
+configs -- the ladder discipline this work used before -- not a product. My earlier "front end is 94%, codegen is 5.6%" was
+measured with nvcc/ptxas and does not transfer to hgcc.
+
 ## Retracted
 
 **"Q3 is 20.7% slower than Q5 in MoE and 27% on dense, and it is the only format whose LOW plane also folds (F1=2) --
