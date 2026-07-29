@@ -43,7 +43,7 @@ static constexpr double HBM_GBS = 2766.0;
 // containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
 // the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
 // per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
-#define LOWBIT_MOE_BENCH_REV 6
+#define LOWBIT_MOE_BENCH_REV 7
 
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
@@ -224,6 +224,25 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
               gbs_c < 0.9 * HBM_GBS ? "  NOT-BW" : "");
 }
 
+// DID THIS ROW ACTUALLY RUN? Two independent nets, because the first only catches causes we already know about.
+//   1. moeg_fail_count() grew  -> can_implement / workspace / initialize refused and launch() returned without a kernel.
+//   2. the compulsory weight traffic could not have crossed the bus in the measured time -> whatever the cause, nothing ran.
+// Net 2 is what would have caught this class immediately: the bench reported `q5 128x128:256 w32x64 s3` at 3.17 us as its
+// FASTEST config, which is 6.6 TB/s against a 2.77 TB/s peak. A win that violates the hardware is not a win, and a harness
+// that cannot say so will rank its own failures.
+inline bool moe_row_ran(const Band& bd, const char* tag, double us, int fail0, int bits_total) {
+  const double wb  = double(bd.N) * double(bd.K) * double(bits_total) / 8.0;
+  const double gbs = (double(bd.active) * wb) / (us * 1e-6) / 1e9;   // weights alone: the least it can possibly have moved
+  const bool refused    = moe_grouped_ppu::moeg_fail_count() > fail0;
+  const bool impossible = gbs > HBM_GBS;
+  if (refused || impossible) {
+    std::printf("    %-30s %8.2f us | DID NOT RUN (%s) -- excluded from the verdict\n", tag, us,
+                refused ? "launch refused" : "implies > HBM peak");
+    return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // LEGALITY, as one constexpr predicate rather than as a hand-maintained row list.
 //
@@ -248,7 +267,14 @@ constexpr bool moe_ok() {
       // precisely that dead config, so the bound is what makes "int1 cannot reach TK=32" a filter instead of a build break.
       && (WM * WN) / 32 <= 192
       && (long long)WN * TK * bmin >= 4096                             // swzl delivery <= fragment slots, per plane
-      && ((long long)TM * TK * 2 + (long long)TN * TK * bits_total / 8) * Stages <= 262144;
+      // SMEM MUST INCLUDE THE SCALE AND ZERO TILES. Leaving them out let q5 (128,128,256) s3 through at a computed 252 KB
+      // when the real figure is 264 KB, and the launch then failed at runtime with "[moe_grouped] init failed" -- which the
+      // bench timed as 3.17 us and reported as its FASTEST config. fold_traits.hpp already had the complete expression
+      // (TM*TK*2 + TN*TK*Bits/8 + TN*(TK/Gs)*2*(Zero?2:1)); this one was written again, and short.
+      // gs is a RUNTIME argument, so size for the smallest gs supported (16) and stay conservative: a filter that is too
+      // tight loses a config, one that is too loose produces a fake winner.
+      && ((long long)TM * TK * 2 + (long long)TN * TK * bits_total / 8
+          + (long long)TN * (TK / 16) * 2 * 2) * Stages <= 262144;
 }
 
 // (The hand-written (TileM, WarpM) grid that used to sit here is gone. One unit fixes one shape, so TileM and WarpM are
@@ -280,10 +306,10 @@ constexpr bool moe_ok() {
             (BD).dA, _b1.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
             (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr, _b2.get()); };                           \
-      double u;                                                                                                    \
+      double u; const int _f0 = moe_grouped_ppu::moeg_fail_count();                                                \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
-      report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),32,true>);  upd(BEST, _t, u);                                                 \
+      if (moe_row_ran(BD, _t, u, _f0, (LOB)+(HIB))) { report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),32,true>);  upd(BEST, _t, u); } \
     }                                                                                                              \
   }
 
@@ -320,10 +346,10 @@ constexpr bool moe_ok() {
             (BD).dA, _db.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
             (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr); };                                      \
-      double u;                                                                                                    \
+      double u; const int _f0 = moe_grouped_ppu::moeg_fail_count();                                                \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
-      report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(BITS),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(BITS),32,true>);  upd(BEST, _t, u);                                                      \
+      if (moe_row_ran(BD, _t, u, _f0, (BITS))) { report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(BITS),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(BITS),32,true>);  upd(BEST, _t, u); } \
     }                                                                                                              \
   }
 

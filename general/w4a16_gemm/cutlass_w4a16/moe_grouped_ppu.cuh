@@ -45,6 +45,12 @@ constexpr bool has_zero(QuantMode q) { return q == QuantMode::FinegrainedScaleZe
 using GroupShape = cute::Shape<int,int,int>;                            // per-expert [M,N,K]
 using GroupProblemShape = cutlass::gemm::GroupProblemShape<GroupShape>;
 
+// LAUNCHES THAT DID NOT HAPPEN MUST BE VISIBLE TO THE CALLER. launch() returns void and reports failure by printf, so a
+// harness that times it measures an empty call -- the MoE bench ranked several `init failed` rows as its FASTEST configs at
+// 3.17 us, which is 6.6 TB/s against a 2.77 TB/s HBM peak. A counter costs nothing and needs no signature change through the
+// twenty-odd callers of filter_and_run.
+inline int& moeg_fail_count() { static int c = 0; return c; }
+
 // group_shapes_dev/host: L entries of [M_e,N,K]. A/B/scales single L-strided bases (2a uniform). L=num_experts.
 template <QuantMode QuantOp, class KernelSchedule,
           class TileShape, class ScaleTileShape, class WarpShape, int Stages, bool AiuInterleaved,
@@ -198,10 +204,10 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
 
   Gemm gemm;
   auto st = gemm.can_implement(args);
-  if (st != cutlass::Status::kSuccess) { std::printf("[moe_grouped] can_implement: %s\n", cutlassGetStatusString(st)); return; }
+  if (st != cutlass::Status::kSuccess) { std::printf("[moe_grouped] can_implement: %s\n", cutlassGetStatusString(st)); ++moeg_fail_count(); return; }
   size_t need = gemm.get_workspace_size(args);
-  if (need > workspace_bytes) { std::printf("[moe_grouped] workspace %zu > %zu\n", need, workspace_bytes); return; }
-  if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) { std::printf("[moe_grouped] init failed\n"); return; }
+  if (need > workspace_bytes) { std::printf("[moe_grouped] workspace %zu > %zu\n", need, workspace_bytes); ++moeg_fail_count(); return; }
+  if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) { std::printf("[moe_grouped] init failed\n"); ++moeg_fail_count(); return; }
   // Ragged O(log L) decode: write the m-tile prefix [L+1] into the workspace (the non-persistent kernel does
   // NOT use the scheduler workspace, so it's free). AFTER initialize (no clobber), BEFORE run. Uniform path
   // (mtiles_uniform>0) uses blockIdx.z and ignores this. Blocking copy -> ordered before run; L+1 ints, tiny.
