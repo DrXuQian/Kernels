@@ -220,10 +220,12 @@ int get_bits_in_quant_type(QuantTypeClass quant_type)
 // int1 only.
 //
 // xplane::place_derived replaces both: it covers the fold walk AND the interleave-256 walk, so one call also absorbs
-// preprocess_weights_for_mixed_gemm. Byte-identical on all 17 configurations the callers actually use (l64), and
+// preprocess_weights_for_mixed_gemm. Byte-identical on all 27 configurations the callers actually use (l64) -- which
+// now includes every row of test_fold_int2's FOLD_CONFIGS, the last non-gate consumer, migrated under #13 -- and
 // correct where the whole-word packer is not.
 //
-// They are reachable ONLY as `legacy::` from the gates now, so reaching a landmine requires typing the namespace.
+// So there is now NO consumer outside fold_derivation/, and build.sh FAILS the build if a CMake-built source grows
+// one: quarantine by structure rather than by the reader noticing this comment.
 
 // The derived replacement for the deleted five steps. Same signature, so no call site changes.
 //

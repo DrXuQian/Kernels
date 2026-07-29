@@ -78,6 +78,34 @@ if [ -n "${PPU_DEFS:-}" ]; then
   grep -F "PPU_EXTRA_DEFS ->" cmake.log || echo "  WARNING: cmake did not report PPU_EXTRA_DEFS -- the defines did NOT reach the build"
 fi
 TARGET="${TARGET:-bench_cutlass_w4a16}"
+
+# #13: NO SHIPPING TARGET MAY REACH THE LEGACY PACKERS. fold_derivation/legacy_pipeline.hpp still holds
+# nfold_regroup_gmem and nfold_place_bits_int1_tk64, on purpose -- they are the INDEPENDENT reference the l58/l61/l64
+# gates diff xplane::place_derived against, and deleting them would turn those gates into "the derived walk equals the
+# derived walk". But nfold_regroup_gmem moves whole uint32 words, so one word carries one logical column, so it is
+# correct only at warp-N extent 32 -- and w64x32 is worth +7 to +9 points, i.e. exactly where the tuning is going. A
+# harness that picked it up would miscompute silently.
+#
+# The gates are host-only files under fold_derivation/ that no CMake target builds, so today nothing shipping can reach
+# them. This makes that structural instead of merely true: the header can only be reached by naming its path, so grep
+# for the path in the sources CMake actually compiles.
+#
+# TWO THINGS THIS GREP GOT WRONG ON THE FIRST WRITING, both from stating what grep emits instead of reading it:
+#   * `grep -rln <dir>` prints `fold_derivation/l11...` with NO leading slash, so `grep -v "/fold_derivation/"` matched
+#     nothing and every gate came back as a violation. --exclude-dir is the option that actually does this.
+#   * matching the bare filename also matches the ~30 lines of COMMENTARY that explain why the packers are quarantined,
+#     so the two files documenting the rule were reported as breaking it. Anchor on the #include.
+_leg=$(grep -rln '^[[:space:]]*#[[:space:]]*include.*legacy_pipeline\.hpp' \
+         --include=*.cu --include=*.cuh --include=*.hpp \
+         --exclude-dir=fold_derivation "$(dirname "$0")" 2>/dev/null || true)
+if [ -n "$_leg" ]; then
+  echo "  ERROR: a CMake-built source includes fold_derivation/legacy_pipeline.hpp:"
+  printf '           %s\n' $_leg
+  echo "         nfold_regroup_gmem is correct only at WN=32. Use xplane::place_derived (see #13); the legacy"
+  echo "         packers exist ONLY as the gates' independent reference."
+  exit 1
+fi
+
 make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log
 
 # CMAKE RECEIVING THE DEFINES IS NOT THE SAME AS THIS TARGET GETTING THEM, and the difference is invisible in a perf

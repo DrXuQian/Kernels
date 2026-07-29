@@ -107,6 +107,17 @@ int main() {
   T(one<2,  64, 128,  64>("fold_int2", 512, 512));
   T(one<1,  64, 128,  64, 32, 64>("fold_int2 w32x64", 512, 512));
 
+  // EVERY ROW OF test_fold_int2's FOLD_CONFIGS, which is what it now dispatches after the #13 migration. The rows
+  // above were written for the pre-migration harness and miss two of them -- and "the neighbours match" is exactly the
+  // reasoning that let rung 5 ship broken (l52 passed because its probe value was invariant under the displacement).
+  printf("\n  test_fold_int2 FOLD_CONFIGS: all 10 rows, so the gate covers what the harness actually runs\n");
+  T(one<2,  32, 128, 128>("FOLD_CONFIGS", 512, 512));  T(one<2,  32, 128,  64>("FOLD_CONFIGS", 512, 512));
+  T(one<2,  64, 128, 128>("FOLD_CONFIGS", 512, 512));  T(one<2,  64, 128,  64>("FOLD_CONFIGS", 512, 512));
+  T(one<2,  64,  64, 128>("FOLD_CONFIGS", 512, 512));  T(one<2,  64,  64,  64>("FOLD_CONFIGS", 512, 512));
+  T(one<1,  32, 128, 128>("FOLD_CONFIGS", 512, 512));  T(one<1,  64, 128, 128>("FOLD_CONFIGS", 512, 512));
+  T(one<1,  64,  64, 128>("FOLD_CONFIGS", 512, 512));
+  T(one<1,  64, 128,  64, 32, 64>("FOLD_CONFIGS", 512, 512));
+
   printf("\n  %s\n", bad ? "SOME CONFIGURATIONS DIFFER -- migrate only the ones that match"
                          : "every migrated configuration is byte-identical -- safe to delete both legacy packers");
   return bad ? 1 : 0;
