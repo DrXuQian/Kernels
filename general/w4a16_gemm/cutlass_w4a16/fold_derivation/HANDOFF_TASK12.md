@@ -493,3 +493,33 @@ would mean inventing a factorisation neither instruction exposes. Recorded on th
 
 NOT SEEN: test_q3_bconcat_real's own output for this build. Q3 is the one format running real GGUF weights under a
 byte-identity requirement, so it is worth one explicit look.
+
+## #17 multi-expert: CLOSED for all six formats, max_rel exactly zero
+
+`test_lowbit_grouped`, L=4 ragged and L=8 uniform, 11 rows each: **22/22 MATCH with max_rel = 0.000e+00**. Not "within
+tolerance" -- bit-exact, which is the correct signature for a grouped-vs-L=1 oracle, since the two runs perform identical
+arithmetic and differ only in per-expert addressing.
+
+  Q3 / Q6 / Q5   two Block_K each  -- plane 2's own per-expert L-stride, a hand-written byte count
+                                      (int64_t(N)*int64_t(K)*sizeof_bits<PlaneB2>/8), validated for the FIRST time
+  int2           three configs      -- the actual gap; it had single-expert coverage only
+  int1           one config         -- the HARNESS check, and it earned its place on first use (below)
+  int4           one config         -- cross-checkable against test_moe_grouped_verify
+
+WHAT THE SELF-CHECK ROW BOUGHT. The first run failed 11 of 11 INCLUDING int1, which has an independent passing
+multi-expert gate, so "the harness is wrong, not the kernel" was available before any debugging. A second free signal
+pointed at the reference: for e=1 the grouped run returned the same 38.1250 at L=4 and L=8 while the ORACLE returned
+30.5000 and 34.3125, and both runs read the same A row (offs[1] == 64 in both). Root cause was mine --
+cutlass::uint2b_t / uint1b_t / int4b_t all have sizeof == 1, so `ptr + e*K*N` advances BYTES, over-advancing 4x / 8x / 2x
+and putting expert 1 past the end of the allocation. Eight earlier instances of that same failure class each cost a full
+box round; this one cost one read, and the only difference was having a row whose answer was already known.
+
+## build.sh's PPU_DEFS check was crying wolf, and the chunked grouped path is still unverified
+
+The post-make check grepped make.log for `-D<define>`. The device compiles are add_custom_command with a COMMENT, so
+make.log holds `[100%] [hgcc] foo.cu` and NEVER a compile line -- the grep could not succeed even when the flag was
+present. So the warning on the passing run above is spurious, and, more importantly, whether that build had
+PPU_B_CHUNK cannot be determined from it. **The grouped runs so far should be treated as UNCHUNKED until re-run.**
+
+Fixed to read cmake's generated `CMakeFiles/<target>.dir/build.make`, which does carry the full command, and to check it
+for THIS target's directory -- "cmake received the defines" is a weaker claim and was already covered separately.

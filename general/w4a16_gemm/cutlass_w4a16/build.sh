@@ -84,16 +84,27 @@ make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log
 # number. The defines used to be attached to three targets by hand, so
 #   PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q3_bconcat_bench ./build.sh
 # configured cleanly, printed "PPU_DEFS applied", printed no warning, and produced a binary WITHOUT the macro. The run
-# that followed compared a binary against itself and read as "the change does nothing". So check the compile line.
+# that followed compared a binary against itself and read as "the change does nothing".
+#
+# LOOK IN build.make, NOT make.log. The first version of this check grepped make.log and cried wolf on every build: the
+# device compiles are add_custom_command with a COMMENT, so make.log holds "[100%] [hgcc] foo.cu" and never a compile
+# line, meaning the grep could not succeed even when the flag WAS present. cmake's generated build.make does carry the
+# full command, so that is what gets checked -- and it is checked for THIS target's directory, which is the claim that
+# matters ("cmake received it" is a different and weaker claim, already covered above).
 if [ -n "${PPU_DEFS:-}" ]; then
-  for _d in $PPU_DEFS; do
-    if grep -qF -- "-D$_d" make.log; then
-      echo "PPU_DEFS verified on the compile line: -D$_d"
-    else
-      echo "  WARNING: -D$_d is NOT on $TARGET's compile line -- THIS BUILD DOES NOT HAVE IT."
-      echo "           Any A/B against it is a binary compared with itself. (make.log had no -D$_d.)"
-    fi
-  done
+  _bm=$(find . -path "*${TARGET}.dir/build.make" | head -1)
+  if [ -z "$_bm" ]; then
+    echo "  WARNING: no build.make found for $TARGET -- cannot verify the defines reached it."
+  else
+    for _d in $PPU_DEFS; do
+      if grep -qF -- "-D$_d" "$_bm"; then
+        echo "PPU_DEFS verified on $TARGET's compile command: -D$_d"
+      else
+        echo "  WARNING: -D$_d is NOT on $TARGET's compile command -- THIS BUILD DOES NOT HAVE IT."
+        echo "           Any A/B against it is a binary compared with itself. (checked $_bm)"
+      fi
+    done
+  fi
 fi
 
 BIN="$(find "$BUILD" -name "$TARGET" -type f -perm -u+x | head -1)"
