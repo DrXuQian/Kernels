@@ -6,6 +6,7 @@
 //
 // Official finegrained path needs block_k >= group_size, so gs=128 uses TK=128 (NOT the generic path's 64).
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include "cutlass/util/device_memory.h"
@@ -45,16 +46,34 @@ int main(int argc, char** argv) {
   // separately via the bench harness). Each TIME(...) is a distinct compiled instantiation. block_k (TK) is
   // now swept too: TK=128 satisfies the official block_k>=gs gate; TK=64 probes the relaxed gate (does the
   // FinegrainedGs128 kernel accept a group spanning 2 k-tiles?).
+  // ONE ROW, ONE LAUNCH -- so acu can answer instead of me decomposing GB/s ratios into a traffic term and a
+  // serialisation residual. The split-K attribution was argued from arithmetic twice and corrected once; acu reports DRAM
+  // throughput, achieved occupancy and the stall breakdown directly, which is what the argument was standing in for.
+  //   FPA_ONLY=<substring of the row name>   run only matching rows, e.g. "16x32x64/16x16/s2/spk8"
+  //   FPA_ACU=1                              ONE launch, no warmup (these are NOT timings)
+  const char* only = std::getenv("FPA_ONLY");
+  const bool  acu  = std::getenv("FPA_ACU") != nullptr;
+  if (only) std::printf("  FPA_ONLY='%s' -- every other row is SKIPPED\n", only);
+  if (acu)  std::printf("  *** FPA_ACU=1: ONE COLD LAUNCH per row, no warmup. NOT timings. ***\n");
   const int warmup = 20, iters = 100;
   char best_name[64] = ""; double best_tf = 0.0, best_gbps = 0.0, best_score = 0.0;
 #define TIME(TM,TN,TK,WM,WN,ST,SPLITK) do {                                                          \
     auto launch = [&]{ fpa_intb_ppu::filter_and_run<fpa_intb_ppu::QuantMode::FinegrainedScaleOnly,   \
         TM, TN, TK, WM, WN, ST>(A.get(), B.get(), scales.get(), nullptr, D.get(), m, n, k, g,        \
         SPLITK, ws.get(), ws_bytes, nullptr); };                                                     \
-    launch();                                                                                        \
-    for (int i = 0; i < warmup; i++) launch();                                                       \
-    PpuTimer t; t.start(); for (int i = 0; i < iters; i++) launch(); t.stop();                       \
-    double us = double(t.elapsed_millis()) * 1e3 / iters;                                            \
+    const char* nm0 = #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK;                    \
+    if (only && !std::strstr(nm0, only)) break;                                                      \
+    double us;                                                                                        \
+    if (acu) {                                                                                        \
+      PpuTimer t; t.start(); launch(); t.stop();                                                       \
+      us = double(t.elapsed_millis()) * 1e3;                                                          \
+      std::printf("  [acu] ONE COLD launch (not a timing): %s\n", nm0);                               \
+    } else {                                                                                          \
+      launch();                                                                                       \
+      for (int i = 0; i < warmup; i++) launch();                                                      \
+      PpuTimer t; t.start(); for (int i = 0; i < iters; i++) launch(); t.stop();                      \
+      us = double(t.elapsed_millis()) * 1e3 / iters;                                                  \
+    }                                                                                                 \
     double tf = 2.0 * m * n * k / (us * 1e-6) / 1e12;                                                \
     double gbps = wbytes / (us * 1e-6) / 1e9;                                                        \
     const char* nm = #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK;                     \
