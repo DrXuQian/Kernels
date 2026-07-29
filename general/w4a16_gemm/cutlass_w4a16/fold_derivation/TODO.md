@@ -210,7 +210,28 @@ grid warps but also doubles A-smem and takes masking from 15/16 to 31/32 -- so o
 free, and WarpN=16 is the MMA atom floor. That is why split-K is now the only remaining lever rather than one option among
 several.
 
-## split-K REFUTED on the dense ladder: raising grid warps through K costs 9x
+## WITHDRAWN: the dense split-K ladder was run on an EMPTY machine, so it refutes nothing
+
+acu on `16x32x64/16x16/s2/spk1` at m=8 reports **`Size (1,64,1)x(64,1,1)` -- 64 CTAs on 72 CUs -- with DRAM Throughput
+4.43% and Compute 7.00%**. Less than one CTA per CU: the machine is idle, and the 19.88 us is latency on an empty device.
+Every conclusion below was drawn against that baseline and none of them stands.
+
+**Why the shape was wrong.** m=8 with TileM=16 gives `mt = ceil(8/16) = 1`, while grouped decode has `mt = 8` (eight
+experts). That factor of 8 is the entire difference between grouped's 512 CTAs and this test's 64, so the ladder compared
+split-K against a pathological baseline rather than against the loaded regime the grouped kernel runs in. The traffic-vs-
+serialisation decomposition (1.37x traffic, 4% serialisation at S=8) rests on the same bad baseline and is withdrawn too.
+
+**The shape that CAN answer it is m=128.** `mt = ceil(128/16) = 8` and `ntile = 2048/32 = 64` gives **512 CTAs**, and
+`gw/CU = mt*n*TM/(WM*WN)/72 = 8*2048*16/(16*16)/72 = 14.2` -- exactly the 13.65 acu measured on the grouped decode winner.
+So m=128 reproduces the grouped grid and occupancy at spk1, and only from there does the ladder measure what split-K adds:
+
+    $BIN/test_fpA_intB_ppu 128 2048 2048 32     # then read gw/CU from 14.2 upward
+
+GB/s still climbing => occupancy remains a lever that grouped cannot reach (its 14.2 already exhausts WarpN>=16 and
+TileM/WarpM<=2), so grouped split-K is worth writing, parallel with fp16 partials. GB/s already peaked at spk1 => saturated
+near 14.2 warps/CU and split-K has nowhere to go -- but concluded on the right baseline this time.
+
+## (withdrawn, kept for the record) split-K "REFUTED" on the dense ladder
 
 `test_fpA_intB_ppu 8 2048 2048 32` (m=8, the decode shape), int4, gs=32, scale-only. The ladder at `16x32x64/16x16/s2`:
 
