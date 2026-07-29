@@ -38,6 +38,20 @@
 #include "xplane_offline.hpp"
 #include "moe_grouped_ppu.cuh"
 
+// SELF-DESCRIBING RUN. Whether PPU_B_CHUNK was active has now been undeterminable from the build output twice: the
+// device compiles are add_custom_command with a COMMENT so make.log holds no compile line, and the build.sh line that
+// does check scrolls away above a long result. The binary reports its own configuration instead -- a log that does not
+// describe its own run has cost this work three separate rounds.
+// `#x` stringizes a macro PARAMETER only, so `#PPU_B_CHUNK` outside a function-like macro is ill-formed -- two levels.
+#define PPU_STR2_(x) #x
+#define PPU_STR1_(x) PPU_STR2_(x)
+#if defined(PPU_B_CHUNK)
+#define PPU_CHUNK_STR "PPU_B_CHUNK=" PPU_STR1_(PPU_B_CHUNK)
+#else
+#define PPU_CHUNK_STR "PPU_B_CHUNK=off"
+#endif
+
+
 using half_t  = cutlass::half_t;
 using int4_t  = cutlass::int4b_t;
 using uint2_t = cutlass::uint2b_t;
@@ -83,8 +97,8 @@ int main(int argc, char** argv) {
     me[e] = ragged ? Mb * ((e % 4) + 1) : Mb;
     offs[e] = total; total += me[e]; Mmax = std::max(Mmax, me[e]);
   }
-  std::printf("[q65-grouped] L=%d %s Mb=%d N=%d K=%d gs=%d total=%d Mmax=%d  (two-plane, per-expert addressing)\n",
-              L, ragged ? "ragged" : "uniform", Mb, N, K, gs, total, Mmax);
+  std::printf("[lowbit-grouped] %s  L=%d %s Mb=%d N=%d K=%d gs=%d total=%d Mmax=%d  (two-plane, per-expert addressing)\n",
+              PPU_CHUNK_STR, L, ragged ? "ragged" : "uniform", Mb, N, K, gs, total, Mmax);
 
   // ---- A and the scales. Both are [total][K] and [L][scale_k][N], i.e. the layouts the grouped path expects.
   std::vector<half_t> hA((size_t)total * K), hSc((size_t)L * scale_k * N), hZr((size_t)L * scale_k * N);

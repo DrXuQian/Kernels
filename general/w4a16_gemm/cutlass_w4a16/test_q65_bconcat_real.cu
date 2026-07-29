@@ -30,6 +30,20 @@
 #include "xplane_offline.hpp"
 #include "moe_grouped_ppu.cuh"
 
+// SELF-DESCRIBING RUN. Whether PPU_B_CHUNK was active has now been undeterminable from the build output twice: the
+// device compiles are add_custom_command with a COMMENT so make.log holds no compile line, and the build.sh line that
+// does check scrolls away above a long result. The binary reports its own configuration instead -- a log that does not
+// describe its own run has cost this work three separate rounds.
+// `#x` stringizes a macro PARAMETER only, so `#PPU_B_CHUNK` outside a function-like macro is ill-formed -- two levels.
+#define PPU_STR2_(x) #x
+#define PPU_STR1_(x) PPU_STR2_(x)
+#if defined(PPU_B_CHUNK)
+#define PPU_CHUNK_STR "PPU_B_CHUNK=" PPU_STR1_(PPU_B_CHUNK)
+#else
+#define PPU_CHUNK_STR "PPU_B_CHUNK=off"
+#endif
+
+
 using half_t  = cutlass::half_t;
 using int4_t  = cutlass::int4b_t;
 using uint2_t = cutlass::uint2b_t;
@@ -46,8 +60,8 @@ int main(int argc, char** argv) {
   if (argc > 3) K = atoi(argv[3]);
   if (argc > 4) gs = atoi(argv[4]);
   const int scale_k = K / gs;
-  std::printf("[q65-bconcat] M=%d N=%d K=%d gs=%d   Q6 = int4+int2 (q in [0,64)), Q5 = int4+int1 (q in [0,32))\n",
-              M, N, K, gs);
+  std::printf("[q65-bconcat] %s  M=%d N=%d K=%d gs=%d   Q6 = int4+int2 (q in [0,64)), Q5 = int4+int1 (q in [0,32))\n",
+              PPU_CHUNK_STR, M, N, K, gs);
 
   // ---- A, scales. THE ZERO POINT MUST CANCEL int4's BIAS, WITH A PLUS SIGN. apply_scale_atom is `multiplies` then
   // `plus`, i.e. w = dl * emitted + zero, and the converter emits q - 8, so w = dl*q needs zero = +8*dl.

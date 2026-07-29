@@ -206,6 +206,17 @@ ppu_w4a16_executable(
 )
 target_compile_options(test_lowbit_grouped PRIVATE -w)
 
+# MoE SHAPE BAND perf sweep, all low-bit formats. Separate from the correctness harness on purpose. Prints m_tiles and the
+# masked-row fraction NEXT TO the time, because the dense winner cannot be inherited: TN=128 won on dense by halving A's
+# re-read count (A traffic), while MoE is weight-bound and the recorded rule is to minimise the TOTAL m-tile count -- and
+# large TileM then wastes rows at ~128 rows per expert. The bench decides which effect dominates instead of assuming one.
+#   Build: TARGET=test_lowbit_moe_bench ./build.sh ; run: ./<bin> [L] [rows] [N] [K] [gs] [ragged]
+ppu_w4a16_executable(
+  test_lowbit_moe_bench
+  test_lowbit_moe_bench.cu
+)
+target_compile_options(test_lowbit_moe_bench PRIVATE -w)
+
 # B-CONCAT CONTROLLED-INPUT PROBE: A=identity + scale=1/zero=0 + index-labelled bit planes, so D reads back WHICH
 # (n,k) each consumed bit came from. Rungs 0/1/2 separate mantissa PLACEMENT from bit PERMUTATION; rung 3 decodes
 # the permutation. Same technique that cracked the int2 sigma_n bug (sim layouts are NOT trustworthy here).
