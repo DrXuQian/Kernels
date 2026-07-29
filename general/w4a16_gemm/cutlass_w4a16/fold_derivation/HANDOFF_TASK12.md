@@ -563,3 +563,56 @@ more sweeping.
 
 **The %HBM column was garbage in this run** (116-181%) and is fixed to a compulsory floor plus a noreuse ratio; see the
 commit. On the worst row the floor is 17.6%, so "bandwidth-bound" is not established and this model cannot settle it.
+
+## The MoE sweep was not a sweep, and the compile was serial. Both fixed by measurement.
+
+**IT WAS 30 HAND-WRITTEN ROWS.** TileK appeared only as 64; TileN only as one value per family; WarpN only as each
+format's minimum; and **stages was not an axis** -- it was baked into each row. That last one had already corrupted the
+verdict: int4's single-plane winner ran s3 while int2's IDENTICAL shape ran s2, so `i4 382.76 vs i2 420.83` was measuring
+stages, not formats. The `(TileM, WarpM)` grid was five points on an L-shape, so `(128,32)` and `(256,32)` were absent --
+and "WarpM=32 is predictably worse because `cvt/mma = 128/WM`" is a PREDICTION, the same kind that was wrong about int4
+not being the ceiling and about `w64x32` being unnecessary.
+
+Now: the full `(TileM, WarpM) x TileN x WarpN x stages{2,3,4}` product, filtered by ONE constexpr predicate rather than a
+hand-maintained list. **336 rows at TileK=64, 304 at 128** -- verified two ways that agree on a DISCRIMINATING case (a
+python mirror of the predicate, and a static_assert probe compiled through nvcc: 42 rows per format-unit at TK=64, 38 at
+TK=128). `FoldF` comes from `fold::FoldTraits` now; it used to be hand-passed as 2/4, 1/2, 1/4, which are the TileK=64
+values, so TileK could not have become an axis without them silently being wrong.
+
+**COMPILE PARALLELISM: THE CEILING WAS THE SOURCE COUNT, NOT `-j`.** `cutlass_build_dev_kernels` emits one
+`add_custom_command` per `.cu`, so a sweep in one file is strictly serial however large `-j` is. Granularity was chosen by
+measurement, not taste (nvcc front end, local):
+
+| unit size | wall |
+|---|---|
+| 0 kernels (header only) | **5 s** -- the fixed cost |
+| 3 kernels (one shape, 2-plane) | **25 s** |
+| 21 kernels | 57 s |
+| 42 kernels | 109 s |
+| 30 kernels (the ORIGINAL single file) | ~80 s modelled |
+
+Marginal cost is not linear: a 3-kernel unit pays 20 s for its first kernel because the whole collective instantiates
+once, then ~2.5 s each. So the useful floor is one shape per unit. **128 generated units, one per shape (all three stage
+counts inside), 112 non-empty, critical path ~25 s on a 192-core box** -- less wall clock than the ORIGINAL 30-row sweep
+while instantiating 11x as many configurations.
+
+**Stages deliberately stay INSIDE a unit**, because that axis is a runtime cost, not a compile one: the offline pack is
+per SHAPE and stages do not change the shape, so all three share one pack. Measured: 31 ms per two-plane shape (19.2 int2
++ 11.8 int1), 24 ms single-plane, ~3 s over the sweep -- already the same order as the GPU time, so splitting stages would
+triple it for nothing. TileM/TileN/WarpM/WarpN are all part of the shape, so splitting on those is free.
+
+**THE TRAP THAT COST A ROUND: `if constexpr (false)` DOES NOT SUPPRESS INSTANTIATION IN A PLAIN FUNCTION.** It only does
+so inside a templated entity. So `moe_ok` returning false did NOT make an illegal shape compile away -- three of four
+probe units built clean and the `(TileM=32, WarpM=64)` one produced **99 errors** headed by
+`gemm_operands.hpp: division by zero`, because `warpOnM = TM/WM = 0` and the collective builder degrades to `int` (the
+failure already recorded in the skill for TM=16/WM=32). Fix: the unit body is a `template <int Dummy>` function.
+**The evidence was already in hand** -- a static_assert probe I had written minutes earlier fired from inside a discarded
+branch, which is the same rule. Only the consequence was missed.
+
+Two guards kept for the split: each unit **votes on its own `PPU_B_CHUNK`** at static-init time and main reports the
+tally, because a unit missing the `-D` would otherwise run the unchunked collective under a banner (compiled in a
+different TU) saying chunked; and `MOE_UNIT_COUNT` is compiled in from the generator so a silently shrunk enumeration
+shows up in the log.
+
+Also: the pack ran once per EXPERT on byte-identical input -- 268 M positions per row to produce one row's worth of
+information. Pack expert 0, memcpy the other 63.

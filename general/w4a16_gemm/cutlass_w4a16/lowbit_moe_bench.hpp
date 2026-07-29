@@ -57,6 +57,19 @@ static constexpr double HBM_GBS = 2766.0;
 #define PPU_CHUNK_STR "PPU_B_CHUNK=off"
 #endif
 
+// EVERY UNIT VOTES ON ITS OWN PPU_B_CHUNK. The 8 hand-written units each printed their state; 128 generated ones cannot
+// each print a line, but the check must survive, because a unit that misses the -D silently runs the UNCHUNKED collective
+// while main's banner -- a different translation unit -- still says chunked. Each unit registers its state at static-init
+// time and main reports the tally, so a split brain is one line in the log instead of a perf number nobody can explain.
+struct MoeChunkTally { int on = 0, off = 0; };
+inline MoeChunkTally& moe_chunk_tally() { static MoeChunkTally t; return t; }
+inline void moe_chunk_vote(bool on) { if (on) ++moe_chunk_tally().on; else ++moe_chunk_tally().off; }
+#if defined(PPU_B_CHUNK)
+#define PPU_CHUNK_ON 1
+#else
+#define PPU_CHUNK_ON 0
+#endif
+
 // Everything a sweep needs about the band. Passed by const reference so the per-format translation units share ONE
 // set of device buffers instead of each allocating its own.
 struct Band {
@@ -142,16 +155,9 @@ constexpr bool moe_ok() {
       && ((long long)TM * TK * 2 + (long long)TN * TK * bits_total / 8) * Stages <= 262144;
 }
 
-// THE MATCHED GRID: the full (TileM, WarpM) product with WarpM <= TileM, shared by every format so it cannot drift.
-//
-// The previous version was five hand-picked points on an L-shape -- (32,32) (64,32) (64,64) (128,64) (256,64) -- chosen
-// so WarpM at fixed TileM=64 separated from TileM at fixed WarpM=64. That reasoning was right and the coverage was not:
-// (128,32) and (256,32) were simply absent, and `cvt/mma = 128/WM` being worse at WM=32 is a PREDICTION, which is
-// exactly the kind of claim that has been wrong twice here (int4 was declared "not the ceiling" only because it had
-// never been tuned on the same grid; w64x32 was missing from a whole scan and worth +7 to +9 points).
-#define MOE_GRID(EMIT)                                                                  \
-  EMIT( 32,  32)  EMIT( 64,  32)  EMIT( 64,  64)  EMIT(128,  32)                        \
-  EMIT(128,  64)  EMIT(256,  32)  EMIT(256,  64)
+// (The hand-written (TileM, WarpM) grid that used to sit here is gone. One unit fixes one shape, so TileM and WarpM are
+// generated axes now, and moe_ok's WM <= TM rejects the illegal corner -- the L-shape is a CONSEQUENCE of the predicate
+// rather than a list someone maintains. The five points it used to enumerate were missing (128,32) and (256,32).)
 
 // STAGES IS AN AXIS, and it was not one. It was baked into each hand-written row, which left int4's single-plane
 // winner at s3 and int2's IDENTICAL shape at s2 -- so `i4 382.76 vs i2 420.83` was not a format comparison, it was s3
@@ -223,12 +229,6 @@ constexpr bool moe_ok() {
     MOE_STAGE_LIST(MOE1_TIME, BD,BEST,NAME,ELEM,BITS,TMv,TNv,TKv,WMv,WNv)                                          \
   } } while (0)
 
-// One entry point per translation unit. Each prints its own section header and folds into the shared Best.
-void sweep_q3     (const Band&, Best&);
-void sweep_q5     (const Band&, Best&);
-void sweep_q6_wn32(const Band&, Best&);
-void sweep_q6_wn64(const Band&, Best&);
-void sweep_i2_wn32(const Band&, Best&);
-void sweep_i2_wn64(const Band&, Best&);
-void sweep_i4_wn32(const Band&, Best&);
-void sweep_i4_wn64(const Band&, Best&);
+// The unit entry points are DECLARED IN GENERATED CODE (moe_bench_units.inc, written by CMakeLists), one per shape.
+// Nothing is declared here on purpose: 128 hand-written declarations would be a second copy of the enumeration, and the
+// whole reason the sweep is generated is that the enumeration must live in exactly one place.

@@ -45,10 +45,12 @@ F1=1). The correlation now holds across two regimes and two shapes. Next instrum
 more reasoning and not more tile sweeping -- three mechanistic theories for the int1 fold were all wrong before
 measurement settled it.
 
-**#17b -- MoE band.** Instrument is shipped and the correctness half is closed. `%HBM` printed 116-181% because the
-A term assumed every n-tile column re-reads all of A from DRAM; it is now a compulsory FLOOR plus a `noreuse Nx` ratio
-and needs one confirming run. Read the floor as conclusive in one direction only: low means **not** bandwidth-bound,
-however much re-reading happens.
+**#17b -- MoE band.** Instrument is shipped and the correctness half is closed. The sweep is now a 336-row product
+across 128 generated translation units (one per shape) instead of 30 hand-written rows; `build.sh` takes `JOBS`. Read
+`floor %HBM` as conclusive in one direction only, check that all units agree on `PPU_B_CHUNK`, and run `MOE_TK=128`
+separately for the TileK half. The `%HBM` column that printed 116-181% was an upper bound whose A term assumed every
+n-tile column re-reads all of A from DRAM; it is a compulsory FLOOR plus a `noreuse Nx` ratio now, and needs one
+confirming run.
 
 ## Closed, with the reason
 
