@@ -154,6 +154,62 @@ i.e. with `MMA_K = TK/16` (2 atoms at TileK=32, 16 at 256), so the product sweep
 configs -- the ladder discipline this work used before -- not a product. My earlier "front end is 94%, codegen is 5.6%" was
 measured with nvcc/ptxas and does not transfer to hgcc.
 
+## acu on the decode winner, twice: the limiter is the GRID, and split-K must be paired with a smaller TileK
+
+Two captures of the same shape family, `MOE_ONLY=<tag> MOE_ACU=1` (one cold launch, no warmup):
+
+| | `16x64:256 w16x32 s2` | `16x32:256 w16x16 s2` |
+|---|---|---|
+| harness / acu duration | 23.39 / 22.77 us | **20.74 / 19.55 us** |
+| DRAM Throughput | 33.39% | **38.94%** |
+| Compute (issue) Throughput | 32.79% | 39.98% |
+| Theoretical occupancy | 21.88% (14 warps/CU) | **28.13% (18)** |
+| Achieved occupancy | 10.90% (6.97) | **21.33% (13.65)** |
+| Block Limit SMem / Registers | 7 / 12 | **9 / 20** |
+| Regs per thread | 148 | **102** |
+| **Memory Dependency** | 0.451 | **1.015** |
+| **Instruction Fetch** | **0.471** (top) | 0.433 |
+| grid | (8,32,1) x (64,1,1) | (8,64,1) x (64,1,1) |
+
+**Two model predictions confirmed, twice each.** `grid warps = mt*N*TM/(WM*WN)` predicts 14.2 warps/CU and acu measured
+13.65; the smem expression predicts `Block Limit Shared Mem = 9` and acu measured 9. Both are now safe to reason with.
+
+**THE STALL PICTURE INVERTED, and that is the useful part.** Memory Dependency went 0.451 -> 1.015 and is now 2.3x Instruction
+Fetch, which was previously the top stall. The kernel moved from fetch/issue-limited to MEMORY-LATENCY-limited -- exactly the
+direction wanted, since doubling occupancy put more requests in flight -- and DRAM followed, 33.4% -> 38.9%. Registers are not
+a constraint anywhere near here: 102 used, and the register-occupancy curve is flat until ~168.
+
+**THE GRID IS THE LIMITER AND TileK CANNOT MOVE IT.** achieved = min(theoretical 18, grid 14.2), measured 13.65. TileK does
+not appear in the grid identity, so TileK=128 would take smem 26 KB -> 13 KB and theoretical 18 -> 40 while achieved stays at
+14.2. Conversely split-K alone raises the grid to 56.9 and achieved stops at the smem-limited 18. **They must be paired:**
+
+| | theoretical | grid | achieved |
+|---|---|---|---|
+| now | 18 | 14.2 | **13.65 (21%)** |
+| + split-K S=4 only | 18 | 56.9 | 18 (28%) |
+| + TileK=128 only | 40 | 14.2 | 14.2 (22%) |
+| **TileK=128 AND split-K S=4** | 40 | 56.9 | **40 (62.5%)** |
+
+One raises the ceiling, the other raises the floor, and neither alone gets past ~28%.
+
+**#20 Phase 1 re-enters the picture here.** Dropping the zero tile takes smem/stage 13 KB -> 12.5 KB and `blk` 9 -> 10,
+i.e. +11% theoretical. That was irrelevant at the previous config (theoretical was far above the grid) and is not now
+(theoretical is only 27% above it).
+
+Full decode progression, i4, 8 active experts x 1 row, N=K=2048, gs=32:
+
+| config | us | %HBM | what changed |
+|---|---|---|---|
+| `32x64:32 w32x32 s4` | 32.15 | 24.8% | starting point |
+| `16x32:32 w16x32 s4` | 29.63 | 26.3% | TileM=16 |
+| `16x64:256 w16x32 s2` | 23.39 | 33.3% | TileK=256 |
+| **`16x32:256 w16x16 s2`** | **20.74** | **37.5%** | WarpN=16, TileN=32 |
+
+**-35.5% cumulative, and 2.66x from the memory roof (7.79 us).** TileM=32/WarpM=16 was in the sweep and LOST -- it doubles the
+grid warps but also doubles A-smem and takes masking from 15/16 to 31/32 -- so of the two routes to occupancy only WarpN was
+free, and WarpN=16 is the MMA atom floor. That is why split-K is now the only remaining lever rather than one option among
+several.
+
 ## Retracted
 
 **"Q3 is 20.7% slower than Q5 in MoE and 27% on dense, and it is the only format whose LOW plane also folds (F1=2) --
