@@ -616,3 +616,41 @@ shows up in the log.
 
 Also: the pack ran once per EXPERT on byte-identical input -- 268 M positions per row to produce one row's worth of
 information. Pack expert 0, memcpy the other 63.
+
+## 336 rows: the verdict changes, and one recorded finding is retracted
+
+Full product sweep, L=64 skewed, N=K=2048, gs=32, PPU_B_CHUNK=1, MOE_TK=64.
+
+| format | best | us | MFU |
+|---|---|---|---|
+| **i2** | `64x128:64 w64x32 s3` | **300.26** | **55.5%** |
+| q5 | `64x128:64 w64x64 s2` | 340.75 | 48.9% |
+| q3 | `64x128:64 w64x64 s2` | 349.38 | 47.7% |
+| q6 | `64x128:64 w64x64 s2` | 354.79 | 47.0% |
+| i4 | `64x64:64 w64x32 s3` | 362.14 | 46.1% |
+
+**The single-plane winner changed from i4 to i2 and the whole band got 21.5% faster** (382.76 -> 300.26), entirely from
+configurations the 30-row table did not contain. **int2 now beats int4 by 17%**, the reverse of dense AND the reverse of
+the old verdict -- which had int4 ahead only because int4's row was s3 while int2's IDENTICAL shape was s2. The old
+comparison was measuring the stage count.
+
+**The optimal stage count is format- and shape-dependent.** q3/q5 want s2, i2/q6 want s3, i4 wants **s4**, and s4 was in
+no row of the old table: `i4 64x128:64 w64x32` is s2 418.64 / s3 402.79 / **s4 378.23**, while `q3 64x128:64 w64x64` is
+**s2 349.38** / s3 407.38 / s4 536.83 -- a 1.54x spread on one shape. No single hard-coded value works.
+
+**RETRACTED: "Q3 is 20.7% slower than Q5 in MoE and 27% on dense, and it is the only format whose LOW plane also folds
+(F1=2) -- a correlation holding across two regimes, worth an acu investigation."** It was the GRID, not the format. q3's
+best is 349.38 against q5's 340.75, a **2.5%** gap. The 30-row table measured q3 at a configuration that suited it worse
+than the one it gave q5, and I read the difference as a property of the format. Everything built on the F1=2 correlation
+goes with it.
+
+**Nothing in the band is bandwidth-bound.** The compulsory floor is 5-29% of HBM on all 336 rows, `noreuse` 4.5-13.5x.
+And `mt`/`msk` remain non-predictive at 336 rows exactly as at 30: the winner has neither the smallest m-tile count
+(TM=256) nor the least masking (TM=32). The lever is occupancy/latency, so acu is the next instrument -- now reachable
+without an edit-and-rebuild via `MOE_ONLY=<tag> MOE_ACU=1`, which issues exactly one launch.
+
+**A 23% CROSS-RUN DRIFT IS UNEXPLAINED.** The identical config `q3 64x128:64 w64x64 s2` measured 429.19 us in the 30-row
+run and 349.38 here, same data, same shape, same chunk state. Testable hypothesis: the old sweep packed 64 experts per row
+(~1.2-1.5 s of host time) where this one packs once and memcpys (~30 ms), so the old run idled the GPU for a second before
+every timing loop and these are "hot clock" numbers. Until that is checked, compare only WITHIN a run -- which is what
+every conclusion above does.

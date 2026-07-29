@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #include <cstdint>
 #include <algorithm>
@@ -70,6 +71,27 @@ inline void moe_chunk_vote(bool on) { if (on) ++moe_chunk_tally().on; else ++moe
 #define PPU_CHUNK_ON 0
 #endif
 
+// ROW SELECTION, for acu and for cheap re-runs. acu needs EXACTLY ONE kernel launch in the process, and the sweep issues
+// 336 x 21 of them; there was no way to profile a single row without editing and rebuilding, which is how a cross-config
+// mismatch gets introduced (the same trap FOLD_ONCE exists for in test_fold_int2).
+//
+//   MOE_ONLY=<substring>   run only rows whose tag contains it, e.g. MOE_ONLY="i2 64x128:64 w64x32 s3" or MOE_ONLY=i4
+//   MOE_ACU=1              with MOE_ONLY, issue ONE launch instead of 1 warmup + 20 timed
+//
+// The shape-level test matches in BOTH directions on purpose: a full row tag ("i2 64x128:64 w64x32 s3") contains the shape
+// string, and a loose filter ("i4") is contained BY it. Getting this backwards would silently pack nothing and print an
+// empty sweep, which reads exactly like a broken build.
+inline const char* moe_only() { static const char* v = std::getenv("MOE_ONLY"); return v; }
+inline bool moe_acu() { static const bool v = std::getenv("MOE_ACU") != nullptr; return v; }
+inline bool moe_row_selected(const char* tag) {
+  const char* f = moe_only();
+  return !f || std::strstr(tag, f) != nullptr;
+}
+inline bool moe_shape_selected(const char* shape) {
+  const char* f = moe_only();
+  return !f || std::strstr(shape, f) != nullptr || std::strstr(f, shape) != nullptr;
+}
+
 // Everything a sweep needs about the band. Passed by const reference so the per-format translation units share ONE
 // set of device buffers instead of each allocating its own.
 struct Band {
@@ -85,7 +107,15 @@ struct Band {
 struct Best { char tag[64]; double us; };
 inline void upd(Best& b, const char* t, double u) { if (u < b.us) { b.us = u; std::snprintf(b.tag, 64, "%s", t); } }
 
+// iters == 0 means EXACTLY ONE launch and no warmup: acu attributes counters to the whole process, so a warmup would
+// double-count and 20 iterations would make the report meaningless.
 template <class F> inline double time_it(F&& f, int iters) {
+  if (iters == 0) {
+    auto a = std::chrono::high_resolution_clock::now();
+    f(); CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    auto b = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::micro>(b - a).count();
+  }
   f(); CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
   auto t0 = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < iters; ++i) f();
@@ -172,19 +202,25 @@ constexpr bool moe_ok() {
 // sweep only became affordable at this size because of it.
 #define MOE2_TIME(BD,BEST,NAME,LOELEM,HIELEM,LOB,HIB,TMv,TNv,TKv,WMv,WNv,Sv)                                       \
   if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,Sv,LOB,HIB>()) {                                                        \
-    const double u = time_it([&]{                                                                                  \
-      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,LOELEM,HIELEM>(              \
-          (BD).dA, _b1.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                       \
-          (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                  \
-          (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr, _b2.get()); }, 20);                        \
     char _t[64]; std::snprintf(_t, 64, NAME " %dx%d:%d w%dx%d s%d", TMv, TNv, TKv, WMv, WNv, Sv);                  \
-    report(BD, _t, u, TMv, TNv, (LOB)+(HIB));  upd(BEST, _t, u);                                                   \
+    if (moe_row_selected(_t)) {                                                                                    \
+      auto _go = [&]{                                                                                              \
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,LOELEM,HIELEM>(            \
+            (BD).dA, _b1.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
+            (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
+            (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr, _b2.get()); };                           \
+      double u;                                                                                                    \
+      if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
+      else             u = time_it(_go, 20);                                                                       \
+      report(BD, _t, u, TMv, TNv, (LOB)+(HIB));  upd(BEST, _t, u);                                                 \
+    }                                                                                                              \
   }
 
 #define MOE2(BD,BEST,NAME,LOELEM,HIELEM,LOB,HIB,TMv,TNv,TKv,WMv,WNv) do {                                          \
   constexpr int _F1 = fold::FoldTraits<LOB,TMv,TNv,TKv,3,WMv,WNv>::F;                                              \
   constexpr int _F2 = fold::FoldTraits<HIB,TMv,TNv,TKv,3,WMv,WNv>::F;                                              \
-  if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,2,LOB,HIB>()) {                                                         \
+  char _sh[64]; std::snprintf(_sh, 64, NAME " %dx%d:%d w%dx%d", TMv, TNv, TKv, WMv, WNv);                           \
+  if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,2,LOB,HIB>()) if (moe_shape_selected(_sh)) {                            \
     const size_t _lo = (size_t)(BD).K*(BD).N*(LOB)/8, _hi = (size_t)(BD).K*(BD).N*(HIB)/8;                          \
     std::vector<int8_t> _blo((size_t)(BD).L*_lo), _bhi((size_t)(BD).L*_hi);                                        \
     { std::vector<uint8_t> _l((size_t)(BD).K*(BD).N), _h((size_t)(BD).K*(BD).N);                                    \
@@ -206,18 +242,24 @@ constexpr bool moe_ok() {
 // ---- single plane, same structure.
 #define MOE1_TIME(BD,BEST,NAME,ELEM,BITS,TMv,TNv,TKv,WMv,WNv,Sv)                                                   \
   if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,Sv,BITS>()) {                                                           \
-    const double u = time_it([&]{                                                                                  \
-      moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,ELEM>(                       \
-          (BD).dA, _db.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                       \
-          (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                  \
-          (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr); }, 20);                                   \
     char _t[64]; std::snprintf(_t, 64, NAME " %dx%d:%d w%dx%d s%d", TMv, TNv, TKv, WMv, WNv, Sv);                  \
-    report(BD, _t, u, TMv, TNv, (BITS));  upd(BEST, _t, u);                                                        \
+    if (moe_row_selected(_t)) {                                                                                    \
+      auto _go = [&]{                                                                                              \
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,ELEM>(                     \
+            (BD).dA, _db.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
+            (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
+            (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr); };                                      \
+      double u;                                                                                                    \
+      if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
+      else             u = time_it(_go, 20);                                                                       \
+      report(BD, _t, u, TMv, TNv, (BITS));  upd(BEST, _t, u);                                                      \
+    }                                                                                                              \
   }
 
 #define MOE1(BD,BEST,NAME,ELEM,BITS,TMv,TNv,TKv,WMv,WNv) do {                                                      \
   constexpr int _F = fold::FoldTraits<BITS,TMv,TNv,TKv,3,WMv,WNv>::F;                                              \
-  if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,2,BITS>()) {                                                            \
+  char _sh[64]; std::snprintf(_sh, 64, NAME " %dx%d:%d w%dx%d", TMv, TNv, TKv, WMv, WNv);                           \
+  if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,2,BITS>()) if (moe_shape_selected(_sh)) {                               \
     const size_t _per = (size_t)(BD).K*(BD).N*(BITS)/8;                                                            \
     std::vector<int8_t> _bb((size_t)(BD).L*_per);                                                                  \
     { std::vector<uint8_t> _q((size_t)(BD).K*(BD).N);                                                              \
