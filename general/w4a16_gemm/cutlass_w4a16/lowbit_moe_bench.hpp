@@ -22,7 +22,6 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "xplane_offline.hpp"
-#include "fold_traits.hpp"
 #include "moe_grouped_ppu.cuh"
 
 using half_t  = cutlass::half_t;
@@ -124,6 +123,14 @@ template <class F> inline double time_it(F&& f, int iters) {
   return std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
 }
 
+// F WITHOUT INSTANTIATING FoldTraits, and that distinction is the whole point. FoldTraits carries static_asserts --
+// `delivery <= slots` among them -- so computing F from it fires those asserts for configurations moe_ok would have
+// rejected. That is what broke the TileK=32 build: moe_ok correctly rejects int2 at WarpN=32 (slots = 32*32/32 = 32 against
+// delivery = 128/2 = 64), but `constexpr int _F = FoldTraits<...>::F` sat ABOVE the `if constexpr (moe_ok<...>)` gate, and
+// a template argument is instantiated whether or not a later gate would have discarded the statement. Same closed form
+// here, no asserts; FoldTraits still fires for the configurations that actually launch, from inside the collective.
+template <int Bits> constexpr int moe_fold(int TK) { const int c = TK * Bits / 8; return c >= 32 ? 1 : 32 / c; }
+
 // THE TRAFFIC MODEL LIVES HERE, not in prose. I argued "not bandwidth-bound" from traffic computed by hand in a
 // message; that number changes with every shape and tile, so the tool has to produce it or the argument is
 // unfalsifiable.
@@ -223,10 +230,10 @@ constexpr bool moe_ok() {
   }
 
 #define MOE2(BD,BEST,NAME,LOELEM,HIELEM,LOB,HIB,TMv,TNv,TKv,WMv,WNv) do {                                          \
-  constexpr int _F1 = fold::FoldTraits<LOB,TMv,TNv,TKv,3,WMv,WNv>::F;                                              \
-  constexpr int _F2 = fold::FoldTraits<HIB,TMv,TNv,TKv,3,WMv,WNv>::F;                                              \
   char _sh[64]; std::snprintf(_sh, 64, NAME " %dx%d:%d w%dx%d", TMv, TNv, TKv, WMv, WNv);                           \
   if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,2,LOB,HIB>()) if (moe_shape_selected(_sh)) {                            \
+    constexpr int _F1 = moe_fold<LOB>(TKv);                                                                        \
+    constexpr int _F2 = moe_fold<HIB>(TKv);                                                                        \
     const size_t _lo = (size_t)(BD).K*(BD).N*(LOB)/8, _hi = (size_t)(BD).K*(BD).N*(HIB)/8;                          \
     std::vector<int8_t> _blo((size_t)(BD).L*_lo), _bhi((size_t)(BD).L*_hi);                                        \
     { std::vector<uint8_t> _l((size_t)(BD).K*(BD).N), _h((size_t)(BD).K*(BD).N);                                    \
@@ -263,9 +270,9 @@ constexpr bool moe_ok() {
   }
 
 #define MOE1(BD,BEST,NAME,ELEM,BITS,TMv,TNv,TKv,WMv,WNv) do {                                                      \
-  constexpr int _F = fold::FoldTraits<BITS,TMv,TNv,TKv,3,WMv,WNv>::F;                                              \
   char _sh[64]; std::snprintf(_sh, 64, NAME " %dx%d:%d w%dx%d", TMv, TNv, TKv, WMv, WNv);                           \
   if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,2,BITS>()) if (moe_shape_selected(_sh)) {                               \
+    constexpr int _F = moe_fold<BITS>(TKv);                                                                        \
     const size_t _per = (size_t)(BD).K*(BD).N*(BITS)/8;                                                            \
     std::vector<int8_t> _bb((size_t)(BD).L*_per);                                                                  \
     { std::vector<uint8_t> _q((size_t)(BD).K*(BD).N);                                                              \
