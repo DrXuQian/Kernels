@@ -228,14 +228,34 @@ negative from S=2 onward**: `16x32x256` gives spk1 266 / spk2 251 / spk4 208 / s
 `16x64x256/16x16/s2/**spk1**` at 273 GB/s -- so **split-K's contribution to the real winner is zero**; the small gain at
 TileK=64/spk2 sits on a config already 30% behind.
 
-**Mechanism.** Serial split-K serialises the S slices of one (m,n) tile at the EPILOGUE through the semaphore, so the
-parallelism won in the mainloop is given back there; and every slice reads and writes the whole D tile, making
-`D traffic = S * 2 * M*N*2` -- 2 MB at S=32 against 2.1 MB of weights, i.e. the total traffic roughly doubles on top of a
-32-deep serial chain. A PARALLEL split-K (fp32 partials + reduction) pays the same in workspace traffic.
+**Mechanism, DECOMPOSED -- and the first version of this attributed it to the wrong term.** `wbytes` in the harness is a
+constant, so GB/s is exactly inverse time. With output elements `E = mt*TM*N = 32768` and a baseline of ~2.43 MB
+(weights + scale + A), serial split-K adds `E*2*(2S-1)` of D traffic:
+
+| S | traffic ratio | measured time ratio | residual = serialisation |
+|---|---|---|---|
+| 2 | 1.06x | **0.86x (FASTER)** | -- |
+| 8 | 1.37x | 1.43x | **1.04x** |
+| 16 | 1.79x | 2.89x | 1.61x |
+| 32 | 2.63x | 7.71x | 2.93x |
+
+**At S=8 the serialisation costs 4%; the whole 43% is PARTIAL TRAFFIC.** So a PARALLEL split-K with a separate lightweight
+reduction -- which removes only the serialisation -- would land at ~1.37x slower, not better. And its traffic is not lower:
+per output element, serial is a fp16 read+write per slice (~4S*E), parallel with fp16 partials is a write per slice plus one
+read by the reduction (~4S*E, IDENTICAL), and parallel with fp32 partials is ~8S*E, i.e. TWICE serial. The lightweight reduce
+removes a term that was already negligible at the useful S.
+
+**S=2 DOES win, and the first version of this missed it**: 185 -> 214 GB/s at TileK=64, +16%, because the occupancy gain
+1.8 -> 3.6 warps/CU beats a 6% traffic cost. So split-K is not useless -- it is useful only at S=2, and only where the kernel
+is latency-starved. On the configuration that actually wins it is negative from S=2 onward: `16x32x256` 266 -> 251 (-6%),
+`16x64x256` 273 -> 259 (-5%). Consistent reading: **TileK=256 already removed the latency starvation (kit 8 rather than 32),
+so split-K has no occupancy left to buy there and only traffic to pay.**
 
 **This kills the "TileK=128 + split-K S=4 -> 62% occupancy" plan**, and with it the grouped split-K specialization -- several
 hundred lines and multiple box rounds, cancelled by one dense measurement that needed no new kernel. That is why the cheap
-dense ladder was the right first step rather than writing the grouped kernel.
+dense ladder was the right first step rather than writing the grouped kernel. The decisive number is not the S=32 collapse
+(which is mostly serialisation and would be fixed by a parallel reduce) but **S=8, where serialisation is 4% and an 8x
+occupancy gain still lost 43% to partial traffic**.
 
 **DO NOT OVER-GENERALISE THIS.** The ladder refutes *obtaining* warps through K-slicing, not occupancy as a lever. The
 grouped kernel's 14.2 warps/CU come from 8 INDEPENDENT experts with no epilogue serialisation; the dense ladder's 14.2 come
