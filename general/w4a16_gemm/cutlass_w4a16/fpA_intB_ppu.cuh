@@ -158,7 +158,17 @@ void dispatch_gs(const cutlass::half_t* A, const cutlass::int4b_t* B, const cutl
             TileShape, cute::Shape<cute::Int<TN>, cute::Int<CTA_SCALE_K>>, WarpShape, Stages, AiuInterleaved>(
             A, B, scales, zeros, D, m, n, k, group_size, split_k, ws, ws_bytes, stream); break;
       }
-      default: std::printf("[fpA_intB] group_size %d unsupported (finegrained: 64/128)\n", group_size);
+      case 32: {
+        // gs=32 IS THE DECODE GROUP SIZE and it was not dispatched here, so the dense split-K path could not be
+        // measured at the shape the grouped kernel actually runs. The Gs32 schedule exists in dispatch_policy.hpp
+        // and its mainloop policy exposes `Schedule = KernelAiuMultistageMixedInput`, which is exactly what the
+        // SplitKSerialScheduler specialization enable_ifs on -- so this reaches the split-K kernel unchanged.
+        constexpr int CTA_SCALE_K = (TK + 31) / 32;
+        generic_launcher<QuantOp, cutlass::gemm::KernelAiuMultistageMixedInputFinegrainedGs32,
+            TileShape, cute::Shape<cute::Int<TN>, cute::Int<CTA_SCALE_K>>, WarpShape, Stages, AiuInterleaved>(
+            A, B, scales, zeros, D, m, n, k, group_size, split_k, ws, ws_bytes, stream); break;
+      }
+      default: std::printf("[fpA_intB] group_size %d unsupported (finegrained: 32/64/128)\n", group_size);
     }
   } else {  // per-column
     generic_launcher<QuantOp, cutlass::gemm::KernelAiuMultistageMixedInputPerCol,

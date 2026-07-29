@@ -24,7 +24,9 @@ int main(int argc, char** argv) {
   // Split-k workspace = grid_m*grid_n*sizeof(int) per the kernel, with grid largest for the SMALLEST tile
   // (Bm=16, Bn=64) and largest split_k in the sweep. Size for the worst case so split_k configs actually run
   // -- an undersized workspace made initialize() fail silently and the kernel no-op (garbage >peak TFLOP/s).
-  const size_t ws_bytes = (size_t)cutlass::ceil_div(m,16) * cutlass::ceil_div(n,64) * 8 /*max split_k*/ * 4;
+  // max split_k raised 8 -> 32 for the occupancy ladder below. The comment above is load-bearing: an undersized
+  // workspace made initialize() fail SILENTLY and the kernel no-op, and the only symptom was a >peak TFLOP/s number.
+  const size_t ws_bytes = (size_t)cutlass::ceil_div(m,16) * cutlass::ceil_div(n,64) * 32 /*max split_k*/ * 4;
 
   cutlass::DeviceAllocation<half_t> A((size_t)m*k), scales((size_t)n*scale_k), D((size_t)m*n);
   cutlass::DeviceAllocation<int4_t> B((size_t)n*k);       // int4b_t elements (packed by the allocator)
@@ -37,7 +39,7 @@ int main(int argc, char** argv) {
 
   std::printf("fpA_intB official path sweep: m=%d n=%d k=%d gs=%d (FinegrainedGs128, scale-only)\n", m,n,k,g);
   std::printf("  compute-bound metric = MFU vs 500 TFLOP/s ; memory-bound (small m) = %% of 2200 GB/s\n");
-  std::printf("%-32s %-9s %-6s %-9s %s\n", "TILE(MxNxK)/WARP/ST/spk", "TFLOP/s", "MFU", "GB/s", "%HBM");
+  std::printf("%-32s %-9s %-6s %-9s %-7s %5s\n", "TILE(MxNxK)/WARP/ST/spk", "TFLOP/s", "MFU", "GB/s", "%HBM", "gw/CU");
 
   // GEMM timing is data-independent, so uninitialized buffers give a valid perf number (correctness checked
   // separately via the bench harness). Each TIME(...) is a distinct compiled instantiation. block_k (TK) is
@@ -56,10 +58,15 @@ int main(int argc, char** argv) {
     double tf = 2.0 * m * n * k / (us * 1e-6) / 1e12;                                                \
     double gbps = wbytes / (us * 1e-6) / 1e9;                                                        \
     const char* nm = #TM "x" #TN "x" #TK "/" #WM "x" #WN "/s" #ST "/spk" #SPLITK;                     \
+    /* grid warps per CU = mt * n * TM * split_k / (WM*WN) / CU. Derived and then confirmed twice by acu on the  */ \
+    /* grouped kernel (predicted 14.2, measured 13.65). TileN and TileK CANCEL, so split_k is the only factor    */ \
+    /* here that is not already at its floor -- which is exactly what this ladder measures.                      */ \
+    const double gwcu = double(cutlass::ceil_div(m,(TM))) * double(n) * double(TM) * double(SPLITK)               \
+                      / (double(WM) * double(WN)) / 72.0;                                                        \
     /* no-op guard both regimes: faster than compute peak OR faster than HBM peak == kernel never ran */ \
     bool ran = (tf <= TF_PEAK) && (gbps <= 1.5*HBM_PEAK);                                             \
-    if (ran) std::printf("%-32s %-9.1f %-6.1f %-9.0f %.1f%%\n", nm, tf, 100.0*tf/TF_PEAK, gbps, 100.0*gbps/HBM_PEAK); \
-    else     std::printf("%-32s %-9s %-6s %-9s %s\n", nm, "-", "-", "-", "FAIL (no-op)");             \
+    if (ran) std::printf("%-32s %-9.1f %-6.1f %-9.0f %-6.1f%% %5.1f\n", nm, tf, 100.0*tf/TF_PEAK, gbps, 100.0*gbps/HBM_PEAK, gwcu); \
+    else     std::printf("%-32s %-9s %-6s %-9s %-7s %5.1f  FAIL (no-op)\n", nm, "-", "-", "-", "-", gwcu); \
     /* rank by the binding metric: MFU for large m (compute-bound), GB/s for small m (memory-bound) */ \
     double score = (m >= 256) ? tf : gbps;                                                           \
     if (ran && score > best_score) { best_score = score; best_tf = tf; best_gbps = gbps;             \
@@ -78,6 +85,22 @@ int main(int argc, char** argv) {
   TIME(32, 64, 64,  32, 16, 2, 1);  TIME(32, 64, 64,  32, 16, 2, 2);  TIME(32, 64, 64,  32, 16, 3, 1);
   TIME(32, 64, 128, 32, 16, 2, 1);  TIME(32, 64, 128, 32, 16, 2, 2);
   TIME(32, 64, 256, 32, 16, 2, 1);  TIME(32, 64, 256, 32, 16, 2, 2);
+
+  // --- SPLIT-K OCCUPANCY LADDER, the one experiment the grouped path cannot run ---
+  // The grouped MoE kernel is stuck at grid warps/CU = mt*N*TM/(WM*WN)/72 = 14.2, because WarpN=16 is the MMA atom floor,
+  // TileM/WarpM > 1 was measured and lost, and TileN/TileK cancel out of the identity. split_k is the ONLY remaining factor,
+  // and it does not exist for the grouped ProblemShape -- but it does for the dense one, with the same collective (every
+  // finegrained mainloop policy, fold included, exposes `Schedule = KernelAiuMultistageMixedInput`, which is what the
+  // SplitKSerialScheduler specialization enable_ifs on) and the same non-EVT epilogue the split-K kernel needs.
+  //
+  // So: measure whether raising grid warps/CU past 14.2 keeps buying time, on dense, before building grouped split-K.
+  // split_k <= K/TileK, so TileK=64 reaches spk=32 (56.9 warps/CU) while TileK=256 stops at spk=8 (14.2).
+  // Run it at the decode shape: <bin> 8 2048 2048 32
+  TIME(16, 32, 64,  16, 16, 2, 1);  TIME(16, 32, 64,  16, 16, 2, 2);  TIME(16, 32, 64,  16, 16, 2, 4);
+  TIME(16, 32, 64,  16, 16, 2, 8);  TIME(16, 32, 64,  16, 16, 2, 16); TIME(16, 32, 64,  16, 16, 2, 32);
+  TIME(16, 32, 256, 16, 16, 2, 1);  TIME(16, 32, 256, 16, 16, 2, 2);  TIME(16, 32, 256, 16, 16, 2, 4);
+  TIME(16, 32, 256, 16, 16, 2, 8);
+  TIME(16, 64, 64,  16, 16, 2, 8);  TIME(16, 64, 64,  16, 16, 2, 16); TIME(16, 64, 64,  16, 16, 2, 32);
 
   // --- mid/large Bm (prefill regime): split_k=1 ---
   TIME(64,  64,  64,  32, 32, 3, 1);  TIME(64,  64,  64,  32, 32, 4, 1);  TIME(64,  64,  64,  32, 32, 2, 2);
