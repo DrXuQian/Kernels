@@ -1,4 +1,9 @@
-// MULTI-EXPERT (L>1) + RAGGED gate for the TWO-PLANE path: Q3 = int2+int1, Q6 = int4+int2, Q5 = int4+int1 [box-only].
+// MULTI-EXPERT (L>1) + RAGGED gate for every LOW-BIT format on the grouped path [box-only]:
+//   two-plane    Q3 = int2+int1, Q6 = int4+int2, Q5 = int4+int1
+//   single-plane int2, int1, int4
+//
+// Named for what it covers. It was test_q65_grouped, and that read as "Q6 and Q5 only" even though Q3 was the first
+// entry -- the name is the only part a reader sees, so a name that misdescribes the coverage is a real defect.
 //
 // WHY THIS EXISTS. Everything measured for the two-plane formats so far runs L=1. The plumbing L>1 adds is per-expert
 // ADDRESSING, and the two-plane path has twice as much of it as a single-plane one: a second weight base pointer with its
@@ -14,7 +19,11 @@
 // EVERY EXPERT GETS DIFFERENT WEIGHTS, in both planes and in the scales. With identical experts, "every expert read
 // plane 0" passes silently -- which is exactly the defect the comment above describes. The codes are seeded on e.
 //
-//   Build: TARGET=test_q65_grouped ./build.sh        (PPU_DEFS=PPU_B_CHUNK=1 for the chunked path)
+// int1 IS A CHECK ON THE HARNESS, not on the kernel. It already has an independent multi-expert gate
+// (test_w1a16_grouped) that passes, so int1 failing here while passing there means this harness is wrong. A new test
+// with no known-good row in it can only tell you that something is broken, never which of the two.
+//
+//   Build: TARGET=test_lowbit_grouped ./build.sh      (PPU_DEFS=PPU_B_CHUNK=1 for the chunked path)
 //   Run:   ./<bin> [L] [ragged 0|1] [Mb] [N] [K] [gs]
 #include <cstdio>
 #include <cstdlib>
@@ -149,6 +158,70 @@ int main(int argc, char** argv) {
     if (bad) ++fails;                                                                                                     \
   } while (0)
 
+  // Single-plane variant: identical structure, no B2 argument. Same L=1-per-expert oracle, so it isolates the same
+  // thing -- per-expert addressing -- for the formats that ship without a companion plane.
+#define GROUPED1(TAG, ELEM, BITS, TMv, TNv, TKv, WMv, WNv, Sv, Fv, QMODE) do {                                          \
+    const size_t per = (size_t)K * N * (BITS) / 8;                                                                       \
+    std::vector<int8_t> bb((size_t)L * per);                                                                             \
+    for (int e = 0; e < L; ++e) {                                                                                        \
+      std::vector<uint8_t> q((size_t)K * N);                                                                             \
+      for (size_t i = 0; i < q.size(); ++i)                                                                              \
+        q[i] = uint8_t(((size_t(e) * 104729 + i) * 2654435761u >> 5) & ((1u << (BITS)) - 1u));                            \
+      xplane::place_derived<BITS, TMv, TNv, TKv, WMv, WNv, Fv>(bb.data() + (size_t)e * per, q, N, K);                     \
+    }                                                                                                                    \
+    cutlass::DeviceAllocation<ELEM> db((size_t)L * K * N);                                                                \
+    db.copy_from_host(reinterpret_cast<ELEM const*>(bb.data()));                                                          \
+    std::vector<GS> rsh(L); std::vector<half_t*> pdh(L); std::vector<DStride> sdh(L); std::vector<int> gmh(L);            \
+    for (int e = 0; e < L; ++e) { rsh[e] = cute::make_shape(me[e], N, K); pdh[e] = dD.get() + (size_t)offs[e] * N;         \
+                                  sdh[e] = out_stride(me[e]); gmh[e] = me[e]; }                                            \
+    cutlass::DeviceAllocation<GS> rdev(L);       rdev.copy_from_host(rsh.data());                                         \
+    cutlass::DeviceAllocation<half_t*> pd(L);    pd.copy_from_host(pdh.data());                                            \
+    cutlass::DeviceAllocation<DStride> sd(L);    sd.copy_from_host(sdh.data());                                            \
+    cutlass::DeviceAllocation<int> gm(L);        gm.copy_from_host(gmh.data());                                            \
+    cutlass::DeviceAllocation<int> offdev(L);    offdev.copy_from_host(offs.data());                                       \
+    const size_t wsb = (size_t)cutlass::ceil_div(Mmax,16)*cutlass::ceil_div(N,64)*(size_t)L*64;                            \
+    cutlass::DeviceAllocation<char> ws(wsb);                                                                               \
+    CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)total * N));                                       \
+    moe_grouped_ppu::filter_and_run<QMODE, TMv, TNv, TKv, WMv, WNv, Sv, ELEM>(                                            \
+        dA.get(), db.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                                          \
+        Mmax, N, K, L, gs, rdev.get(), rsh.data(), ragged ? offdev.get() : nullptr, ws.get(), wsb, nullptr);              \
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());                                                                            \
+    CUTLASS_PPU_CHECK(hggcMemset(dD1.get(), 0, sizeof(half_t) * (size_t)total * N));                                      \
+    for (int e = 0; e < L; ++e) {                                                                                          \
+      const int Me = me[e];                                                                                              \
+      std::vector<GS> s1{cute::make_shape(Me, N, K)};                                                                     \
+      std::vector<half_t*> p1{dD1.get() + (size_t)offs[e] * N};                                                            \
+      std::vector<DStride> t1{out_stride(Me)}; std::vector<int> g1{Me}, o1{0};                                             \
+      cutlass::DeviceAllocation<GS> s1d(1);       s1d.copy_from_host(s1.data());                                           \
+      cutlass::DeviceAllocation<half_t*> p1d(1);  p1d.copy_from_host(p1.data());                                            \
+      cutlass::DeviceAllocation<DStride> t1d(1);  t1d.copy_from_host(t1.data());                                            \
+      cutlass::DeviceAllocation<int> g1d(1);      g1d.copy_from_host(g1.data());                                            \
+      const size_t w1b = (size_t)cutlass::ceil_div(Me,16)*cutlass::ceil_div(N,64)*64;                                      \
+      cutlass::DeviceAllocation<char> w1(w1b);                                                                              \
+      moe_grouped_ppu::filter_and_run<QMODE, TMv, TNv, TKv, WMv, WNv, Sv, ELEM>(                                          \
+          dA.get() + (size_t)offs[e] * K, db.get() + (size_t)e * K * N,                                                  \
+          dSc.get() + (size_t)e * scale_k * N, dZr.get() + (size_t)e * scale_k * N,                                      \
+          p1d.get(), t1d.get(), g1d.get(), Me, N, K, 1, gs, s1d.get(), s1.data(), nullptr, w1.get(), w1b, nullptr);      \
+      CUTLASS_PPU_CHECK(hggcDeviceSynchronize());                                                                          \
+    }                                                                                                                      \
+    std::vector<half_t> h((size_t)total*N), h1((size_t)total*N);                                                           \
+    dD.copy_to_host(h.data()); dD1.copy_to_host(h1.data());                                                                \
+    int bad = 0, worst_e = -1; double mr = 0;                                                                               \
+    for (int e = 0; e < L; ++e)                                                                                            \
+      for (int i = 0; i < me[e]; ++i)                                                                                      \
+        for (int j = 0; j < N; ++j) {                                                                                       \
+          const size_t idx = ((size_t)offs[e] + i) * N + j;                                                                \
+          const double a = double(float(h[idx])), b = double(float(h1[idx]));                                              \
+          const double rel = std::abs(a - b) / (std::abs(b) + 1e-3);                                                       \
+          if (rel > 2e-2) { if (bad < 4) std::printf("      e=%d i=%d j=%d grouped=%.4f oracle=%.4f\n", e, i, j, a, b);   \
+                            ++bad; }                                                                                        \
+          if (rel > mr) { mr = rel; worst_e = e; }                                                                          \
+        }                                                                                                                   \
+    std::printf("    %-46s bad=%d/%d max_rel=%.3e (worst e=%d) %s\n", TAG, bad, total * N, mr, worst_e,                    \
+                bad ? "MISMATCH" : "MATCH");                                                                                \
+    if (bad) ++fails;                                                                                                       \
+  } while (0)
+
   std::printf("  --- Q3 = int2 + int1 ---\n");
   GROUPED("(64,128, 64) w64x64 s2  F1=2 F2=4", uint2_t, uint1_t, 2, 1, 64,128, 64,64,64,2,2,4, QM::FinegrainedScaleZero);
   GROUPED("(64,128,128) w32x64 s3  F1=1 F2=2", uint2_t, uint1_t, 2, 1, 64,128,128,32,64,3,1,2, QM::FinegrainedScaleZero);
@@ -158,6 +231,13 @@ int main(int argc, char** argv) {
   std::printf("  --- Q5 = int4 + int1 ---\n");
   GROUPED("(64,128, 64) w64x64 s2  F1=1 F2=4", int4_t, uint1_t, 4, 1, 64,128, 64,64,64,2,1,4, QM::FinegrainedScaleZero);
   GROUPED("(64,128,128) w32x32 s3  F1=1 F2=2", int4_t, uint1_t, 4, 1, 64,128,128,32,32,3,1,2, QM::FinegrainedScaleZero);
+
+  std::printf("  --- single plane: int2 (the gap), int1 (HARNESS check), int4 ---\n");
+  GROUPED1("int2 (64, 64, 64) w64x32 s2  F=2", uint2_t, 2, 64, 64, 64,64,32,2,2, QM::FinegrainedScaleZero);
+  GROUPED1("int2 (64,128, 64) w64x32 s3  F=2", uint2_t, 2, 64,128, 64,64,32,3,2, QM::FinegrainedScaleZero);
+  GROUPED1("int2 (64, 64,128) w32x32 s3  F=1", uint2_t, 2, 64, 64,128,32,32,3,1, QM::FinegrainedScaleZero);
+  GROUPED1("int1 (64,128, 64) w64x64 s2  F=4", uint1_t, 1, 64,128, 64,64,64,2,4, QM::FinegrainedScaleZero);
+  GROUPED1("int4 (64, 64, 64) w64x32 s3  F=1", int4_t,  4, 64, 64, 64,64,32,3,1, QM::FinegrainedScaleZero);
 
   std::printf("\n  => %d failing configuration(s)\n", fails);
   return fails ? 1 : 0;

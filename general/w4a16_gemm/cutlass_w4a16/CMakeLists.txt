@@ -191,16 +191,20 @@ ppu_w4a16_executable(
 )
 target_compile_options(test_q65_bconcat_real PRIVATE -w)
 
-# MULTI-EXPERT (L>1) + RAGGED gate for the two-plane path (Q3 / Q6 / Q5). The oracle is the L=1 kernel run per expert, so
-# a mismatch is per-expert ADDRESSING and nothing else -- notably plane 2's own L-stride, a hand-written byte count that
-# has never been tested. Every expert gets DIFFERENT weights in both planes and different scales, because with identical
-# experts "every expert read plane 0" passes silently.
-#   Build: TARGET=test_q65_grouped ./build.sh ; run: ./<bin> [L] [ragged] [Mb] [N] [K] [gs]
+# MULTI-EXPERT (L>1) + RAGGED gate for every LOW-BIT format on the grouped path: the two-plane ones (Q3 = int2+int1,
+# Q6 = int4+int2, Q5 = int4+int1) and the single-plane ones (int2, int1, int4). Named for what it covers -- it was
+# test_q65_grouped, which read as "Q6 and Q5 only" even though Q3 was the first entry, and the name is the only part a
+# reader sees. The oracle is the L=1 kernel run per expert, so a mismatch is per-expert ADDRESSING and nothing else --
+# notably plane 2's own L-stride, a hand-written byte count that had never been tested. Every expert gets DIFFERENT
+# weights in every plane and different scales, because with identical experts "every expert read plane 0" passes
+# silently. int1 is included as a check on the HARNESS: it already has an independent multi-expert gate
+# (test_w1a16_grouped), so int1 failing here while passing there would mean this harness is wrong, not the kernel.
+#   Build: TARGET=test_lowbit_grouped ./build.sh ; run: ./<bin> [L] [ragged] [Mb] [N] [K] [gs]
 ppu_w4a16_executable(
-  test_q65_grouped
-  test_q65_grouped.cu
+  test_lowbit_grouped
+  test_lowbit_grouped.cu
 )
-target_compile_options(test_q65_grouped PRIVATE -w)
+target_compile_options(test_lowbit_grouped PRIVATE -w)
 
 # B-CONCAT CONTROLLED-INPUT PROBE: A=identity + scale=1/zero=0 + index-labelled bit planes, so D reads back WHICH
 # (n,k) each consumed bit came from. Rungs 0/1/2 separate mantissa PLACEMENT from bit PERMUTATION; rung 3 decodes
