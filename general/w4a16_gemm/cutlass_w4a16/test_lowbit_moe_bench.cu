@@ -137,12 +137,13 @@ int main(int argc, char** argv) {
     std::printf("  %-4s %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU)%s\n", moe_fmt_names[ord[i]], e.tag, e.us, tf,
                 100.0 * tf * 1e12 / PEAK, i == 0 ? "   <-- fastest" : "");
   }
-  std::printf("  HBM lo..hi BRACKETS the achieved bandwidth: lo = floor/t (every byte crosses once), hi = ceil/t (no L2\n");
-  std::printf("  reuse at all). The CEILING is the conclusive end -- hi < peak proves NOT saturated, and rows where that\n");
-  std::printf("  holds are tagged NOT-BW. A low lo says NOTHING: the truth may sit at hi. (The first version of this text\n");
-  std::printf("  claimed the opposite, and three conclusions were drawn from it before the decode run exposed it.)\n");
-  std::printf("  Stronger still, and needing neither bound: if two configs of one format differ 1.4-2.8x in ceiling\n");
-  std::printf("  traffic yet land within a few %% in TIME, traffic is not the limiter.\n");
+  std::printf("  HBM is the COMPULSORY traffic: padded A (mt*TM*K*2) + one read of each ACTIVE expert's weights and scales\n");
+  std::printf("  + D. At decode mt == active, so B and S are EXACT, not bounds -- the traffic is LOCKED, and HBM%% is the\n");
+  std::printf("  answer rather than a lower bound. Ax is the only uncertainty left: A may be re-fetched up to Ax times if\n");
+  std::printf("  L2 gives nothing across n-tiles. Judge that on its size -- at decode the whole distinct A footprint is\n");
+  std::printf("  ~1 MB shared inside one wave, so it is an L2 question, not a bandwidth one.\n");
+  std::printf("  blk/wrp come from fold::warps_per_cu_chunked (registers billed to a power of two), NOT from a smem+warps\n");
+  std::printf("  formula -- acu already showed that one to be register-limited and mis-ordering. wav = cta/(72*blk).\n");
   std::printf("  Then read mt and msk: smallest mt winning => the weight-bound rule holds; least msk => the dense\n");
   std::printf("  reasoning carries over; neither => the lever is occupancy and the next instrument is acu.\n");
   if (bd.mode == 3) {

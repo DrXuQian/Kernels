@@ -22,6 +22,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "xplane_offline.hpp"
+#include "fold_traits.hpp"   // warps_per_cu_chunked: the occupancy model WITH the register term
 #include "moe_grouped_ppu.cuh"
 
 using half_t  = cutlass::half_t;
@@ -42,7 +43,7 @@ static constexpr double HBM_GBS = 2766.0;
 // containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
 // the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
 // per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
-#define LOWBIT_MOE_BENCH_REV 5
+#define LOWBIT_MOE_BENCH_REV 6
 
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
@@ -164,8 +165,13 @@ template <int Bits> constexpr int moe_fold(int TK) { const int c = TK * Bits / 8
 // can is the number of tile loads in flight, which per CTA is exactly `Stages`, and per CU is `blocks/CU * Stages`. That
 // quantity was never on screen, so the hypothesis could only be argued.
 //
-// `blk<=` is an UPPER BOUND: it accounts for smem and the 64-warps/CU limit only. Registers also cap it and this cannot know
-// the compiler's allocation, so the real occupancy comes from acu. Labelled `<=` so it cannot be quoted as measured.
+// `blk` COMES FROM fold::warps_per_cu_chunked, NOT from a formula written here. The first version of this used
+// `min(262144/smem, 64/warps)` -- which fold_traits.hpp and the README both record as KNOWN-WRONG: acu said outright
+// "theoretical occupancy (25.0%) is limited by the number of required registers", shared memory allowing 10 blocks where
+// registers allowed 4, and that missing register term is why an earlier `blk` "kept failing to order the data". The correct
+// model bills registers ROUNDED UP TO A POWER OF TWO (129 costs exactly what 256 costs) and is pinned by static_assert to
+// acu's measured points. Re-deriving it here would have been the same mistake a second time.
+// `wav` uses CU = 72, which acu confirmed independently through its own wave arithmetic (1024 - 3*288 = 160).
 //
 // AND `ifl` IS INVARIANT IN Stages WHENEVER smem BINDS, which it does at every decode shape here (blk_smem 19 < blk_warp 32
 // for i4 (32,64,32) w32x32). Since blk = 256KB / (smem_per_stage * Stages), the product blk*Stages collapses to
@@ -175,7 +181,7 @@ template <int Bits> constexpr int moe_fold(int TK) { const int c = TK * Bits / 8
 // scale term (3328 -> 2688 B, ifl <= 97). Dropping the zero tile (#20 Phase 1) is only 128 B of 3328, i.e. 3.8%.
 // Which of depth-vs-width wins at a fixed total is exactly what the sweep is for.
 inline void report(const Band& bd, const char* tag, double us, int TM, int TN, int TK, int WM, int WN, int Stages,
-                   int bits_total) {
+                   int bits_total, int wcu) {
   long long mt = 0, mt_max = 0;
   for (int e = 0; e < bd.L; ++e) {
     const long long t = (bd.me[e] + TM - 1) / TM; mt += t; mt_max = std::max(mt_max, t);
@@ -187,11 +193,18 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
   const double ntile = std::ceil(double(bd.N) / double(TN));
   const double wb    = double(bd.N) * double(bd.K) * double(bits_total) / 8.0;         // one expert's weights
   const double sb    = double(bd.N) * (double(bd.K) / double(bd.gs)) * 2.0 * 2.0;      // scale + zero, fp16
-  const double dfl   = double(bd.total) * double(bd.K) * 2.0 + double(bd.active) * (wb + sb)
-                     + double(bd.total) * double(bd.N) * 2.0;
-  const double dce   = double(mt) * ntile * double(TM) * double(bd.K) * 2.0 + double(mt) * wb
-                     + double(mt) * ntile * double(TN) * (double(bd.K) / double(bd.gs)) * 2.0 * 2.0
-                     + double(bd.total) * double(bd.N) * 2.0;
+  // A IS PADDED IN THE FLOOR. The kernel fetches TM rows whether or not they are real, so `mt*TM*K*2` is compulsory and
+  // `total*K*2` was an under-count -- at decode that is 1.05 MB against 32 KB of real rows.
+  //
+  // AND AT DECODE THE TRAFFIC IS LOCKED, NOT A BRACKET, which is the correction that produced this version: `mt == active`
+  // there, so B is exactly `active*wb` and S exactly `active*sb` -- each active expert's weights read once. The 2.6x
+  // "noreuse" the previous version printed came ENTIRELY from A's cross-n-tile term (33.5 MB of a 54.5 MB ceiling), and
+  // that term assumes 32 CTAs each re-fetch their m-tile's A from DRAM when the whole distinct A footprint is 8 x 128 KB =
+  // 1 MB shared inside one wave. Calling that a bandwidth question is not defensible, so it is no longer folded into a
+  // bracket: the floor is reported as THE number and A's reuse factor is printed beside it as `Ax`.
+  const double a_pad  = double(mt) * double(TM) * double(bd.K) * 2.0;
+  const double dfl    = a_pad + double(bd.active) * (wb + sb) + double(bd.total) * double(bd.N) * 2.0;
+  const double dce    = ntile * a_pad + double(mt) * (wb + sb) + double(bd.total) * double(bd.N) * 2.0;
   const double gbs = dfl / (us * 1e-6) / 1e9;
   const double tf  = 2.0 * double(bd.total) * double(bd.N) * double(bd.K) / (us * 1e-6) / 1e12;
   // S's SHARE OF THE FLOOR is what #20 can possibly buy, and without it the floor cannot answer that question. At decode
@@ -200,16 +213,14 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
   const double s_share = dfl > 0 ? double(bd.active) * sb / dfl : 0.0;
   const double gbs_c = dce / (us * 1e-6) / 1e9;
   const int  warps  = (TM / WM) * (TN / WN);
-  const int  sk     = (TK + bd.gs - 1) / bd.gs;                       // scale groups per K-tile
-  const long smem_s = (long)TM*TK*2 + (long)TN*TK*bits_total/8 + (long)TN*sk*2*2;   // A + B(all planes) + scale&zero
-  const long smem_b = smem_s * Stages;
-  const int  blk    = std::min(int(262144 / (smem_b > 0 ? smem_b : 1)), 64 / (warps > 0 ? warps : 1));
-  const long ctas   = mt * (long)std::ceil(double(bd.N) / double(TN));
+  const int  blk    = warps > 0 ? wcu / warps : 0;          // wcu comes from fold::warps_per_cu_chunked at the call site
+  const long ctas   = mt * (long)ntile;
+  const double waves = (blk > 0) ? double(ctas) / (72.0 * double(blk)) : 0.0;   // CU = 72, confirmed by acu wave arithmetic
   std::printf("    %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU) | mt=%-5lld msk=%4.1f%% skw=%.1fx |"
-              " HBM %4.1f%%..%5.1f%% S=%4.1f%% | smem %3ldK blk<=%-2d wrp<=%-2d ifl<=%-3d cta=%-5ld%s\n",
+              " HBM %4.1f%% Ax%-2.0f S=%4.1f%% | blk %-2d wrp %-2d ifl %-3d cta=%-5ld wav=%4.2f%s\n",
               tag, us, tf, 100.0 * tf * 1e12 / PEAK, mt, 100.0 * masked, skew,
-              100.0 * gbs / HBM_GBS, 100.0 * gbs_c / HBM_GBS, 100.0 * s_share,
-              smem_b / 1024, blk, blk * warps, blk * Stages, ctas,
+              100.0 * gbs / HBM_GBS, ntile, 100.0 * s_share,
+              blk, blk * warps, blk * Stages, ctas, waves,
               gbs_c < 0.9 * HBM_GBS ? "  NOT-BW" : "");
 }
 
@@ -272,7 +283,7 @@ constexpr bool moe_ok() {
       double u;                                                                                                    \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
-      report(BD, _t, u, TMv, TNv, TKv, WMv, WNv, Sv, (LOB)+(HIB));  upd(BEST, _t, u);                                                 \
+      report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),32,true>);  upd(BEST, _t, u);                                                 \
     }                                                                                                              \
   }
 
@@ -312,7 +323,7 @@ constexpr bool moe_ok() {
       double u;                                                                                                    \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
-      report(BD, _t, u, TMv, TNv, TKv, WMv, WNv, Sv, (BITS));  upd(BEST, _t, u);                                                      \
+      report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(BITS),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(BITS),32,true>);  upd(BEST, _t, u);                                                      \
     }                                                                                                              \
   }
 
