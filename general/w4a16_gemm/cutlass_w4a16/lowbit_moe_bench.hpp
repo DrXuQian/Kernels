@@ -43,7 +43,7 @@ static constexpr double HBM_GBS = 2766.0;
 // containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
 // the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
 // per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
-#define LOWBIT_MOE_BENCH_REV 8
+#define LOWBIT_MOE_BENCH_REV 9
 
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
@@ -299,8 +299,53 @@ constexpr bool moe_ok() {
 // tiny tile: i4 (32,64,32) is ~3.25 KB/stage, so s16 costs 52 KB of the 256 KB budget. The collective caps nothing above
 // `Stages >= 2`; smem does, and moe_ok's smem predicate filters the rest, so these cost nothing on the prefill shapes where
 // A-smem is 8-32 KB/stage and they simply do not fit.
-#define MOE_STAGE_LIST(F, ...)  F(__VA_ARGS__, 2)  F(__VA_ARGS__, 3)  F(__VA_ARGS__, 4)  \
-                                F(__VA_ARGS__, 6)  F(__VA_ARGS__, 8)  F(__VA_ARGS__, 12)
+// MOE_STAGES narrows this axis from the build, for the same reason the tile lists can be narrowed: the cost is entirely
+// front-end template instantiation at ~3.0 s per kernel, so halving the stage list halves the per-unit time.
+//   PPU_DEFS="PPU_B_CHUNK=1 MOE_STAGES_4 MOE_STAGES_8"   -- define the ones you want; none defined = all six
+#if defined(MOE_STAGES_2) || defined(MOE_STAGES_3) || defined(MOE_STAGES_4) || \
+    defined(MOE_STAGES_6) || defined(MOE_STAGES_8) || defined(MOE_STAGES_12)
+   // at least one was requested: leave the others undefined so only the requested stages are emitted
+#else
+#  define MOE_STAGES_2
+#  define MOE_STAGES_3
+#  define MOE_STAGES_4
+#  define MOE_STAGES_6
+#  define MOE_STAGES_8
+#  define MOE_STAGES_12
+#endif
+#define MOE_STAGE_LIST(F, ...)                                                                 \
+  MOE_STG_2(F, __VA_ARGS__)  MOE_STG_3(F, __VA_ARGS__)  MOE_STG_4(F, __VA_ARGS__)              \
+  MOE_STG_6(F, __VA_ARGS__)  MOE_STG_8(F, __VA_ARGS__)  MOE_STG_12(F, __VA_ARGS__)
+#ifdef MOE_STAGES_2
+#  define MOE_STG_2(F, ...)  F(__VA_ARGS__, 2)
+#else
+#  define MOE_STG_2(F, ...)
+#endif
+#ifdef MOE_STAGES_3
+#  define MOE_STG_3(F, ...)  F(__VA_ARGS__, 3)
+#else
+#  define MOE_STG_3(F, ...)
+#endif
+#ifdef MOE_STAGES_4
+#  define MOE_STG_4(F, ...)  F(__VA_ARGS__, 4)
+#else
+#  define MOE_STG_4(F, ...)
+#endif
+#ifdef MOE_STAGES_6
+#  define MOE_STG_6(F, ...)  F(__VA_ARGS__, 6)
+#else
+#  define MOE_STG_6(F, ...)
+#endif
+#ifdef MOE_STAGES_8
+#  define MOE_STG_8(F, ...)  F(__VA_ARGS__, 8)
+#else
+#  define MOE_STG_8(F, ...)
+#endif
+#ifdef MOE_STAGES_12
+#  define MOE_STG_12(F, ...)  F(__VA_ARGS__, 12)
+#else
+#  define MOE_STG_12(F, ...)
+#endif
 
 // ---- two-plane: pack ONCE per shape, then time every stage count against the same device buffer.
 //
