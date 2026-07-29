@@ -241,7 +241,9 @@ set(_MOE_FORMATS
   "i4|0|int4_t|half_t|4|0|32,64"
 )
 set(_MOE_TM_LIST 32 64 128 256)
-set(_MOE_TN_LIST 64 128)
+# 32 is here for DECODE. At batch 1 the grid is 8 m-tiles x (N/TN), so TileN is the only knob that adds CTAs, and the decode
+# measurement says the band is latency/occupancy-bound rather than bandwidth-bound. It self-filters where WarpN > TileN.
+set(_MOE_TN_LIST 32 64 128)
 set(_MOE_WM_LIST 32 64)
 
 set(_MOE_UNIT_SRCS "")

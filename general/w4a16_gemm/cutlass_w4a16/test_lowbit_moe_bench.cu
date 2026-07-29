@@ -137,10 +137,12 @@ int main(int argc, char** argv) {
     std::printf("  %-4s %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU)%s\n", moe_fmt_names[ord[i]], e.tag, e.us, tf,
                 100.0 * tf * 1e12 / PEAK, i == 0 ? "   <-- fastest" : "");
   }
-  std::printf("  floor %%HBM is the COMPULSORY lower bound -- every byte crossing the bus at least once -- so it is\n");
-  std::printf("  conclusive in ONE direction: low means NOT bandwidth-bound however much re-reading happens. noreuse is\n");
-  std::printf("  ceil/floor, i.e. how much reuse the L2 must be supplying; it is a ratio, not a percentage, because the\n");
-  std::printf("  first version of this printed 116-181%% of HBM and a bound looser than the peak measures nothing.\n");
+  std::printf("  HBM lo..hi BRACKETS the achieved bandwidth: lo = floor/t (every byte crosses once), hi = ceil/t (no L2\n");
+  std::printf("  reuse at all). The CEILING is the conclusive end -- hi < peak proves NOT saturated, and rows where that\n");
+  std::printf("  holds are tagged NOT-BW. A low lo says NOTHING: the truth may sit at hi. (The first version of this text\n");
+  std::printf("  claimed the opposite, and three conclusions were drawn from it before the decode run exposed it.)\n");
+  std::printf("  Stronger still, and needing neither bound: if two configs of one format differ 1.4-2.8x in ceiling\n");
+  std::printf("  traffic yet land within a few %% in TIME, traffic is not the limiter.\n");
   std::printf("  Then read mt and msk: smallest mt winning => the weight-bound rule holds; least msk => the dense\n");
   std::printf("  reasoning carries over; neither => the lever is occupancy and the next instrument is acu.\n");
   if (bd.mode == 3) {

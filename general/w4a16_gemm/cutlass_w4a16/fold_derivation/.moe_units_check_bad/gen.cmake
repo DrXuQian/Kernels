@@ -8,7 +8,9 @@ set(_MOE_FORMATS
   "i4|0|int4_t|half_t|4|0|32,64"
 )
 set(_MOE_TM_LIST 32 64 128 256)
-set(_MOE_TN_LIST 64 128)
+# 32 is here for DECODE. At batch 1 the grid is 8 m-tiles x (N/TN), so TileN is the only knob that adds CTAs, and the decode
+# measurement says the band is latency/occupancy-bound rather than bandwidth-bound. It self-filters where WarpN > TileN.
+set(_MOE_TN_LIST 32 64 128)
 set(_MOE_WM_LIST 32 64)
 
 set(_MOE_UNIT_SRCS "")
@@ -102,11 +104,30 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different
 # never see target properties (the same reason PPU_DEFS has to be forwarded twice). The generated units find the .inc via
 # the custom command's own -I<source dir of the file>, but test_lowbit_moe_bench.cu lives in the source tree and would
 # not find moe_bench_units.inc in the binary tree without this.
+# DERIVE the expected count from the same lists the slice defines -- writing 128 in here went stale the moment TileN gained
+# a third value, and a gate whose expected value is hand-maintained fails for the wrong reason.
+list(LENGTH _MOE_TM_LIST _ntm)
+list(LENGTH _MOE_TN_LIST _ntn)
+list(LENGTH _MOE_WM_LIST _nwm)
+list(LENGTH _MOE_FORMATS  _nfmt)
+set(_exp 0)
+foreach(_row IN LISTS _MOE_FORMATS)
+  string(REPLACE "|" ";" _f "${_row}")
+  list(GET _f 6 _w)
+  string(REPLACE "," ";" _w "${_w}")
+  list(LENGTH _w _nwn)
+  math(EXPR _exp "${_exp} + ${_nwn} * ${_ntn} * ${_nwm} * ${_ntm}")
+endforeach()
 file(GLOB _gen "${_MOE_GEN_DIR}/*.cu")
 list(LENGTH _gen _ngen)
-message(STATUS "generated .cu files on disk: ${_ngen}")
-if(NOT _ngen EQUAL 128)
-  message(FATAL_ERROR "expected 128 generated units, got ${_ngen}")
+message(STATUS "generated .cu files on disk: ${_ngen} (derived expectation ${_exp}, generator said ${_MOE_UNIT_N})")
+# two independent comparisons: vs the derived product (catches a loop that skipped rows) and vs the generator's own list
+# length (catches a file that failed to write).
+if(NOT _ngen EQUAL _exp)
+  message(FATAL_ERROR "expected ${_exp} generated units from the axis lists, got ${_ngen} on disk")
+endif()
+if(NOT _ngen EQUAL _MOE_UNIT_N)
+  message(FATAL_ERROR "generator listed ${_MOE_UNIT_N} sources but ${_ngen} are on disk")
 endif()
 foreach(_pat q6_tn64_wn32 q6_tn64_wn64 i4_tn128_wn64 i2_tn64_wn32)
   file(GLOB _hit "${_MOE_GEN_DIR}/moe_unit_${_pat}_*.cu")
@@ -126,10 +147,10 @@ string(REGEX MATCHALL "\nvoid moe_unit_" _dc "${_d}")
 list(LENGTH _dc _ndc)
 string(REGEX MATCHALL "\n  moe_unit_" _cc "${_d}")
 list(LENGTH _cc _ncc)
-if(NOT _ndc EQUAL 128 OR NOT _ncc EQUAL 128)
-  message(FATAL_ERROR "dispatcher has ${_ndc} declarations and ${_ncc} calls, expected 128 of each")
+if(NOT _ndc EQUAL _exp OR NOT _ncc EQUAL _exp)
+  message(FATAL_ERROR "dispatcher has ${_ndc} declarations and ${_ncc} calls, expected ${_exp} of each")
 endif()
-foreach(_need "MOE_UNIT_COUNT 128" "MOE_FMT_COUNT 5" "moe_fmt_names")
+foreach(_need "MOE_UNIT_COUNT ${_exp}" "MOE_FMT_COUNT ${_nfmt}" "moe_fmt_names")
   string(FIND "${_d}" "${_need}" _f)
   if(_f EQUAL -1)
     message(FATAL_ERROR "dispatcher is missing '${_need}' -- main will not compile against it")

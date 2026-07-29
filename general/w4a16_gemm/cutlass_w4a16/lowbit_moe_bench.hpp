@@ -42,7 +42,7 @@ static constexpr double HBM_GBS = 2766.0;
 // containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
 // the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
 // per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
-#define LOWBIT_MOE_BENCH_REV 3
+#define LOWBIT_MOE_BENCH_REV 4
 
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
@@ -151,8 +151,14 @@ template <int Bits> constexpr int moe_fold(int TK) { const int c = TK * Bits / 8
 //   ceil   the DMA-issued bound above
 //   noreuse = ceil/floor -- how much reuse the L2 must be supplying. A ratio, deliberately not a percentage.
 //
-// Read the FLOOR: it is conclusive in one direction only. Low means NOT bandwidth-bound however much re-reading
-// happens; high means look at acu, because the floor cannot tell you where between the two ends the truth sits.
+// WHICH END IS CONCLUSIVE, and I had this BACKWARDS in the first version of this comment and in three messages built on it.
+// Achieved traffic lies in [floor, ceil], so achieved bandwidth lies in [floor/t, ceil/t]:
+//   * ceil/t  < peak  =>  DEFINITELY NOT saturated. CONCLUSIVE, and it is the ceiling that gives it.
+//   * floor/t ~ peak  =>  DEFINITELY saturated. CONCLUSIVE the other way.
+//   * a LOW floor/t says NOTHING -- the truth may sit at the ceiling. That is the error: "low floor means not
+//     bandwidth-bound" is false, because the lower bound being small does not bound the actual from above.
+// Both ends are printed now. And the strongest argument needs neither: if two configs of the same format differ by 1.4-2.8x
+// in ceiling traffic and land within 0.4-6% in TIME, traffic is not the limiter -- that is what the decode run showed.
 inline void report(const Band& bd, const char* tag, double us, int TM, int TN, int bits_total) {
   long long mt = 0, mt_max = 0;
   for (int e = 0; e < bd.L; ++e) {
@@ -176,10 +182,12 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
   // (1 row per active expert) the weight term is read exactly once per active expert, so floor and ceiling coincide on B
   // and S and this share is a tight number rather than a bound.
   const double s_share = dfl > 0 ? double(bd.active) * sb / dfl : 0.0;
+  const double gbs_c = dce / (us * 1e-6) / 1e9;
   std::printf("    %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU) | mt=%-5lld msk=%4.1f%% skw=%.1fx |"
-              " floor %6.0f MB %6.0f GB/s (%4.1f%% HBM) S=%4.1f%% noreuse %.1fx\n",
+              " HBM %4.1f%%..%5.1f%% (floor %5.0f MB x%.1f) S=%4.1f%%%s\n",
               tag, us, tf, 100.0 * tf * 1e12 / PEAK, mt, 100.0 * masked, skew,
-              dfl / 1e6, gbs, 100.0 * gbs / HBM_GBS, 100.0 * s_share, dfl > 0 ? dce / dfl : 0.0);
+              100.0 * gbs / HBM_GBS, 100.0 * gbs_c / HBM_GBS, dfl / 1e6, dfl > 0 ? dce / dfl : 0.0,
+              100.0 * s_share, gbs_c < 0.9 * HBM_GBS ? "  NOT-BW" : "");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
