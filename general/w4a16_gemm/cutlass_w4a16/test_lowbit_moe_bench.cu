@@ -125,6 +125,18 @@ int main(int argc, char** argv) {
   for (int i = 0; i < MOE_FMT_COUNT; ++i) { b[i].tag[0] = '\0'; b[i].us = 1e18; }
   moe_run_all(bd, b);
 
+  // THE ROOFLINE, STATED. Arithmetic intensity against the machine's ridge point decides which roof applies, and saying it
+  // outright stops `%HBM` from having to be argued about: at decode AI is ~3 FLOP/B against a ridge of PEAK/HBM = 181, so the
+  // memory roof is the only one in play and the measured time can be compared to it directly.
+  {
+    const double fl   = 2.0 * double(bd.total) * double(bd.N) * double(bd.K);
+    const double ridge = PEAK / (HBM_GBS * 1e9);
+    std::printf("\n  roofline: ridge = PEAK/HBM = %.0f FLOP/B. This shape has %.0f MFLOP over the compulsory traffic below,\n",
+                ridge, fl / 1e6);
+    std::printf("            so read HBM%%%% as \"%%%% of the memory roof\": 100%%%% means saturated, and the shortfall is\n");
+    std::printf("            latency or transaction efficiency, not bandwidth. run=/kit= are the two TileK-controlled\n");
+    std::printf("            candidates for it (AIU contiguous run in bytes; k-iteration count).\n");
+  }
   std::printf("\n  ================= VERDICT: best config per format =================\n");
   int ord[MOE_FMT_COUNT];
   for (int i = 0; i < MOE_FMT_COUNT; ++i) ord[i] = i;

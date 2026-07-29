@@ -43,7 +43,7 @@ static constexpr double HBM_GBS = 2766.0;
 // containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
 // the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
 // per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
-#define LOWBIT_MOE_BENCH_REV 7
+#define LOWBIT_MOE_BENCH_REV 8
 
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
@@ -212,15 +212,25 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
   // and S and this share is a tight number rather than a bound.
   const double s_share = dfl > 0 ? double(bd.active) * sb / dfl : 0.0;
   const double gbs_c = dce / (us * 1e-6) / 1e9;
+  // THE TWO QUANTITIES TileK CONTROLS, both candidates for why a memory-bound kernel misses its own roofline.
+  //   run  = F*TK*bits/8, the AIU CONTIGUOUS run in bytes. The fold targets the AIU's 32 B minimum, which is right on
+  //          prefill (it shrinks A-smem) and may be exactly wrong at decode: 24.8% of peak is suspiciously close to
+  //          32/128, i.e. one 32 B run per 128 B line.
+  //   kit  = K/TK, the k-iteration count. 64 dependent iterations at TK=32 against 8 at TK=256.
+  // Both improve monotonically with TileK, so they are confounded across a TileK scan -- report them so the confound is
+  // visible rather than discovered later.
+  const int  fold_l = (TK * bits_total / 8) >= 32 ? 1 : 32 / (TK * bits_total / 8);
+  const int  run_b  = fold_l * TK * bits_total / 8;
+  const long kit    = bd.K / TK;
   const int  warps  = (TM / WM) * (TN / WN);
   const int  blk    = warps > 0 ? wcu / warps : 0;          // wcu comes from fold::warps_per_cu_chunked at the call site
   const long ctas   = mt * (long)ntile;
   const double waves = (blk > 0) ? double(ctas) / (72.0 * double(blk)) : 0.0;   // CU = 72, confirmed by acu wave arithmetic
   std::printf("    %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU) | mt=%-5lld msk=%4.1f%% skw=%.1fx |"
-              " HBM %4.1f%% Ax%-2.0f S=%4.1f%% | blk %-2d wrp %-2d ifl %-3d cta=%-5ld wav=%4.2f%s\n",
+              " HBM %4.1f%% Ax%-2.0f S=%4.1f%% | blk %-2d wrp %-2d ifl %-3d cta=%-5ld wav=%4.2f run=%-3dB kit=%-3ld%s\n",
               tag, us, tf, 100.0 * tf * 1e12 / PEAK, mt, 100.0 * masked, skew,
               100.0 * gbs / HBM_GBS, ntile, 100.0 * s_share,
-              blk, blk * warps, blk * Stages, ctas, waves,
+              blk, blk * warps, blk * Stages, ctas, waves, run_b, kit,
               gbs_c < 0.9 * HBM_GBS ? "  NOT-BW" : "");
 }
 
