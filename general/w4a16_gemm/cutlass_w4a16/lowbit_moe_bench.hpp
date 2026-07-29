@@ -165,10 +165,14 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
                      + double(bd.total) * double(bd.N) * 2.0;
   const double gbs = dfl / (us * 1e-6) / 1e9;
   const double tf  = 2.0 * double(bd.total) * double(bd.N) * double(bd.K) / (us * 1e-6) / 1e12;
+  // S's SHARE OF THE FLOOR is what #20 can possibly buy, and without it the floor cannot answer that question. At decode
+  // (1 row per active expert) the weight term is read exactly once per active expert, so floor and ceiling coincide on B
+  // and S and this share is a tight number rather than a bound.
+  const double s_share = dfl > 0 ? double(bd.active) * sb / dfl : 0.0;
   std::printf("    %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU) | mt=%-5lld msk=%4.1f%% skw=%.1fx |"
-              " floor %6.0f MB %6.0f GB/s (%4.1f%% HBM) noreuse %.1fx\n",
+              " floor %6.0f MB %6.0f GB/s (%4.1f%% HBM) S=%4.1f%% noreuse %.1fx\n",
               tag, us, tf, 100.0 * tf * 1e12 / PEAK, mt, 100.0 * masked, skew,
-              dfl / 1e6, gbs, 100.0 * gbs / HBM_GBS, dfl > 0 ? dce / dfl : 0.0);
+              dfl / 1e6, gbs, 100.0 * gbs / HBM_GBS, 100.0 * s_share, dfl > 0 ? dce / dfl : 0.0);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
