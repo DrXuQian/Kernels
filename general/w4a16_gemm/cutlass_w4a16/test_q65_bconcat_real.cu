@@ -49,13 +49,24 @@ int main(int argc, char** argv) {
   std::printf("[q65-bconcat] M=%d N=%d K=%d gs=%d   Q6 = int4+int2 (q in [0,64)), Q5 = int4+int1 (q in [0,32))\n",
               M, N, K, gs);
 
-  // ---- A, scales. zero = -8*dl so the dequantised weight is exactly dl*q.
+  // ---- A, scales. THE ZERO POINT MUST CANCEL int4's BIAS, WITH A PLUS SIGN. apply_scale_atom is `multiplies` then
+  // `plus`, i.e. w = dl * emitted + zero, and the converter emits q - 8, so w = dl*q needs zero = +8*dl.
+  //
+  // My first version wrote -8*dl and every Q6/Q5 configuration came out bad=32768/32768 with IDENTICAL values across
+  // configurations -- and, decisively, with got - exp = -16 * sum_k A*dl carrying NO q dependence at all (the six
+  // printed columns were exact multiples 1,7,6,5,4,3 of one another, which is the shape of the dl generator). That
+  // forces sum_k A*dl*(emitted - q) = -8 * sum_k A*dl for every (m,n), hence emitted == q - 8 exactly. In other words
+  // the failure PROVED the two-plane combination lo + 16*hi was already right on hardware and only the test's sign was
+  // wrong. A whole-output MISMATCH whose residual is independent of the quantised data is never the kernel.
+  //
+  // A real Q6_K would put its own centre here instead (w = d*sc*(q - 32) means zero = (8 - 32)*d*sc); zero = +8*dl is
+  // chosen so the dequantised weight is exactly dl*q and the golden is a plain sum.
   std::vector<half_t> A((size_t)M * K), Sc((size_t)scale_k * N), Zr((size_t)scale_k * N);
   for (size_t i = 0; i < A.size(); ++i)  A[i]  = half_t(float(int((i * 2654435761u >> 9) & 7) - 3) * 0.125f);
   for (size_t i = 0; i < Sc.size(); ++i) {
     const float dl = float(int((i * 40503u >> 3) & 7) + 1) * 0.0625f;   // varying, period coprime to 8/16/32
     Sc[i] = half_t(dl);
-    Zr[i] = half_t(-8.0f * dl);
+    Zr[i] = half_t(+8.0f * dl);                                        // cancels the converter's -8
   }
 
   cutlass::DeviceAllocation<half_t> dA((size_t)M*K), dSc((size_t)scale_k*N), dZr((size_t)scale_k*N), dD((size_t)M*N);

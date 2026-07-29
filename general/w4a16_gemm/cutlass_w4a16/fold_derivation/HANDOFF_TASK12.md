@@ -417,3 +417,43 @@ PPU_DEFS=PPU_B_CHUNK=1 TARGET=test_q3_bconcat_bench  ./build.sh && $BIN/test_q3_
 `test_q65_bconcat_real` is synthetic with the FULL code range and a double-precision CPU golden: 5 Q6 configurations and
 4 Q5. Q3's own test must still MATCH -- everything about Q3 is required to be byte-identical, and l66/l67 check that
 locally, so a Q3 regression there would mean a plumbing change the local gates cannot see.
+
+## Box results, gs=16, PPU_B_CHUNK=1
+
+Q3 is CLEAN -- control plus all five rungs `bad=0/32768` against the native Q3_K golden, so the whole cute-ification
+(d, a, c, b, e, f) and the converter generalisation are behaviour-preserving on hardware, not just in the local gates.
+
+Perf, `2048 4096 4096 16`:
+
+| | best | us | MFU | vs int4 alone |
+|---|---|---|---|---|
+| int4 (1 plane, 4-bit) | (64,64,64) w64x32 s3 | 230.73 | 59.6% | 1.00x |
+| Q3 = int2+int1 | (64,128,64) w64x64 s2 | 262.15 | 52.4% | **1.14x** |
+| Q5 = int4+int1 | (64,128,64) w64x64 s2 | 268.14 | 51.3% | **1.16x** |
+| Q6 = int4+int2 | (64,128,64) w64x64 s2 | 281.93 | 48.8% | **1.22x** |
+| int2 (1 plane) | (64,64,64) w64x32 s2 | 248.15 | 55.4% | |
+| int1 (1 plane) | (64,128,64) w64x64 s3 | 224.73 | 61.2% | |
+
+All three bit-plane formats land within **1.14-1.22x of a single 4-bit GEMM** while carrying 3, 5 and 6 bits. A-concat's
+honest sum is 472.88 us, so B-concat/A-concat is 0.55x. All three peak at the SAME geometry, `(64,128,64) w64x64 s2`.
+
+Q6/Q5 at Block_K=128 are far worse (417-441 us) than at 64, mirroring Q3.
+
+## The Q6/Q5 numeric failure was the TEST, and the residual proved the kernel right
+
+First Q6/Q5 run: every configuration `bad=32768/32768`, with values IDENTICAL across configurations and Q6's residual
+equal to Q5's. `got - exp` came out -15.25, -106.73, -91.53, -76.25, -61.0, -45.75 for n=0..5 -- exact multiples
+1,7,6,5,4,3 of -15.25, which is the shape of the `dl` generator `(&7)+1`. So
+
+    got - exp = -16 * sum_k A*dl        with NO q dependence whatsoever
+
+`apply_scale_atom` is `multiplies` then `plus`, i.e. `w = dl*emitted + zero`, and the test set `zero = -8*dl` while the
+converter emits `q - 8`; the correct zero is `+8*dl`. Substituting gives exactly `-16 * sum_k A*dl`.
+
+The useful part is what the residual's q-INDEPENDENCE forces: `sum_k A*dl*(emitted - q) = -8*sum_k A*dl` for every
+(m,n), hence `emitted == q - 8` exactly, i.e. **the two-plane combination lo + 16*hi was already correct on hardware for
+both Q6 and Q5**. A whole-output mismatch whose residual does not depend on the quantised data is never the kernel.
+
+Added 12 bench rows around the two winners, including the w*x32 family for Q6 -- its int2 high plane needs only
+WN >= 2048/TK = 32 and its int4 low plane WN >= 1024/TK = 16, so all of w*x32 is legal for Q6 and none of it was sampled.
+Q5's int1 high plane pins it to w*x64 at Block_K=64.

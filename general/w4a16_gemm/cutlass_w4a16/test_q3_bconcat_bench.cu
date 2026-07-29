@@ -364,6 +364,23 @@ int main(int argc, char** argv) {
   Q65("q5", bQ5, 1, uint1_t, 64,128,128,64,32,3,2);
   Q65("q5", bQ5, 1, uint1_t, 64,128, 64,64,64,2,4);
   Q65("q5", bQ5, 1, uint1_t,128,128, 64,64,64,2,4);
+  // NEIGHBOURS OF THE TWO WINNERS. Both formats peaked at (64,128,64) w64x64 s2 -- the same geometry as Q3 -- and on Q3
+  // the rows within 2% of that were (128,128,64) w64x64 s3 and (64,256,64) w64x64 s3, neither of which was sampled here.
+  // Q6 can additionally use w32x32 at TK=64: its int2 high plane needs only WN >= 2048/TK = 32 and the int4 low plane
+  // WN >= 1024/TK = 16, so the whole w*x32 family is legal for Q6 and was never tried. Q5's int1 high pins it to w*x64.
+  std::printf("  --- Q6 / Q5 neighbours of the winners ---\n");
+  Q65("q6", bQ6, 2, uint2_t, 64,128, 64,64,64,3,2);
+  Q65("q6", bQ6, 2, uint2_t,128,128, 64,64,64,3,2);
+  Q65("q6", bQ6, 2, uint2_t,128,128, 64,64,64,2,2);
+  Q65("q6", bQ6, 2, uint2_t, 64,256, 64,64,64,3,2);
+  Q65("q6", bQ6, 2, uint2_t, 64,256, 64,64,64,2,2);
+  Q65("q6", bQ6, 2, uint2_t, 64,128, 64,32,32,3,2);
+  Q65("q6", bQ6, 2, uint2_t, 64,128, 64,32,64,2,2);
+  Q65("q5", bQ5, 1, uint1_t, 64,128, 64,64,64,3,4);
+  Q65("q5", bQ5, 1, uint1_t,128,128, 64,64,64,3,4);
+  Q65("q5", bQ5, 1, uint1_t, 64,256, 64,64,64,2,4);
+  Q65("q5", bQ5, 1, uint1_t, 64,256, 64,64,64,3,4);
+  Q65("q5", bQ5, 1, uint1_t, 32,128, 64,32,64,2,4);
 
   std::printf("  ================= VERDICT =================\n");
   std::printf("  B-concat  best: %-16s %8.2f us\n", bBC.tag, bBC.us);
