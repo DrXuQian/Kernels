@@ -90,6 +90,20 @@ Row counts, from the predicate (both the python mirror and a static_assert probe
 | MOE_TK=64 | 336 | 42 | 42 | 84 | 84 | 84 |
 | MOE_TK=128 | 304 | 38 | 38 | 76 | 76 | 76 |
 
+**TileK=32 MEASURED, and it is the best band so far.** i2 `64x128:32 w64x64 s4` = **295.08 us (56.5% MFU)**,
+i4 `64x128:32 w64x64 s4` = 317.26 (52.6%), q6 `64x128:32 w64x64 s4` = 357.71 (46.6%); q3/q5 filtered as designed.
+Against TileK=64: i2 300.26 -> 295.08 (+1.7%), **i4 362.14 -> 317.26 (+12.4%)**, q6 354.79 -> 357.71 (-0.8%).
+TileK=128 was worse across the board.
+
+**The mechanism is stages, i.e. occupancy.** Every TileK=32 winner is **s4**, where TileK=64's winners were s2/s3 -- A-smem
+= TM*TK*2 halves to 4 KB/stage, so a fourth stage fits. That is the same lever the 336-row sweep pointed at when it found
+nothing bandwidth-bound.
+
+**F is still NOT isolated.** TileK 64->32 changes F for all three formats (i4 1->2, i2 2->4, q6 (1,2)->(2,4)) at the same
+time as A-smem, so i4's 12.4% cannot be attributed. The clean datum remains **i4 at TileK=64 vs 128**, where int4's F stays
+1 at both (contig 32 B and 64 B, both >= 32) so only A-smem moves. That number is still needed to decide whether
+`F > F_min` is worth opening as an axis.
+
 q3/q5 self-filter to zero at TK=32 rather than breaking the build: their int1 plane needs `WN >= 4096/32 = 128`, and
 w64x128's accumulator alone wants `WM*WN/32 = 256` registers per thread against a 256 ceiling. `moe_ok` now carries that
 register bound (`WM*WN/32 <= 192`) so the dead config is a filter, not a compile error.
