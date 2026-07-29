@@ -156,13 +156,13 @@ inline std::vector<int> tile_map_hi() {
   constexpr int PDcopy = (DL1 / DL2) ? (DL1 / DL2) : 1;
   constexpr int VR     = LowBits / HiBits;
   constexpr int kPairs = 16 / LowBits, hstride = 16 / HiBits;
-  // (c) the converter's cross-plane pairing, as layouts rather than index algebra:
-  //   LoCodeL : (lt, half)                -> the LOW crumb's code index within a low word
-  //   HiCodeL : (lt, v % VR, half)        -> the HIGH code index within a high word
-  // What the old int1-only form hid: its `(lt % 4) + 4 * (lt / 4)` is the IDENTITY on lt in [0,8) -- an expression that
-  // looks like a permutation and is not.
-  using LoCodeL = Layout<Shape<Int<kPairs>, _2>,                Stride<_1, Int<kPairs>>>;
-  using HiCodeL = Layout<Shape<Int<kPairs>, Int<VR>, _2>,       Stride<_1, Int<kPairs>, Int<hstride>>>;
+  // (g) THE PAIRING COMES FROM THE CONVERTER, not from a second statement of it here. These used to be local Layouts
+  // saying the same thing the converter said as arithmetic -- one rule, two forms, which is the class that produced both
+  // 2-plane defects this session. MixGemm2Plane now owns LoCodeL / HiCodeL / HVregL and both sides call them.
+  // (What the original int1-only code hid, worth keeping: its `(lt % 4) + 4 * (lt / 4)` is the IDENTITY on lt in [0,8).)
+  using Cvt = cutlass::MixGemm2Plane<LowBits, HiBits>;
+  static_assert(Cvt::kPairs == kPairs && Cvt::kVregRatio == VR && Cvt::kHiStride == hstride,
+                "the offline and the converter must agree on the pairing shape");
 
   using CTV1 = CubeTV<LowBits, TM, TN, TK, WM, WN, F1>;
   using CTV2 = CubeTV<HiBits,  TM, TN, TK, WM, WN, F2>;
@@ -175,14 +175,14 @@ inline std::vector<int> tile_map_hi() {
         for (int v = 0; v < 4; ++v)
           for (int lt = 0; lt < kPairs; ++lt)
             for (int half = 0; half < 2; ++half) {
-              const int j1 = int(LoCodeL{}(lt, half));
+              const int j1 = Cvt::lo_code(lt, half);
               const int row1 = CTV1::base_row(w, ii) + CTV1::cube_row(lane, v), wd1 = CTV1::cube_wd(lane, v, kb % DL1);
               if (row1 >= Ng1) continue;
               const int e1 = m1[(((size_t)row1 * DL1 + kb % DL1) * 8 + wd1) * CPW1 + j1];
               if (e1 < 0) continue;
               const int base = (kb % PDcopy) + PDcopy * (ii / (NI2 ? NI2 : 1));
-              // the high vregs one low delivery consumes sit VR apart -- the same rule the converter's hi[VR*(V/VR)] uses
-              const int v2 = base + VR * (v / VR), j2 = int(HiCodeL{}(lt, v % VR, half));
+              // the high vreg and the code inside it, from the converter's own layouts
+              const int v2 = base + Cvt::hi_vreg(v), j2 = Cvt::hi_code(lt, v, half);
               if (v2 >= 4) continue;
               const int inst2 = (NI2 > 1) ? (ii % NI2) : 0;
               const int row2 = CTV2::base_row(w, inst2) + CTV2::cube_row(lane, v2),

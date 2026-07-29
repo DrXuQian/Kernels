@@ -226,6 +226,24 @@ static bool gate(const char* tag) {
                            : (bad_cute ? "DIFFERS <-- do not refactor yet" : "IDENTICAL -- safe to delete the arithmetic"));
   }
 
+  // (h) THE DESTINATION BASE AS A SLICE. `out + 4*NAPC*ii` was the last hand-multiplied stride in the B chain; the
+  // collective now slices tCrB_one's mode 1 at n-atom NAPC*ii and takes .data(). tCrB_one is make_fragment_like'd from
+  // one mma atom, so it is COMPACT -- mode1 stride == size<0> == 8 fp16 == 4 half2 -- and the slice must land on exactly
+  // the half2 the arithmetic did. Checked against a stub with tCrB_one's layout, the collective's own copy being
+  // device-only.
+  {
+    auto one_l = make_layout(make_shape(shape<0>(tCrB_mma.layout()), Int<8>{}),
+                             make_stride(stride<0>(tCrB_mma.layout()), Int<8>{}));
+    int bad_slice = 0;
+    for (int ii = 0; ii < CPY_N; ++ii) {
+      const int cute_off = int(one_l(make_coord(make_coord(0, 0, 0), NAPC * ii))) / 2;   // fp16 -> half2
+      if (cute_off != 4 * NAPC * ii) ++bad_slice;
+    }
+    printf("  %-32s destination base: cute slice vs 4*NAPC*ii over %d deliveries: %s\n", "", CPY_N,
+           bad_slice ? "DIFFERS <-- do not slice" : "identical");
+    if (bad_slice) ++bad_dest;
+  }
+
   printf("  %-32s MMA_N=%d MMA_K=%d CPY_N=%d CPY_K=%d KAPC=%d NAPC=%d kAtoms=%d S1=%d\n",
          tag, MMA_N, MMA_K, CPY_N, CPY_K, KAPC, NAPC, kAtoms, S1);
   printf("  %-32s Chunk formula %s | partition %s | rebase %s | dest vs unchunked %s\n", "",
