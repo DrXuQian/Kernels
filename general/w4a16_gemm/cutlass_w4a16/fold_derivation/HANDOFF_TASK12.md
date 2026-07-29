@@ -457,3 +457,39 @@ both Q6 and Q5**. A whole-output mismatch whose residual does not depend on the 
 Added 12 bench rows around the two winners, including the w*x32 family for Q6 -- its int2 high plane needs only
 WN >= 2048/TK = 32 and its int4 low plane WN >= 1024/TK = 16, so all of w*x32 is legal for Q6 and none of it was sampled.
 Q5's int1 high plane pins it to w*x64 at Block_K=64.
+
+## After (g)(h)(i)(j): both position chains are closed, and it cost nothing
+
+Box, gs=16, PPU_B_CHUNK=1. Q6/Q5 numerics: 9 configurations, all bad=0/32768. Perf, before -> after the whole
+cute-ification (g: pairing layouts shared, h: destination slice, i: descriptor extents off the tensor, j: scale/zero
+coordinates):
+
+| | before | after |
+|---|---|---|
+| Q3 = int2+int1 | 262.60 | 261.48 |
+| Q5 = int4+int1 | 268.13 | 267.97 |
+| Q6 = int4+int2 | 282.07 | 281.62 |
+| int2 (1 plane) | 248.08 | 248.02 |
+| int1 (1 plane) | 224.56 | 224.96 |
+| int4 (1 plane) | 228.13 | 227.35 |
+
+All inside noise, which is what an equivalence refactor should measure. gs=16 is the sharpest operating point for (j) --
+APG = gs/16 = 1 there, i.e. a scale reload at EVERY mma atom, so ScaleSplit and ScaleThrDupL are exercised as hard as
+they ever will be, and nothing moved.
+
+WHAT IS NOW CUTE, END TO END. B operand: MixGemmEmit -> ChunkPlace -> right_inverse(frag.layout()) -> partition_B ->
+CubeTV (partition_S + LogicalTV) -> HiPlaneSrc -> LoCodeL/HiCodeL/HVregL -> place_from_map's two destination layouts ->
+MixGemmMmaPermK. Scale/zero: the copy view's (group, stage) as coordinates, ScaleSplit for the divide/mod, ScaleThrDupL
+for the thread wrap. No rule is stated twice, no stride is hand-multiplied, and no multi-coordinate index is flattened
+and then recomputed.
+
+WHAT IS DELIBERATELY NOT CUTE, and should stay that way: the VALUE constants (mask/mul/add/bpos and the 0x64006400 base)
+describe what a code becomes, not where it goes; the capacity bounds (F = 32/contig, RPS, WN*TK*Bits >= 4096) are
+inequalities, not maps; AiuDesc is a hardware struct, and its inputs now come off the tensor.
+
+TASK #7 SHOULD BE CLOSED, NOT DONE. A write-side LogicalTV would be the identity on the cube: both AIU instructions carry
+.swzl and the two cancel, so the read atom's LogicalTV is already the map of write-then-read. Splitting that cancellation
+would mean inventing a factorisation neither instruction exposes. Recorded on the traits themselves.
+
+NOT SEEN: test_q3_bconcat_real's own output for this build. Q3 is the one format running real GGUF weights under a
+byte-identity requirement, so it is worth one explicit look.
