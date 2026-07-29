@@ -82,6 +82,12 @@ int main(int argc, char** argv) {
   std::printf("             total=%d Mmax=%d Mmin=%d zero-row experts=%d active=%d  PEAK=%.0f TFLOP/s\n",
               bd.total, bd.Mmax, mn, zeros, bd.active, PEAK / 1e12);
   std::printf("             MFU is on the REAL rows (2*total*N*K), so wasting rows cannot buy MFU.\n");
+  // A LOG THAT DOES NOT DESCRIBE ITS OWN RUN. MOE_ACU and MOE_ONLY are exported for an acu capture and then stay exported in
+  // the shell, so the next plain run silently measures ONE COLD LAUNCH of ONE row and reports it as the winner -- which came
+  // back as 1179.86 us for a config that had just measured 23.54, i.e. 18 GB/s, not a slow kernel but an untimed one. Say it
+  // in the banner, and refuse to call anything "fastest" when the numbers are single-shot.
+  if (moe_only())  std::printf("             MOE_ONLY='%s' -- every other row is SKIPPED\n", moe_only());
+  if (moe_acu())   std::printf("             *** MOE_ACU=1: ONE COLD LAUNCH per row, no warmup. These are NOT timings. ***\n");
   // The unit count is compiled in from the generator, so a silently shrunk enumeration shows up here rather than as a
   // quietly smaller sweep. Units whose shape is illegal (WarpM > TileM, or the delivery bound) compile to nothing and
   // print no rows, which is why this can exceed the number of sections that appear below.
@@ -137,7 +143,9 @@ int main(int argc, char** argv) {
     std::printf("            latency or transaction efficiency, not bandwidth. run=/kit= are the two TileK-controlled\n");
     std::printf("            candidates for it (AIU contiguous run in bytes; k-iteration count).\n");
   }
-  std::printf("\n  ================= VERDICT: best config per format =================\n");
+  std::printf("\n  ================= %s =================\n",
+              moe_acu() ? "MOE_ACU=1: single cold launches, NOT a ranking"
+                        : "VERDICT: best config per format");
   int ord[MOE_FMT_COUNT];
   for (int i = 0; i < MOE_FMT_COUNT; ++i) ord[i] = i;
   for (int i = 1; i < MOE_FMT_COUNT; ++i)                    // insertion sort: 5 entries, fastest first
@@ -147,7 +155,7 @@ int main(int argc, char** argv) {
     if (e.us > 1e17) { std::printf("  %-4s no legal row ran (filtered, or MOE_ONLY excluded it)\n", moe_fmt_names[ord[i]]); continue; }
     const double tf = 2.0 * double(bd.total) * double(bd.N) * double(bd.K) / (e.us * 1e-6) / 1e12;
     std::printf("  %-4s %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU)%s\n", moe_fmt_names[ord[i]], e.tag, e.us, tf,
-                100.0 * tf * 1e12 / PEAK, i == 0 ? "   <-- fastest" : "");
+                100.0 * tf * 1e12 / PEAK, (i == 0 && !moe_acu()) ? "   <-- fastest" : "");
   }
   std::printf("  HBM is the COMPULSORY traffic: padded A (mt*TM*K*2) + one read of each ACTIVE expert's weights and scales\n");
   std::printf("  + D. At decode mt == active, so B and S are EXACT, not bounds -- the traffic is LOCKED, and HBM%% is the\n");

@@ -43,7 +43,7 @@ static constexpr double HBM_GBS = 2766.0;
 // containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
 // the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
 // per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
-#define LOWBIT_MOE_BENCH_REV 9
+#define LOWBIT_MOE_BENCH_REV 11
 
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
@@ -226,11 +226,19 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
   const int  blk    = warps > 0 ? wcu / warps : 0;          // wcu comes from fold::warps_per_cu_chunked at the call site
   const long ctas   = mt * (long)ntile;
   const double waves = (blk > 0) ? double(ctas) / (72.0 * double(blk)) : 0.0;   // CU = 72, confirmed by acu wave arithmetic
+  // ACHIEVED occupancy is set by the GRID, not by the per-CU limits, and the identity says which knobs can move it:
+  //     grid warps = ctas * warps/blk = [mt * N/TN] * [(TM/WM)(TN/WN)] = mt * N * TM / (WM * WN)
+  // TileN and TileK CANCEL. At the decode winner that is 8*2048*16/(16*32) = 512 warps over 72 CUs = 7.1 warps/CU, and acu
+  // measured achieved 6.97 -- the identity closes. So the only levers are mt (fixed by the router), TM/WM, and WN; smem caps
+  // THEORETICAL occupancy (acu: 21.88%, Block Limit Shared Mem 7) while ACHIEVED (10.90%) is grid-limited, which is why
+  // shrinking the scale or zero tile raises a ceiling that is not being reached.
+  const double gwarps = double(mt) * double(bd.N) * double(TM) / (double(WM) * double(WN));
+  const double wcu_grid = gwarps / 72.0;
   std::printf("    %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU) | mt=%-5lld msk=%4.1f%% skw=%.1fx |"
-              " HBM %4.1f%% Ax%-2.0f S=%4.1f%% | blk %-2d wrp %-2d ifl %-3d cta=%-5ld wav=%4.2f run=%-3dB kit=%-3ld%s\n",
+              " HBM %4.1f%% S=%4.1f%% | blk %-2d wrp/CU %-3d grid_wrp/CU %5.1f cta=%-5ld wav=%4.2f run=%-3dB kit=%-3ld%s\n",
               tag, us, tf, 100.0 * tf * 1e12 / PEAK, mt, 100.0 * masked, skew,
-              100.0 * gbs / HBM_GBS, ntile, 100.0 * s_share,
-              blk, blk * warps, blk * Stages, ctas, waves, run_b, kit,
+              100.0 * gbs / HBM_GBS, 100.0 * s_share,
+              blk, blk * warps, wcu_grid, ctas, waves, run_b, kit,
               gbs_c < 0.9 * HBM_GBS ? "  NOT-BW" : "");
 }
 
@@ -362,7 +370,7 @@ constexpr bool moe_ok() {
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
             (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr, _b2.get()); };                           \
       double u; const int _f0 = moe_grouped_ppu::moeg_fail_count();                                                \
-      if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
+      if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE COLD launch (not a timing): %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
       if (moe_row_ran(BD, _t, u, _f0, (LOB)+(HIB))) { report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(LOB)+(HIB),32,true>);  upd(BEST, _t, u); } \
     }                                                                                                              \
@@ -402,7 +410,7 @@ constexpr bool moe_ok() {
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
             (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr); };                                      \
       double u; const int _f0 = moe_grouped_ppu::moeg_fail_count();                                                \
-      if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
+      if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE COLD launch (not a timing): %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
       if (moe_row_ran(BD, _t, u, _f0, (BITS))) { report(BD,_t,u,TMv,TNv,TKv,WMv,WNv,Sv,(BITS),fold::warps_per_cu_chunked<TMv,TNv,TKv,WMv,WNv,Sv,(BITS),32,true>);  upd(BEST, _t, u); } \
     }                                                                                                              \

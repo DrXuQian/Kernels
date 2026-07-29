@@ -237,8 +237,8 @@ set(_MOE_FORMATS
   "q3|1|uint2_t|uint1_t|2|1|64"
   "q5|1|int4_t|uint1_t|4|1|64"
   "q6|1|int4_t|uint2_t|4|2|32,64"
-  "i2|0|uint2_t|half_t|2|0|32,64"
-  "i4|0|int4_t|half_t|4|0|32,64"
+  "i2|0|uint2_t|half_t|2|0|16,32,64"
+  "i4|0|int4_t|half_t|4|0|16,32,64"
 )
 # 16 IS THE HARDWARE FLOOR, and it was missing. Every MMA atom in cute/atom/mma_traits_ppu0015.hpp has M = 16
 # (Shape_MNK = Shape<_16,...>, all eight of them), so TileM must be a multiple of 16 and TileM=8 is not reachable with these
@@ -292,7 +292,14 @@ foreach(_ax TM TN WM)
 endforeach()
 # 32 is here for DECODE. At batch 1 the grid is 8 m-tiles x (N/TN), so TileN is the only knob that adds CTAs, and the decode
 # measurement says the band is latency/occupancy-bound rather than bandwidth-bound. It self-filters where WarpN > TileN.
-set(_MOE_TN_LIST 32 64 128)
+# 16 IS HERE BECAUSE acu SAID THE GRID CANNOT FILL THE MACHINE. At the decode winner (i4 16x64:256 w16x32 s2) acu reports
+# theoretical occupancy 21.88% limited by SHARED MEMORY (Block Limit Shared Mem = 7, registers would allow 12) and achieved
+# occupancy 10.90% -- exactly half -- because the grid is mt*(N/TN) = 8*32 = 256 CTAs against a capacity of 72*7 = 504.
+# TileN fixes BOTH layers at once: it shrinks smem/block (so blocks/CU rises) and multiplies the CTA count.
+#   TN=64  36 KB/blk  7 blk/CU   256 CTAs   51% of capacity   <- the current winner
+#   TN=32  26 KB/blk  9 blk/CU   512 CTAs   79%
+#   TN=16  21 KB/blk  12 blk/CU  1024 CTAs  full (and register-limited from here)
+set(_MOE_TN_LIST 16 32 64 128)
 # WarpM=16 comes with it (TileM=16 admits no other), and is offered at every TileM rather than only at 16: cvt/mma = 128/WM
 # is 8 there, which the skill records as a ~13-point cliff on PREFILL -- but decode runs at 0.4% MFU where the converter is
 # not the bottleneck, so that cost is a prediction to test, not a reason to exclude the axis.
