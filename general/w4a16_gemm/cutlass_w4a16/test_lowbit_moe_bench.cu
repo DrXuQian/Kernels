@@ -112,12 +112,25 @@ int main(int argc, char** argv) {
   bd.rdev = rdev.get(); bd.pd = pd.get(); bd.sd = sd.get(); bd.gm = gm.get(); bd.offdev = offdev.get();
   bd.ws = ws.get(); bd.wsb = wsb;
 
-  Best b2p{"",1e18}, b1p{"",1e18};
-  moe_run_all(bd, b2p, b1p);
+  // ONE BEST PER NUMERIC PRECISION, not per implementation family. "two-plane best" groups Q3/Q5/Q6 together and
+  // "single-plane" groups i2/i4 -- a split by how the kernel is built, not by anything a caller picks, and it hid i4's
+  // own best entirely once i2 started winning the shared slot.
+  Best b[MOE_FMT_COUNT];
+  for (int i = 0; i < MOE_FMT_COUNT; ++i) { b[i].tag[0] = '\0'; b[i].us = 1e18; }
+  moe_run_all(bd, b);
 
-  std::printf("\n  ================= VERDICT =================\n");
-  std::printf("  two-plane best : %-34s %8.2f us\n", b2p.tag, b2p.us);
-  std::printf("  single-plane   : %-34s %8.2f us\n", b1p.tag, b1p.us);
+  std::printf("\n  ================= VERDICT: best config per format =================\n");
+  int ord[MOE_FMT_COUNT];
+  for (int i = 0; i < MOE_FMT_COUNT; ++i) ord[i] = i;
+  for (int i = 1; i < MOE_FMT_COUNT; ++i)                    // insertion sort: 5 entries, fastest first
+    for (int j = i; j > 0 && b[ord[j]].us < b[ord[j-1]].us; --j) { const int t = ord[j]; ord[j] = ord[j-1]; ord[j-1] = t; }
+  for (int i = 0; i < MOE_FMT_COUNT; ++i) {
+    const Best& e = b[ord[i]];
+    if (e.us > 1e17) { std::printf("  %-4s no legal row ran (filtered, or MOE_ONLY excluded it)\n", moe_fmt_names[ord[i]]); continue; }
+    const double tf = 2.0 * double(bd.total) * double(bd.N) * double(bd.K) / (e.us * 1e-6) / 1e12;
+    std::printf("  %-4s %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU)%s\n", moe_fmt_names[ord[i]], e.tag, e.us, tf,
+                100.0 * tf * 1e12 / PEAK, i == 0 ? "   <-- fastest" : "");
+  }
   std::printf("  floor %%HBM is the COMPULSORY lower bound -- every byte crossing the bus at least once -- so it is\n");
   std::printf("  conclusive in ONE direction: low means NOT bandwidth-bound however much re-reading happens. noreuse is\n");
   std::printf("  ceil/floor, i.e. how much reuse the L2 must be supplying; it is a ratio, not a percentage, because the\n");

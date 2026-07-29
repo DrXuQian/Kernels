@@ -181,6 +181,12 @@ constexpr bool moe_ok() {
   constexpr int bmin = BitsHi ? (BitsLo < BitsHi ? BitsLo : BitsHi) : BitsLo;
   return WM <= TM && WN <= TN && TM % WM == 0 && TN % WN == 0
       && (TM / WM) * (TN / WN) <= 32                                   // <= 1024 threads per block
+      // ACCUMULATOR REGISTERS. The fp32 C fragment is WM*WN elements over 32 lanes, so WM*WN/32 registers per thread
+      // against a hard ceiling of 256 (see the occupancy notes for CC 8.0). w64x128 hits exactly 256 -- the accumulator
+      // alone would consume the entire budget -- so it must be REJECTED here rather than left to fail deep in the
+      // collective. This matters the moment TileK shrinks: at TK=32 an int1 plane needs WN >= 4096/32 = 128, which is
+      // precisely that dead config, so the bound is what makes "int1 cannot reach TK=32" a filter instead of a build break.
+      && (WM * WN) / 32 <= 192
       && (long long)WN * TK * bmin >= 4096                             // swzl delivery <= fragment slots, per plane
       && ((long long)TM * TK * 2 + (long long)TN * TK * bits_total / 8) * Stages <= 262144;
 }

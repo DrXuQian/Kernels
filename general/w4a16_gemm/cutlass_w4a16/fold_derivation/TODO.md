@@ -71,6 +71,38 @@ separately for the TileK half. The `%HBM` column that printed 116-181% was an up
 n-tile column re-reads all of A from DRAM; it is a compulsory FLOOR plus a `noreuse Nx` ratio now, and needs one
 confirming run.
 
+**TileK=32 is reachable for i4/i2/q6, and the code's comment saying otherwise was wrong.** `moe_grouped_ppu.cuh` carried
+"TK=32 still won't compile (AIU needs TK>=64)" for a long time; the three folded configurations the delivery bound allows
+build with zero errors through the front end that DOES fire the collective's static_asserts. The claim looked plausible
+because **B's smem K-extent is `FoldF*TK`, not `TK`**: at TK=32 int2 folds by 4, so the run is 128 elements and the >=64
+requirement lands on the folded extent.
+
+This is the axis worth trying next, and the reason is the sweep's own verdict: nothing is bandwidth-bound (floor 5-29%),
+so the lever is occupancy, and occupancy is driven by **A-smem = TM*TK*2** -- 4 KB/stage at (TM=64, TK=32) against 8 KB at
+TK=64. It is also exactly the mechanism by which foldN paid off on dense for int1 and int2: the fold is what makes a small
+TileK legal for B at all.
+
+Row counts, from the predicate (both the python mirror and a static_assert probe agree):
+
+| | rows | q3 | q5 | q6 | i2 | i4 |
+|---|---|---|---|---|---|---|
+| MOE_TK=32 | 168 | 0 | 0 | 42 | 42 | 84 |
+| MOE_TK=64 | 336 | 42 | 42 | 84 | 84 | 84 |
+| MOE_TK=128 | 304 | 38 | 38 | 76 | 76 | 76 |
+
+q3/q5 self-filter to zero at TK=32 rather than breaking the build: their int1 plane needs `WN >= 4096/32 = 128`, and
+w64x128's accumulator alone wants `WM*WN/32 = 256` registers per thread against a 256 ceiling. `moe_ok` now carries that
+register bound (`WM*WN/32 <= 192`) so the dead config is a filter, not a compile error.
+
+**foldN's coefficient is threaded but is NOT an axis.** The offline uses `fold::FoldTraits::F` and the kernel derives
+`MOEG_FOLD` / `P2_FOLD` from the same closed form (verified equivalent: the kernel's
+`P2_CONTIG = MOEG_RUN_B*P2_BITS/MOEG_BITS == TK*hi_bits/8`), so offline and kernel cannot disagree -- but `filter_and_run`
+takes no `FoldF` parameter, so F is always its MINIMUM legal value and `F > F_min` has never been tried. It is a free
+knob in the two quantities that usually bind: `b_smem = Ng*(F*TK*bits/8)` with `Ng = TN/F` is `TN*TK*bits/8`, INDEPENDENT
+of F; and the delivery bound `WN*TK*bits >= 4096` does not contain F either. Opening it needs a template parameter on
+`filter_and_run` plus relaxing `fold_traits.hpp`'s `contig_bytes*F == 32` to `>= 32`. Decide after the TK=32/128 halves,
+which already move F as a side effect.
+
 ## Retracted
 
 **"Q3 is 20.7% slower than Q5 in MoE and 27% on dense, and it is the only format whose LOW plane also folds (F1=2) --

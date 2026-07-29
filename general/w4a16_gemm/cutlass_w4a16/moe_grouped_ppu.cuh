@@ -242,7 +242,15 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
   //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K
   //   (e.g. gs=32) now works -- the old "gs>=64 / SK<=2" limit is gone. gs=32/TK=64 (SK=2) validated vs the
-  //   dequant golden; larger SK is structurally supported. TK=32 still won't compile (AIU needs TK>=64).
+  //   dequant golden; larger SK is structurally supported.
+  //   TK=32 DOES compile, contrary to what this comment claimed for a long time. Verified by building the folded
+  //   configurations that the delivery bound allows -- i4 (64,128,32) w64x32, i2 (64,128,32) w64x64 and q6 (64,128,32)
+  //   w64x64 -- all with zero errors through the front end that DOES fire the collective's static_asserts (an
+  //   over-delivering row trips fold_traits.hpp, and WarpM > TileM trips gemm_operands.hpp). The reason the old claim
+  //   looked plausible is that B's smem K-extent is FoldF*TK, not TK: at TK=32 int2 folds by 4, giving a 128-element run,
+  //   so the >=64 requirement lands on the FOLDED extent and is satisfied. Formats with an int1 plane still cannot reach
+  //   TK=32, but the reason is the delivery bound needing WarpN>=128 and that config's accumulator alone wanting 256
+  //   registers per thread -- not this.
   #define MOEG_FG(SCH, SK) do { \
       if constexpr ((SK) <= (TK/16)) { if (il) MOEG_CALL(SCH, cute::Int<SK>, true); else MOEG_CALL(SCH, cute::Int<SK>, false); } \
       else std::printf("[moe_grouped] gs=%d + TK=%d -> SK=%d > TK/16=%d UNSUPPORTED (gs<16); use dequant->bf16\n", group_size, TK, (SK), TK/16); \

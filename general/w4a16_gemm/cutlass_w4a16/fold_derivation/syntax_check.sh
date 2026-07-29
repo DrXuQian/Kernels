@@ -47,13 +47,22 @@ for f in $FILES; do
   #   -DPPU_FORCE_INSTANTIATE  odr-uses device_kernel<GemmKernel>, which pulls in the whole mainloop
   # Verified: with these, a static_assert planted in the 2-plane mainloop fires 32 times; without them, 0.
   #
-  # Two signatures are dropped as ENVIRONMENTAL, not filtered by pattern-guessing: cute::_ and cute::product report
+  # THREE ERROR FORMS, READ OFF THE ACTUAL OUTPUT. The pattern was `: error`, so a source that could not even find its
+# headers was reported CLEAN -- which happened to test_lowbit_moe_bench.cu the moment it started including a GENERATED
+# file that is not on this gate's -I. The forms are:
+#   path(line): error: ...                     EDG, the normal one
+#   path(line): catastrophic error: ...        EDG, cannot open source file
+#   path:line:col: fatal error: ...            the PREPROCESSOR, gcc-style -- this is the one a missing include gives
+# I fixed this once by adding `catastrophic error` from memory and it still passed, because the actual line was the
+# third form. All three share `: <kind>: `, so that is what is matched.
+#
+# Two signatures are dropped as ENVIRONMENTAL, not filtered by pattern-guessing: cute::_ and cute::product report
   # "undefined in device code" because CUTE_INLINE_CONSTANT resolves to `static constexpr` here while the box takes
   # the `static const __device__` branch. They cannot mask a real error -- a real one has a different message.
   sig=$(nvcc -std=c++17 -arch=sm_80 --expt-relaxed-constexpr -D__HGGCCC__ -DPPU_FORCE_INSTANTIATE=1 $EXTRA_DEFS \
         -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
         -cuda -o /dev/null -x cu "$f" -Wno-deprecated-gpu-targets 2>&1 \
-        | grep ": error" | grep -v 'identifier "cute::_" is undefined in device code' \
+        | grep -E ": (error|fatal error|catastrophic error):" | grep -v 'identifier "cute::_" is undefined in device code' \
                          | grep -v 'identifier "cute::product" is undefined in device code' \
         | sed -E 's#^.*/([^/]+)#\1#; s#\(([0-9]+)\)#()#' | sort | uniq -c \
         | sed -E 's/^ +//' | sort)
