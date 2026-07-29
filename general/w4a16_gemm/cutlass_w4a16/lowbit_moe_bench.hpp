@@ -42,7 +42,7 @@ static constexpr double HBM_GBS = 2766.0;
 // containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
 // the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
 // per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
-#define LOWBIT_MOE_BENCH_REV 4
+#define LOWBIT_MOE_BENCH_REV 5
 
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
@@ -159,7 +159,23 @@ template <int Bits> constexpr int moe_fold(int TK) { const int c = TK * Bits / 8
 //     bandwidth-bound" is false, because the lower bound being small does not bound the actual from above.
 // Both ends are printed now. And the strongest argument needs neither: if two configs of the same format differ by 1.4-2.8x
 // in ceiling traffic and land within 0.4-6% in TIME, traffic is not the limiter -- that is what the decode run showed.
-inline void report(const Band& bd, const char* tag, double us, int TM, int TN, int bits_total) {
+// OCCUPANCY IS PRINTED, not inferred. The decode measurement showed 256 CTAs and 128 CTAs of the same format landing within
+// 0.4% of each other -- both fit in one wave, so the time is ONE CTA's K-loop latency and adding CTAs cannot touch it. What
+// can is the number of tile loads in flight, which per CTA is exactly `Stages`, and per CU is `blocks/CU * Stages`. That
+// quantity was never on screen, so the hypothesis could only be argued.
+//
+// `blk<=` is an UPPER BOUND: it accounts for smem and the 64-warps/CU limit only. Registers also cap it and this cannot know
+// the compiler's allocation, so the real occupancy comes from acu. Labelled `<=` so it cannot be quoted as measured.
+//
+// AND `ifl` IS INVARIANT IN Stages WHENEVER smem BINDS, which it does at every decode shape here (blk_smem 19 < blk_warp 32
+// for i4 (32,64,32) w32x32). Since blk = 256KB / (smem_per_stage * Stages), the product blk*Stages collapses to
+// 256KB / smem_per_stage: i4 (32,64,32) gives ifl 76 at s4 and 72 at s12 -- deepening the pipeline does not add in-flight
+// loads, it CONCENTRATES the same total into fewer CTAs and costs warps. So "more stages" and "more occupancy" pull opposite
+// ways here, and the lever that actually raises the total is SHRINKING smem per stage: TileN=32 halves both the B and the
+// scale term (3328 -> 2688 B, ifl <= 97). Dropping the zero tile (#20 Phase 1) is only 128 B of 3328, i.e. 3.8%.
+// Which of depth-vs-width wins at a fixed total is exactly what the sweep is for.
+inline void report(const Band& bd, const char* tag, double us, int TM, int TN, int TK, int WM, int WN, int Stages,
+                   int bits_total) {
   long long mt = 0, mt_max = 0;
   for (int e = 0; e < bd.L; ++e) {
     const long long t = (bd.me[e] + TM - 1) / TM; mt += t; mt_max = std::max(mt_max, t);
@@ -183,11 +199,18 @@ inline void report(const Band& bd, const char* tag, double us, int TM, int TN, i
   // and S and this share is a tight number rather than a bound.
   const double s_share = dfl > 0 ? double(bd.active) * sb / dfl : 0.0;
   const double gbs_c = dce / (us * 1e-6) / 1e9;
+  const int  warps  = (TM / WM) * (TN / WN);
+  const int  sk     = (TK + bd.gs - 1) / bd.gs;                       // scale groups per K-tile
+  const long smem_s = (long)TM*TK*2 + (long)TN*TK*bits_total/8 + (long)TN*sk*2*2;   // A + B(all planes) + scale&zero
+  const long smem_b = smem_s * Stages;
+  const int  blk    = std::min(int(262144 / (smem_b > 0 ? smem_b : 1)), 64 / (warps > 0 ? warps : 1));
+  const long ctas   = mt * (long)std::ceil(double(bd.N) / double(TN));
   std::printf("    %-30s %8.2f us | %6.1f TF/s (%4.1f%% MFU) | mt=%-5lld msk=%4.1f%% skw=%.1fx |"
-              " HBM %4.1f%%..%5.1f%% (floor %5.0f MB x%.1f) S=%4.1f%%%s\n",
+              " HBM %4.1f%%..%5.1f%% S=%4.1f%% | smem %3ldK blk<=%-2d wrp<=%-2d ifl<=%-3d cta=%-5ld%s\n",
               tag, us, tf, 100.0 * tf * 1e12 / PEAK, mt, 100.0 * masked, skew,
-              100.0 * gbs / HBM_GBS, 100.0 * gbs_c / HBM_GBS, dfl / 1e6, dfl > 0 ? dce / dfl : 0.0,
-              100.0 * s_share, gbs_c < 0.9 * HBM_GBS ? "  NOT-BW" : "");
+              100.0 * gbs / HBM_GBS, 100.0 * gbs_c / HBM_GBS, 100.0 * s_share,
+              smem_b / 1024, blk, blk * warps, blk * Stages, ctas,
+              gbs_c < 0.9 * HBM_GBS ? "  NOT-BW" : "");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -225,7 +248,12 @@ constexpr bool moe_ok() {
 // winner at s3 and int2's IDENTICAL shape at s2 -- so `i4 382.76 vs i2 420.83` was not a format comparison, it was s3
 // vs s2. On dense the same tile moved 1.46x between s2 and s3. 4 is included because it is the toolchain's default
 // and therefore the value someone gets by accident.
-#define MOE_STAGE_LIST(F, ...)  F(__VA_ARGS__, 2)  F(__VA_ARGS__, 3)  F(__VA_ARGS__, 4)
+// DEEPER THAN 4, because `Stages` IS the per-CTA count of tile loads in flight and the decode band is latency-bound with a
+// tiny tile: i4 (32,64,32) is ~3.25 KB/stage, so s16 costs 52 KB of the 256 KB budget. The collective caps nothing above
+// `Stages >= 2`; smem does, and moe_ok's smem predicate filters the rest, so these cost nothing on the prefill shapes where
+// A-smem is 8-32 KB/stage and they simply do not fit.
+#define MOE_STAGE_LIST(F, ...)  F(__VA_ARGS__, 2)  F(__VA_ARGS__, 3)  F(__VA_ARGS__, 4)  \
+                                F(__VA_ARGS__, 6)  F(__VA_ARGS__, 8)  F(__VA_ARGS__, 12)
 
 // ---- two-plane: pack ONCE per shape, then time every stage count against the same device buffer.
 //
@@ -244,7 +272,7 @@ constexpr bool moe_ok() {
       double u;                                                                                                    \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
-      report(BD, _t, u, TMv, TNv, (LOB)+(HIB));  upd(BEST, _t, u);                                                 \
+      report(BD, _t, u, TMv, TNv, TKv, WMv, WNv, Sv, (LOB)+(HIB));  upd(BEST, _t, u);                                                 \
     }                                                                                                              \
   }
 
@@ -284,7 +312,7 @@ constexpr bool moe_ok() {
       double u;                                                                                                    \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE launch: %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
-      report(BD, _t, u, TMv, TNv, (BITS));  upd(BEST, _t, u);                                                      \
+      report(BD, _t, u, TMv, TNv, TKv, WMv, WNv, Sv, (BITS));  upd(BEST, _t, u);                                                      \
     }                                                                                                              \
   }
 
