@@ -30,7 +30,7 @@ mkdir -p "$OUT"
   awk '/^set\(_MOE_FORMATS/{p=1} /^ppu_w4a16_executable\(/{if(p)exit} p' "$CML" \
     | { if [ -n "${BAD:-}" ]; then sed 's/4|2|32,64/4|2|32;64/'; else cat; fi; }
   cat <<'ASSERT'
-# DERIVE the expected count from the same lists the slice defines -- writing 128 in here went stale the moment TileN gained
+# DERIVE every expectation from the same lists the slice defines -- writing 128 in here went stale the moment TileN gained
 # a third value, and a gate whose expected value is hand-maintained fails for the wrong reason.
 list(LENGTH _MOE_TM_LIST _ntm)
 list(LENGTH _MOE_TN_LIST _ntn)
@@ -55,11 +55,14 @@ endif()
 if(NOT _ngen EQUAL _MOE_UNIT_N)
   message(FATAL_ERROR "generator listed ${_MOE_UNIT_N} sources but ${_ngen} are on disk")
 endif()
+# DERIVED, like the total. This said 8 (4 TileM x 2 WarpM) and went stale the moment TileM gained 16 and WarpM gained 16 --
+# the same hand-maintained-expectation failure the total count already had, one check further down.
+math(EXPR _per_slice "${_ntm} * ${_nwm}")
 foreach(_pat q6_tn64_wn32 q6_tn64_wn64 i4_tn128_wn64 i2_tn64_wn32)
   file(GLOB _hit "${_MOE_GEN_DIR}/moe_unit_${_pat}_*.cu")
   list(LENGTH _hit _nh)
-  if(NOT _nh EQUAL 8)
-    message(FATAL_ERROR "moe_unit_${_pat}_* : expected 8 (TileM x WarpM), got ${_nh}")
+  if(NOT _nh EQUAL _per_slice)
+    message(FATAL_ERROR "moe_unit_${_pat}_* : expected ${_per_slice} (TileM x WarpM), got ${_nh}")
   endif()
 endforeach()
 file(GLOB _stray "${_MOE_GEN_DIR}/moe_unit_64_*.cu")

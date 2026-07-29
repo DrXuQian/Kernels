@@ -7,11 +7,23 @@ set(_MOE_FORMATS
   "i2|0|uint2_t|half_t|2|0|32,64"
   "i4|0|int4_t|half_t|4|0|32,64"
 )
-set(_MOE_TM_LIST 32 64 128 256)
+# 16 IS THE HARDWARE FLOOR, and it was missing. Every MMA atom in cute/atom/mma_traits_ppu0015.hpp has M = 16
+# (Shape_MNK = Shape<_16,...>, all eight of them), so TileM must be a multiple of 16 and TileM=8 is not reachable with these
+# instructions -- the FA path's ppu.mma.m8n16 is raw asm in a different kernel family, not a cute atom here. TileM=16 IS
+# reachable and this project has run it (the Q3 B-concat sweep used 16x32 warps at TM=16, which fold_traits.hpp still notes),
+# but the list started at 32 so the whole row was absent from every sweep.
+#
+# At decode it is the largest smem term: A = TM*TK*2 is 2048 of 3328 B/stage at (32,64,32), so TM=16 takes ifl from 78 to 113
+# and TM=16 with TileN=32 to 157 -- roughly 2x the in-flight loads -- while the CTA count does NOT change, because at one row
+# per expert mt = ceil(1/TM) = 1 whatever TileM is.
+set(_MOE_TM_LIST 16 32 64 128 256)
 # 32 is here for DECODE. At batch 1 the grid is 8 m-tiles x (N/TN), so TileN is the only knob that adds CTAs, and the decode
 # measurement says the band is latency/occupancy-bound rather than bandwidth-bound. It self-filters where WarpN > TileN.
 set(_MOE_TN_LIST 32 64 128)
-set(_MOE_WM_LIST 32 64)
+# WarpM=16 comes with it (TileM=16 admits no other), and is offered at every TileM rather than only at 16: cvt/mma = 128/WM
+# is 8 there, which the skill records as a ~13-point cliff on PREFILL -- but decode runs at 0.4% MFU where the converter is
+# not the bottleneck, so that cost is a prediction to test, not a reason to exclude the axis.
+set(_MOE_WM_LIST 16 32 64)
 
 set(_MOE_UNIT_SRCS "")
 set(_MOE_LAST_NM "")
@@ -104,7 +116,7 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different
 # never see target properties (the same reason PPU_DEFS has to be forwarded twice). The generated units find the .inc via
 # the custom command's own -I<source dir of the file>, but test_lowbit_moe_bench.cu lives in the source tree and would
 # not find moe_bench_units.inc in the binary tree without this.
-# DERIVE the expected count from the same lists the slice defines -- writing 128 in here went stale the moment TileN gained
+# DERIVE every expectation from the same lists the slice defines -- writing 128 in here went stale the moment TileN gained
 # a third value, and a gate whose expected value is hand-maintained fails for the wrong reason.
 list(LENGTH _MOE_TM_LIST _ntm)
 list(LENGTH _MOE_TN_LIST _ntn)
@@ -129,11 +141,14 @@ endif()
 if(NOT _ngen EQUAL _MOE_UNIT_N)
   message(FATAL_ERROR "generator listed ${_MOE_UNIT_N} sources but ${_ngen} are on disk")
 endif()
+# DERIVED, like the total. This said 8 (4 TileM x 2 WarpM) and went stale the moment TileM gained 16 and WarpM gained 16 --
+# the same hand-maintained-expectation failure the total count already had, one check further down.
+math(EXPR _per_slice "${_ntm} * ${_nwm}")
 foreach(_pat q6_tn64_wn32 q6_tn64_wn64 i4_tn128_wn64 i2_tn64_wn32)
   file(GLOB _hit "${_MOE_GEN_DIR}/moe_unit_${_pat}_*.cu")
   list(LENGTH _hit _nh)
-  if(NOT _nh EQUAL 8)
-    message(FATAL_ERROR "moe_unit_${_pat}_* : expected 8 (TileM x WarpM), got ${_nh}")
+  if(NOT _nh EQUAL _per_slice)
+    message(FATAL_ERROR "moe_unit_${_pat}_* : expected ${_per_slice} (TileM x WarpM), got ${_nh}")
   endif()
 endforeach()
 file(GLOB _stray "${_MOE_GEN_DIR}/moe_unit_64_*.cu")
@@ -156,4 +171,4 @@ foreach(_need "MOE_UNIT_COUNT ${_exp}" "MOE_FMT_COUNT ${_nfmt}" "moe_fmt_names")
     message(FATAL_ERROR "dispatcher is missing '${_need}' -- main will not compile against it")
   endif()
 endforeach()
-message(STATUS "OK: 128 units, both WarpN for q6/i2/i4, no stray-format units, dispatcher 128/128 with 5 format slots")
+message(STATUS "OK: ${_exp} units, both WarpN for q6/i2/i4, no stray-format units, dispatcher ${_exp}/${_exp} with ${_nfmt} format slots")

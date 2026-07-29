@@ -240,11 +240,23 @@ set(_MOE_FORMATS
   "i2|0|uint2_t|half_t|2|0|32,64"
   "i4|0|int4_t|half_t|4|0|32,64"
 )
-set(_MOE_TM_LIST 32 64 128 256)
+# 16 IS THE HARDWARE FLOOR, and it was missing. Every MMA atom in cute/atom/mma_traits_ppu0015.hpp has M = 16
+# (Shape_MNK = Shape<_16,...>, all eight of them), so TileM must be a multiple of 16 and TileM=8 is not reachable with these
+# instructions -- the FA path's ppu.mma.m8n16 is raw asm in a different kernel family, not a cute atom here. TileM=16 IS
+# reachable and this project has run it (the Q3 B-concat sweep used 16x32 warps at TM=16, which fold_traits.hpp still notes),
+# but the list started at 32 so the whole row was absent from every sweep.
+#
+# At decode it is the largest smem term: A = TM*TK*2 is 2048 of 3328 B/stage at (32,64,32), so TM=16 takes ifl from 78 to 113
+# and TM=16 with TileN=32 to 157 -- roughly 2x the in-flight loads -- while the CTA count does NOT change, because at one row
+# per expert mt = ceil(1/TM) = 1 whatever TileM is.
+set(_MOE_TM_LIST 16 32 64 128 256)
 # 32 is here for DECODE. At batch 1 the grid is 8 m-tiles x (N/TN), so TileN is the only knob that adds CTAs, and the decode
 # measurement says the band is latency/occupancy-bound rather than bandwidth-bound. It self-filters where WarpN > TileN.
 set(_MOE_TN_LIST 32 64 128)
-set(_MOE_WM_LIST 32 64)
+# WarpM=16 comes with it (TileM=16 admits no other), and is offered at every TileM rather than only at 16: cvt/mma = 128/WM
+# is 8 there, which the skill records as a ~13-point cliff on PREFILL -- but decode runs at 0.4% MFU where the converter is
+# not the bottleneck, so that cost is a prediction to test, not a reason to exclude the axis.
+set(_MOE_WM_LIST 16 32 64)
 
 set(_MOE_UNIT_SRCS "")
 set(_MOE_LAST_NM "")
