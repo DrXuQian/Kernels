@@ -45,10 +45,34 @@ echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
 # nullglob so patterns that match nothing (e.g. no *.cpp right now) vanish instead of aborting under set -e.
+# *.inc is in the list because the MoE sweep's generated units all #include moe_bench_unit.inc, and this glob is an
+# EXTENSION WHITELIST: leaving it out did not fail here, it failed 100+ lines into hgcc as
+# `fatal error: moe_bench_unit.inc: No such file or directory` repeated once per generated unit.
 shopt -s nullglob
-_overlay_files=("$HERE"/*.cu "$HERE"/*.cpp "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*.h "$HERE/CMakeLists.txt")
+_overlay_files=("$HERE"/*.cu "$HERE"/*.cpp "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*.h "$HERE"/*.inc "$HERE/CMakeLists.txt")
 shopt -u nullglob
 cp "${_overlay_files[@]}" "$EX_DIR/"
+
+# ...and then ASSERT THE WHITELIST IS COMPLETE, by inverting it. The first version of this check scanned the #includes of
+# the overlaid files -- which could not have caught the bug it was written for: the file that includes moe_bench_unit.inc
+# is a GENERATED unit, created by cmake later, in the build tree. It only fired in my test because the test seeded a probe.
+#
+# So instead: every regular file HERE must either reach the overlay or have an extension on the ignore list. A new .def or
+# .tpp then fails HERE, in one line, instead of 100+ lines into a parallel hgcc build once per unit.
+_ignored='sh|md|py|log|bin|json|patch|pyc'
+_missing=""
+for _f in "$HERE"/*; do
+  [ -f "$_f" ] || continue                                   # directories (fold_derivation, real_weight, ...) are not overlaid
+  _b="$(basename "$_f")"
+  [ "$_b" = "CMakeLists.txt" ] && continue
+  echo "$_b" | grep -qE "\.($_ignored)\$" && continue
+  [ -f "$EX_DIR/$_b" ] || _missing="$_missing $_b"
+done
+if [ -n "$_missing" ]; then
+  echo "  ERROR: the overlay is an extension whitelist and it dropped:$_missing"
+  echo "         add the extension to _overlay_files above, or to _ignored if it is genuinely not needed to build."
+  exit 1
+fi
 
 # register it in the foreach list (idempotent: only if absent)
 if ! grep -q "$EX_NAME" "$EX_LIST"; then
