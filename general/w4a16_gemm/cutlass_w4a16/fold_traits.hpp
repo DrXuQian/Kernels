@@ -208,13 +208,21 @@ inline constexpr int regs_billed_measured =
 template <int TM, int TN, int TK, int WM, int WN, int Stages, int Bits, int Gs = 32, bool Zero = false>
 inline constexpr int warps_per_cu = [] {
   constexpr int warps = (TM / WM) * (TN / WN);
+  // TOTAL FOR DEGENERATE SHAPES, and that is not defensive dressing. WM > TM or WN > TN makes `warps` zero and
+  // the divisions below ill-formed -- and a caller cannot protect this by putting the use inside
+  // `if constexpr (legal)`: naming a constexpr VARIABLE TEMPLATE as an argument instantiates it even in a
+  // discarded branch. The MoE bench did exactly that and the box build died on
+  // `warps_per_cu_chunked<128,32,256,32,64,...>` with "division by zero", for a config moe_ok rejects. Third time
+  // in this work that a template named in a discarded statement was instantiated anyway, so the rule is: make the
+  // template TOTAL, do not rely on the guard. 0 warps is the honest answer for a shape with no legal warp tiling.
+  if constexpr (warps < 1) { return 0; } else {
   constexpr int smem  = (TM * TK * 2 + TN * TK * Bits / 8 + TN * (TK / Gs) * 2 * (Zero ? 2 : 1)) * Stages;
   constexpr int blk_s = 262144 / smem;
   constexpr int blk_w = 64 / warps;
   constexpr int blk_r = regs_per_cu
                       / (regs_billed<regs_per_thread<TM, TN, TK, WM, WN, Zero>> * warps * 32);
   constexpr int blk   = blk_s < blk_w ? (blk_s < blk_r ? blk_s : blk_r) : (blk_w < blk_r ? blk_w : blk_r);
-  return blk * warps;
+  return blk * warps; }
 }();
 // CHUNK-AWARE variant. The B fragment holds ONE k-atom instead of MMA_K of them, so its term is 4*MMA_N = WN/4
 // instead of WN*TK/64. Added because the sweep printed the UNCHUNKED model in a chunked build -- regs=260/bill=512 next
@@ -228,12 +236,20 @@ inline constexpr int regs_per_thread_chunked = WM * WN / 32          // accumula
 template <int TM, int TN, int TK, int WM, int WN, int Stages, int Bits, int Gs = 32, bool Zero = false>
 inline constexpr int warps_per_cu_chunked = [] {
   constexpr int warps = (TM / WM) * (TN / WN);
+  // TOTAL FOR DEGENERATE SHAPES, and that is not defensive dressing. WM > TM or WN > TN makes `warps` zero and
+  // the divisions below ill-formed -- and a caller cannot protect this by putting the use inside
+  // `if constexpr (legal)`: naming a constexpr VARIABLE TEMPLATE as an argument instantiates it even in a
+  // discarded branch. The MoE bench did exactly that and the box build died on
+  // `warps_per_cu_chunked<128,32,256,32,64,...>` with "division by zero", for a config moe_ok rejects. Third time
+  // in this work that a template named in a discarded statement was instantiated anyway, so the rule is: make the
+  // template TOTAL, do not rely on the guard. 0 warps is the honest answer for a shape with no legal warp tiling.
+  if constexpr (warps < 1) { return 0; } else {
   constexpr int smem  = (TM * TK * 2 + TN * TK * Bits / 8 + TN * (TK / Gs) * 2 * (Zero ? 2 : 1)) * Stages;
   constexpr int blk_r = regs_per_cu
       / (regs_billed<regs_per_thread_chunked<TM, TN, TK, WM, WN, Zero> + regs_measured_offset> * warps * 32);
   constexpr int blk_s = 262144 / smem, blk_w = 64 / warps;
   constexpr int blk   = blk_s < blk_w ? (blk_s < blk_r ? blk_s : blk_r) : (blk_w < blk_r ? blk_w : blk_r);
-  return blk * warps;
+  return blk * warps; }
 }();
 
 // THE MODEL, and it took three tries to get here because each earlier attempt varied only ONE of two independent
