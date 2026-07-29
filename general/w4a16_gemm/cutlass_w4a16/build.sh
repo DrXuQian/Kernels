@@ -106,7 +106,10 @@ if [ -n "$_leg" ]; then
   exit 1
 fi
 
-make -j"$(nproc)" "$TARGET" 2>&1 | tee make.log
+# JOBS overrides -j. Needed since the MoE bench became 9 sources: each hgcc instantiates ~42 kernels and wants GBs, and
+# running all of them at once OOM-killed the front end locally -- an OOM kill looks like a compile failure with an empty
+# log, which is the least informative way for a build to fail. `JOBS=4 ./build.sh` when memory is tight.
+make -j"${JOBS:-$(nproc)}" "$TARGET" 2>&1 | tee make.log
 
 # CMAKE RECEIVING THE DEFINES IS NOT THE SAME AS THIS TARGET GETTING THEM, and the difference is invisible in a perf
 # number. The defines used to be attached to three targets by hand, so

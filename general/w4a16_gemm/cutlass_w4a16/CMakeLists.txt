@@ -211,9 +211,17 @@ target_compile_options(test_lowbit_grouped PRIVATE -w)
 # re-read count (A traffic), while MoE is weight-bound and the recorded rule is to minimise the TOTAL m-tile count -- and
 # large TileM then wastes rows at ~128 rows per expert. The bench decides which effect dominates instead of assuming one.
 #   Build: TARGET=test_lowbit_moe_bench ./build.sh ; run: ./<bin> [L] [rows] [N] [K] [gs] [ragged]
+# EIGHT SOURCES, ON PURPOSE. Every sweep row is a kernel instantiation and cutlass_build_dev_kernels emits one
+# add_custom_command per .cu, so a single-file sweep compiles strictly serially no matter what -j says. Split by
+# (format, WarpN) -- q3/q5 have one legal WarpN so they stay whole; q6/i2/i4 have two -- which keeps the largest unit
+# near the size of the old single-file sweep while instantiating several times as many configurations.
 ppu_w4a16_executable(
   test_lowbit_moe_bench
   test_lowbit_moe_bench.cu
+  moe_bench_q3.cu       moe_bench_q5.cu
+  moe_bench_q6_wn32.cu  moe_bench_q6_wn64.cu
+  moe_bench_i2_wn32.cu  moe_bench_i2_wn64.cu
+  moe_bench_i4_wn32.cu  moe_bench_i4_wn64.cu
 )
 target_compile_options(test_lowbit_moe_bench PRIVATE -w)
 
