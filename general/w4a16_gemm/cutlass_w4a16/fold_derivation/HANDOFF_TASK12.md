@@ -523,3 +523,43 @@ PPU_B_CHUNK cannot be determined from it. **The grouped runs so far should be tr
 
 Fixed to read cmake's generated `CMakeFiles/<target>.dir/build.make`, which does carry the full command, and to check it
 for THIS target's directory -- "cmake received the defines" is a weaker claim and was already covered separately.
+
+## #17b measured: the tile is not the lever, cvt/mma is worth more than on dense, and #9 is closed
+
+`test_lowbit_moe_bench`, L=64 experts, ~128 rows each, N=K=2048, gs=32, PPU_B_CHUNK=1, **skewed** rows (arbitrary counts,
+8 zero-row experts, total=9941, Mmax=417).
+
+**Verdict: two-plane q5 (64,128,64) w64x64 s2 = 355.50 us; single-plane i4 (64,64,64) w64x32 s3 = 382.76 us.** Q5 BEATS
+int4 in the MoE band -- the two-plane overhead does not merely shrink here, it inverts.
+
+**THE TILE IS NOT THE LEVER.** TileM 32/64/128/256 at fixed warpM=64: the winner TM=64 has neither the smallest m-tile
+count (TM=32 has 256) nor the least masking (TM=32 has 8.1%). The two candidate explanations point at opposite ends and
+the winner sits between them. The recorded weight-bound rule "minimise the TOTAL m-tile count" does **not** hold -- more
+m-tiles measured faster. And since `A ~= mt*TM*K*2` with `mt*TM ~= total_rows` (so A is roughly TileM-independent) while
+`B ∝ mt ∝ 1/TM`, the configurations that move the FEWEST bytes are the slowest. What is left is occupancy:
+A-smem = `TM*TK*2` = 4/8/16/32 KB per stage across the sweep.
+
+**cvt/mma IS WORTH MORE IN MoE THAN ON DENSE.** Matched (TileM, TileN), only warpM moving, so it is separated from the
+m-tile count (the first version of this sweep confounded them):
+
+| | w32x64 (cvt/mma 4) | w64x64 (cvt/mma 2) | |
+|---|---|---|---|
+| Q3 | 539.57 | 429.19 | +20.5% |
+| Q5 | 476.30 | 355.50 | +25.3% |
+| Q6 | 473.69 | 361.53 | +23.7% |
+
+against eleven points on dense. Consistent: MoE collapses the useful A work, so conversion is a larger share of what is
+left.
+
+**#9 CLOSED BY MEASUREMENT, no code needed.** Q6's high plane is int2, so Q6 can legally run w*x32 today: 408.28 us
+against w64x64's 361.53 -- **WN=32 loses by 13%**. Halving `accum = WM*WN/32` was the hoped-for occupancy win and it does
+not pay, because the n-tile count doubles and `cvt/mma = 128/WM` is untouched by WN. So int1 being pinned to WN=64 costs
+nothing and relaxing the delivery bound would unlock only worse configurations.
+
+**Q3 IS THE OUTLIER IN BOTH REGIMES.** Same grid: Q3 429.19 vs Q5 355.50, i.e. Q3 20.7% slower in MoE against 27% on
+dense. Q3 remains the only format whose LOW plane also folds (F1=2, where Q5 and Q6 are F1=1). That correlation now holds
+across two regimes and two shapes, which makes it a hypothesis to test -- next instrument is acu on the two configs, not
+more sweeping.
+
+**The %HBM column was garbage in this run** (116-181%) and is fixed to a compulsory floor plus a noreuse ratio; see the
+commit. On the worst row the floor is 17.6%, so "bandwidth-bound" is not established and this model cannot settle it.
