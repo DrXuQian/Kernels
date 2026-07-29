@@ -47,3 +47,6 @@ profiles/
 exported_binaries/
 bench_expert_map
 general/w4a16_gemm/fpA_intB/
+
+# generator gate scratch
+general/w4a16_gemm/cutlass_w4a16/fold_derivation/.moe_units_check/

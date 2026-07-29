@@ -226,12 +226,19 @@ target_compile_options(test_lowbit_grouped PRIVATE -w)
 # the illegal combinations are not listed anywhere because moe_ok<> in lowbit_moe_bench.hpp rejects them and the unit
 # compiles to an empty function -- notably WarpM > TileM, and the per-plane delivery bound WN*TK*bits >= 4096 whose
 # SPARSEST plane binds (which is what pins q3/q5 to WarpN=64 and lets q6 reach 32).
+# THE WarpN LIST IS COMMA-SEPARATED, NOT SEMICOLON-SEPARATED, and that is not cosmetic: `;` IS CMake's list separator, so
+# "q6|1|int4_t|uint2_t|4|2|32;64" is not one element containing a semicolon -- `foreach(IN LISTS)` splits it into
+# "q6|1|int4_t|uint2_t|4|2|32" and a stray "64", and the stray row has one field so every list(GET) past 0 goes out of
+# range. Worse, the generator still printed "128 generated units" while doing it, because 8 broken iterations x 16 happens
+# to equal the 5 correct formats x 16 -- so the count that exists to catch a shrunken enumeration agreed with the right
+# answer for the wrong reason. Hence the field-count check below: a malformed row must stop the configure, not produce a
+# plausible number.
 set(_MOE_FORMATS
   "q3|1|uint2_t|uint1_t|2|1|64"
   "q5|1|int4_t|uint1_t|4|1|64"
-  "q6|1|int4_t|uint2_t|4|2|32;64"
-  "i2|0|uint2_t|half_t|2|0|32;64"
-  "i4|0|int4_t|half_t|4|0|32;64"
+  "q6|1|int4_t|uint2_t|4|2|32,64"
+  "i2|0|uint2_t|half_t|2|0|32,64"
+  "i4|0|int4_t|half_t|4|0|32,64"
 )
 set(_MOE_TM_LIST 32 64 128 256)
 set(_MOE_TN_LIST 64 128)
@@ -245,6 +252,11 @@ set(_MOE_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/moe_units")
 file(MAKE_DIRECTORY "${_MOE_GEN_DIR}")
 foreach(_row IN LISTS _MOE_FORMATS)
   string(REPLACE "|" ";" _f "${_row}")
+  list(LENGTH _f _nf)
+  if(NOT _nf EQUAL 7)
+    message(FATAL_ERROR "_MOE_FORMATS row '${_row}' has ${_nf} fields, expected 7 "
+                        "(name|2plane|lo_elem|hi_elem|lo_bits|hi_bits|WarpN,list). A ';' anywhere in a row splits it.")
+  endif()
   list(GET _f 0 _nm)
   list(GET _f 1 _2p)
   list(GET _f 2 _lo)
@@ -252,6 +264,7 @@ foreach(_row IN LISTS _MOE_FORMATS)
   list(GET _f 4 _lob)
   list(GET _f 5 _hib)
   list(GET _f 6 _wns)
+  string(REPLACE "," ";" _wns "${_wns}")   # comma -> real CMake list, only now that the row is safely split
   foreach(_wn IN LISTS _wns)
     foreach(_tn IN LISTS _MOE_TN_LIST)
       foreach(_wm IN LISTS _MOE_WM_LIST)
