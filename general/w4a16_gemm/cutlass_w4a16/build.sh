@@ -112,9 +112,16 @@ echo "[build.sh] TILE=${TILE_M}x${TILE_N} WARP=${WARP_M}x${WARP_N} STAGES=${STAG
 # --- configure & build just our target ---
 BUILD="$ACTLIZE/build_w4a16_compare"
 rm -rf "$BUILD" && mkdir -p "$BUILD" && cd "$BUILD"
+# FORWARD THE SWEEP AXIS KNOBS. They were added to CMakeLists.txt and then not wired through here, so narrowing a sweep was
+# impossible from build.sh -- the knob existed and could not be reached, which is worse than no knob because it reads as
+# available. Any MOE_* variable in the environment is passed through as a cache var.
+_MOE_VARS=()
+for _v in MOE_TM_LIST MOE_TN_LIST MOE_WM_LIST MOE_FORMATS MOE_CORES; do
+  if [ -n "${!_v:-}" ]; then _MOE_VARS+=("-D$_v=${!_v}"); echo "[build.sh] $_v=${!_v}"; fi
+done
 cmake .. -DPPU_SDK_ROOT="$PPU_SDK_ROOT" -DCUTLASS_PPU_ARCHS="$ARCH" \
   -DTILE_M="$TILE_M" -DTILE_N="$TILE_N" -DWARP_M="$WARP_M" -DWARP_N="$WARP_N" -DSTAGES="$STAGES" -DBENCH_QUANT="$QUANT" -DTSK="$TSK" \
-  -DPPU_EXTRA_DEFS="${PPU_DEFS:-}" \
+  -DPPU_EXTRA_DEFS="${PPU_DEFS:-}" "${_MOE_VARS[@]+"${_MOE_VARS[@]}"}" \
   >cmake.log 2>&1 || { tail -40 cmake.log; exit 1; }
 # cmake's stdout is redirected above, so its message(STATUS ...) never reaches the terminal. Surface the extra
 # defines here instead -- telling someone to "check that the line appeared" when it cannot appear is worse than

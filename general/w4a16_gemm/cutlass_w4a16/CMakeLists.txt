@@ -260,10 +260,33 @@ set(_MOE_TM_LIST 16 32 64 128 256)
 # TileM only sets smem, so larger is strictly worse), and a prefill question does not need the deep stages. Override any axis
 # from build.sh, semicolon-separated:
 #   PPU_DEFS=... MOE_TM_LIST="16;32" MOE_STAGES="4;6;8;12" TARGET=test_lowbit_moe_bench ./build.sh
+# MOE_FORMATS keeps only the named formats (semicolon-separated, e.g. "i4" or "i4;i2"). This is the axis that cuts the most
+# when the question is about ONE format -- the decode work is all i4 right now, and carrying q3/q5/q6/i2 through it is 4/5 of
+# the compile for none of the answer.
+if(MOE_FORMATS)
+  set(_keep "")
+  foreach(_row IN LISTS _MOE_FORMATS)
+    string(REPLACE "|" ";" _f "${_row}")
+    list(GET _f 0 _nm)
+    # list(FIND) rather than IN_LIST: IN_LIST needs policy CMP0057 NEW, which a `cmake -P` slice of this file does not
+    # inherit -- so the generator gate would fail on syntax the real configure accepts. Depending on ambient policy makes the
+    # gate and the build behave differently, which is the one thing a gate must not do.
+    list(FIND MOE_FORMATS "${_nm}" _idx)
+    if(NOT _idx EQUAL -1)
+      list(APPEND _keep "${_row}")
+    endif()
+  endforeach()
+  if(NOT _keep)
+    message(FATAL_ERROR "MOE_FORMATS='${MOE_FORMATS}' matched no row of _MOE_FORMATS")
+  endif()
+  string(REPLACE ";" " " _show "${MOE_FORMATS}")
+  message(STATUS "MoE sweep: formats restricted to ${_show}")
+  set(_MOE_FORMATS ${_keep})
+endif()
 foreach(_ax TM TN WM)
   if(MOE_${_ax}_LIST)
     string(REPLACE ";" " " _show "${MOE_${_ax}_LIST}")
-    message(STATUS "MoE sweep: Tile/Warp${_ax} restricted to ${_show}")
+    message(STATUS "MoE sweep: MOE_${_ax}_LIST restricted to ${_show}")
     set(_MOE_${_ax}_LIST ${MOE_${_ax}_LIST})
   endif()
 endforeach()
