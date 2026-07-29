@@ -46,6 +46,25 @@ using GS      = moe_grouped_ppu::GroupShape;
 using DStride = moe_grouped_ppu::DStride;
 using QM      = moe_grouped_ppu::QuantMode;
 
+
+// SUB-BYTE POINTER ARITHMETIC IS IN BYTES, NOT ELEMENTS -- and that is what broke the first version of this test.
+// cutlass::uint2b_t / uint1b_t / int4b_t all have sizeof == 1 (a byte-sized wrapper holding 2, 1 or 4 bits), so
+// `ptr + n` on one of them advances n BYTES. Offsetting an expert by e*K*N therefore over-advanced by 4x for int2, 8x
+// for int1 and 2x for int4, and expert 1 already read past the end of the allocation.
+//
+// The failure was legible before any debugging, and only because the harness contains a row whose answer is already
+// known: EVERY format failed including int1, which has an independent multi-expert gate that passes. And the grouped run
+// returned the SAME value for e=1 at L=4 and L=8 while the ORACLE returned two different ones -- so the thing that varied
+// was the reference, not the subject. A new test with no known-good row could not have said which side was wrong.
+template <class T>
+static T const* expert_ptr(T const* base, size_t e, size_t bytes_per_expert) {
+  return reinterpret_cast<T const*>(reinterpret_cast<int8_t const*>(base) + e * bytes_per_expert);
+}
+template <class T>
+static T* expert_ptr(T* base, size_t e, size_t bytes_per_expert) {
+  return reinterpret_cast<T*>(reinterpret_cast<int8_t*>(base) + e * bytes_per_expert);
+}
+
 static int L = 4, Mb = 64, N = 256, K = 256, gs = 32;
 static bool ragged = true;
 
@@ -99,9 +118,12 @@ int main(int argc, char** argv) {
       xplane::place_derived<LOWB, TMv, TNv, TKv, WMv, WNv, F1v>(blo.data() + (size_t)e * lo_per, lo, N, K);             \
       xplane::place_hi<LOWB, HIB, TMv, TNv, TKv, WMv, WNv, F2v, F1v>(bhi.data() + (size_t)e * hi_per, hi, N, K);        \
     }                                                                                                                   \
-    cutlass::DeviceAllocation<LOWELEM> dblo((size_t)L * K * N);                                                         \
+    /* SIZED IN BYTES, because sizeof(uint2b_t) == 1: DeviceAllocation<LOWELEM>(L*K*N) would allocate L*K*N BYTES and
+       copy_from_host would then read L*K*N bytes out of a host buffer holding only L*K*N*BITS/8 -- an out-of-bounds host
+       read. L*lo_per is both the exact host size and exactly what the kernel's element-based L-stride resolves to. */    \
+    cutlass::DeviceAllocation<LOWELEM> dblo((size_t)L * lo_per);                                                         \
     dblo.copy_from_host(reinterpret_cast<LOWELEM const*>(blo.data()));                                                  \
-    cutlass::DeviceAllocation<HIELEM> dbhi((size_t)L * K * N);                                                          \
+    cutlass::DeviceAllocation<HIELEM> dbhi((size_t)L * hi_per);                                                          \
     dbhi.copy_from_host(reinterpret_cast<HIELEM const*>(bhi.data()));                                                   \
     /* ---- the full L>1 run, contiguous D[total][N] via the ptr-array epilogue */                                       \
     std::vector<GS> rsh(L); std::vector<half_t*> pdh(L); std::vector<DStride> sdh(L); std::vector<int> gmh(L);          \
@@ -134,10 +156,10 @@ int main(int argc, char** argv) {
       const size_t w1b = (size_t)cutlass::ceil_div(Me,16)*cutlass::ceil_div(N,64)*64;                                    \
       cutlass::DeviceAllocation<char> w1(w1b);                                                                            \
       moe_grouped_ppu::filter_and_run<QMODE, TMv, TNv, TKv, WMv, WNv, Sv, LOWELEM, HIELEM>(                             \
-          dA.get() + (size_t)offs[e] * K, dblo.get() + (size_t)e * K * N,                                               \
+          dA.get() + (size_t)offs[e] * K, expert_ptr(dblo.get(), (size_t)e, lo_per),                                    \
           dSc.get() + (size_t)e * scale_k * N, dZr.get() + (size_t)e * scale_k * N,                                     \
           p1d.get(), t1d.get(), g1d.get(), Me, N, K, 1, gs, s1d.get(), s1.data(), nullptr, w1.get(), w1b, nullptr,      \
-          dbhi.get() + (size_t)e * K * N);                                                                               \
+          expert_ptr(dbhi.get(), (size_t)e, hi_per));                                                                               \
       CUTLASS_PPU_CHECK(hggcDeviceSynchronize());                                                                        \
     }                                                                                                                    \
     std::vector<half_t> h((size_t)total*N), h1((size_t)total*N);                                                         \
@@ -169,7 +191,7 @@ int main(int argc, char** argv) {
         q[i] = uint8_t(((size_t(e) * 104729 + i) * 2654435761u >> 5) & ((1u << (BITS)) - 1u));                            \
       xplane::place_derived<BITS, TMv, TNv, TKv, WMv, WNv, Fv>(bb.data() + (size_t)e * per, q, N, K);                     \
     }                                                                                                                    \
-    cutlass::DeviceAllocation<ELEM> db((size_t)L * K * N);                                                                \
+    cutlass::DeviceAllocation<ELEM> db((size_t)L * per);   /* bytes -- see the note in the two-plane macro */            \
     db.copy_from_host(reinterpret_cast<ELEM const*>(bb.data()));                                                          \
     std::vector<GS> rsh(L); std::vector<half_t*> pdh(L); std::vector<DStride> sdh(L); std::vector<int> gmh(L);            \
     for (int e = 0; e < L; ++e) { rsh[e] = cute::make_shape(me[e], N, K); pdh[e] = dD.get() + (size_t)offs[e] * N;         \
@@ -199,7 +221,7 @@ int main(int argc, char** argv) {
       const size_t w1b = (size_t)cutlass::ceil_div(Me,16)*cutlass::ceil_div(N,64)*64;                                      \
       cutlass::DeviceAllocation<char> w1(w1b);                                                                              \
       moe_grouped_ppu::filter_and_run<QMODE, TMv, TNv, TKv, WMv, WNv, Sv, ELEM>(                                          \
-          dA.get() + (size_t)offs[e] * K, db.get() + (size_t)e * K * N,                                                  \
+          dA.get() + (size_t)offs[e] * K, expert_ptr(db.get(), (size_t)e, per),                                          \
           dSc.get() + (size_t)e * scale_k * N, dZr.get() + (size_t)e * scale_k * N,                                      \
           p1d.get(), t1d.get(), g1d.get(), Me, N, K, 1, gs, s1d.get(), s1.data(), nullptr, w1.get(), w1b, nullptr);      \
       CUTLASS_PPU_CHECK(hggcDeviceSynchronize());                                                                          \
