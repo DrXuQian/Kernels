@@ -53,23 +53,32 @@ _overlay_files=("$HERE"/*.cu "$HERE"/*.cpp "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*
 shopt -u nullglob
 cp "${_overlay_files[@]}" "$EX_DIR/"
 
-# ...and then ASSERT THE WHITELIST IS COMPLETE, by inverting it. The first version of this check scanned the #includes of
-# the overlaid files -- which could not have caught the bug it was written for: the file that includes moe_bench_unit.inc
-# is a GENERATED unit, created by cmake later, in the build tree. It only fired in my test because the test seeded a probe.
+# ...and then ASSERT THE WHITELIST IS COMPLETE. The criterion is GIT TRACKING, and the two earlier attempts show why it
+# has to be something this specific:
 #
-# So instead: every regular file HERE must either reach the overlay or have an extension on the ignore list. A new .def or
-# .tpp then fails HERE, in one line, instead of 100+ lines into a parallel hgcc build once per unit.
-_ignored='sh|md|py|log|bin|json|patch|pyc'
+#   * scanning the #includes of the overlaid files could not catch the bug it was written for -- the file that includes
+#     moe_bench_unit.inc is a GENERATED unit, created later by cmake in the build tree, so it is not in the scan set at
+#     overlay time. It passed on the real tree while the real build was broken.
+#   * "every regular file here must be copied unless its extension is ignored" then failed the build on this box for
+#     *.acurep -- acu reports, an untracked artifact of previous runs that does not exist in a fresh checkout, so the
+#     ignore list could not have been written correctly from a clean tree.
+#
+# Tracked-ness is the right criterion because the box builds from COMMITTED state: what the build can possibly need is
+# exactly what is committed. Artifacts (acu reports, logs, binaries, dumped weights) are untracked and skip themselves, and
+# a newly added .def or .tpp is tracked the moment it is `git add`ed, which is also the moment it could reach the box.
+_ignored='sh|md|py|log|bin|json|patch|pyc|txt'
 _missing=""
-for _f in "$HERE"/*; do
-  [ -f "$_f" ] || continue                                   # directories (fold_derivation, real_weight, ...) are not overlaid
-  _b="$(basename "$_f")"
-  [ "$_b" = "CMakeLists.txt" ] && continue
-  echo "$_b" | grep -qE "\.($_ignored)\$" && continue
-  [ -f "$EX_DIR/$_b" ] || _missing="$_missing $_b"
-done
+if _tracked=$(git -C "$HERE" ls-files . 2>/dev/null) && [ -n "$_tracked" ]; then
+  while IFS= read -r _b; do
+    case "$_b" in */*) continue ;; esac                       # subdirectories are deliberately not overlaid
+    echo "$_b" | grep -qE "\.($_ignored)\$" && continue
+    [ -f "$EX_DIR/$_b" ] || _missing="$_missing $_b"
+  done <<< "$_tracked"
+else
+  echo "  NOTE: not a git checkout, skipping the overlay completeness check"
+fi
 if [ -n "$_missing" ]; then
-  echo "  ERROR: the overlay is an extension whitelist and it dropped:$_missing"
+  echo "  ERROR: the overlay is an extension whitelist and it dropped tracked source:$_missing"
   echo "         add the extension to _overlay_files above, or to _ignored if it is genuinely not needed to build."
   exit 1
 fi
