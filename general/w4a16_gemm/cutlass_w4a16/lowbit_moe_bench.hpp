@@ -37,6 +37,13 @@ static constexpr double PEAK    = 500.0e12;
 // in which "is this bandwidth-bound?" is answerable.
 static constexpr double HBM_GBS = 2766.0;
 
+// WHICH SOURCE DID THIS BINARY COMPILE AGAINST. Bump this whenever a macro in this header changes shape. The banner prints
+// it, so a run can no longer be ambiguous about whether it used the fixed header -- a failed build showed a macro expansion
+// containing `fold::FoldTraits` while the checked-out tree had `moe_fold`, and there was no way to tell from here whether
+// the box had built an older commit or the overlay had a stale copy. That ambiguity has cost rounds twice in this work (the
+// per-unit PPU_B_CHUNK vote exists for the same reason), so it gets an invariant instead of a guess.
+#define LOWBIT_MOE_BENCH_REV 3
+
 // TileK is a BUILD knob, not a row: it changes the per-plane fold factor, so sweeping it at runtime would mean packing
 // every row twice. One extra build (PPU_DEFS=MOE_TK=128) covers it.
 #ifndef MOE_TK

@@ -83,6 +83,19 @@ if [ -n "$_missing" ]; then
   exit 1
 fi
 
+# AND PROVE THE OVERLAY IS THE CHECKOUT, not a survivor of an earlier run. cleanup() rm -rf's $EX_DIR on exit, so a stale
+# copy should be impossible -- but a build failed with a macro expansion from the PRE-fix header while the checkout had the
+# fixed one, and from outside the box there was no way to tell "built an older commit" from "overlay was stale". cmp is
+# cheap and turns that into a one-line answer.
+for _f in "$EX_DIR"/*; do
+  [ -f "$_f" ] || continue
+  _b="$(basename "$_f")"
+  if [ -f "$HERE/$_b" ] && ! cmp -s "$_f" "$HERE/$_b"; then
+    echo "  ERROR: the overlaid $_b differs from the checked-out one -- the build would not compile your tree."
+    exit 1
+  fi
+done
+
 # register it in the foreach list (idempotent: only if absent)
 if ! grep -q "$EX_NAME" "$EX_LIST"; then
   # insert just before the closing paren of the foreach(EXAMPLE ... ) block that ends with 16_ppu_mixed_dtype_gemm
