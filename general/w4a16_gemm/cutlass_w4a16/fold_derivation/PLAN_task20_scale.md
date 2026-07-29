@@ -30,7 +30,50 @@ Scale bytes per weight byte, `S/B`:
 **The fp16 scale path is NOT deleted.** fp16 IS the native form for GPTQ and AWQ, so `ElementScale = half_t` stays the
 default specialization and the GPTQ regression in `real_weight/` is what proves nothing was traded away.
 
-## Feasibility: the native layouts ARE cute-expressible (this is the load-bearing result)
+## DECIDED: repack, because the pipeline stage already exists and literal-raw is traffic-NEGATIVE
+
+Two facts settled this, both read off the code rather than assumed.
+
+**1. Literal-raw GGUF gives the win away, and for Q4_K it is worse than today.** The 12-byte scale block is superblock-
+granular (256 weights) while a K-tile is 32-128, and **the block does not slice by group**: Q3_K's low nibble lives in byte
+`t + 4*q0` (0-7) and its high 2 bits in byte `8+t` (8-11), so ANY 8-group tile touches all 12 bytes and the next k-tile reads
+the same superblock again. Q4_K is worse — groups >= 4 borrow their high 2 bits from bytes 0-3, so a 2-group tile at g=4
+needs bytes {0,1,4,5,8,9}. Bytes actually read per group:
+
+| | fp16 today | literal raw GGUF | compact repack |
+|---|---|---|---|
+| Q3_K gs=16, TK=128 (8 groups/tile) | 2.0 (ScaleOnly, after Phase 1) | **1.75** | 0.875 (4+2 planes) / **1.125 (int8)** |
+| Q4_K gs=32, TK=64 (2 groups/tile) | 4.0 | **4.0-5.0** | 2.0 (4+2) / **2.5 (int8)** |
+
+**2. The offline pass, and a repack, ALREADY EXIST.** `dump_real_weights.py` emits `q` as `int8 [N][K]` — one code per byte,
+i.e. the weights are fully unpacked and transposed on the host, with the final device relayout done in C++ by
+`place_derived`. And it emits `scale` as fp16 `[L][scale_k][N]`, so **the widening is itself an offline step**, and
+`[scale_k][N]` is already a repack of GGUF's `[n][superblock][12 B]`. Changing the scale's emitted form is editing an
+existing stage, not adding one. The `.bin` is an intermediate; the device layout is decided in C++, which is where the cute
+Layout belongs.
+
+So the awkward GGUF bit maps stay on the **HOST**, where they cost nothing, and the kernel sees a trivially affine layout.
+
+**Recommendation: a uniform `int8` scale plane first, not 4+2 bit planes.** The 4+2 split buys 0.25 B/group more on Q3_K
+(0.875 vs 1.125) at the cost of a two-plane assembly in the inner loop, and #14 bounds the ENTIRE scale path at 2.6% — so
+there is very little to win there and a real risk of spending more than the traffic saves. int8 is also exactly what Q6_K
+already is natively, so one of the five formats needs no transformation at all. Traffic with a uniform int8 plane:
+
+| format | gs | fp16 today | int8 plane | ratio |
+|---|---|---|---|---|
+| Q2_K | 16 | 4.0 | 2.25 | 1.8x |
+| Q3_K | 16 | 2.0 (after Phase 1) | 1.125 | 1.8x |
+| Q4_K | 32 | 4.0 | 2.5 | 1.6x |
+| Q5_K | 32 | 4.0 | 2.5 | 1.6x |
+| Q6_K | 16 | 2.0 (after Phase 1) | 1.125 | 1.8x |
+
+Keep the 4+2 plane form documented as the fallback if decode/GEMV turns out to be traffic-bound there — the host-side maps
+below are what it would need, and they are already derived.
+
+`ElementScale = int8_t` then becomes a clean specialization: decode is one byte load, an int8->fp16 convert, and one `hmul`
+by the tile-constant `d` — amortised over the `APG = gs/16` mma atoms that share the register.
+
+## The GGUF bit maps, for the HOST side (and the 4+2 fallback)
 
 Read off `real_weight/dump_real_weights.py`, which is the decoder already regressed against
 `marlin_gguf_ppu.cuh:gguf_q4k_scales` — **not** written from memory.
@@ -114,13 +157,20 @@ Note the synergy with Phase 2: Q4_K's zero is `-dmin·mn + 8·scale` (the int4 `
 * `d` / `dmin` ride along as a `[TileN]` per-tile vector (pending the Phase-0 verification that they are tile-constant).
 * `ElementScale = half_t` remains the default specialization, untouched, for GPTQ/AWQ.
 
-### Phase 3 — the offline stops widening
+### Phase 3 — the offline emits int8 + d instead of widening to fp16
 
-`real_weight/dump_real_weights.py` emits the native scale bytes plus `d`/`dmin` instead of the widened fp16 plane. **Open
-question to settle by reading, not assuming**: whether the scale needs any per-tile permutation. The B operand does
-(`place_derived`), but the scale is indexed by `(n, k/gs)` and is broadcast along M, and the current path builds it with a
-stride-0 broadcast view rather than a permutation — so probably only N-tile blocking is needed. Confirm against the actual
-`make_scale_fragment` before writing a packer.
+Edit the EXISTING stage: `real_weight/dump_real_weights.py` emits `sc` as `int8 [L][scale_k][N]` (and `mn` likewise where
+the format has one) plus `d`/`dmin` as fp16 `[L][K/256][N]`, instead of the pre-multiplied fp16 plane. The host keeps all the
+awkward GGUF unpacking it already does; only the OUTPUT form changes. Bump the `.bin` magic (`RWMOE\0\0\0`) so an old
+fixture cannot be read as a new one — a silently misread header is the worst failure mode available here.
+
+Precision check to include: today the host computes `d*sc` in fp32 and rounds once to fp16; the new path multiplies
+`half(d) * int8->half(sc)` on device, also one rounding, with `sc <= 63` exactly representable. Expected equal or 1 ulp, and
+the existing GPTQ + Q4_K real-weight regressions are what confirm it.
+
+**Settled by reading, not assumed**: the scale needs no per-tile permutation. The current path builds the fragment with a
+stride-0 broadcast view (`ScaleSplit` / `ScaleThrDupL`, task #1), not a permutation, so only N-tile blocking applies — unlike
+the B operand, which does need `place_derived`.
 
 ### Phase 4 — measure, in the places where it can show
 
@@ -128,6 +178,27 @@ Not the MoE band first. In order: **gs=16 dense** (largest channel, and where th
 TN=128/TK=128/s3), then **decode/GEMV**, then the MoE band with `MOE_ONLY` on the current winners to confirm no regression.
 Report the smem delta explicitly — if occupancy moves, that is the mechanism, and if it does not, the traffic saving is real
 but invisible here and should be claimed for decode only.
+
+## What reading the scale path actually changed in this plan
+
+The scale goes **gmem -> smem -> registers**, in the multistage pipeline, so the "smem holds native bytes" design is
+available as written:
+
+* **g2s** is `Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, ElementScale>` — a plain `cp.async` at 16 B/thread, NOT the AIU
+  bulk path — issued next to A and B at lines 1093 / 1112 of the 2-plane collective.
+* **smem** is `SmemLayoutScale` via `tile_to_shape`, in `shared_tensors.smem_scale`, with `smem_zero` as a second block.
+* **s2r** is `SmemCopyAtomScale` + `make_tiled_copy_B`. Note there are **TWO** layouts: `SmemLayoutScale` (storage) and
+  `SmemCopyLayoutScale` (copy view). The in-file comment says conflating them is what produced the `hi_vreg0` defect, so
+  Phase 2 must change both, consistently.
+
+**One hardcoded relation to fix on the way**: the copy assert reads "Scale_TileN must split into ThrH threads of a multiple
+of **8** elements". That 8 is `16 / sizeof(half_t)` written as a literal; with a 1-byte element it must be 16. Read it off
+`sizeof(ElementScale)` — this is exactly the class of bug the METHOD section is about, and it will silently mis-vectorise
+otherwise.
+
+**smem delta**: the scale tile halves (fp16 -> int8) and the zero tile disappears entirely for Q3_K/Q6_K after Phase 1. At
+TileN=128 / Scale_TileK=8 / Stages=3 that is 12 KB -> 3 KB. Whether that buys anything is an occupancy question, and the
+TileK=32 result (every winner moved to s4 once A-smem halved) says occupancy is the currency.
 
 ## Risks, and the two things to verify before writing kernel code
 
