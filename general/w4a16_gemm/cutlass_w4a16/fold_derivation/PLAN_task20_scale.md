@@ -102,10 +102,26 @@ field's byte index and bit shift is **affine** in a suitably nested group coordi
 
 **Q6_K**, `int8 scales[16]`, `gs=16`, no min: byte `= g`, shift 0, **signed**. One plane, trivially affine.
 
-**`d` is CONSTANT over a K-tile.** The GGUF block tiles K in chunks of 256 per column, and every TileK we run (32/64/128)
-divides 256 with aligned tiles, so `d` (and `dmin`) is one value per `(n, k-tile)` — a `[TileN]` vector per tile, not a
-per-group quantity. The per-group work is therefore ONLY the 4+2 field extraction; the `d` multiply is a per-tile broadcast.
-**Verify this before relying on it** (it is exactly the kind of relation that must be read off the tensor, not asserted).
+**`d` is CONSTANT over a K-tile, and this is GUARANTEED BY THE FILE FORMAT, not merely by our tile choices.** Read off
+`src/llama-quant.cpp:360` `tensor_type_fallback`: llama.cpp never pads a K-quant to fit — if `ncols % blck_size != 0` it
+changes the TYPE (Q2_K/Q3_K -> Q4_0, Q4_K -> Q5_0, Q5_K -> Q5_1, Q6_K -> Q8_0, the 256-block IQ types -> IQ4_NL, and F16 if
+even 32 does not divide), backed by a hard `GGML_ASSERT(nelements % block_size == 0)` at line 254. So **every K-quant tensor
+in a GGUF file has K divisible by 256 and there is never a partial superblock.** Every TileK we run (32/64/128) divides 256
+and tiles start at k=0, so no tile can straddle a superblock: `d`/`dmin` is one value per `(n, k-tile)`, a `[TileN]` vector.
+The per-group work is ONLY the field extraction; the `d` multiply is a per-tile broadcast.
+
+**N, however, has NO alignment guarantee** — it is `ne[1]`, the row count, and nothing constrains it. Since the sub-byte
+scale planes pack along N (below), the 2-bit plane's row stride is only a whole number of bytes when `N % 4 == 0`. Adopt
+llama.cpp's own idiom for exactly this, from `ggml/src/ggml-cuda/ggml-cuda.cu:818` and its three siblings: **pad the
+ALLOCATION, not the data.** `MATRIX_ROW_PADDING = 512`, and `get_alloc_size` over-allocates every quantised tensor's row by
+`ggml_row_size(type, 512 - ne0%512)` with the comment "to avoid out-of-bounds memory accesses"; `mmq.cu:112` separately pads
+the *activation* row length so the MMQ K-loop is a whole number of blocks. So:
+
+* the FILE stores the exact `ceil(N*bits/8)` bytes per group-row — not one bit more, which is what the size constraint asks
+* the DEVICE buffer is padded to whatever the copy atom wants; the tail bytes are garbage that predication ignores
+* an n-tile's byte offset is aligned for free, because `n0 = tile_n * TileN` and TileN in {64,128} is a multiple of 4 — only
+  the last partial tile reads fewer columns, which is already predicated
+* in practice N is a multiple of 64 in every real model shape (2048 / 4096 / 5120 / 11008 / 14336), so the padding is zero
 
 ## Where the decode goes: smem holds NATIVE bytes
 
@@ -202,8 +218,9 @@ TileK=32 result (every winner moved to s4 once A-smem halved) says occupancy is 
 
 ## Risks, and the two things to verify before writing kernel code
 
-1. **`d` tile-constancy** — asserted above from block geometry, not yet read off the tensor. If a K-tile can straddle a
-   superblock, the `[TileN]` simplification collapses and `d` becomes per-group.
+1. ~~**`d` tile-constancy**~~ — **DISCHARGED**, not by geometry but by `llama-quant.cpp`'s type-fallback: a K-quant tensor
+   whose K is not a multiple of 256 is stored as a DIFFERENT type, so a partial superblock cannot exist in a GGUF file. What
+   replaced this risk is the N-alignment question above, and llama.cpp's allocation-padding idiom answers it.
 2. **Decode cost vs the 2.6% ceiling.** #14 bounds the entire scale path at 2.6% (gs=16, APG=1), so the decode must stay
    at a couple of ops per scale register. Decode **once per group into the fragment**, amortised over the `APG` mma atoms
    that share it — never per mma atom.
