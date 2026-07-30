@@ -2,7 +2,7 @@
 // per-thread K step that ties them together.
 #pragma once
 
-#include "gemv_common.hpp"
+#include "gemv_wformat.hpp"
 
 namespace ppu_gemv {
 
@@ -43,66 +43,6 @@ struct PackedAccess {
 };
 
 // ---------------------------------------------------------------------------------------------------
-// Weight layout: the (base, step, stride) byte triple a GMemIterator needs, per layout.
-//
-// INVARIANT WORTH STATING, because everything downstream leans on it: for BOTH layouts the logical K
-// index a thread touches is
-//        k = iter * (Threads*StepK) + tid*StepK + j,    j in [0, StepK)
-// -- for TileK because TileSizeK is a whole multiple of StepK, so
-//        (tid/TPT)*TileSizeK + (tid%TPT)*StepK == tid*StepK.
-// Only the ADDRESS differs between layouts. Activation, scale and zero indexing are therefore
-// layout-independent, and a layout bug can never masquerade as a scale bug.
-template <WLayout Lay, int Bits, int StepK, int Threads, int TileSizeK>
-struct WLayoutTraits;
-
-template <int Bits, int StepK, int Threads, int TileSizeK>
-struct WLayoutTraits<WLayout::Native, Bits, StepK, Threads, TileSizeK> {
-  static constexpr int kStepBytes = StepK * Bits / 8;   // bytes one thread pulls per iteration
-  static_assert(StepK * Bits % 8 == 0, "StepK*Bits must be a whole number of bytes");
-
-  // [N][K], K contiguous.
-  __host__ __device__ static int64_t base(int n, int tid, int64_t N, int64_t K) {
-    (void)N;
-    return n * (K * Bits / 8) + int64_t(tid) * kStepBytes;
-  }
-  __host__ __device__ static int64_t step(int64_t N, int64_t K) {
-    (void)N; (void)K;
-    return int64_t(Threads) * kStepBytes;
-  }
-  __host__ __device__ static int64_t stride(int64_t N, int64_t K) {
-    (void)N;
-    return K * Bits / 8;
-  }
-};
-
-template <int Bits, int StepK, int Threads, int TileSizeK>
-struct WLayoutTraits<WLayout::TileK, Bits, StepK, Threads, TileSizeK> {
-  static constexpr int kStepBytes = StepK * Bits / 8;
-  static constexpr int kTilePerCol = TileSizeK * Bits / 8;    // bytes of one (column, k-tile)
-  static constexpr int kTPT = TileSizeK / StepK;              // threads covering one k-tile
-  static_assert(StepK * Bits % 8 == 0, "StepK*Bits must be a whole number of bytes");
-  static_assert(TileSizeK % StepK == 0, "TileSizeK must be a whole multiple of StepK");
-  static_assert(Threads % kTPT == 0, "Threads must cover a whole number of k-tiles");
-
-  // [K/TileSizeK][N][TileSizeK] -- cutlass::layout::ColumnMajorInterleaved<TileSizeK>, i.e. the buffer the
-  // prefill AIU collective already reads.
-  __host__ __device__ static int64_t base(int n, int tid, int64_t N, int64_t K) {
-    (void)K;
-    return int64_t(tid / kTPT) * (N * kTilePerCol)
-         + int64_t(n) * kTilePerCol
-         + int64_t(tid % kTPT) * kStepBytes;
-  }
-  __host__ __device__ static int64_t step(int64_t N, int64_t K) {
-    (void)K;
-    return int64_t(Threads / kTPT) * (N * kTilePerCol);
-  }
-  __host__ __device__ static int64_t stride(int64_t N, int64_t K) {
-    (void)N; (void)K;
-    return kTilePerCol;
-  }
-};
-
-// ---------------------------------------------------------------------------------------------------
 // One instantiation.
 template <typename ADetails_, WFormat Fmt, WLayout Lay, int StepK_, int Threads_, int TileSizeK_ = 256>
 struct KernelDetails {
@@ -140,8 +80,9 @@ struct KernelDetails {
   using HiAccess = PackedAccess<(kHiBits ? kStepK * kHiBits / 8 : 4)>;
   using AAccess  = PackedAccess<kStepK * int(sizeof(AType))>;
 
-  using LoLayout = WLayoutTraits<Lay, kLoBits, kStepK, kThreads, kTileSizeK>;
-  using HiLayout = WLayoutTraits<Lay, (kHiBits ? kHiBits : 1), kStepK, kThreads, kTileSizeK>;
+  // Defined as cute Layouts in gemv_wformat.hpp; the byte triple is derived from them.
+  using LoLayout = WFormatTraits<Lay, kLoBits, kStepK, kThreads, kTileSizeK>;
+  using HiLayout = WFormatTraits<Lay, (kHiBits ? kHiBits : 1), kStepK, kThreads, kTileSizeK>;
 
   static constexpr int kLoStepBytes = kStepK * kLoBits / 8;
   static constexpr int kHiStepBytes = kHiBits ? kStepK * kHiBits / 8 : 0;

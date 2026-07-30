@@ -106,6 +106,17 @@ bool gemv_dispatch_quant(Params const& p, KernelArgs const& args, int rows_max, 
 // problem does not fit the instantiation.
 template <typename Details, int CtaN, int Chunk>
 bool launch_gemv(Params const& p, cudaStream_t s) {
+  // The buffer's own record wins over anything the caller claims in Params.
+  if (p.record) {
+    char const* why = "";
+    if (!wfmt_matches<Details>(*reinterpret_cast<WeightFormatRecord const*>(p.record),
+                              p.n, p.k, p.groupsize, p.quant, &why)) {
+      char msg[128];
+      std::snprintf(msg, sizeof(msg), "weight format record disagrees: %s", why);
+      gemv_refuse(msg);
+      return false;
+    }
+  }
   if (p.format != Details::kFormat) { gemv_refuse("format mismatch"); return false; }
   if (p.layout != Details::kLayout) { gemv_refuse("layout mismatch"); return false; }
   if (p.is_bf16 != Details::ADetails::kIsBF16) { gemv_refuse("A type mismatch"); return false; }
@@ -139,6 +150,8 @@ bool launch_gemv(Params const& p, cudaStream_t s) {
   args.w_lo_stride_e = p.w_bytes_per_expert;
   args.w_hi_stride_e = p.w_hi_bytes_per_expert;
   args.scale_stride_e = p.scale_elems_per_expert;
+  args.lo_s = Details::LoLayout::strides(p.n, p.k);
+  args.hi_s = Details::HiLayout::strides(p.n, p.k);
 
   return gemv_dispatch_quant<Details, CtaN, Chunk>(p, args, rows_max, s);
 }

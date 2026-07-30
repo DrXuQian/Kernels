@@ -123,9 +123,16 @@ enum class WLayout : int {
   Native = 0,   // [N][K] column-major, K contiguous. GGUF/GPTQ native -- zero offline pass.
   TileK,        // [K/TS][N][TS]. Matches cutlass::layout::ColumnMajorInterleaved<TS> with TS = TileSizeK,
                 // i.e. the buffer the prefill AIU collective already reads for int4.
+  FoldCube,     // The sub-byte offline layout: cube-tiled with a within-cube permutation that compensates
+                // for the AIU converter's fixed emission order (xplane_offline.hpp). Parameterised by the
+                // PREFILL tile shape (tm,tn,tk,wm,wn,F), and NOT affine in k at StepK granularity -- a
+                // contiguous logical-k run of one column scatters inside the cube. Describable here, and
+                // deliberately refused by the affine GEMV path rather than read wrongly.
 };
 
-inline const char* name_of(WLayout l) { return l == WLayout::Native ? "native" : "tileK"; }
+inline const char* name_of(WLayout l) {
+  return l == WLayout::Native ? "native" : l == WLayout::TileK ? "tileK" : "foldcube";
+}
 
 // ---------------------------------------------------------------------------------------------------
 // Runtime arguments. num_experts == 0 selects the dense path; otherwise the grouped/MoE path.
@@ -163,6 +170,11 @@ struct Params {
   int64_t    w_bytes_per_expert   = 0;  // low-plane bytes between consecutive experts
   int64_t    w_hi_bytes_per_expert = 0; // high-plane bytes between consecutive experts
   int64_t    scale_elems_per_expert = 0; // scale (and zero) elements between consecutive experts
+
+  // Optional format record for the weight buffer (gemv_wformat.hpp). When present the launcher REFUSES a
+  // buffer whose recorded layout is not the one this instantiation reads, instead of computing wrong
+  // numbers from bytes it misread. Null keeps the old behaviour: caller asserts the format by construction.
+  void const* record = nullptr;   // WeightFormatRecord const*
 
   Params() = default;
 };

@@ -23,6 +23,9 @@ struct KernelArgs {
   int64_t     w_lo_stride_e;   // bytes
   int64_t     w_hi_stride_e;   // bytes
   int64_t     scale_stride_e;  // elements
+  // Weight addressing, derived on the host by evaluating the format's cute Layout (gemv_wformat.hpp).
+  WStrides    lo_s;
+  WStrides    hi_s;
 };
 
 // A group size is legal when a thread's StepK run never straddles a group boundary and a CTA step is a
@@ -72,8 +75,6 @@ __global__ void gemv_kernel(KernelArgs args) {
   using LoAcc = typename Details::LoAccess;
   using HiAcc = typename Details::HiAccess;
   using AAcc  = typename Details::AAccess;
-  using LoLay = typename Details::LoLayout;
-  using HiLay = typename Details::HiLayout;
 
   int const tid = threadIdx.x;
   int const e   = Grouped ? int(blockIdx.z) : 0;
@@ -112,10 +113,19 @@ __global__ void gemv_kernel(KernelArgs args) {
   T const* bias = reinterpret_cast<T const*>(args.bias) + n0;
   T const* act_scale = reinterpret_cast<T const*>(args.act_scale) + tid * StepK;
 
-  ByteIterator<true, typename LoAcc::Vec, LoAcc::kCount> it_lo(
-      w_lo, LoLay::base(n0, tid, n, k), LoLay::step(n, k), LoLay::stride(n, k));
-  ByteIterator<TwoPlane, typename HiAcc::Vec, HiAcc::kCount> it_hi(
-      w_hi, HiLay::base(n0, tid, n, k), HiLay::step(n, k), HiLay::stride(n, k));
+  // The format is entirely carried by four host-computed byte strides: the address of (column n0+col,
+  // thread tid, iteration iter) is n0*col + (tid/TPT)*thr_major + (tid%TPT)*thr_minor + iter*iter. TPT is a
+  // compile-time constant, and for a flat layout tid/TPT is 0 so the major term costs nothing.
+  constexpr int TPT_LO = Details::LoLayout::kTPT;
+  constexpr int TPT_HI = Details::HiLayout::kTPT;
+  int64_t const off_lo = int64_t(n0) * args.lo_s.col
+                       + int64_t(tid / TPT_LO) * args.lo_s.thr_major
+                       + int64_t(tid % TPT_LO) * args.lo_s.thr_minor;
+  int64_t const off_hi = int64_t(n0) * args.hi_s.col
+                       + int64_t(tid / TPT_HI) * args.hi_s.thr_major
+                       + int64_t(tid % TPT_HI) * args.hi_s.thr_minor;
+  ByteIterator<true, typename LoAcc::Vec, LoAcc::kCount> it_lo(w_lo, off_lo, args.lo_s.iter, args.lo_s.col);
+  ByteIterator<TwoPlane, typename HiAcc::Vec, HiAcc::kCount> it_hi(w_hi, off_hi, args.hi_s.iter, args.hi_s.col);
 
   T2 acc[CtaM * Pairs];
   fill<CtaM * Pairs>(acc, M::to_vec2(M::from_float(0.f)));

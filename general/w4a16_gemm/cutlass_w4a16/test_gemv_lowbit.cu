@@ -318,6 +318,119 @@ static bool run_case(CaseSpec const& c, uint32_t seed) {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// LAYOUT IDENTITY GATE. The iterator reads address (base + iter*step + col*stride); the format's DEFINITION
+// is the cute Layout. This checks they are the same object at every point the kernel touches, for every
+// (layout, width, StepK, Threads, TS) actually instantiated. Without it the closed form is a SECOND
+// definition of the format, free to drift from the one the record describes.
+template <WLayout Lay, int Bits, int StepK, int Threads, int TS>
+static void gate_layout(const char* tag) {
+  using Tr = WFormatTraits<Lay, Bits, StepK, Threads, TS>;
+  constexpr int TPT = Tr::kTPT;
+  int bad = 0, checked = 0, stride_bad = 0;
+  int first_n = -1, first_tid = -1, first_iter = -1, first_col = -1;
+  int64_t got0 = 0, want0 = 0;
+  for (int N : {64, 128, 2048})
+    for (int K : {Threads * StepK, Threads * StepK * 4}) {
+      int const CtaK = Threads * StepK;
+      WStrides const w = Tr::strides(N, K);
+      for (int n0 = 0; n0 + 8 <= N; n0 += std::max(1, N / 5))
+        for (int tid = 0; tid < Threads; tid += std::max(1, Threads / 8))
+          for (int iter = 0; iter < K / CtaK; ++iter)
+            for (int col = 0; col < 8; ++col) {
+              // exactly the address the kernel forms
+              int64_t const got = int64_t(n0) * w.col
+                                + int64_t(tid / TPT) * w.thr_major
+                                + int64_t(tid % TPT) * w.thr_minor
+                                + int64_t(iter) * w.iter
+                                + int64_t(col) * w.col;
+              // what the format means, written out independently
+              int const k = iter * CtaK + tid * StepK;
+              int64_t want;
+              if constexpr (Lay == WLayout::Native)
+                want = (int64_t(n0 + col) * K + k) * Bits / 8;
+              else
+                want = ((int64_t(k / TS) * N * TS) + int64_t(n0 + col) * TS + (k % TS)) * Bits / 8;
+              ++checked;
+              if (got != want) {
+                if (bad == 0) { first_n = n0; first_tid = tid; first_iter = iter; first_col = col;
+                                got0 = got; want0 = want; }
+                ++bad;
+              }
+            }
+    }
+  (void)stride_bad;
+  if (bad == 0) {
+    std::printf("  [ok]   layout   %-24s %d points, cute strides == format\n", tag, checked);
+    ++g_pass;
+  } else {
+    std::printf("  [FAIL] layout   %-24s %d/%d bad; first n0=%d tid=%d iter=%d col=%d got %lld want %lld\n",
+                tag, bad, checked, first_n, first_tid, first_iter, first_col,
+                (long long)got0, (long long)want0);
+    ++g_fail;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// RECORD GATE, with the negative control that makes it mean something: a record describing a DIFFERENT
+// offline format must be refused, not read.
+template <typename Details, int CtaN, int Chunk>
+static void gate_record(const char* tag) {
+  int const N = 64, K = 2048, gs = 32;
+  QuantOp const q = QuantOp::FinegrainedScaleOnly;
+  auto rec = wfmt_record<Details>(N, K, gs, q, 0);
+  char const* why = "";
+
+  bool const self_ok = wfmt_matches<Details>(rec, N, K, gs, q, &why);
+
+  // round-trip through a file, as the offline pass would write it
+  char path[256];
+  std::snprintf(path, sizeof(path), "/tmp/claude-0/-root/57027199-de80-4d5b-b901-e3ed437519e8/scratchpad/wfmt_%s.bin", tag);
+  WeightFormatRecord back{};
+  bool const io_ok = wfmt_write(path, rec) && wfmt_read(path, back)
+                  && std::memcmp(&rec, &back, sizeof(rec)) == 0;
+
+  // negative controls: each perturbation must be REFUSED
+  int refused = 0, controls = 0;
+  auto expect_refusal = [&](WeightFormatRecord r, const char* what) {
+    ++controls;
+    char const* w = "";
+    if (!wfmt_matches<Details>(r, N, K, gs, q, &w)) ++refused;
+    else std::printf("         !! accepted a record with a wrong %s\n", what);
+  };
+  { auto r = rec; r.layout = int32_t(WLayout::FoldCube); r.fold = 2; r.tm = 32; expect_refusal(r, "layout (cube-folded)"); }
+  { auto r = rec; r.lo_bits += 1;                        expect_refusal(r, "low-plane width"); }
+  { auto r = rec; r.group_size = 128;                    expect_refusal(r, "group size"); }
+  { auto r = rec; r.k = K / 2;                           expect_refusal(r, "problem shape"); }
+  { auto r = rec; r.tile_k = (r.tile_k == 256 ? 128 : 256); r.layout = int32_t(WLayout::TileK);
+                                                         expect_refusal(r, "tile K"); }
+  { auto r = rec; std::snprintf(r.layout_str_lo, sizeof(r.layout_str_lo), "(1,1):(1,1)");
+                                                         expect_refusal(r, "layout string"); }
+  { auto r = rec; r.magic[0] = 'X';                      expect_refusal(r, "magic"); }
+
+  // and the launcher must actually honour it
+  int const fail0 = gemv_fail_count();
+  Params bad_p;
+  bad_p.n = N; bad_p.k = K; bad_p.groupsize = gs; bad_p.quant = q; bad_p.m = 1;
+  bad_p.format = Details::kFormat; bad_p.layout = Details::kLayout;
+  auto bad_rec = rec; bad_rec.group_size = 128;
+  bad_p.record = &bad_rec;
+  bool const launched = launch_gemv<Details, CtaN, Chunk>(bad_p, 0);
+  bool const launcher_refused = !launched && gemv_fail_count() == fail0 + 1;
+
+  bool const ok = self_ok && io_ok && refused == controls && launcher_refused;
+  if (ok) {
+    std::printf("  [ok]   record   %-24s self+io, %d/%d controls refused, launcher honours it\n",
+                tag, refused, controls);
+    ++g_pass;
+  } else {
+    std::printf("  [FAIL] record   %-24s self=%d io=%d controls=%d/%d launcher_refused=%d (%s)\n",
+                tag, int(self_ok), int(io_ok), refused, controls, int(launcher_refused), why);
+    ++g_fail;
+  }
+  if (self_ok && io_ok) wfmt_print(rec);
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Instantiations. StepK is set by the SPARSEST plane (StepK*min(bits) >= 32) and Threads by CtaK <= K.
 template <WFormat F, WLayout L> struct Pick;
 template <WLayout L> struct Pick<WFormat::Int8,  L> { using D = KernelDetails<FP16DetailsA, WFormat::Int8,  L, 16, 128>; };
@@ -331,7 +444,22 @@ template <WLayout L> struct Pick<WFormat::Q3_21, L> { using D = KernelDetails<FP
 int main(int argc, char** argv) {
   bool const quick = (argc > 1 && std::string(argv[1]) == "quick");
 
-  std::printf("== converter gate ==\n");
+  std::printf("== layout identity gate (iterator triple == cute Layout) ==\n");
+  gate_layout<WLayout::Native, 4, 16, 128, 256>("native int4 s16 t128");
+  gate_layout<WLayout::Native, 2, 16, 128, 256>("native int2 s16 t128");
+  gate_layout<WLayout::Native, 1, 32,  64, 256>("native int1 s32 t64");
+  gate_layout<WLayout::Native, 8, 16, 128, 256>("native int8 s16 t128");
+  gate_layout<WLayout::TileK,  4, 16, 128, 256>("tileK  int4 s16 t128 TS256");
+  gate_layout<WLayout::TileK,  2, 16, 128, 256>("tileK  int2 s16 t128 TS256");
+  gate_layout<WLayout::TileK,  1, 32,  64, 256>("tileK  int1 s32 t64  TS256");
+  gate_layout<WLayout::TileK,  4, 16, 128, 128>("tileK  int4 s16 t128 TS128");
+
+  std::printf("\n== weight format record ==\n");
+  gate_record<Pick<WFormat::Int4, WLayout::Native>::D, 8, 2>("int4-native");
+  gate_record<Pick<WFormat::Int4, WLayout::TileK>::D,  8, 2>("int4-tileK");
+  gate_record<Pick<WFormat::Q3_21, WLayout::Native>::D, 8, 2>("q3-native");
+
+  std::printf("\n== converter gate ==\n");
   gate_converter<8, false>("int8");
   gate_converter<4, false>("int4");
   gate_converter<2, false>("int2");
