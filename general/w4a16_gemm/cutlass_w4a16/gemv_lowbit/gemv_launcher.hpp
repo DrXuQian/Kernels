@@ -23,6 +23,13 @@ namespace ppu_gemv {
 #define GEMV_CTAM_MAX 4
 #endif
 
+// Which quant ops get instantiated, for the same reason as GEMV_GS_LIST: every entry is a full set of kernels
+// and a perf sweep that only ever calls two of the three should not pay for the third. Default is all three.
+#ifndef GEMV_QUANT_LIST
+#define GEMV_QUANT_LIST(EMIT, G)                                                                   \
+  EMIT(QuantOp::PerColScaleOnly, G) EMIT(QuantOp::FinegrainedScaleOnly, G) EMIT(QuantOp::FinegrainedScaleZero, G)
+#endif
+
 // ---------------------------------------------------------------------------------------------------
 // Compile-time legality of one (GS, QuantOp, StepK) triple. Checked with if constexpr inside a TEMPLATE so
 // the illegal combinations are never instantiated -- an if constexpr in a plain function does not suppress
@@ -90,10 +97,7 @@ bool gemv_dispatch_quant(Params const& p, KernelArgs const& args, int rows_max, 
       return gemv_dispatch_grouped<Details, CtaN, Chunk, (G), (QO)>(p, args, rows_max, s);         \
     else { gemv_refuse("group size illegal for this StepK"); return false; }                       \
   }
-#define GEMV_EMIT_GS(G)                                                                            \
-  GEMV_TRY_QGS(QuantOp::PerColScaleOnly, G)                                                        \
-  GEMV_TRY_QGS(QuantOp::FinegrainedScaleOnly, G)                                                   \
-  GEMV_TRY_QGS(QuantOp::FinegrainedScaleZero, G)
+#define GEMV_EMIT_GS(G) GEMV_QUANT_LIST(GEMV_TRY_QGS, G)
   GEMV_GS_LIST(GEMV_EMIT_GS)
 #undef GEMV_EMIT_GS
 #undef GEMV_TRY_QGS
