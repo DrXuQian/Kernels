@@ -1183,3 +1183,35 @@ AiuContElemSize is 64 and CUBE_H is TileM. launch() refuses Mmax > 1.
 
 Expected: no gain at decode (work-bound, four measurements) -- this banks the capability and the geometry knowledge.
 Unmeasured on hardware.
+
+### The local gate accepts a static_assert in an incomplete class body; hgcc does not
+
+PPU_A_PACK=1 compiled clean under the local nvcc front end on four harnesses and then failed on the box with
+
+    error: no type named 'SharedStorage' in cutlass::gemm::collective::CollectiveMma<...>
+
+Cause: static_assert(aPackDisjoint(), ...) sat in the CLASS BODY and calls a member function of that same class,
+which is still incomplete there. EDG accepts it, clang/hgcc rejects it, and the rejection surfaces as the whole
+class failing -- so the reported error names SharedStorage and says nothing about the assert.
+
+Moved to the top of mma(), where the class is complete. Same numbers checked, same guard.
+
+This is a NEW blind spot in syntax_check.sh, distinct from the ones already recorded: not a missing include, not an
+uninstantiated template, but a construct EDG is more permissive about than clang. Worth remembering as a class --
+the local gate proves a translation unit PARSES under nvcc, and permissiveness differences are exactly what it
+cannot see.
+
+Also settled this round, and it invalidated a measurement: the box was at ef838e4, one commit BEFORE PPU_A_PACK
+landed, so grep -c PPU_A_PACK on moe_grouped_ppu.cuh returned 0. build.sh verified -DPPU_A_PACK=1 was on every
+compile line -- host and device, main file and all eleven generated units -- and the run was still the default
+build, because nothing in that checkout responds to the macro. sk_pack.log is void.
+
+So build.sh checks that the flag is PASSED, never that anything USES it. A misspelled macro name or a stale
+checkout both pass silently, which is the same shape as the accident its own comment at line 218 records. The fix
+belongs in the kernel, not the build script: when a macro is meant to change SharedStorageSize, compare it against
+the unpacked arithmetic at launch and treat equality as a FAILURE. Then 'the macro did nothing' is a refusal
+instead of a plausible-looking set of timings.
+
+Next session, in order: (1) that self-report check plus host/device consistency in build.sh, (2) re-measure
+PPU_A_PACK for real, (3) redo #11 passing the second scale fragment as NAMED parameters -- appending to the
+cute::tuple<Ts...> would not deduce.
