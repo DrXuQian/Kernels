@@ -48,6 +48,11 @@ echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 if [ -x "$HERE/fold_derivation/cmake_calls_check.sh" ]; then
   "$HERE/fold_derivation/cmake_calls_check.sh" || exit 1
 fi
+# NVIDIA-only spellings in box-built sources. The syntax check cannot see these: local nvcc has cuda_fp16.h
+# whether or not -D__HGGCCC__ is passed, so a wrong-platform include parses clean and only hgcc disagrees.
+if [ -x "$HERE/fold_derivation/ppu_portability_check.py" ]; then
+  "$HERE/fold_derivation/ppu_portability_check.py" || exit 1
+fi
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"

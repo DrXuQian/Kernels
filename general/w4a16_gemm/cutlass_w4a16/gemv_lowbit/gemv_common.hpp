@@ -30,9 +30,27 @@
 #include <string>
 #include <type_traits>
 
+// PLATFORM HEADERS. The intrinsic SPELLINGS are the same on both sides -- half2, __hfma2, __hsub2,
+// __half2half2, __shfl_xor_sync, __float2half all exist under hgcc -- but they arrive from a different
+// header. Getting this wrong is invisible to a local syntax check, because nvcc has cuda_fp16.h whether or
+// not __HGGCCC__ is defined; only the box says so. See fold_derivation/ppu_portability_check.sh.
+#if defined(__HGGCCC__)
+#include <hggc_fp16.h>
+#if defined(ENABLE_BF16)
+#include <hggc_bf16.h>
+#endif
+#else
 #include <cuda_fp16.h>
 #if defined(ENABLE_BF16)
 #include <cuda_bf16.h>
+#endif
+#endif
+
+// The stream type differs; nothing else in the launch path does.
+#if defined(__HGGCCC__)
+using gemv_stream_t = hggcStream_t;
+#else
+using gemv_stream_t = cudaStream_t;
 #endif
 
 namespace ppu_gemv {

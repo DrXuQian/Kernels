@@ -35,7 +35,7 @@ constexpr bool gemv_combo_ok() {
 }
 
 template <typename Details, int CtaM, int CtaN, int Chunk, int GS, QuantOp QOp, bool EnableBias, bool Grouped>
-void gemv_exec(Params const& p, KernelArgs const& args, int grid_m, cudaStream_t s) {
+void gemv_exec(Params const& p, KernelArgs const& args, int grid_m, gemv_stream_t s) {
   dim3 const grid(grid_m, p.n / CtaN, Grouped ? p.num_experts : 1);
   dim3 const block(Details::kThreads);
   gemv_kernel<Details, CtaM, CtaN, Chunk, GS, QOp, /*EnableActScale=*/false, EnableBias,
@@ -44,7 +44,7 @@ void gemv_exec(Params const& p, KernelArgs const& args, int grid_m, cudaStream_t
 
 // ---- CtaM ----
 template <typename Details, int CtaN, int Chunk, int GS, QuantOp QOp, bool EnableBias, bool Grouped>
-bool gemv_dispatch_ctam(Params const& p, KernelArgs const& args, int rows_max, cudaStream_t s) {
+bool gemv_dispatch_ctam(Params const& p, KernelArgs const& args, int rows_max, gemv_stream_t s) {
 #define GEMV_TRY_CTAM(CM)                                                                        \
   if (rows_max <= (CM) || (CM) == GEMV_CTAM_MAX) {                                                 \
     constexpr int _cm = (CM);                                                                      \
@@ -68,14 +68,14 @@ bool gemv_dispatch_ctam(Params const& p, KernelArgs const& args, int rows_max, c
 
 // ---- bias ----
 template <typename Details, int CtaN, int Chunk, int GS, QuantOp QOp, bool Grouped>
-bool gemv_dispatch_bias(Params const& p, KernelArgs const& args, int rows_max, cudaStream_t s) {
+bool gemv_dispatch_bias(Params const& p, KernelArgs const& args, int rows_max, gemv_stream_t s) {
   if (p.bias) return gemv_dispatch_ctam<Details, CtaN, Chunk, GS, QOp, true, Grouped>(p, args, rows_max, s);
   return gemv_dispatch_ctam<Details, CtaN, Chunk, GS, QOp, false, Grouped>(p, args, rows_max, s);
 }
 
 // ---- grouped ----
 template <typename Details, int CtaN, int Chunk, int GS, QuantOp QOp>
-bool gemv_dispatch_grouped(Params const& p, KernelArgs const& args, int rows_max, cudaStream_t s) {
+bool gemv_dispatch_grouped(Params const& p, KernelArgs const& args, int rows_max, gemv_stream_t s) {
   if (p.num_experts > 0)
     return gemv_dispatch_bias<Details, CtaN, Chunk, GS, QOp, true>(p, args, rows_max, s);
   return gemv_dispatch_bias<Details, CtaN, Chunk, GS, QOp, false>(p, args, rows_max, s);
@@ -83,7 +83,7 @@ bool gemv_dispatch_grouped(Params const& p, KernelArgs const& args, int rows_max
 
 // ---- (quant op, group size) ----
 template <typename Details, int CtaN, int Chunk>
-bool gemv_dispatch_quant(Params const& p, KernelArgs const& args, int rows_max, cudaStream_t s) {
+bool gemv_dispatch_quant(Params const& p, KernelArgs const& args, int rows_max, gemv_stream_t s) {
 #define GEMV_TRY_QGS(QO, G)                                                                        \
   if (p.quant == (QO) && p.groupsize == (G)) {                                                     \
     if constexpr (gemv_combo_ok<Details, (G), (QO)>())                                             \
@@ -105,7 +105,7 @@ bool gemv_dispatch_quant(Params const& p, KernelArgs const& args, int rows_max, 
 // Entry point for one compiled shape. Returns false (and bumps gemv_fail_count) without launching if the
 // problem does not fit the instantiation.
 template <typename Details, int CtaN, int Chunk>
-bool launch_gemv(Params const& p, cudaStream_t s) {
+bool launch_gemv(Params const& p, gemv_stream_t s) {
   // The buffer's own record wins over anything the caller claims in Params.
   if (p.record) {
     char const* why = "";

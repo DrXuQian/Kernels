@@ -6,7 +6,11 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstdint>
+#if defined(__HGGCCC__)
+#include <hggc_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 
 namespace moe_splitk_ppu {
 

@@ -142,8 +142,8 @@ __device__ __forceinline__ void epilogue(typename Details::AType* out, int strid
 #pragma unroll
     for (int cp = 0; cp < Pairs; ++cp) {
       float2 v;
-      v.x = M::to_float(__low2half(acc[m * Pairs + cp]));
-      v.y = M::to_float(__high2half(acc[m * Pairs + cp]));
+      v.x = M::to_float(M::lo(acc[m * Pairs + cp]));
+      v.y = M::to_float(M::hi(acc[m * Pairs + cp]));
       v.x = warp_reduce_sum(v.x);
       v.y = warp_reduce_sum(v.y);
       if (lane == 0) {
