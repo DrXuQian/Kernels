@@ -47,21 +47,30 @@ int main(int argc, char** argv) {
   if (sk_only()) std::printf("   SPLITK_ONLY=\"%s\"\n", sk_only());
   if (sk_acu())  std::printf("   *** SPLITK_ACU: ONE COLD LAUNCH PER ROW. Captures, not timings. ***\n");
 
-  // A GRID BELOW ONE WAVE CANNOT ANSWER ANYTHING, and this has now cost two rounds: a dense m=8 ladder ran 64
-  // CTAs on 72 CUs (acu: DRAM 4.43%) and was withdrawn, then a mode-3 run with top-k misread as rows-per-expert
-  // did the same thing at 64 CTAs and produced a split-K "speedup" of 0.517x. The smallest TileN swept is 32, so
-  // the most CTAs any row here can launch is mt*(N/32)*S; if even that is short of the machine, say so before the
-  // numbers scroll past rather than leaving it to be noticed in a screenshot.
+  // A GRID BELOW ONE WAVE CANNOT ANSWER ANYTHING, so this REFUSES rather than warns. A printed warning was not
+  // enough: the run that prompted it printed this very banner, named the corrected command, and was then
+  // re-issued unchanged -- so a verdict table appeared for a 1-expert problem twice. Three rounds of this
+  // session have now been spent on numbers taken from a grid too small to measure (a dense m=8 ladder at 64
+  // CTAs, acu DRAM 4.43%, withdrawn; then this shape twice).
+  //
+  // The bound is computed from the LARGEST TileM and SMALLEST TileN actually swept, so it is a property of the
+  // sweep and not a guess: if even the widest row cannot fill 72 CUs at S=1, no row can.
   {
     int mt_min = 0;
-    for (int e = 0; e < bd.L; ++e) mt_min += (bd.me[e] + 63) / 64;   // the largest TileM swept
-    int const cta_best = mt_min * ((bd.N + 31) / 32);                 // the smallest TileN swept, at S=1
+    for (int e = 0; e < bd.L; ++e) mt_min += (bd.me[e] + 63) / 64;
+    int const cta_best = mt_min * ((bd.N + 31) / 32);
     if (bd.active < 2 || cta_best < 72) {
-      std::printf("\n  *** THIS GEOMETRY CANNOT ANSWER ANYTHING ***\n"
-                  "      active experts = %d, and the widest row here launches only %d CTAs on 72 CUs at S=1.\n"
-                  "      Every number below is latency on an empty machine. In mode 3, `Rows` is the TOP-K:\n"
-                  "      the recorded decode band is  %s 64 8 %d %d %d 3\n\n",
-                  bd.active, cta_best, "$BIN/test_moe_splitk_bench", bd.N, bd.K, bd.gs);
+      std::printf("\n  *** REFUSING TO RUN: THIS GEOMETRY CANNOT ANSWER ANYTHING ***\n"
+                  "      active experts = %d, and the widest row here launches only %d CTAs on 72 CUs at S=1,\n"
+                  "      so every number would be latency on an empty machine.\n\n"
+                  "      In mode 3, `Rows` is the TOP-K (how many experts are ACTIVE), not rows per expert.\n"
+                  "      You ran L=%d Rows=%d. The recorded decode band is:\n\n"
+                  "          $BIN/test_moe_splitk_bench 64 8 %d %d %d 3\n\n"
+                  "      Expect active=8, roof ~7.6 us (21 MB), and cta 512 for 16x32:256 at S=1.\n"
+                  "      To measure this geometry anyway: SPLITK_FORCE=1\n",
+                  bd.active, cta_best, bd.L, bd.Rows, bd.N, bd.K, bd.gs);
+      if (!std::getenv("SPLITK_FORCE")) return 2;
+      std::printf("      SPLITK_FORCE=1 set -- proceeding. These numbers do not bound anything.\n\n");
     }
   }
 
