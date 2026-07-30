@@ -22,7 +22,11 @@ namespace moe_splitk_ppu {
 // locally at all (every half_t method degrades to host `inline`). The caller reinterpret_casts, which is free:
 // cutlass::half_t wraps __half with the same layout. This is the difference between a merge that has been
 // measured against an fp64 reference and one that has only been observed to compile.
-__global__ void moeg_splitk_reduce(__half* __restrict__ D,
+// STATIC, because this header is now included by SIX translation units (main plus one per generated config)
+// and a __global__ function has EXTERNAL linkage: the split into per-config units turned a working header into
+// `multiple definition of moeg_splitk_reduce` at link time. A __global__ cannot be `inline` in CUDA, so internal
+// linkage is the fix -- six copies of a grid-stride elementwise add cost nothing.
+static __global__ void moeg_splitk_reduce(__half* __restrict__ D,
                                    __half const* __restrict__ partials,
                                    int64_t elems, int slices) {
   int64_t const stride = int64_t(gridDim.x) * blockDim.x;
