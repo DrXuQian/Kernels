@@ -668,3 +668,29 @@ is the refusal COUNT (5 launches refused), not worst_e.
 
 Also fixed: the vacuity return preceded the MOEG_DUMP/MOEG_CHECK block, so the one oracle that does not share
 this binary's collective was unreachable exactly when it mattered. Cross-build compare now runs first.
+
+### NaN defeats every comparison-based check, and it produced TWO simultaneous MATCHes on garbage
+
+The box printed three readings that have no solution over the reals:
+
+    grouped-L=8 vs grouped-L=1 oracle: max_rel=0.000e+00 (worst e=-1) bad=0 -> MATCH
+    cross-build vs /tmp/d_off.bin:     max_rel=0.000e+00 (worst idx=0) bad=0 -> MATCH   <- reference judged LIVE
+    *** VACUOUS: the oracle never produced a nonzero value ***                          <- golden judged ALL ZERO
+
+All-zero golden plus bit-exact equality plus a nonzero reference cannot hold together. NaN reconciles all three:
+every `if (x > y)` is FALSE when x is NaN, so rel = |got-NaN|/(NaN+1e-3) = NaN never updates max_rel and never
+trips `rel > 5e-2`; abs(NaN) > gold_absmax fails so the golden reads as all-zero; and `g != 0` is TRUE for NaN,
+which is how an all-NaN reference passed the liveness test. A comparison-based checker reports a PERFECT MATCH on
+a buffer full of NaN -- on both sides at once.
+
+Fix: non-finite values are counted, not compared, and are bad by definition on either side; both absmaxes, the
+non-finite counts and the first four values of each buffer are printed unconditionally, because a verdict derived
+from comparisons cannot distinguish 'equal' from 'both zero' from 'both NaN'.
+
+This is the same class as the refused-launch pass, one level deeper: the check was structurally incapable of
+seeing the failure it was written to catch. Both times the tell was an internal inconsistency between two
+printed numbers, not a value that looked wrong on its own.
+
+Open question the next run answers: WHICH side is non-finite, and whether it predates PPU_A_CUBE_H -- the OFF
+build's dump was judged live, but under NaN that judgement is worthless, so the baseline at Mb=1 is now also
+unverified. Mb=1 had never been run before this line of work.

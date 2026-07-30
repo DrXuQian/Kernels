@@ -105,11 +105,18 @@ int main(int argc, char** argv) {
   std::vector<half_t> hD((size_t)total * N); D.copy_to_host(hD.data());
 
   // ---- ORACLE: each expert alone (L=1), compare vs the contiguous D rows ----
+  half_t hD0[4] = {half_t(0.f), half_t(0.f), half_t(0.f), half_t(0.f)};   // expert 0's oracle rows, for the dump below
   // gold_absmax, not worst_e, is what decides whether this comparison had anything in it. worst_e stays -1 on a
   // BIT-EXACT pass -- rel is 0 for every element, so `rel > max_rel` never fires -- and the L=1 oracle is
   // bit-exact by construction. Keying vacuity on worst_e therefore failed a genuine pass, which is how this check
   // first reported itself wrong.
-  double max_rel = 0, gold_absmax = 0; int bad = 0, worst_e = -1;
+  // NaN DEFEATS EVERY COMPARISON-BASED CHECK IN THIS FILE, so it is counted explicitly rather than compared.
+  // Every `if (x > y)` is FALSE when x is NaN: rel = |got-NaN|/(NaN+1e-3) is NaN, so `rel > max_rel` and
+  // `rel > 5e-2` both fail, max_rel stays 0, bad stays 0, worst_e stays -1, and abs(NaN) > gold_absmax fails too.
+  // A buffer full of NaN therefore printed 'max_rel=0.000e+00 bad=0 -> MATCH' on BOTH the L=1 and the cross-build
+  // comparisons while gold_absmax reported the golden as all-zero -- three mutually contradictory readings that
+  // only NaN reconciles. Non-finite values are now bad by definition, on either side.
+  double max_rel = 0, gold_absmax = 0, got_absmax = 0; int bad = 0, worst_e = -1, nan_gold = 0, nan_got = 0;
   for (int e = 0; e < L; ++e) {
     const int Me = me[e];
     cutlass::DeviceAllocation<half_t> Ae((size_t)Me * K), Se((size_t)N * scale_k), De((size_t)Me * N);
@@ -131,12 +138,16 @@ int main(int argc, char** argv) {
                 Me, N, K, /*L=*/1, gs, gs1d.get(), gs1.data(), /*offsets=*/nullptr, ws1b.get(), ws1);
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
     std::vector<half_t> hDe((size_t)Me * N); De.copy_to_host(hDe.data());
+    if (e == 0) for (int t = 0; t < 4 && t < Me * N; ++t) hD0[t] = hDe[t];
 
     for (int i = 0; i < Me; ++i)
       for (int j = 0; j < N; ++j) {
         double gold = (double)float(hDe[(size_t)i * N + j]);
-        if (std::abs(gold) > gold_absmax) gold_absmax = std::abs(gold);
         double got  = (double)float(hD[((size_t)offs[e] + i) * N + j]);   // CONTIGUOUS: row offs[e]+i
+        if (!std::isfinite(gold)) { ++nan_gold; ++bad; if (worst_e < 0) worst_e = e; continue; }
+        if (!std::isfinite(got))  { ++nan_got;  ++bad; if (worst_e < 0) worst_e = e; continue; }
+        if (std::abs(gold) > gold_absmax) gold_absmax = std::abs(gold);
+        if (std::abs(got)  > got_absmax)  got_absmax  = std::abs(got);
         double rel  = std::abs(got - gold) / (std::abs(gold) + 1e-3);
         if (rel > max_rel) { max_rel = rel; worst_e = e; }
         if (rel > 5e-2) ++bad;
@@ -150,6 +161,16 @@ int main(int argc, char** argv) {
               L, ragged ? "ragged" : "uniform", Mb, N, K, gs, total, Mmax);
   std::printf("  grouped-L=%d(contiguous D[total][N]) vs grouped-L=1 oracle: max_rel=%.3e (worst e=%d) bad=%d -> %s\n",
               L, max_rel, worst_e, bad, bad == 0 ? "MATCH" : "MISMATCH");
+  // What is actually in the buffers. Printed unconditionally: the whole point is that a verdict computed from
+  // comparisons could not distinguish 'equal', 'both zero' and 'both NaN'.
+  std::printf("  |gold|max=%.4g  |got|max=%.4g  non-finite: gold=%d got=%d   gold[0..3]=%g %g %g %g  got[0..3]=%g %g %g %g\n",
+              gold_absmax, got_absmax, nan_gold, nan_got,
+              (double)float(hD0[0]), (double)float(hD0[1]), (double)float(hD0[2]), (double)float(hD0[3]),
+              (double)float(hD[0]),  (double)float(hD[1]),  (double)float(hD[2]),  (double)float(hD[3]));
+  if (nan_gold || nan_got) {
+    std::printf("  *** NON-FINITE OUTPUT: %d in the L=1 oracle, %d in the grouped run. FAILURE. ***\n", nan_gold, nan_got);
+    return 5;
+  }
 
   int const refused = moe_grouped_ppu::moeg_fail_count() - fails_before;
   if (refused) {
@@ -174,15 +195,18 @@ int main(int argc, char** argv) {
     size_t const rd = std::fread(ref.data(), sizeof(half_t), ref.size(), fp);
     std::fclose(fp);
     if (rd != ref.size()) { std::printf("  MOEG_CHECK: %s has %zu halfs, expected %zu\n", f, rd, ref.size()); return 4; }
-    int xbad = 0; double xmax = 0; size_t xi = 0; bool ref_live = false;
+    int xbad = 0, xnan = 0; double xmax = 0, ref_absmax = 0; size_t xi = 0;
     for (size_t i = 0; i < ref.size(); ++i) {
       double g = (double)float(ref[i]), o = (double)float(hD[i]);
-      if (g != 0) ref_live = true;
+      // 'g != 0' was TRUE for NaN, which is how an all-NaN reference passed itself off as live.
+      if (!std::isfinite(g) || !std::isfinite(o)) { ++xnan; ++xbad; continue; }
+      if (std::abs(g) > ref_absmax) ref_absmax = std::abs(g);
       double r = std::abs(o - g) / (std::abs(g) + 1e-3);
       if (r > xmax) { xmax = r; xi = i; }
       if (r > 5e-2) ++xbad;
     }
-    if (!ref_live) { std::printf("  *** MOEG_CHECK: the reference dump is ALL ZERO -- it verifies nothing. ***\n"); return 3; }
+    std::printf("  MOEG_CHECK: |ref|max=%.4g non-finite=%d\n", ref_absmax, xnan);
+    if (ref_absmax == 0) { std::printf("  *** MOEG_CHECK: the reference has no finite nonzero value -- it verifies nothing. ***\n"); return 3; }
     std::printf("  cross-build vs %s: max_rel=%.3e (worst idx=%zu) bad=%d -> %s\n",
                 f, xmax, xi, xbad, xbad == 0 ? "MATCH" : "MISMATCH");
     if (xbad) return 1;
