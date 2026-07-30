@@ -1277,3 +1277,29 @@ SK_QUANT added to the bench to price the scale channel by removing it:
     0           PerColScaleOnly         no per-GROUP reload at all -- the FINE path's 8 dependent smem loads per
                                         k-tile disappear, which is the ceiling on what TODO #11 could ever win
 The mode is in the row tag so a log cannot be mistaken for the default.
+
+### Two measurement facts that invalidate earlier comparisons
+
+**acu's Duration and the bench's number measure different things, and the gap is 17%.** The bench runs
+`time_it(go, 20)` -- twenty iterations of wall time, launch and sync included -- while `SPLITK_ACU=1` runs
+`time_it(go, 0)`, one cold launch, and the row even prints "ONE COLD launch (not a timing)". acu's 18.33 us against
+the bench's 21.57 us for the same config is the difference, i.e. roughly 3 us of per-launch overhead on a 20 us
+kernel. Both numbers are right for their own question; comparing them is not. Worth knowing for the real workload:
+at decode about a sixth of the cost is launch overhead, which no kernel change can touch.
+
+**Same-config run-to-run spread is 13%, not the 3-7% I had recorded.** The same row measured 20.18 (inside a full
+sweep), 22.91 and 21.57 (single filtered rows). A filtered single-row run has no warm-up from the rows before it.
+So an A/B is only valid inside ONE run, or across runs with identical filtering back to back -- which is what the
+SK_QUANT triple did, so its 11.5% / 7.3% split stands, while "20.18 is the best number" does not.
+
+### PPU_SCALE_PREFETCH: the applicability was written as a requirement, and three units failed to compile
+
+`static_assert(GRP <= 2)` where GRP = K_ATOM_PER_COPY / APG_. The TileK=64 configs have GRP > 2, so instead of
+keeping the per-group reload they failed the build. Two register sets are an APPLICABILITY CONDITION, not a
+precondition of the code.
+
+Now `if constexpr (kPfOk)` with kPfOk = (GRP == 2) && tuple_size<PfPack> == 4, and the original loop in the else.
+The GRP expression also guards divisibility -- `K_ATOM_PER_COPY % APG_` non-zero would have truncated to a GRP that
+skips groups, and the old assert let GRP == 0 through, which would have loaded no scale at all while passing.
+
+Same shape as the four "two places must agree" errors: a boundary check that guarded one end only.
