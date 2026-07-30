@@ -1360,3 +1360,25 @@ over-constrain the wider tiles.
 Expectation on the record before measuring: at S=1 with a 16x64 tile the grid supplies 4 blocks/CU while 106
 registers already allow 9, so registers are not the binding limit and this should do nothing. The S=2 experiment
 already showed occupancy rising 14 -> 26.8 for no gain.
+
+### The scale channel, read off the layout (l89_scale_read.cu)
+
+    SmemLayoutScale   = (64, 8, 2) : (1, 64, 512)      <- group stride 64 halfs = 128 B
+    max_common_vector = 1                              <- the read is scalar-grade
+
+128 B is exactly 32 banks x 4 B, so CONSECUTIVE GROUPS START ON THE SAME BANK. N is contiguous inside a group, so one
+group covers the banks once and is fine on its own; the conflicts come from stepping in the group or stage direction.
+That matches acu: +252k conflicts on +272k scale reads, 1.02 each, doubling the channel's transactions to +504k while
+shared memory sits at 28% of peak -- transactions times latency, not a bandwidth wall.
+
+PPU_SCALE_PAD adds N halfs to the group stride (8 shifts each group by 4 banks). Data, the gmem->smem copy and every
+read all go through this layout, so nothing else changes and the only cost is the extra bytes.
+
+The second half, widening the read, is NOT done: max_common_vector on the pair I built came back 1, but my slice of
+tCsS did not reduce to a single group (the printed strides still carried the 512 stage stride), so the 32-elements-
+at-width-1 reading disagrees with acu's ~4 instructions per group per warp by 8x. One of the two is wrong and I did
+not resolve which. Do that before touching the copy atom -- the width fix has to start from a slice that is
+demonstrably one group.
+
+Also settled: PPU_MAXREG raised occupancy and changed nothing, the third independent confirmation that warp count is
+not this shape's constraint (after the TileN ladder at 1.066x and split-K's 14 -> 26.8 warps for -4%).
