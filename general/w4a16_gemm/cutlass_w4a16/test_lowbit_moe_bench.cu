@@ -88,6 +88,9 @@ int main(int argc, char** argv) {
   // in the banner, and refuse to call anything "fastest" when the numbers are single-shot.
   if (moe_only())  std::printf("             MOE_ONLY='%s' -- every other row is SKIPPED\n", moe_only());
   if (moe_acu())   std::printf("             *** MOE_ACU=1: ONE COLD LAUNCH per row, no warmup. These are NOT timings. ***\n");
+  if (moe_abcast()) std::printf("             *** MOE_ABCAST=1: A's m-stride is 0, so the TileM-1 padding rows read the\n"
+                               "                 expert's real row. Legal ONLY at Mmax==1 -- launch() refuses it above\n"
+                               "                 that, so rows would be EXCLUDED rather than measured. ***\n");
   // The unit count is compiled in from the generator, so a silently shrunk enumeration shows up here rather than as a
   // quietly smaller sweep. Units whose shape is illegal (WarpM > TileM, or the delivery bound) compile to nothing and
   // print no rows, which is why this can exceed the number of sections that appear below.

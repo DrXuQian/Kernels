@@ -69,6 +69,12 @@ static constexpr double HBM_GBS = 2766.0;
 // each print a line, but the check must survive, because a unit that misses the -D silently runs the UNCHUNKED collective
 // while main's banner -- a different translation unit -- still says chunked. Each unit registers its state at static-init
 // time and main reports the tally, so a split brain is one line in the log instead of a perf number nobody can explain.
+// DECODE A BROADCAST, as an A/B in ONE binary. A's m-stride goes to 0 so the TileM-1 padding rows read the
+// expert's real row instead of 15 other rows -- legal only because the epilogue's residue mask discards them,
+// and only when every expert has ONE row, which launch() enforces. Off by default: above Mmax == 1 it would be
+// refused, and a sweep that silently refused half its rows is worse than one that never tried.
+inline bool moe_abcast() { static int c = -1; if (c < 0) c = std::getenv("MOE_ABCAST") ? 1 : 0; return c != 0; }
+
 struct MoeChunkTally { int on = 0, off = 0; };
 inline MoeChunkTally& moe_chunk_tally() { static MoeChunkTally t; return t; }
 inline void moe_chunk_vote(bool on) { if (on) ++moe_chunk_tally().on; else ++moe_chunk_tally().off; }
@@ -362,13 +368,15 @@ constexpr bool moe_ok() {
 // sweep only became affordable at this size because of it.
 #define MOE2_TIME(BD,BEST,NAME,LOELEM,HIELEM,LOB,HIB,TMv,TNv,TKv,WMv,WNv,Sv)                                       \
   if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,Sv,LOB,HIB>()) {                                                        \
-    char _t[64]; std::snprintf(_t, 64, NAME " %dx%d:%d w%dx%d s%d", TMv, TNv, TKv, WMv, WNv, Sv);                  \
+    char _t[64]; std::snprintf(_t, 64, NAME " %dx%d:%d w%dx%d s%d%s", TMv, TNv, TKv, WMv, WNv, Sv,                 \
+                              moe_abcast() ? " B" : "");                                                            \
     if (moe_row_selected(_t)) {                                                                                    \
       auto _go = [&]{                                                                                              \
         moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,LOELEM,HIELEM>(            \
             (BD).dA, _b1.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
-            (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr, _b2.get()); };                           \
+            (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr, _b2.get(),                                \
+            /*k_full=*/-1, /*prefix_ready=*/false, /*splitk=*/1, moe_abcast()); };                                  \
       double u; const int _f0 = moe_grouped_ppu::moeg_fail_count();                                                \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE COLD launch (not a timing): %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
@@ -402,13 +410,18 @@ constexpr bool moe_ok() {
 // ---- single plane, same structure.
 #define MOE1_TIME(BD,BEST,NAME,ELEM,BITS,TMv,TNv,TKv,WMv,WNv,Sv)                                                   \
   if constexpr (moe_ok<TMv,TNv,TKv,WMv,WNv,Sv,BITS>()) {                                                           \
-    char _t[64]; std::snprintf(_t, 64, NAME " %dx%d:%d w%dx%d s%d", TMv, TNv, TKv, WMv, WNv, Sv);                  \
+    char _t[64]; std::snprintf(_t, 64, NAME " %dx%d:%d w%dx%d s%d%s", TMv, TNv, TKv, WMv, WNv, Sv,                 \
+                              moe_abcast() ? " B" : "");                                                            \
     if (moe_row_selected(_t)) {                                                                                    \
       auto _go = [&]{                                                                                              \
-        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,ELEM>(                     \
+        /* PlaneB2 is NAMED (void) on purpose: passing nullptr for B2 while letting PlaneB2 deduce makes the    \
+           deduction fail on std::nullptr_t, and a failed deduction is NOT rescued by the default template       \
+           argument -- the call simply stops matching. */                                                        \
+        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,ELEM,void>(                \
             (BD).dA, _db.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
-            (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr); };                                      \
+            (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr,                                          \
+            /*B2=*/nullptr, /*k_full=*/-1, /*prefix_ready=*/false, /*splitk=*/1, moe_abcast()); };                   \
       double u; const int _f0 = moe_grouped_ppu::moeg_fail_count();                                                \
       if (moe_acu()) { u = time_it(_go, 0); std::printf("  [acu] ONE COLD launch (not a timing): %s\n", _t); }                         \
       else             u = time_it(_go, 20);                                                                       \
