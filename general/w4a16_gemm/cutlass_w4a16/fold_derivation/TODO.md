@@ -644,3 +644,27 @@ first time that instruction's geometry actually changes. That is necessary, not 
 
 Order stays: PPU_DEFS=PPU_A_CUBE_H=1 TARGET=test_moe_grouped_verify ./build.sh, and only then timing. Mmax > 1
 cases are REFUSED by launch(), so expect them excluded rather than passing.
+
+### PPU_A_CUBE_H=1 runs, and A's smem is 64x smaller. Plus: I read a passing signature as a failing one.
+
+First hardware run that neither faulted nor was refused (Mb=1, so Mmax==1 as this path requires):
+
+    PPU_DEFS verified on test_moe_grouped_verify's compile command: -DPPU_A_CUBE_H=1
+    [moe_grouped] smem/block = 13456 B  (A = 768 B = 384 elems, 6%)  PPU_A_CUBE_H = 1
+    [moe_grouped]   blocks/CU at 256 KB = 19
+    verify: L=8 uniform Mb=1 ... Mmax=1   max_rel=0.000e+00 bad=0 -> MATCH
+
+A = 384 elems = TileK 128 x Stages 3, i.e. exactly one row, against 64*128*3 = 24576 elems by default: 49152 B
+-> 768 B, and the block from ~62 KB to 13456 B. Read off SharedStorageSize and cosize_v<SmemLayoutA>.
+
+MY LIVENESS CHECK WAS WRONG, and it failed that very run. rel = |got-gold|/(|gold|+1e-3), so a BIT-EXACT pass
+gives rel == 0 for every element and `if (rel > max_rel)` never fires -- worst_e keeps its initial -1. That is
+the signature of a PASS, and the L=1 oracle is bit-exact by construction. I had asserted the opposite one turn
+earlier ("worst e=-1 is the tell") and built the check on it. Vacuity now keys on gold_absmax == 0, i.e. on the
+golden VALUES, which is what I claimed to be testing all along.
+
+What still stood from that turn: the earlier default-Mb run really did verify nothing, but the evidence for that
+is the refusal COUNT (5 launches refused), not worst_e.
+
+Also fixed: the vacuity return preceded the MOEG_DUMP/MOEG_CHECK block, so the one oracle that does not share
+this binary's collective was unreachable exactly when it mattered. Cross-build compare now runs first.

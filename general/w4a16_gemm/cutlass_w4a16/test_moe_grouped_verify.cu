@@ -105,7 +105,11 @@ int main(int argc, char** argv) {
   std::vector<half_t> hD((size_t)total * N); D.copy_to_host(hD.data());
 
   // ---- ORACLE: each expert alone (L=1), compare vs the contiguous D rows ----
-  double max_rel = 0; int bad = 0, worst_e = -1;
+  // gold_absmax, not worst_e, is what decides whether this comparison had anything in it. worst_e stays -1 on a
+  // BIT-EXACT pass -- rel is 0 for every element, so `rel > max_rel` never fires -- and the L=1 oracle is
+  // bit-exact by construction. Keying vacuity on worst_e therefore failed a genuine pass, which is how this check
+  // first reported itself wrong.
+  double max_rel = 0, gold_absmax = 0; int bad = 0, worst_e = -1;
   for (int e = 0; e < L; ++e) {
     const int Me = me[e];
     cutlass::DeviceAllocation<half_t> Ae((size_t)Me * K), Se((size_t)N * scale_k), De((size_t)Me * N);
@@ -131,6 +135,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < Me; ++i)
       for (int j = 0; j < N; ++j) {
         double gold = (double)float(hDe[(size_t)i * N + j]);
+        if (std::abs(gold) > gold_absmax) gold_absmax = std::abs(gold);
         double got  = (double)float(hD[((size_t)offs[e] + i) * N + j]);   // CONTIGUOUS: row offs[e]+i
         double rel  = std::abs(got - gold) / (std::abs(gold) + 1e-3);
         if (rel > max_rel) { max_rel = rel; worst_e = e; }
@@ -139,7 +144,7 @@ int main(int argc, char** argv) {
   }
   // Oracle liveness: an all-zero golden makes every rel exactly 0 and the comparison vacuous. Independent of the
   // refusal count, because a silently-not-launched kernel is not the only way to get an untouched buffer.
-  bool const oracle_dead = (worst_e < 0);
+  bool const oracle_dead = (gold_absmax == 0.0);
 
   std::printf("verify(grouping+contiguous): L=%d %s Mb=%d N=%d K=%d gs=%d total=%d Mmax=%d\n",
               L, ragged ? "ragged" : "uniform", Mb, N, K, gs, total, Mmax);
@@ -152,11 +157,6 @@ int main(int argc, char** argv) {
                 "      PPU_A_CUBE_H=1 needs Mmax==1: run with Mb=1, e.g. ./test_moe_grouped_verify 8 1\n", refused);
     return 2;
   }
-  if (oracle_dead) {
-    std::printf("  *** VACUOUS: the oracle never produced a nonzero value, so rel==0 everywhere. FAILURE. ***\n");
-    return 3;
-  }
-
   // Cross-build oracle. The L=1 comparison above shares this binary's collective, so a defect common to both
   // sides is invisible to it -- exactly the hole PPU_A_CUBE_H sits in. Dump from a build without the macro, check
   // from a build with it, and the reference is a DIFFERENT compilation rather than the same one twice.
@@ -187,5 +187,10 @@ int main(int argc, char** argv) {
                 f, xmax, xi, xbad, xbad == 0 ? "MATCH" : "MISMATCH");
     if (xbad) return 1;
   }
+  if (oracle_dead) {
+    std::printf("  *** VACUOUS: the oracle never produced a nonzero value, so rel==0 everywhere. FAILURE. ***\n");
+    return 3;
+  }
+
   return bad == 0 ? 0 : 1;
 }
