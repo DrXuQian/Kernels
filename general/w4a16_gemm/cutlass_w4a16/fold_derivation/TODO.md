@@ -401,3 +401,69 @@ wrong shape -- recorded in ppu-moe-gemm-design. The scheduler carries none of th
 One thing in our favour that Marlin does not have: PPU's 256 KB of shared memory against Marlin's 96 KB. A
 bigger tile or a deeper pipeline means FEWER work units, which makes the tail relatively larger -- an argument
 FOR stream-K, not against.
+
+---
+
+## GEMV on the box: ALU-bound, not bandwidth-bound -- and it does NOT beat the tensor-core GEMM at decode (2026-07-30)
+
+First real numbers for the CUDA-core GEMV, 42 generated units, ppu001.
+
+### The decode band, shape [0] = L=8 active experts x 1 row, N=K=2048, gs=32, ScaleZero
+
+| implementation | time | %HBM |
+|---|---|---|
+| grouped mixed-input GEMM, `i4 16x32:256 w16x16 s2` (recorded earlier) | **20.74 us** | 37.5% |
+| GEMV `int4 native s16/t128 N2 C2` | 22.27 us | 34.1% |
+| GEMV `int4 tileK  s32/t64  N2 C2` | 22.26 us | 34.2% |
+| GEMV `int2 native s32/t64  N2 C2` | 21.83 us | 20.9% |
+| GEMV `int1 native s32/t64  N4 C2` | 21.72 us | 14.1% |
+| GEMV `q3(2+1) native s32/t64 N2 C2` | 27.04 us | 22.5% |
+| GEMV `q6(4+2) native s32/t64 N2 C2` | 27.49 us | 38.7% |
+
+**The GEMV is 7% SLOWER than the tensor-core GEMM here.** The prediction that it would win because its grid is
+~7 waves against the GEMM's single resident wave is REFUTED. Occupancy was not the binding constraint for a
+kernel that already has enough of it.
+
+### The observation that settles why, without acu
+
+int1 and int4 take the SAME TIME (21.72 vs 22.27 us, 2.5% apart) while int4 moves **4x the weight bytes**. They
+have the same element count, the same loop trip count and the same number of mma hfma2s; only the extraction
+differs slightly. So the time is set by per-ELEMENT work, not by bytes: **this kernel is ALU/latency-bound.**
+
+The %HBM column being in exact inverse bit-width order across the formats (q6 38.7 > i4 34.1 > i2 20.9 > i1
+14.1) is the same fact seen from the other side -- with the time pinned, %HBM only reports the bit width.
+
+**This also predicts split-K will not help**, for the same reason: split-K buys CTAs, and CTAs are not what is
+short. That prediction is exactly what test_moe_splitk_bench measures, so it is still worth running.
+
+### Where the GEMV does look good
+
+Shape [5], dense m=1 N=12288 K=4096, gs=128 ScaleOnly: `int4 native s32/t64 N4 C2` at 18.48 us and **50.8%
+HBM** -- the best efficiency in the whole table. At m=1 a larger N gives more independent columns per unit of A
+traffic, so efficiency rises with N/K.
+
+### An open question, not to be hand-waved
+
+Dense prefers CtaN=8 (shape [3]: `s16/t128 N8 C4`, 256 CTAs); MoE prefers CtaN=2 (shape [0]: `N2 C2`, 8192
+CTAs). The prediction in the bench header -- that DENSE would need SMALL CtaN to buy parallelism -- is backwards.
+"Larger CtaN amortises the activation broadcast, so fewer ops/element" explains dense under an ALU-bound
+reading but then fails to explain why MoE goes the other way. For acu, not for a story.
+
+### If acu confirms ALU-bound, the lever changes from occupancy to OPS PER ELEMENT
+
+At CtaM=1 each element of each column currently costs roughly 1 shift + 1 and + 1 or (extraction) + 1 hfma2
+(affine) + a half-share of 1 hfma2 (mma) -- four to five ops per useful fma. The tensor-core GEMM pays the same
+dequant but amortises it over a 16x16x16 mma.
+
+The largest single reduction available: **move the affine from per-element to per-group.** With (s, z) constant
+inside a group,
+
+    sum_k a_k*(q_k*s + z) = s * (sum_k a_k*q_k) + z * (sum_k a_k)
+
+so accumulate the RAW integer-code dot product plus one column-independent `sum a` shared by all CtaN columns,
+and apply (s, z) once per group per column. The affine term drops from StepK*CtaN/2 hfma2 per iteration to
+CtaN/2 -- 16x at StepK=16. Needs its own numeric gate: the accumulation now runs on unscaled codes, so the
+partial magnitudes rise (int4: q<=15 x depth 16 -> ~240; Q6: ~1008, both inside fp16's exact-integer range, but
+that is an argument for measuring rather than a proof).
+
+Ordering: confirm with acu first. The 4x-bytes-same-time evidence is strong but indirect; acu says which pipe.
