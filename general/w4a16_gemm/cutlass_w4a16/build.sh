@@ -53,6 +53,11 @@ fi
 if [ -x "$HERE/fold_derivation/ppu_portability_check.py" ]; then
   "$HERE/fold_derivation/ppu_portability_check.py" || exit 1
 fi
+# The unit generators, run against the axis lists rather than a written-down count. A malformed row once
+# produced the RIGHT unit count out of the wrong iterations, so the configure log looked correct.
+if [ -x "$HERE/fold_derivation/gen_gemv_units_check.sh" ]; then
+  "$HERE/fold_derivation/gen_gemv_units_check.sh" || exit 1
+fi
 
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"

@@ -46,10 +46,15 @@
 #endif
 #endif
 
-// The stream type differs; nothing else in the launch path does.
+// The stream type differs, and it comes from the RUNTIME header, not the fp16 one. Every other file in this
+// tree gets hggcStream_t transitively through a cutlass header; this one is standalone, so it has to ask.
+// (Caught by syntax_check.sh only because the new baseline line was READ rather than accepted: a bare
+// `error: identifier "hggcStream_t" is undefined` is not fatal, so nothing stops it becoming "known noise".)
 #if defined(__HGGCCC__)
+#include <hggc_runtime.h>
 using gemv_stream_t = hggcStream_t;
 #else
+#include <cuda_runtime.h>
 using gemv_stream_t = cudaStream_t;
 #endif
 

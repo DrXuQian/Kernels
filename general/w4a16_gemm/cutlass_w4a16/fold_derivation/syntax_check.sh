@@ -28,6 +28,13 @@ if [ "${1:-}" = "--baseline" ]; then RECORD=1; shift; fi
 # locally instead of on the box. Two box round trips were burned on errors this would have shown:
 #   EXTRA_DEFS=-DPPU_B_CHUNK=1 ./syntax_check.sh --baseline <file>   then   EXTRA_DEFS=... ./syntax_check.sh <file>
 EXTRA_DEFS="${EXTRA_DEFS:-}"
+# GENERATED INCLUDES. A target whose sweep is generated (test_gemv_perf, test_moe_splitk_bench) includes a .inc
+# that only exists in the build tree, so without this the front end stops at that include and the file is not
+# checked at all. Point it at a directory holding the generated .inc:
+#   GEN_INC=/path/to/gemv_units ./syntax_check.sh ../test_gemv_perf.cu
+GEN_INC="${GEN_INC:-}"
+_gen_flag=""
+[ -n "$GEN_INC" ] && _gen_flag="-I$GEN_INC"
 # NOTE the baseline file is deliberately NOT keyed on EXTRA_DEFS: a flag-on run is diffed against the flag-OFF
 # baseline, so anything that appears only with the macro set shows up as NEW. Keying it would have let me baseline my
 # own bugs.
@@ -59,7 +66,7 @@ for f in $FILES; do
 # Two signatures are dropped as ENVIRONMENTAL, not filtered by pattern-guessing: cute::_ and cute::product report
   # "undefined in device code" because CUTE_INLINE_CONSTANT resolves to `static constexpr` here while the box takes
   # the `static const __device__` branch. They cannot mask a real error -- a real one has a different message.
-  sig=$(nvcc -std=c++17 -arch=sm_80 --expt-relaxed-constexpr -D__HGGCCC__ -DPPU_FORCE_INSTANTIATE=1 $EXTRA_DEFS \
+  sig=$(nvcc -std=c++17 -arch=sm_80 --expt-relaxed-constexpr -D__HGGCCC__ -DPPU_FORCE_INSTANTIATE=1 $EXTRA_DEFS $_gen_flag \
         -I"$STUB" -I"$ACT/include" -I"$ACT/tools/util/include" -I"$SRC" \
         -cuda -o /dev/null -x cu "$f" -Wno-deprecated-gpu-targets 2>&1 \
         | grep -E ": (error|fatal error|catastrophic error):" | grep -v 'identifier "cute::_" is undefined in device code' \
@@ -67,6 +74,18 @@ for f in $FILES; do
         | sed -E 's#^.*/([^/]+)#\1#; s#\(([0-9]+)\)#()#' | sort | uniq -c \
         | sed -E 's/^ +//' | sort)
   bl="$BLDIR/$base.txt"
+  # A FATAL ERROR MEANS NOTHING WAS CHECKED, so it must never become "accepted noise". The preprocessor stops at
+  # the first one -- a missing generated .inc gives exactly this -- and baselining it turns the check into a
+  # no-op that reports success forever. This happened: `--baseline` on a target whose sweep is generated recorded
+  # `fatal error: moe_splitk_units.inc: No such file or directory` as one accepted line, so the file was never
+  # parsed and the script still said "baseline recorded". Fixing the include (GEN_INC) is the answer, not
+  # accepting the line.
+  if printf '%s\n' "$sig" | grep -q ": fatal error:\|: catastrophic error:"; then
+    echo "$base: REFUSING to proceed -- a fatal/catastrophic error means the front end STOPPED and the file was"
+    echo "        not checked. Fix the include (see GEN_INC) rather than baselining it:"
+    printf '%s\n' "$sig" | grep ": fatal error:\|: catastrophic error:" | head -4 | sed 's/^/          /'
+    rc=1; continue
+  fi
   if [ "$RECORD" = 1 ]; then
     printf '%s\n' "$sig" > "$bl"
     echo "$base: baseline recorded ($(printf '%s\n' "$sig" | grep -c . ) accepted noise lines)"
