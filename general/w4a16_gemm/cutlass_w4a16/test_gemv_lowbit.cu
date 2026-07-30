@@ -296,6 +296,9 @@ static bool run_case(CaseSpec const& c, uint32_t seed) {
       if (c.exact) {
         if (got != want) { if (bad == 0) bad_at = int(i); ++bad; }
       } else {
+        // NaN would slip through here: std::max(max_rel, NaN) returns max_rel and `NaN > 4e-3` is false. The
+        // exact branch above is immune only by accident -- `got != want` is TRUE for NaN.
+        if (!std::isfinite(got)) { if (bad == 0) bad_at = int(i); ++bad; continue; }
         double const rel = std::fabs(got - want) / maxg;
         max_rel = std::max(max_rel, rel);
         if (rel > 4e-3) { if (bad == 0) bad_at = int(i); ++bad; }

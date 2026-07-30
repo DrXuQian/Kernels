@@ -694,3 +694,32 @@ printed numbers, not a value that looked wrong on its own.
 Open question the next run answers: WHICH side is non-finite, and whether it predates PPU_A_CUBE_H -- the OFF
 build's dump was judged live, but under NaN that judgement is worthless, so the baseline at Mb=1 is now also
 unverified. Mb=1 had never been run before this line of work.
+
+### CLOSED FOR A READ-OFF REASON: A's smem floor is TileM x TileK x Stages, and CUBE_H is not a footprint knob
+
+l78 (fold_derivation/l78_cubeh_delivery.cu), all values as template arguments out of the compiler:
+
+                     cosize<SmemLayoutA>   Src/Dst bits   size(tCsA)   size(tCrA)   mma atom
+    CUBE_H = 16              8192           4096 / 4096      256          128       (16,.,16)
+    PPU_A_CUBE_H = 1          512           4096 / 4096      256          128       (16,.,16)
+
+The allocation shrinks 16x and NOT ONE of the three delivery quantities moves. CUBE_H is the M extent of the
+instruction's cube, so changing it changes the swzl permutation: the same 4096 bits land in different registers,
+the 128-element fragment is filled from the wrong positions, and the output is wrong -- NaN once uninitialised
+registers join in -- WITHOUT faulting, because the addresses fold into the single row. At CUBE_H=16 the same
+512-element allocation faults instead, since the instruction still sources 16 rows. That is all three box
+failures from one cause, and the user's reading confirms it: ON is wrong, OFF is correct.
+
+So A's floor is TileM x TileK x Stages with TileM >= 16 forced by the MMA atom shape. The decode winner
+16x128:256 s2 ALREADY sits at that floor (16*256*2*2 = 16,384 B), so A's 62% share is irreducible at fixed
+(TileK, Stages) and the whole line was chasing something that does not exist.
+
+The lever that does exist is TileK, which cuts A AND B AND the scale channel together:
+
+    16x128:256 s2   A 16384 + B 32768 + sz 8192 = 57,344 -> 4 blocks/CU
+    16x128:128 s2   A  8192 + B 16384 + sz 4096 = 28,672 -> 9 blocks/CU
+
+That is TODO #22, promoted from a sweep point to the principled next step. Constraints to respect: TK >= gs (SK
+= ceil(TK/gs) <= 2) and the AIU 32B contiguous-K run, TK*bits/8 >= 32, which at int4 means TK >= 64.
+
+PPU_A_CUBE_H stays in the tree, off, and now prints a KNOWN-WRONG banner whenever it is compiled in.

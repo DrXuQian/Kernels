@@ -137,13 +137,24 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
       } else {
         std::vector<half_t> ref(nelem);
         cutlass::device_memory::copy_to_host(ref.data(), cx.dRef->get(), nelem);
-        double maxr = 1e-30, worst = 0.0; int bad = 0;
-        for (size_t i = 0; i < nelem; ++i) maxr = std::max(maxr, std::fabs(double(float(ref[i]))));
+        // Non-finite values are COUNTED, never compared. d = |NaN - NaN| is NaN and `NaN > 4e-3` is false, so an
+        // all-NaN pair on both sides used to score bad=0 and be reported as agreeing with S=1. std::max(x, NaN)
+        // also returns x, so `worst` and `maxr` stayed clean while the data was garbage. This check called an
+        // all-NaN kernel numerically correct in test_moe_grouped_verify's sibling case; same shape of bug.
+        double maxr = 1e-30, worst = 0.0; int bad = 0, nonfinite = 0;
         for (size_t i = 0; i < nelem; ++i) {
-          double const d = std::fabs(double(float(got[i])) - double(float(ref[i])));
+          double const r = double(float(ref[i]));
+          if (std::isfinite(r)) maxr = std::max(maxr, std::fabs(r)); else ++nonfinite;
+        }
+        for (size_t i = 0; i < nelem; ++i) {
+          double const g = double(float(got[i])), r = double(float(ref[i]));
+          if (!std::isfinite(g) || !std::isfinite(r)) { ++bad; continue; }
+          double const d = std::fabs(g - r);
           worst = std::max(worst, d);
           if (d / maxr > 4e-3) ++bad;
         }
+        if (nonfinite)
+          std::printf("  %-34s %8s | %d NON-FINITE values in the S=1 reference itself\n", tag, "-", nonfinite);
         if (bad) {
           std::printf("  %-34s %8.2f us | NUMERICS: %d/%lld differ from S=1 by >4e-3 rel "
                       "(worst abs %.3g, |ref|max %.3g) -- EXCLUDED\n",

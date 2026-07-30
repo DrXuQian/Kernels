@@ -215,6 +215,16 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // partition_D writes every tile row to the same place, so the sources must all BE the same row. Forced here so
   // the two halves cannot be enabled separately.
 #if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H == 1)
+  // KNOWN WRONG ON HARDWARE -- kept only so the probe can be re-run, never to be trusted. l78 reads it off the
+  // types: shrinking CUBE_H drops cosize_v<SmemLayoutA> 8192 -> 512 while the copy op's SrcLayout/DstLayout stay
+  // at 4096 bits, size(tCsA) stays 256 and size(tCrA) stays 128. CUBE_H is the instruction cube's M extent, so
+  // changing it changes the swzl permutation: the same bits land in different registers, the fragment is filled
+  // from the wrong positions, and the result is wrong (NaN once uninitialised registers are in the mix) WITHOUT
+  // faulting, because the addresses now fold into the one row. At CUBE_H=16 the same 512-element allocation
+  // faults instead, since the instruction still sources 16 rows. Two faults and one silent-NaN round, one cause.
+  { static bool warned = false;
+    if (!warned) { warned = true;
+      std::printf("[moe_grouped] *** PPU_A_CUBE_H=1 IS KNOWN TO PRODUCE WRONG RESULTS (see fold_derivation/l78) ***\n"); } }
   a_row_broadcast = true;
 #endif
   if (a_row_broadcast) {
