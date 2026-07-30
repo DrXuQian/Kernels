@@ -467,3 +467,34 @@ partial magnitudes rise (int4: q<=15 x depth 16 -> ~240; Q6: ~1008, both inside 
 that is an argument for measuring rather than a proof).
 
 Ordering: confirm with acu first. The 4x-bytes-same-time evidence is strong but indirect; acu says which pipe.
+
+## The TileM padding freedom, and its three forms (2026-07-30)
+
+At decode every expert has one row against TileM >= 16 (forced: every MMA atom in mma_traits_ppu0015.hpp is
+Shape<_16,...>). Two consequences, both measured:
+
+  * 16x of the ARITHMETIC is on padded rows. acu: v.mma.f32.f16.m16n16k16 = 131,072, which equals
+    mt*N*TM*K/16^3 exactly and is the MINIMUM for a 16-row atom; useful MACs are 8*2048*2048 = 33.6 M against
+    536 M delivered. S cancels out of that formula, so split-K neither adds nor removes it.
+  * 62% of the block's SHARED MEMORY is A's padding: (16*256*2 + 32*256/2 + 32*8*4)*2 = 26,624 B with A's term
+    16,384 B. 262144/26624 = 9 reproduces acu's measured Block Limit Shared Mem exactly.
+
+The padding rows' results are discarded by the epilogue's residue mask, so their INPUTS are don't-care. Three
+forms of spending that, in increasing generality -- and they are not interchangeable:
+
+  1. **stride-0 on A's m dimension.** All TileM rows read the expert's row 0. Correct ONLY at M_e == 1: at
+     M_e = 3 it would map rows 1 and 2, which are real, onto row 0. Implemented, gated, refused above Mmax == 1.
+     Costs nothing, changes no smem, and is a pure traffic/locality win (A's L2->L1 volume 33.5 MB -> 2.1 MB) --
+     IF the collective's A copy is not already predicated on the m residue, in which case it is a no-op. One
+     measurement decides that (SPLITK_ABCAST=1).
+  2. **Clamp the row index to min(r, M_e-1).** Correct for every M_e <= TileM, but it is not a stride, so it
+     needs the collective's copy changed.
+  3. **Unpredicated over-read, plus TileM rows of padding on the A allocation.** Because a grouped A is
+     GATHERED, expert e owns rows [off_e, off_e + M_e) and reading off_e .. off_e+TileM-1 spills into expert
+     e+1, whose results are masked anyway. This is the CHEAPEST general form -- a uniform, fully vectorised copy
+     for every expert shape, no predicate arithmetic -- and its only requirement is allocation padding. Also a
+     copy change, not a stride.
+
+None of the three touches shared-memory FOOTPRINT, so none of them changes occupancy. Occupancy needs either
+fewer bytes per block or more warps per block; the TileN ladder now in _SPLITK_CFGS is the second, and it is
+free of A's padding because A's smem term does not grow with TileN.

@@ -85,8 +85,17 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
             // memory, but reads only TK of them from global, so the other 15 reads hit L1. Same trick as the
             // stride-0 scale broadcast this codebase already uses.
             //
-            // ONLY LEGAL WHEN Mmax == 1. With more than one row per expert this would compute the wrong answer,
-            // so it is refused rather than silently applied.
+            // ONLY LEGAL WHEN Mmax == 1, and the distinction matters because the FREEDOM is more general than
+            // this trick. The don't-care applies to every padding row, i.e. whenever M_e < TileM; but stride 0
+            // collapses ALL TileM rows onto row 0, which is only the same thing when there is exactly one real
+            // row. At M_e = 3 it would map rows 1 and 2 -- which ARE real -- onto row 0 and compute the wrong
+            // answer. Refused above Mmax == 1 rather than silently applied.
+            //
+            // The general way to spend that freedom is neither this nor a clamp: because a grouped A is GATHERED,
+            // expert e owns rows [off_e, off_e + M_e), so an UNPREDICATED read of off_e .. off_e+TileM-1 merely
+            // spills into expert e+1's rows and those results are masked anyway. All it needs is the A allocation
+            // padded by TileM rows, which buys a uniform fully-vectorised copy for every expert shape. That is a
+            // change to the collective's copy, not to a stride, so it is not done here.
             bool a_row_broadcast = false) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
