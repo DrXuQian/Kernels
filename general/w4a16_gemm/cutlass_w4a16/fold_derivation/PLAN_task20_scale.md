@@ -228,3 +228,48 @@ TileK=32 result (every winner moved to s4 once A-smem halved) says occupancy is 
    constraint is `SK <= TK/16` with `SK = ceil(TK/gs) = TK/16` at gs=16, which holds for **any** TK. That comment was
    probably true of an older cap. The last comment in this file asserting a TileK limit ("TK=32 still won't compile") was
    wrong, so this one gets tested rather than believed.
+
+
+---
+
+## RE-PRICED from the decode band (2026-07-31 session): this is the FIRST-order term there, not a traffic side-effect
+
+The framing above prices this task from the MoE-band sweeps, where nothing is bandwidth-bound, and concludes the traffic
+half should not be expected to move MFU. That still holds. But the decode band (L=8 active experts, one row each,
+N=K=2048, gs=32, ScaleZero) was measured directly this session with a bench knob that removes the channel, and there
+the reload is the largest single cost in the kernel:
+
+    SK_QUANT=2  per-group scale + zero (what ships)   22.91 us
+    SK_QUANT=1  scale only, no zero                   20.28    -11.5%
+    SK_QUANT=0  per-column only, no group reload       18.60    -18.8%
+
+Same tile, same filter, back to back, so the split is trustworthy even though absolute numbers drift 13% across runs.
+
+Item 1 above is confirmed and quantified: with a zero the FINE path reloads twice, and that second reload is 11.5% of
+the kernel. What the plan did not price is the part that matters for Q4_K, whose min is REAL data and cannot be
+dropped: native co-location. The 12-byte packed field holds all eight sub-block scales AND all eight mins, so under
+Phase 2 option (B) -- smem holds native bytes, decode on the s2r path -- one contiguous read serves eight groups and
+both arrays. That collapses **16 reload operations per k-tile per thread to 1**, without dropping any value.
+
+Three further measurements from the same session, each closing a cheaper alternative, which is why the native route is
+the remaining one:
+
+* **prefetching the next group's scale**: implemented (PPU_SCALE_PREFETCH), numerically correct, **0.7%** against a
+  7.3% ceiling. So nine tenths of the reload's cost is issuing the loads, not waiting for them.
+* **padding the group stride to break the bank period** (PPU_SCALE_PAD): **9.7% SLOWER**. l90 explains why -- the
+  concentrating stride is the THREAD stride, not the group stride: the source TV layout is
+  `((4,8,8),(1,(2,2,2,4))) : ((256,1,16),(0,(128,1024,8,2048)))`, so warp 0 reads
+  `{0..7, 256..263, 512..519, 768..775}` and every block lands on banks 0..3 because 256 halfs = 512 B is a multiple of
+  the 128 B bank period. **A warp's 32 lanes sit on four banks.** Native packing changes this for free: consecutive n
+  are then 12 bytes apart instead of 1 half, so the lanes spread.
+* **widening the read at the cute level**: already tried in earlier work and recorded in `make_scale_fragment`'s comment
+  as an acu-verified no-op -- cute asks for 32 slots, the compiler CSEs them to the 8 distinct addresses, and the
+  hardware issues about 2 loads per copy call (272,384 tsm.ld over 131,072 copy calls).
+
+And one arithmetic correction that raises the ceiling further: **the zero's 11.5% is NOT arithmetic.** `v.mul.f16` is
+0.50 per mma against `v.fma.f16` at 5.69, so the `multiplies` and `plus` passes are already fused -- ScaleOnly would
+issue `hmul2` where ScaleZero issues `hfma2`, the same count. The 11.5% is the Z channel's loads, its cp.async stream
+and its smem. All three are what native co-location removes.
+
+So for the decode band the expected payoff is a large fraction of 18.8%, and the mechanism is the reload COUNT, not
+traffic. Phase order is unchanged; only the expectation is.
