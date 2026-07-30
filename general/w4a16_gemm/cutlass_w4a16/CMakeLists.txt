@@ -234,10 +234,31 @@ target_include_directories(test_gemv_perf PRIVATE ${_GEMV_GEN_DIR})
 #
 # A row is TM,TN,TK,WM,WN,Stages, comma-separated (';' is CMake's list separator). The S ladder {1,2,4,8} is a
 # RUNTIME loop inside each unit: split-K changes no template argument, so sweeping S costs no compile.
+# THE BLOCK-SIZE LADDER AT FIXED TileK. acu says the CU holds 9 blocks (shared memory) of 2 warps = 18 warps of
+# 64, i.e. 28% theoretical occupancy, while Block Limit Registers is 20 -- so registers have 2.2x of slack and
+# cutting them buys nothing until shared memory stops binding.
+#
+# A's smem term is TM*TK*2 and does NOT grow with TileN, while warps/block = (TM/WM)*(TN/WN) does. So raising
+# TileN at fixed WarpN amortises A's padding (62% of the block's 26,624 B at decode, where every expert has ONE
+# row against TileM=16) over more warps:
+#
+#   TN=32  w16x16  2 warps/blk  26,624 B  9 blk/CU  18 warps/CU  28%   A = 62% of smem
+#   TN=64  w16x16  4 warps/blk  36,864 B  7 blk/CU  28 warps/CU  44%   A = 44%
+#   TN=128 w16x16  8 warps/blk  57,344 B  4 blk/CU  32 warps/CU  50%   A = 29%
+#
+# This is a DIFFERENT lever from lowering TileK, and the difference is why both are here. WN*TK*bits, the AIU
+# delivery bound, is 16*256*4 = 16384 for all three -- untouched -- whereas TK=64 sits at exactly 4096, the
+# bound itself, which is the suspected reason 16x32:64 s4 measured 19% SLOWER at 19 blocks/CU than 16x32:256 s2
+# at 9. So: if the TileN ladder improves, occupancy is the lever and TK=64 lost on delivery granularity; if it
+# does not, occupancy is not the lever for this kernel and the mainloop surgery to get A out of shared memory is
+# not worth starting.
 set(_SPLITK_CFGS
-  "16,32,256,16,16,2"    # the recorded decode winner
+  "16,32,256,16,16,2"    # the recorded decode winner: 2 warps/blk, 18 warps/CU
+  "16,64,256,16,16,2"    # 4 warps/blk, 28 warps/CU
+  "16,128,256,16,16,2"   # 8 warps/blk, 32 warps/CU
+  "16,128,256,16,32,2"   # same smem, 4 warps/blk -- isolates warps/block from smem
   "16,64,256,16,32,2"
-  "16,32,64,16,16,4"
+  "16,32,64,16,16,4"     # the smem-for-occupancy trade that LOST: 19 blk/CU and 19% slower
   "32,64,64,32,32,4"
   "64,128,64,32,32,4"    # prefill-shaped, for contrast
 )

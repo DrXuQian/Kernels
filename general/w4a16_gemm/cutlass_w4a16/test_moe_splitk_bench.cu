@@ -127,6 +127,9 @@ int main(int argc, char** argv) {
   cx.dPart = &dPart; cx.pdAll = &pdAll; cx.pdOne = &pd; cx.sdAll = &sdAll; cx.sdOne = &sd; cx.dRef = &dRef;
   cx.dD = &dD; cx.S_max = S_MAX;
   std::printf("   in-kernel split-K: ONE launch, the slice on gridDim.z, so the concurrent grid is mt*ntile*S\n");
+  if (sk_abcast())
+    std::printf("   SPLITK_ABCAST=1: A's m-stride is 0, so the TileM-1 padding rows read the expert's real row\n"
+                "   instead of 15 other rows. Legal only because the epilogue masks them (Mmax=%d).\n", bd.Mmax);
   SkBest b1, bS;
   std::printf("\n-- %d generated config units, S in {1,2,4,8} (legal when S divides the k-tile count) --\n",
               SPLITK_UNIT_COUNT);

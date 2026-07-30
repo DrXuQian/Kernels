@@ -77,7 +77,17 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
             bool prefix_ready = false,
             // IN-KERNEL SPLIT-K: slice the K loop across gridDim.z so all S slices are resident in ONE launch.
             // ptr_D/stride_D must then hold L*splitk entries (slice z of expert e writes plane e + z*L).
-            int splitk = 1) {
+            int splitk = 1,
+            // DECODE A BROADCAST. When every expert has at most ONE row, the A tile's 15 padding rows exist only
+            // because TileM >= 16 (every MMA atom is Shape<_16,...>), and their results are discarded by the
+            // epilogue's residue mask -- so what they READ is irrelevant. Setting A's m-stride to 0 maps all TM
+            // rows of the tile onto the expert's real row: the copy still writes TM*TK elements into shared
+            // memory, but reads only TK of them from global, so the other 15 reads hit L1. Same trick as the
+            // stride-0 scale broadcast this codebase already uses.
+            //
+            // ONLY LEGAL WHEN Mmax == 1. With more than one row per expert this would compute the wrong answer,
+            // so it is refused rather than silently applied.
+            bool a_row_broadcast = false) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   // ElementB is now a template param (default int4b_t; uint2b_t for W2A16). AlignmentB below auto-adjusts.
@@ -165,6 +175,15 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // STRIDES FROM k_full, SHAPES FROM k -- see the k_full parameter. Getting this backwards makes every
   // slice after the first walk gmem with a shrunken row pitch and read the wrong rows entirely.
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k_full, L));
+  if (a_row_broadcast) {
+    // m is Mmax here; the caller is asserting every expert has at most one row.
+    if (m > 1) {
+      std::printf("[moe_grouped] a_row_broadcast requires Mmax <= 1, got %d\n", m);
+      ++moeg_fail_count();
+      return;
+    }
+    cute::get<0>(sA) = 0;
+  }
   // N-FOLD: a folded weight buffer is physically (N/FoldF) rows x (FoldF*K) codes -- one physical row carries TWO
   // logical N columns -- so its ROW PITCH is FoldF*K, not K. Computing the stride from (n,k) makes the kernel walk
   // gmem with the unfolded pitch and read scrambled bytes no matter how the offline placed them (this is why three
@@ -259,7 +278,8 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
                     int m, int n, int k, int L, int group_size,
                     GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
                     char* ws, size_t ws_bytes, hggcStream_t stream,
-                    const PlaneB2* B2 = nullptr, int k_full = -1, bool prefix_ready = false, int splitk = 1) {
+                    const PlaneB2* B2 = nullptr, int k_full = -1, bool prefix_ready = false, int splitk = 1,
+                    bool a_row_broadcast = false) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
@@ -273,7 +293,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   #define MOEG_SCHED(SCH) std::conditional_t<(MOEG_FOLD > 1), \
       cutlass::gemm::KernelAiuFold<(MOEG_FOLD > 1 ? MOEG_FOLD : 2), SCH>, SCH>
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, MOEG_SCHED(SCH), TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
-      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full,prefix_ready,splitk)
+      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full,prefix_ready,splitk,a_row_broadcast)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
   //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K

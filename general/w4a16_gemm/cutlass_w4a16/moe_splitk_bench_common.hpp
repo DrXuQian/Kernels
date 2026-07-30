@@ -40,6 +40,9 @@
 
 inline const char* sk_only() { return std::getenv("SPLITK_ONLY"); }
 inline bool sk_acu() { return std::getenv("SPLITK_ACU") != nullptr; }
+// A/B IN ONE BINARY, so the comparison cannot be two different builds. Off by default: it changes the answer
+// for any expert with more than one row, and launch() refuses it above Mmax == 1.
+inline bool sk_abcast() { return std::getenv("SPLITK_ABCAST") != nullptr; }
 inline double pct_of(double gbs) { return 100.0 * gbs / HBM_GBS; }
 inline bool sk_selected(const char* tag) {
   const char* f = sk_only();
@@ -70,7 +73,8 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
   if constexpr (!moe_ok<TM, TN, TK, WM, WN, Stages, 4>()) { (void)slices; return; }
   else {
     char tag[80];
-    std::snprintf(tag, sizeof(tag), "i4 %dx%d:%d w%dx%d s%d  S=%d", TM, TN, TK, WM, WN, Stages, slices);
+    std::snprintf(tag, sizeof(tag), "i4 %dx%d:%d w%dx%d s%d %s S=%d", TM, TN, TK, WM, WN, Stages,
+                  sk_abcast() ? "B" : " ", slices);
     if (!sk_selected(tag)) return;
     const char* why = "";
     if (!moe_splitk_ppu::splitk_ok(bd.K, slices, TK, &why)) {
@@ -90,7 +94,7 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
           // B2 IS LEFT TO ITS DEFAULT ON PURPOSE. Passing `nullptr` explicitly makes deduction of PlaneB2 from
           // std::nullptr_t fail, and a failed deduction is not rescued by the parameter's default template
           // argument -- so the call stops matching. The single-TU version worked only because it never named B2.
-          bd.ws, bd.wsb, hggcStream_t(0));
+          bd.ws, bd.wsb, hggcStream_t(0), sk_abcast());
     };
 
     int const f0 = moe_grouped_ppu::moeg_fail_count();
