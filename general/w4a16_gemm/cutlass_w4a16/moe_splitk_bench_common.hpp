@@ -42,7 +42,10 @@ inline const char* sk_only() { return std::getenv("SPLITK_ONLY"); }
 inline bool sk_acu() { return std::getenv("SPLITK_ACU") != nullptr; }
 // A/B IN ONE BINARY, so the comparison cannot be two different builds. Off by default: it changes the answer
 // for any expert with more than one row, and launch() refuses it above Mmax == 1.
-inline bool sk_abcast() { return std::getenv("SPLITK_ABCAST") != nullptr; }
+// SPLITK_ABCAST is gone: it set a_row_broadcast, which zeroes the AIU descriptor's row pitch and returns NaN,
+// to request behaviour the descriptor's dim_h already provides (the grouped kernel passes the per-expert M, so at
+// one row per expert the AIU reads one row and padz-fills the rest). launch() refuses it now.
+inline bool sk_abcast() { return false; }
 inline double pct_of(double gbs) { return 100.0 * gbs / HBM_GBS; }
 // SPLITK_ONLY matches the whole tag, which means counting the spaces the format string pads out -- and that
 // already cost an acu run ("No kernels were profiled") after the abcast marker changed the spacing from two to

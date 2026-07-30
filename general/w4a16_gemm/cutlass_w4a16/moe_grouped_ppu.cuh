@@ -224,6 +224,25 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // the last expert's rows and any dependence on what the padding rows happen to contain. Same Mmax==1 gate.
 #if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
   a_row_broadcast = true;
+#else
+  // ON THE AIU PATH THIS IS REDUNDANT AND MALFORMED, which is where the NaN came from.
+  //
+  // The descriptor is dim_h = MN, dim_w = get<0>(stride), cube_h = Block_MN (cute/arch/copy_aiu_base.hpp), and the
+  // instruction is ppu.cp.async.aiu.bulk.tensor...padz... -- dim_h is the row EXTENT and rows beyond it are written
+  // as ZERO. The grouped kernel passes the PER-EXPERT M (ppu_aiu_gemm_mixed_input_group.hpp:243, M = get<0>(pe)),
+  // so at one row per expert dim_h is ALREADY 1: the AIU already reads exactly one row per k-tile and already
+  // zero-fills the other TileM-1 rows of the cube. 'Only load one row' is the default, not a feature to add, and it
+  // is why A's whole chain costs 0.15 + 0.26 instructions per mma.
+  //
+  // Zeroing the m-stride to request the same thing puts 0 into dim_w -- the row PITCH -- leaving a descriptor that
+  // claims 16 rows spaced zero apart. That is the NaN. Refused, rather than left available.
+  if (a_row_broadcast) {
+    std::printf("[moe_grouped] a_row_broadcast REFUSED: it zeroes the AIU descriptor row pitch (dim_w),"
+                " which is malformed and returns NaN. dim_h is already the per-expert M, so the AIU"
+                " already reads one row per k-tile and zero-pads the rest -- nothing to enable.\n");
+    ++moeg_fail_count();
+    return;
+  }
 #endif
   if (a_row_broadcast) {
     // m is Mmax here; the caller is asserting every expert has at most one row.

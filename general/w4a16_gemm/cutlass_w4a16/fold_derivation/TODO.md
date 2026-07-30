@@ -898,3 +898,30 @@ from the PPU_A_CUBE_H NaN. Worth 0.2% even if it worked, so not worth the risk.
 Next: the unpack's 27.5. The uniform formula needs 3 instructions per half2 -- 8 codes per atom per thread is 4
 half2, so 12 -- against 27.5 measured. 2.3x slack, and v.bfi / v.shrl / the extra v.or point at the chunked-B or
 interleave-256 handling rather than at the formula.
+
+### 'A stays in smem, load one row' IS ALREADY THE DEFAULT, and a_row_broadcast was a second mechanism fighting it
+
+Read off cute/arch/copy_aiu_base.hpp, AiuDesc::init:
+
+    dim_h  = MN                    <- the tensor's row EXTENT
+    dim_w  = get<0>(stride)        <- the row PITCH
+    cube_h = Block_MN              <- rows per transfer, a template argument
+
+and the instruction is ppu.cp.async.aiu.bulk.tensor.shared.global.padz... -- padz, so rows beyond dim_h land in
+shared memory as ZERO. The grouped kernel passes the PER-EXPERT M (ppu_aiu_gemm_mixed_input_group.hpp:243,
+M = get<0>(pe)), so with one row per expert dim_h is already 1. The AIU already reads exactly one row per k-tile
+and already zero-fills the other TileM-1 rows of the cube, deterministically, not as garbage.
+
+That is the feature, and it explains the 0.15 instructions per mma for A's gmem->smem: it was never moving 16 rows.
+
+It also explains the NaN exactly. a_row_broadcast asked for 'one row' by zeroing the m-stride, and that stride is
+what dim_w is initialised from -- the row PITCH. The result is a descriptor claiming 16 rows spaced zero bytes
+apart, which is malformed, and NaN is what came out. Nothing to do with precision.
+
+So launch() now REFUSES a_row_broadcast on the AIU path, with that explanation, and SPLITK_ABCAST is removed from
+the bench. It stays available only under PPU_A_IN_REG, which issues no AIU copy for A and uses the zero stride
+solely so cute can see the fragment's m aliasing.
+
+The general lesson, and it is the same shape as the CUBE_H one: these AIU parameters are not independent knobs.
+dim_h expresses 'how many rows exist', dim_w 'how far apart they are', cube_h 'how many to move'. Asking for a row
+count through the pitch produces a descriptor no hardware contract covers.
