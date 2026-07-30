@@ -1413,3 +1413,37 @@ disagreement is about.
 Resolve it first, from a slice that is demonstrably one group. This session already paid twice for changing code on
 top of a relation I had written down rather than read off: PPU_SCALE_PAD here, and the four "two places must agree"
 faults before it.
+
+### RETRACTION: the "8x disagreement" was two of my own errors multiplied, not a phenomenon
+
+Both readings were wrong, in opposite directions.
+
+acu side: I divided 272,384 by (8 groups x 8 k-tiles x 4 warps x 256 CTAs) and got 4.16 "per group per warp". The
+4-warp/256-CTA figures belong to the 16x64 config, but that instruction mix was captured on 16x128 -- 8 warps and 128
+CTAs. Corrected:
+
+    16x128:256 s2, gs=32  ->  Scale_TileK = 8, APG_ = 2
+    16 copy calls per k-tile per thread (8 reload points x 2 arrays), 128 per thread over 8 k-tiles
+    128 x 8 warps x 128 CTAs = 131,072 copy calls
+    272,384 / 131,072 = 2.08  ->  about TWO load instructions per copy call
+
+Probe side: l89 built tCsS as make_tiled_copy_B(...).partition_S(sS), while the kernel gets it from
+partition_extra_inputs, where the FOURTH mode is the one sk indexes. The printed strides still carried 64 (group) and
+512 (stage), so that slice was never one group, and its "32 elements at width 1" describes something else.
+
+So the real picture is 2 loads per copy call and 278,528/272,384 = 1.02 conflicts per load -- essentially one 2-way
+conflict on every scale read. A self-consistent explanation, though still an explanation and not a reading:
+WarpN = 16 against 32 lanes means TWO LANES SHARE EACH n and therefore each ADDRESS, and if the hardware does not
+coalesce that into a broadcast it is a permanent 2-way conflict. It also explains all three failures -- padding
+cannot help identical addresses (and adds a multiply), prefetching removes waiting when the cost is issuing, and
+removing the loads is the only thing that recovered the 7.3%.
+
+Also retracted, from the same investigation: I claimed the gmem->smem scale copy "already transposes". It does not.
+StrideScale is Stride<Int<1>, int64_t, int64_t> and the collective static_asserts is_mn_major, so gmem is N-major and
+so is smem. And making smem k-major is not worth it: reads outnumber writes 9.1:1 (272,384 against 29,952 Shared
+Store From Global Load), so dividing reads by 8 while multiplying writes by 8 takes 302k instructions to 274k -- 9%,
+not 8x.
+
+Next step, now a bounded task: build the scale probe THROUGH partition_extra_inputs / retile_extra_mma_info, and read
+the per-thread fragment size and the lane->n map off it. Everything else about this channel is speculation until that
+exists.
