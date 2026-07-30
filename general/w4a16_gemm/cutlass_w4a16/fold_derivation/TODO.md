@@ -1303,3 +1303,31 @@ The GRP expression also guards divisibility -- `K_ATOM_PER_COPY % APG_` non-zero
 skips groups, and the old assert let GRP == 0 through, which would have loaded no scale at all while passing.
 
 Same shape as the four "two places must agree" errors: a boundary check that guarded one end only.
+
+### #11 CLOSED at 0.7% of a 7.3% ceiling -- the reload's cost is the WORK, not the WAIT
+
+Numerically correct (cross-build MATCH), and back-to-back single-row runs with identical filtering:
+
+    baseline               22.81 us
+    PPU_SCALE_PREFETCH=1   22.64 us    -0.7%
+
+SK_QUANT priced the whole per-group reload at 7.3% by removing it. Prefetching only removes the WAITING and
+recovers 0.7% of that, so nine tenths of the reload's cost is the loads, the indexing and the two extra scale
+fragments -- not stall. Which also says Memory Dependency 0.98 is mostly NOT the scale channel.
+
+The 7.3% is still reachable, but by a SHAPE condition rather than scheduling: FINE triggers on
+Scale_TileK > K_BLOCK_MAX, so a copy step that spans exactly one scale group takes the coarse path and reloads
+nothing. At TileK=256, K_BLOCK_MAX = 4, so Scale_TileK <= 4, i.e. gs >= 64, is already free.
+
+### And that reframes every decode number this session produced
+
+The bench hardcodes FinegrainedScaleZero at gs=32 -- Q4_K's worst case. The REAL-weight path already selects by
+format (test_moe_grouped_real.cu: mode 0 -> FinegrainedScaleOnly), so:
+
+    bench, all session         gs=32,  zero, FINE reload      22.91 us
+    GPTQ, real path            gs=128, no zero, COARSE        about the pc row, 18.60 us
+    Q4_K, real path            gs=32,  zero, FINE             equals the bench
+
+GPTQ escapes BOTH the 11.5% zero and the 7.3% reload, and it already does -- no kernel change involved. So every
+decode figure here overstates GPTQ by roughly 19%, and the 18.8% belongs to Q4_K specifically. The bench's default
+should be selectable per format, or the effort keeps landing on costs only one format pays.
