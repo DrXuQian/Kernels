@@ -579,7 +579,7 @@ second wants stride 0. Splitting them is a change to the copy atom's contract. G
 The GMEM half survives and is unaffected: a_row_broadcast still cuts A's L2->L1 volume (33.5 MB -> 2.1 MB) with
 no smem change, and MOE_ABCAST / SPLITK_ABCAST still switch it.
 
-### CLOSED: A's smem cannot be shrunk from the collective. Two box faults, and a false green light.
+### REOPENED (see the next section): A's smem CAN be shrunk -- the override was in the wrong struct
 
 The motivation was sound and stays on record: at decode every expert has ONE row against TileM >= 16 (every MMA
 atom is Shape<_16,...>), so 15/16 of A's smem tile is padding whose results the epilogue's residue mask discards,
@@ -619,3 +619,28 @@ and this whole direction is closed by measurement rather than by two faults. Pad
 What survives from the attempt: the CubeH override on DefaultGemm_AIU_Operand (inert for this path, harmless),
 and the gmem-side a_row_broadcast, which cuts A's L2->L1 volume 33.5 MB -> 2.1 MB with no smem change and is
 still switchable via MOE_ABCAST / SPLITK_ABCAST.
+
+### The A-smem override was in the wrong struct, and the two withdrawals above are themselves withdrawn
+
+The section above closed this line and blamed SwapAB. Both are wrong, and one printout settled it. Printing the
+atom the collective ACTUALLY uses on sA -- InternalSmemCopyAtomA, not SmemCopyAtomA:
+
+    default          PPU0010_TSM_LD_SWZL<half_t, 16, 64, true, false, 4>
+    PPU_A_CUBE_H=1   PPU0010_TSM_LD_SWZL<half_t,  1, 64, true, false, 4>
+
+`half_t` there settles that **SwapAB is FALSE** and the A slot really is the activations. My "SwapAB is true, so
+l77 probed the quantized operand" explanation came from reading `integer_subbyte<4>` out of an UNRESOLVED
+conditional_t branch and taking it for the selected type. So l77's readings (cosize 8192 -> 512, CPY_M = 1) were
+for the right object all along and their withdrawal is retracted. CPY_M staying 1 is expected, as the user said.
+
+And `16, 64, 4` matches the builder's **MixGemm_AIU_Operand** generic form -- (Block_MN, AiuContElemSize, InstNum)
+-- not DefaultGemm_AIU_Operand, which is where I had put the CubeH override. That is the whole reason attempt 2
+faulted with the disassembly's M step unchanged at 512 B: the override was inert, so the allocation shrank 16x
+while the instruction still read 16 rows. The override now lives in MixGemm_AIU_Operand, where A's atom is built.
+
+THE DIFFERENCE FROM THE TWO FAILED ATTEMPTS, stated as a discriminator rather than a hope: in both of those, A's
+atom parameters were IDENTICAL with and without the switch, so an out-of-bounds read was guaranteed. This is the
+first time that instruction's geometry actually changes. That is necessary, not sufficient -- the box decides.
+
+Order stays: PPU_DEFS=PPU_A_CUBE_H=1 TARGET=test_moe_grouped_verify ./build.sh, and only then timing. Mmax > 1
+cases are REFUSED by launch(), so expect them excluded rather than passing.

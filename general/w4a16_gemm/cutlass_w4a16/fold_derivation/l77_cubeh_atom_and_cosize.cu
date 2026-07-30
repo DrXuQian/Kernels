@@ -10,7 +10,7 @@
 #include "cutlass/gemm/collective/builders/ppu_mma_builder.inl"
 using namespace cute;
 
-template <class TCSA, class TCRA, int COSIZE_A> struct REPORT;
+template <class INTERNAL_ATOM_A, class PARAM_ATOM_A, int COSIZE_A, bool SWAPAB> struct REPORT;
 
 using TileShape      = Shape<_16,_32,_256>;
 using ScaleTileShape = Shape<_32,_8>;
@@ -27,7 +27,7 @@ using SmemLayoutA = typename Mainloop::SmemLayoutA;
 static constexpr int COSIZE_A = cute::cosize_v<SmemLayoutA>;
 
 // CPY_M: the M extent partition_S exposes on the smem->reg copy.
-using AtomA = typename Mainloop::SmemCopyAtomA;
+using AtomA = typename Mainloop::InternalSmemCopyAtomA;   // what is ACTUALLY used on sA
 using TMma  = typename Mainloop::TiledMma;
 static auto make_tCsA() {
   Tensor sA = make_tensor(make_smem_ptr(static_cast<cutlass::half_t*>(nullptr)), SmemLayoutA{});
@@ -37,4 +37,4 @@ static auto make_tCrA() {
   Tensor sA = make_tensor(make_smem_ptr(static_cast<cutlass::half_t*>(nullptr)), SmemLayoutA{});
   return TMma{}.get_thread_slice(0).partition_fragment_A(sA(_,_,0));
 }
-REPORT<decltype(make_tCsA().layout()), decltype(make_tCrA().layout()), COSIZE_A> report;
+REPORT<typename Mainloop::InternalSmemCopyAtomA, typename Mainloop::SmemCopyAtomA, COSIZE_A, Mainloop::SwapAB> report;
