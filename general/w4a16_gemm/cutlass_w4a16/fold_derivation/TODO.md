@@ -1018,3 +1018,36 @@ Three attempts, three distinct and now precisely-stated failures:
 plus A-in-register        -> correct, 1.14-1.85x slower (16x the loads, on the contended pipe, because A's reuse is
                                                          between threads)
 PPU_A_CUBE_MN is removed. The record is the deliverable.
+
+### Settled locally: the swzl ldmatrix CANNOT read one row, and cute-ifying its addressing would not change that
+
+l82_swzl_rows.cpp replays ppu_tsm_ld_swzl_sim's arithmetic verbatim on the host (SWAP=true, the fp16 A branch). That
+simulator is the object LogicalTV was derived from and is validated 0-mismatch against hardware in l2l3/l17/l7/l10/
+l12/l13/l16, so this is not a fresh inference:
+
+    CUBE_H=16   16 rows touched, 512 distinct 32-bit words, 0 aliased reads      <- bijective
+    CUBE_H=1    16 rows touched, 152 distinct words, 360 of 512 reads ALIASED
+    (lane,vreg) -> row identical in 128 of 128 cases
+
+Two conclusions. CUBE_H does not change which row any (lane, vreg) reads -- the 16 rows come from
+vreg_row_idx = (v/2)*8 + lane/4 + coord_h, the instruction's lane/vreg structure, and 'm16n16' is in the mnemonic.
+And CUBE_H only scales the slice stride (slice_base += CUBE_H*8*slice_idx), so shrinking it collapses the slices onto
+each other: 360 of 512 reads alias, which is exactly the max_rel = 868 measured on the box.
+
+So the answer to 'would cute-ifying the addressing let it read one row' is NO. Which row a lane/vreg gets is not
+computed from an address at all; it is how the instruction distributes what it fetched. The minimum valid smem region
+for one swzl read is 512 distinct words = 2048 B as 16 rows x 128 B.
+
+BUT the same question has a yes for a different instruction. A PLAIN smem load is per-lane addressed from a real
+layout, which cute expresses natively and which has no cube and no swizzle, so a one-row A tile is legal there. The
+trade, at 16x128:256 s2:
+
+    A's smem      16384 B -> 1024 B                (block 57,344 -> 41,984)
+    instructions  0.26 tsm.ld.swzl -> ~2 smem.ld per mma   (+1.7 of 66, +2.6%)
+    pipe          dedicated TSM -> shared memory pipe, measured 0.003 busy
+    reuse         PRESERVED -- 32 threads read the same 512 B row from smem, which is what A-in-register lost
+
+Worth nothing at decode (work-bound, measured) and worth the 16x at prefill. Implementing: SmemLayoutA to one row,
+A's gmem->smem via plain cp.async (the scale/zero path in the same collective is the existing template), A's
+smem->reg via a plain load into the m == 0 fragment slots, then a register broadcast. No cube, no swizzle, no
+descriptor -- every one of the four earlier failure mechanisms is inapplicable by construction.
