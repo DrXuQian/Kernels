@@ -35,6 +35,14 @@ static void run_grouped(const half_t* A, const int4_t* B, const half_t* scales,
 }
 
 int main(int argc, char** argv) {
+  // Positional args only. A '-'-prefixed argument would atoi() to 0 and silently give L=0 or Mb=0, which runs
+  // nothing and reports success -- the same vacuous-pass shape the refusal check below exists to stop.
+  for (int i = 1; i < argc; ++i)
+    if (argv[i][0] == '-') {
+      std::printf("usage: %s [L] [Mb] [ragged?] [gs]   -- POSITIONAL, no --flags (got '%s')\n"
+                  "  e.g. %s 8 1    (Mmax==1, which PPU_A_CUBE_H=1 requires)\n", argv[0], argv[i], argv[0]);
+      return 64;
+    }
   const int  L      = argc > 1 ? atoi(argv[1]) : 4;
   const int  Mb     = argc > 2 ? atoi(argv[2]) : 128;
   const bool ragged = argc > 3;

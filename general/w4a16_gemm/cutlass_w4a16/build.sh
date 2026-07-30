@@ -243,4 +243,20 @@ fi
 BIN="$(find "$BUILD" -name "$TARGET" -type f -perm -u+x | head -1)"
 echo
 echo "built: $BIN"
-echo "run:   $BIN --m=2048 --n=4096 --k=4096 --g=128 --mode=1 --iterations=100"
+# Per-target run hint. The old line advertised --m=/--mode= for EVERY target, but only the compare example
+# parses that shape: on a positional-arg target each flag becomes atoi("--m=2048") == 0, so copying the hint
+# silently selects L=0 or Mb=0 and the test passes vacuously. One such copy already cost a box round.
+case "$TARGET" in
+  test_moe_grouped_verify)
+    echo "run:   $BIN [L] [Mb] [ragged?] [gs]      # POSITIONAL, no --flags"
+    echo "       $BIN 8 1                          # Mmax==1, required by PPU_A_CUBE_H=1"
+    echo "       MOEG_SMEM=1 MOEG_DUMP=/tmp/d.bin $BIN 8 1     # then MOEG_CHECK=/tmp/d.bin on the other build" ;;
+  test_moe_splitk_bench|test_lowbit_moe_bench)
+    echo "run:   $BIN <L> <rows> <N> <K> <gs> <mode>   # POSITIONAL; mode 3 => rows is top-k"
+    echo "       $BIN 64 8 2048 2048 32 3"
+    echo "       SPLITK_CFG='16x128:256 w16x16 s2' SPLITK_S=1 $BIN 64 8 2048 2048 32 3   # select one acu row" ;;
+  test_gemv_perf)
+    echo "run:   $BIN [shape]                      # GEMV_FMT=/GEMV_CFG= select rows" ;;
+  *)
+    echo "run:   $BIN --m=2048 --n=4096 --k=4096 --g=128 --mode=1 --iterations=100" ;;
+esac
