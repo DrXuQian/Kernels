@@ -860,3 +860,41 @@ general vector memory pipe and filled it. That second effect was missing from my
 
 Ceiling check, so this is not revisited as a tuning task: even at a perfect 8-element vector it would be 16 loads
 against 4, still on the contended pipe. Closed.
+
+### The whole A line was attacking 0.6% of the instructions. Instruction mix, per mma (131,072 mma):
+
+    int4 unpack     v.shll 12.11 + v.lop3 8.17 + v.or 4.01 + v.bfi 2.06 + v.shrl 1.11   = 27.5   42%
+    s.wait                                                                              = 10.2   15%
+    affine          v.fma.f16 6.19 + v.add.f16 2.06                                     =  8.3   13%
+    addressing      v.add.co/ci 4.04 + v.mov.i 2.28 + v.madw/madl 1.32                  =  7.6   12%
+    scalar control  s.add/mov/shll/cbr/cmp/csel                                         =  4.4    7%
+    smem reads      tsm.ld 2.08 + tsm.ld.swzl 0.26 + smem.ld 0.25                       =  2.6    4%
+    v.mma.f32.f16.m16n16k16                                                             =  1.0   1.5%
+                                                                                       ~66 total
+
+A's ENTIRE chain is 0.15 (vmem.acp.commit.grp, the AIU bulk gmem->smem) + ~0.26 (tsm.ld.swzl) = 0.4 per mma, i.e.
+0.6%. Three routes, two faults and one silent-NaN round went after that. A's shared memory is 29-62% of the block
+by SPACE, and on a work-bound shape space does not convert into time -- the bench's own banner said so and the
+measurement confirmed it (wkwrp/CU 14.2 with 57,344 B and with 40,960 B).
+
+Two corrections to what I recommended off the back of this mix:
+
+The mma padding waste is NOT the order-of-magnitude term I called it. mma is 1.5% of instructions, so eliminating
+15/16 of it saves 1.4%. What TileM = 16 actually does is act as the DENOMINATOR for anything moved to the
+accumulator side, which is why the affine idea below is weak.
+
+Moving affine to per-group does not pay at gs = 32. Currently ~6.2 hfma2 per mma atom over 8 B codes; on the
+accumulator it is 8 floats x 2 fma applied every gs/16 = 2 atoms = 8 per atom, i.e. WORSE. The accumulator is
+16x16 per atom, the same size as the B fragment, and the group is fine. At gs = 128 it becomes 2 per atom, ~3x on
+that term (~8% overall). And the -1024 must stay in the converter regardless: folding it into the zero was already
+refuted for fp16 (measured 1.9e-2..4.6e-2 at s = 0.01), and accumulating the biased codes in fp32 costs ~7 of 24
+mantissa bits at K = 2048.
+
+Option 'A stays in smem, read one gmem row' is also withdrawn, on the user's recall that it produced NaN. Likely
+mechanism: a_row_broadcast puts the m-stride at 0 and that stride is what initialises the AIU descriptor
+(desc_.init<>(nullptr, M, K, dA)), and a bulk-DMA row pitch of 0 is not a defined descriptor. Different mechanism
+from the PPU_A_CUBE_H NaN. Worth 0.2% even if it worked, so not worth the risk.
+
+Next: the unpack's 27.5. The uniform formula needs 3 instructions per half2 -- 8 codes per atom per thread is 4
+half2, so 12 -- against 27.5 measured. 2.3x slack, and v.bfi / v.shrl / the extra v.or point at the chunked-B or
+interleave-256 handling rather than at the formula.
