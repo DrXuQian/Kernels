@@ -985,3 +985,36 @@ Deliberately split into two steps, because step 2 is where attempt #1 faulted:
 What I cannot check locally: whether write-then-read is still a byte identity at Cube_MN = 1. Three legs agreeing
 is NECESSARY -- the old attempt lacked it -- and not sufficient. test_moe_grouped_verify 8 1 with MOEG_CHECK against
 a default-build dump decides it.
+
+### A's shared tile is 16 rows because ONE swzl instruction spans 16 rows. Read off LogicalTV, not asserted.
+
+Moving all three legs of the triple removed the NaN and produced wrong values instead:
+
+    non-finite: gold=0 got=0        |gold|max=10.4  |got|max=10.4     (self-consistent, matches its own L=1 oracle)
+    cross-build vs default build:   max_rel=8.685e+02  bad=8055/8192  |ref|max=21.72
+
+Finite, deterministic, a permutation rather than missing data. The reason is in
+Copy_Traits<PPU0010_TSM_LD_SWZL>:
+
+    SrcLayout = (32 lanes, 128 bits) : (128, 1)          <- no CUBE_H in it at all
+    LogicalTV row index = lane/4 + 8*(v/2),  lane/4 in [0,8), v/2 in [0,2)  ->  row in [0,16)
+
+so one instruction's (thread, vreg) structure spans SIXTEEN ROWS by construction -- 32 lanes x 4 vregs arranged as
+8 rows x 2. CUBE_H reframes the hardware cube; it does not shrink that register footprint. And the .swzl
+cancellation that makes write-then-read a byte identity needs the WRITE to frame the same 16-row cube, which is why
+cube_h = 1 corrupted row 0 too, not only the padding rows.
+
+The traits file already stated the boundary and I had read past it: "stock cute covers ANY cube WIDTH". Width, not
+height. Height is fixed at 16 by the TV structure.
+
+This also explains the floor we kept bumping into from the other side: A's read is 4 instructions per k-tile because
+ONE instruction already covers the whole 16-row tile. There is no smaller unit, which is why A's entire chain is
+0.41 instructions per mma, 0.6% of the stream.
+
+Three attempts, three distinct and now precisely-stated failures:
+    stride-0 SmemLayoutA  -> fault    (the swzl read is addressed by coordinate; strides never reach it)
+    read leg only         -> NaN      (16-row cube written, 1-row cube assumed; .swzl no longer cancels)
+    all three legs        -> wrong    (the instruction still delivers 16 rows; the write reframed, the read cannot)
+plus A-in-register        -> correct, 1.14-1.85x slower (16x the loads, on the contended pipe, because A's reuse is
+                                                         between threads)
+PPU_A_CUBE_MN is removed. The record is the deliverable.
