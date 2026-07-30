@@ -90,14 +90,14 @@ target_compile_options(test_fpA_intB_ppu PRIVATE -w)
 # Low-bit weight-only GEMV (gemv_lowbit/). The decode-band kernel: no shared memory in the main loop and K
 # split Threads ways, so the grid is ~2048 CTAs x 128 threads instead of the grouped GEMM's 512 x 64.
 # Build: TARGET=test_gemv_lowbit ./build.sh    Run: $BIN/test_gemv_lowbit  (add `quick` to skip the long tail)
-cutlass_w4a16_example(
+ppu_w4a16_executable(
   test_gemv_lowbit
   test_gemv_lowbit.cu
 )
 target_compile_options(test_gemv_lowbit PRIVATE -w)
 
 # Decode-band perf: the CUDA-core-only GEMV winner. Build: TARGET=test_gemv_perf ./build.sh
-cutlass_w4a16_example(
+ppu_w4a16_executable(
   test_gemv_perf
   test_gemv_perf.cu
 )
@@ -105,7 +105,7 @@ target_compile_options(test_gemv_perf PRIVATE -w)
 
 # Decode-band perf: grouped GEMM at splitk=1 vs splitk>1, the other two winners.
 # Build: TARGET=test_moe_splitk_bench ./build.sh
-cutlass_w4a16_example(
+ppu_w4a16_executable(
   test_moe_splitk_bench
   test_moe_splitk_bench.cu
 )

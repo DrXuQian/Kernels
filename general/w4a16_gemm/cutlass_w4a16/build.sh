@@ -42,6 +42,13 @@ echo "[build.sh] CUTLASS_PPU_ARCHS=$ARCH"
 
 # NOTE: the former MoE/gs32 *.patch files are now baked into the submodule (fork ppu-w4a16-dev). No patch step.
 
+# CHEAP LOCAL CHECKS FIRST, because the expensive failures here are configure-time and box-only. Three target
+# registrations once named a helper that does not exist; nothing caught it until cmake ran on the box, which
+# costs a full pull-and-build to discover a typo.
+if [ -x "$HERE/fold_derivation/cmake_calls_check.sh" ]; then
+  "$HERE/fold_derivation/cmake_calls_check.sh" || exit 1
+fi
+
 # --- overlay our example into the actlize example tree ---
 mkdir -p "$EX_DIR"
 # nullglob so patterns that match nothing (e.g. no *.cpp right now) vanish instead of aborting under set -e.
