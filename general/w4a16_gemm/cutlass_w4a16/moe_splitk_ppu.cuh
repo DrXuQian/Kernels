@@ -63,14 +63,14 @@ void launch_splitk(const cutlass::half_t* A, const ElementB* B, const cutlass::h
                    GroupShape* gsd, GroupShape const* gsh,
                    int const* group_row_offsets, int64_t total_rows,
                    char* ws, size_t ws_bytes, hggcStream_t stream,
-                   bool a_row_broadcast = false,
+                   bool /*unused, was a_row_broadcast*/ = false,
                    const PlaneB2* B2 = nullptr) {
   if (slices < 1) slices = 1;
 
   moe_grouped_ppu::filter_and_run<QuantOp, TM, TN, TK, WM, WN, Stages, ElementB, PlaneB2>(
       A, B, scales, zeros, ptr_D_all, stride_D_all, group_M, m, n, k, L, group_size,
       gsd, gsh, group_row_offsets, ws, ws_bytes, stream, B2,
-      /*k_full=*/-1, /*prefix_ready=*/false, /*splitk=*/slices, a_row_broadcast);
+      /*k_full=*/-1, /*prefix_ready=*/false, /*splitk=*/slices, false);
 
   if (slices == 1) return;
 

@@ -99,7 +99,7 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
             // spills into expert e+1's rows and those results are masked anyway. All it needs is the A allocation
             // padded by TileM rows, which buys a uniform fully-vectorised copy for every expert shape. That is a
             // change to the collective's copy, not to a stride, so it is not done here.
-            bool a_row_broadcast = false) {
+            bool /*unused, was a_row_broadcast*/ = false) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   // ElementB is now a template param (default int4b_t; uint2b_t for W2A16). AlignmentB below auto-adjusts.
@@ -160,23 +160,15 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
     static bool once = false;
     if (!once) {
       once = true;
-      // cosize_v<SmemLayoutA> is the layout's extent, NOT the allocation: under PPU_A_IN_REG the layout survives
-      // for partition_fragment_A while SharedStorage has no member at all, and reporting the layout there printed
-      // 'A = 16384 B, 160%' of a 10240 B block.
-#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
-      constexpr int a_elems = 0, a_bytes = 0;
-#else
+      // cosize_v<SmemLayoutA> is the LAYOUT's extent. It equals the allocation only while SharedStorage actually
+      // has an A member; a variant that dropped the member but kept the layout printed 'A = 16384 B, 160%' of a
+      // 10240 B block.
       constexpr int a_elems = int(cute::cosize_v<typename CollectiveMainloop::SmemLayoutA>);
       constexpr int a_bytes = a_elems * int(sizeof(ElementA));
-#endif
       std::printf("[moe_grouped] smem/block = %d B  (A = %d B = %d elems, %.0f%%)  A path: %s\n",
                   int(GemmKernel::SharedStorageSize), a_bytes, a_elems,
                   100.0 * a_bytes / double(GemmKernel::SharedStorageSize),
-#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
-                  "PPU_A_IN_REG=1 (A never enters smem)"
-#else
-                  "off"
-#endif
+                  "A in smem via AIU + swzl"
       );
       std::printf("[moe_grouped]   blocks/CU at 256 KB = %d\n", 262144 / int(GemmKernel::SharedStorageSize));
     }
@@ -218,41 +210,17 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // STRIDES FROM k_full, SHAPES FROM k -- see the k_full parameter. Getting this backwards makes every
   // slice after the first walk gmem with a shrunken row pitch and read the wrong rows entirely.
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k_full, L));
-  // PPU_A_IN_REG: the mainloop reads A gmem->fragment with no shared-memory stage, so A's m-stride must be 0.
-  // Not for the footprint -- with no smem tile there is nothing to alias -- but because the fragment covers TileM
-  // rows while the expert owns one: stride 0 points every slot at the real row, which removes both the read past
-  // the last expert's rows and any dependence on what the padding rows happen to contain. Same Mmax==1 gate.
-#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
-  a_row_broadcast = true;
-#else
-  // ON THE AIU PATH THIS IS REDUNDANT AND MALFORMED, which is where the NaN came from.
+  // A's m-stride is NEVER zeroed here, and the parameter that used to do it is gone. It looked like a way to say
+  // 'read one row of A' at decode, where TileM >= 16 against one row per expert makes 15/16 of the tile padding --
+  // but AiuDesc::init (cute/arch/copy_aiu_base.hpp) takes dim_w, the row PITCH, from exactly that stride, while
+  // dim_h, the row EXTENT, comes from the problem's M. So it produced a descriptor claiming TileM rows spaced zero
+  // bytes apart, which is malformed, and the kernel returned NaN.
   //
-  // The descriptor is dim_h = MN, dim_w = get<0>(stride), cube_h = Block_MN (cute/arch/copy_aiu_base.hpp), and the
-  // instruction is ppu.cp.async.aiu.bulk.tensor...padz... -- dim_h is the row EXTENT and rows beyond it are written
-  // as ZERO. The grouped kernel passes the PER-EXPERT M (ppu_aiu_gemm_mixed_input_group.hpp:243, M = get<0>(pe)),
-  // so at one row per expert dim_h is ALREADY 1: the AIU already reads exactly one row per k-tile and already
-  // zero-fills the other TileM-1 rows of the cube. 'Only load one row' is the default, not a feature to add, and it
-  // is why A's whole chain costs 0.15 + 0.26 instructions per mma.
-  //
-  // Zeroing the m-stride to request the same thing puts 0 into dim_w -- the row PITCH -- leaving a descriptor that
-  // claims 16 rows spaced zero apart. That is the NaN. Refused, rather than left available.
-  if (a_row_broadcast) {
-    std::printf("[moe_grouped] a_row_broadcast REFUSED: it zeroes the AIU descriptor row pitch (dim_w),"
-                " which is malformed and returns NaN. dim_h is already the per-expert M, so the AIU"
-                " already reads one row per k-tile and zero-pads the rest -- nothing to enable.\n");
-    ++moeg_fail_count();
-    return;
-  }
-#endif
-  if (a_row_broadcast) {
-    // m is Mmax here; the caller is asserting every expert has at most one row.
-    if (m > 1) {
-      std::printf("[moe_grouped] a_row_broadcast requires Mmax <= 1, got %d\n", m);
-      ++moeg_fail_count();
-      return;
-    }
-    cute::get<0>(sA) = 0;
-  }
+  // Nothing was lost by deleting it. The grouped kernel passes the PER-EXPERT M
+  // (ppu_aiu_gemm_mixed_input_group.hpp:243), so dim_h is already 1 at decode, and the instruction is
+  // ppu.cp.async.aiu.bulk.tensor...padz... -- the AIU already fetches exactly one row per k-tile and zero-fills the
+  // rest of the cube. 'Load one row' is the default. It is why A's whole chain costs 0.15 + 0.26 instructions per
+  // mma, 0.6% of the ~66 each mma carries.
   // N-FOLD: a folded weight buffer is physically (N/FoldF) rows x (FoldF*K) codes -- one physical row carries TWO
   // logical N columns -- so its ROW PITCH is FoldF*K, not K. Computing the stride from (n,k) makes the kernel walk
   // gmem with the unfolded pitch and read scrambled bytes no matter how the offline placed them (this is why three
@@ -348,7 +316,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
                     GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
                     char* ws, size_t ws_bytes, hggcStream_t stream,
                     const PlaneB2* B2 = nullptr, int k_full = -1, bool prefix_ready = false, int splitk = 1,
-                    bool a_row_broadcast = false) {
+                    bool /*unused, was a_row_broadcast*/ = false) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
@@ -362,7 +330,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   #define MOEG_SCHED(SCH) std::conditional_t<(MOEG_FOLD > 1), \
       cutlass::gemm::KernelAiuFold<(MOEG_FOLD > 1 ? MOEG_FOLD : 2), SCH>, SCH>
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, MOEG_SCHED(SCH), TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
-      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full,prefix_ready,splitk,a_row_broadcast)
+      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full,prefix_ready,splitk,false)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
   //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K

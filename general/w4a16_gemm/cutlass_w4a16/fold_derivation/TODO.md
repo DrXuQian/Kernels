@@ -925,3 +925,30 @@ solely so cute can see the fragment's m aliasing.
 The general lesson, and it is the same shape as the CUBE_H one: these AIU parameters are not independent knobs.
 dim_h expresses 'how many rows exist', dim_w 'how far apart they are', cube_h 'how many to move'. Asking for a row
 count through the pitch produces a descriptor no hardware contract covers.
+
+### Both NaN mechanisms are now unreachable, by deletion rather than by a fix
+
+Two separate bugs, both understood, neither reachable from the tree:
+
+  1. PPU_A_CUBE_H=1 -- shrinking the swzl atom's cube changed the PERMUTATION, not the footprint, so the right
+     bits landed in the wrong registers. Deleted at all four sites (SmemLayoutA's #if, MixGemm_AIU_Operand's CubeH,
+     four DefaultOperandA call sites, DefaultGemm_AIU_Operand's ninth template parameter).
+  2. a_row_broadcast -- zeroing A's m-stride put 0 into AiuDesc's dim_w, the row PITCH, leaving a descriptor that
+     claimed TileM rows spaced zero bytes apart. The PARAMETER is deleted, from launch(), filter_and_run,
+     moe_splitk_ppu and the bench (SPLITK_ABCAST with it), so the malformed descriptor cannot be constructed.
+
+Neither is "fixed" in the sense of the intended effect now working, and neither needs to be: dim_h already comes
+from the per-expert M and the instruction is ...padz..., so the AIU already reads exactly one row per k-tile at
+decode and zero-fills the rest of the cube. There is no functionality gap left behind.
+
+PPU_A_IN_REG is deleted too, on the user's instruction -- correct but 1.14-1.85x slower, and the reason is
+structural (A's 16x reuse is between threads). 14 conditionals stripped from the collective, 101 lines net removed,
+plus l79/l80. The measurements and the reasons stay recorded here.
+
+What survives from three routes and five box round trips, as facts rather than code:
+  - A's whole chain is 0.41 instructions per mma, 0.6% -- there was never a lever here
+  - the decode shape is work-bound at 1024 warp-tiles / 64 CUs = 16 warps/CU, so freed smem buys no warps
+  - dim_h / dim_w / cube_h are not interchangeable; a row COUNT cannot be expressed through the PITCH
+  - shrinking a shared-memory member is not a weaker form of removing it (smem_b's 32-B alignment held by
+    arithmetic coincidence)
+  - a comparison-based checker reports MATCH on all-NaN buffers, on both sides at once

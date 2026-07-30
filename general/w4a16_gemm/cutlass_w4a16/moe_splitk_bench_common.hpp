@@ -42,10 +42,8 @@ inline const char* sk_only() { return std::getenv("SPLITK_ONLY"); }
 inline bool sk_acu() { return std::getenv("SPLITK_ACU") != nullptr; }
 // A/B IN ONE BINARY, so the comparison cannot be two different builds. Off by default: it changes the answer
 // for any expert with more than one row, and launch() refuses it above Mmax == 1.
-// SPLITK_ABCAST is gone: it set a_row_broadcast, which zeroes the AIU descriptor's row pitch and returns NaN,
-// to request behaviour the descriptor's dim_h already provides (the grouped kernel passes the per-expert M, so at
-// one row per expert the AIU reads one row and padz-fills the rest). launch() refuses it now.
-inline bool sk_abcast() { return false; }
+// SPLITK_ABCAST is gone with the a_row_broadcast parameter it drove: that zeroed the AIU descriptor's row PITCH
+// (dim_w) to request what dim_h already provides, and returned NaN. See moe_grouped_ppu.cuh.
 inline double pct_of(double gbs) { return 100.0 * gbs / HBM_GBS; }
 // SPLITK_ONLY matches the whole tag, which means counting the spaces the format string pads out -- and that
 // already cost an acu run ("No kernels were profiled") after the abcast marker changed the spacing from two to
@@ -92,8 +90,7 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
   if constexpr (!moe_ok<TM, TN, TK, WM, WN, Stages, 4>()) { (void)slices; return; }
   else {
     char tag[80];
-    std::snprintf(tag, sizeof(tag), "i4 %dx%d:%d w%dx%d s%d %s S=%d", TM, TN, TK, WM, WN, Stages,
-                  sk_abcast() ? "B" : " ", slices);
+    std::snprintf(tag, sizeof(tag), "i4 %dx%d:%d w%dx%d s%d  S=%d", TM, TN, TK, WM, WN, Stages, slices);
     if (!sk_selected(tag)) return;
     const char* why = "";
     if (!moe_splitk_ppu::splitk_ok(bd.K, slices, TK, &why)) {
@@ -113,7 +110,7 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
           // B2 IS LEFT TO ITS DEFAULT ON PURPOSE. Passing `nullptr` explicitly makes deduction of PlaneB2 from
           // std::nullptr_t fail, and a failed deduction is not rescued by the parameter's default template
           // argument -- so the call stops matching. The single-TU version worked only because it never named B2.
-          bd.ws, bd.wsb, hggcStream_t(0), sk_abcast());
+          bd.ws, bd.wsb, hggcStream_t(0));
     };
 
     int const f0 = moe_grouped_ppu::moeg_fail_count();
