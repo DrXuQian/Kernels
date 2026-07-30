@@ -38,6 +38,28 @@
 #include "lowbit_moe_bench.hpp"     // Band, time_it, moe_ok, HBM_GBS, PEAK
 #include "moe_splitk_ppu.cuh"
 
+// SK_QUANT: which quantisation channel the row uses, so its cost can be measured by removing it.
+//   2 (default) FinegrainedScaleZero -- per-group scale AND zero, what ships
+//   1           FinegrainedScaleOnly -- drops the zero: one fewer f16x2 pass per atom and no Z smem reload
+//   0           PerColScaleOnly      -- drops the per-GROUP reload entirely, one scale per column read once, so the
+//                                      FINE path's 8 dependent smem loads per k-tile disappear. This is the one that
+//                                      isolates what TODO #11 (prefetch the next group's scale) could ever be worth.
+// The tag carries it so a log cannot be mistaken for the default -- the same lesson as the A-path banner.
+#ifndef SK_QUANT
+#define SK_QUANT 2
+#endif
+#if SK_QUANT == 2
+#define SK_QUANT_MODE QM::FinegrainedScaleZero
+#define SK_QUANT_NAME "sz"
+#elif SK_QUANT == 1
+#define SK_QUANT_MODE QM::FinegrainedScaleOnly
+#define SK_QUANT_NAME "s "
+#else
+#define SK_QUANT_MODE QM::PerColScaleOnly
+#define SK_QUANT_NAME "pc"
+#endif
+
+
 inline const char* sk_only() { return std::getenv("SPLITK_ONLY"); }
 inline bool sk_acu() { return std::getenv("SPLITK_ACU") != nullptr; }
 // A/B IN ONE BINARY, so the comparison cannot be two different builds. Off by default: it changes the answer
@@ -90,7 +112,7 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
   if constexpr (!moe_ok<TM, TN, TK, WM, WN, Stages, 4>()) { (void)slices; return; }
   else {
     char tag[80];
-    std::snprintf(tag, sizeof(tag), "i4 %dx%d:%d w%dx%d s%d  S=%d", TM, TN, TK, WM, WN, Stages, slices);
+    std::snprintf(tag, sizeof(tag), "i4 %s %dx%d:%d w%dx%d s%d  S=%d", SK_QUANT_NAME, TM, TN, TK, WM, WN, Stages, slices);
     if (!sk_selected(tag)) return;
     const char* why = "";
     if (!moe_splitk_ppu::splitk_ok(bd.K, slices, TK, &why)) {
@@ -99,7 +121,7 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
     }
 
     auto go = [&] {
-      moe_splitk_ppu::launch_splitk<QM::FinegrainedScaleZero, TM, TN, TK, WM, WN, Stages, int4_t>(
+      moe_splitk_ppu::launch_splitk<SK_QUANT_MODE, TM, TN, TK, WM, WN, Stages, int4_t>(
           bd.dA, dB.get(), bd.dSc, bd.dZr,
           cx.dD->get(), cx.dPart->get(),
           slices == 1 ? cx.pdOne->get() : cx.pdAll->get(),

@@ -1252,3 +1252,28 @@ the cp.async writer's threads still cost. This path should gate on TileM == 16 a
 So PPU_A_PACK is not a speedup, it is an enabler -- 'A's shared memory' is no longer a reason a config is
 unaffordable. Its immediate consequence is that the Stages ladder is worth revisiting: s3 and s4 all lost to s2
 before, and s4 is now 1.2 us behind instead of 10.
+
+### split-K is settled: it DOES deliver the warps, and they turn straight into more waiting
+
+acu on the same tile, S=1 against S=2 (grid identifies them: z is S, and a 1-D grid is the reduce kernel):
+
+                          S=1      S=2
+    Achieved warps/CU    14.02    26.84     <- it delivers, 1.9x
+    Memory Dependency     0.98     1.772    <- and doubles with them
+    DRAM                 38.65%   41.48%
+    Duration (bench)     20.18    20.96 us
+
+So the "split-K did not deliver warps" hypothesis is refuted -- and the answer is worse than a bug would have been.
+The extra parallelism converted one-for-one into extra waiting: more warps issuing against the same memory path, each
+waiting longer. Bank Conflicts 311,296, about 2.4 per mma, sit on that path.
+
+This also retires "compress registers to raise occupancy": occupancy already went 14 -> 26.8 in this experiment and
+bought nothing, so pushing the 106-register ceiling to the next step (88 regs -> 40 warps on acu's chart) would only
+raise Memory Dependency further. Warp count is not the constraint any more.
+
+SK_QUANT added to the bench to price the scale channel by removing it:
+    2 (default) FinegrainedScaleZero    what ships
+    1           FinegrainedScaleOnly    no zero: one fewer f16x2 pass per atom, no Z reload
+    0           PerColScaleOnly         no per-GROUP reload at all -- the FINE path's 8 dependent smem loads per
+                                        k-tile disappear, which is the ceiling on what TODO #11 could ever win
+The mode is in the row tag so a log cannot be mistaken for the default.
