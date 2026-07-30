@@ -578,3 +578,44 @@ second wants stride 0. Splitting them is a change to the copy atom's contract. G
 
 The GMEM half survives and is unaffected: a_row_broadcast still cuts A's L2->L1 volume (33.5 MB -> 2.1 MB) with
 no smem change, and MOE_ABCAST / SPLITK_ABCAST still switch it.
+
+### CLOSED: A's smem cannot be shrunk from the collective. Two box faults, and a false green light.
+
+The motivation was sound and stays on record: at decode every expert has ONE row against TileM >= 16 (every MMA
+atom is Shape<_16,...>), so 15/16 of A's smem tile is padding whose results the epilogue's residue mask discards,
+and A is 62% of the block's 26,624 B. Removing it would take 9 blocks/CU to 23, 18 warps/CU to 46.
+
+**Attempt 1, stride 0 on SmemLayoutA.** Illegal access. l74_swzl_coord_not_stride.cu measures why: the mma-side
+read is partition_S(make_mix_tensor_like(sA)), a mix tensor carries a COORDINATE, and the coordinate at (m,0,0) is
+(0,m,_0,0) for the compact AND the stride-0 layout -- identical. Strides never reach the addressing.
+
+**Attempt 2, shrink CUBE_H so one cube is one row.** Illegal access again, with the disassembly's M step still
+512 B where CUBE_H=1/CUBE_W=64 would give 128 B. TWO GAPS in my local verification produced a false green light:
+
+  * l76 exercised `DefaultGemm_AIU_Operand` DIRECTLY rather than through the builder. The mixed-input path's A
+    operand is `MixGemm_AIU_Operand`, which hardcodes `CUBE_H = Block_MN{}` and has no override point -- so the
+    override very likely never reached A's atom.
+  * l77 probed `Mainloop::SmemCopyAtomA`, but the collective uses
+    `InternalSmemCopyAtomA = conditional_t<!SwapAB, SmemCopyAtomA, SmemCopyAtomB>`, and SwapAB is TRUE here
+    because the operand that goes through the converter occupies the "A" slot. The atom printed back as
+    `integer_subbyte<4>` -- the QUANTIZED one. So l77's CPY_M, tCsA layout and fragment-size readings were all
+    for the wrong atom and are withdrawn.
+
+The only reading that survives is that cosize_v<SmemLayoutA> follows the layout, which was never in doubt.
+
+**Not attempting a third time, on the measured payoff.** The TileN ladder raised theoretical occupancy 28% -> 50%
+at constant total work and bought 1.066x within one run (22.68 -> 21.28 us). Occupancy is a weak lever for this
+kernel, so the ~2.6x of theoretical occupancy this would unlock is worth well under 1.1x -- against a code path
+that has now faulted twice and that the local toolchain provably cannot verify (symbolic ScaledBasis strides,
+address resolved by the asm, SwapAB renaming the operands).
+
+**Do this instead, and first.** A dummy-padding occupancy sweep: add `char pad[N]` to the kernel's own
+SharedStorage (ppu_aiu_gemm_mixed_input_group.hpp:77, a LOCAL file -- no collective change) and sweep N so
+blocks/CU walks 9 -> 8 -> 7 -> 6 -> 5 -> 4. That measures dTime/dOccupancy in the direction that IS reachable,
+single-variable, with no correctness risk. If time is flat from 9 down to 4 blocks, then 9 -> 23 gains nothing
+and this whole direction is closed by measurement rather than by two faults. Pad values for 16x32:256 s2
+(26,624 B): 2560 -> 8 blk, 6656 -> 7, 11264 -> 6, 17408 -> 5, 26112 -> 4.
+
+What survives from the attempt: the CubeH override on DefaultGemm_AIU_Operand (inert for this path, harmless),
+and the gmem-side a_row_broadcast, which cuts A's L2->L1 volume 33.5 MB -> 2.1 MB with no smem change and is
+still switchable via MOE_ABCAST / SPLITK_ABCAST.
