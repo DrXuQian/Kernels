@@ -537,3 +537,44 @@ DO THE TileN LADDER FIRST. Both changes test the same hypothesis -- that occupan
 already buys 28% -> 50% with code that is already written and gated. If 1.78x of occupancy does not convert into
 time, 2.6x will not either, and there is already one counter-example on record: 16x32:64 s4 reaches 38 warps/CU
 and measures 19% SLOWER than 16x32:256 s2 at 18. One number decides whether the swizzle work is worth starting.
+
+### RESULT: the TileN ladder works but is small (1.066x), and the A smem stride-0 FAULTS
+
+Both from the same box run, L=64 top-k=8, N=K=2048, gs=32, mode 3.
+
+**TileN ladder, S=1, all w16x16 s2 unless noted:**
+
+    16x32:256   22.68 us   cta 512   wkwrp/CU 14.2
+    16x64:256   22.16 us   cta 256   wkwrp/CU 14.2
+    16x128:256  21.28 us   cta 128   wkwrp/CU 14.2   <-- winner, 1.066x over 16x32
+    16x64:256  w16x32  24.47 us   wkwrp/CU 7.1
+    16x128:256 w16x32  24.73 us   wkwrp/CU 7.1
+    16x32:64   s4      26.59 us
+    32x64:64   s4      30.67 us
+    64x128:64  s4      39.78 us
+
+Two things confirmed and one bounded:
+  * wkwrp/CU is 14.2 for EVERY w16x16 row, exactly as warps = mt*N*TM/(WM*WN) predicts -- TileN cancels out of
+    the total work, it only redistributes it into fewer, wider blocks.
+  * more warps per block is the right direction: at identical smem, w16x16 (8 warps/blk) beats w16x32 (4) by
+    1.16x at TN=128 and 1.10x at TN=64.
+  * but the WIN IS 1.066x, not the 1.78x the occupancy arithmetic allows. Occupancy is a WEAK lever for this
+    kernel.
+
+CROSS-RUN ABSOLUTE TIMES ARE NOT COMPARABLE and that nearly produced a wrong claim. Every S=1 row in this run is
+1.03-1.07x slower than the same row in the previous run (16x32:256 was 21.16, now 22.68). It is a uniform shift,
+not per-row noise, so WITHIN-run orderings hold and the 1.066x stands -- but any comparison that spans runs does
+not. State which run a number came from.
+
+**A smem stride-0 (PPU_A_BCAST): reverted, it faults.** cosize_v<SmemLayoutA> would have shrunk the allocation
+16x, but InternalSmemCopyAtomA is a tsm.ld.swzl atom that derives its byte addresses from the swizzled compact
+layout and walks past a stride-0 one -- illegal memory access at
+`tsm.ld.swzl.b32x4.s0.t1.trans0 vreg[64:67], [sreg63] @sreg27`. nvcc's front end accepted it with
+PPU_FORCE_INSTANTIATE, every static_assert passing, so the front end was no evidence here.
+
+What would be needed: the layout plays two roles -- allocation-plus-copy, and the mma's read -- and only the
+second wants stride 0. Splitting them is a change to the copy atom's contract. Given occupancy measured as a
+1.066x lever, that surgery is probably not worth starting.
+
+The GMEM half survives and is unaffected: a_row_broadcast still cuts A's L2->L1 volume (33.5 MB -> 2.1 MB) with
+no smem change, and MOE_ABCAST / SPLITK_ABCAST still switch it.

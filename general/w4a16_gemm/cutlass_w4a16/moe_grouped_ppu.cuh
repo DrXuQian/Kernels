@@ -184,11 +184,9 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // STRIDES FROM k_full, SHAPES FROM k -- see the k_full parameter. Getting this backwards makes every
   // slice after the first walk gmem with a shrunken row pitch and read the wrong rows entirely.
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k_full, L));
-  // PPU_A_BCAST makes A's SMEM tile stride-0 in M, which is only sound if the GMEM side is too -- otherwise the
-  // aliased destination rows race with different values. So the macro forces the runtime half on.
-#if defined(PPU_A_BCAST) && (PPU_A_BCAST != 0)
-  a_row_broadcast = true;
-#endif
+  // PPU_A_BCAST IS GONE: the smem half of this faults on the box (tsm.ld.swzl computes its own addresses from the
+  // swizzled compact layout and walks past a stride-0 one). Only the GMEM half survives, and it is what this flag
+  // still does -- it cuts A's L2->L1 volume without touching the smem footprint. See the collective's comment.
   if (a_row_broadcast) {
     // m is Mmax here; the caller is asserting every expert has at most one row.
     if (m > 1) {
