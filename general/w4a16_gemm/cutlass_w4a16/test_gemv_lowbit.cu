@@ -21,12 +21,30 @@
 #include <random>
 #include <algorithm>
 
+// ITERATION COST. The full matrix instantiates GS{0,16,32,64,128} x 3 quant ops x CtaM 1-4 x bias x grouped
+// for every (format, layout, CtaN, Chunk) row, which is a ~10 minute nvcc build. That is the right cost before
+// a commit and the wrong one while iterating, so GEMV_GATE_FAST narrows the group-size axis to the two that
+// carry most of the coverage. Build the FULL matrix before trusting a result.
+#if defined(GEMV_GATE_FAST)
+#define GEMV_GS_LIST(EMIT) EMIT(0) EMIT(32)
+#endif
 #include "gemv_lowbit/gemv_launcher.hpp"
 #include "gemv_lowbit/gemv_rt.hpp"      // one source, both runtimes -- see the header for why
 
 using namespace ppu_gemv;
 
-static int g_pass = 0, g_fail = 0;
+static int g_pass = 0, g_fail = 0, g_skip = 0;
+
+// Which group sizes this BUILD instantiated. A fast build must SKIP the rows it cannot serve, not let them be
+// refused and counted as failures: an output whose 26 red lines are all expected is one that gets misread the
+// first time it has a real one.
+static bool gs_instantiated(int gs) {
+#if defined(GEMV_GATE_FAST)
+  return gs == 0 || gs == 32;
+#else
+  return true;
+#endif
+}
 
 // ---------------------------------------------------------------------------------------------------
 // Host packing. q[n*K + k] holds the logical code of column n, row k. Both layouts are expressed as a bit
@@ -133,6 +151,7 @@ struct CaseSpec {
 
 template <typename Details, int CtaN, int Chunk>
 static bool run_case(CaseSpec const& c, uint32_t seed) {
+  if (!gs_instantiated(c.gs)) { ++g_skip; return true; }
   constexpr int LoBits = Details::kLoBits;
   constexpr int HiBits = Details::kHiBits;
   constexpr bool TwoPlane = Details::kTwoPlane;
@@ -519,7 +538,11 @@ int main(int argc, char** argv) {
 #undef FMT_CASE
   }
 
-  std::printf("\n== summary ==\n  %d passed, %d failed, %d launches refused\n",
-              g_pass, g_fail, gemv_fail_count());
+#if defined(GEMV_GATE_FAST)
+  std::printf("\n  *** GEMV_GATE_FAST: only gs {0,32} instantiated; %d rows SKIPPED (not passed). Build without\n"
+              "      it before trusting a clean result. ***\n", g_skip);
+#endif
+  std::printf("\n== summary ==\n  %d passed, %d failed, %d skipped, %d launches refused\n",
+              g_pass, g_fail, g_skip, gemv_fail_count());
   return g_fail == 0 ? 0 : 1;
 }
