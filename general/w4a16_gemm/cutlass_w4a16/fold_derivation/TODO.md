@@ -778,3 +778,32 @@ partition_fragment_A, neither of which touches the pointer.
 Worth keeping in mind beyond this bug: shrinking a shared-memory member is not a smaller version of removing it.
 Everything after it moves, and on this hardware the AIU's 32-B alignment is load-bearing and silent -- it held by
 arithmetic coincidence, not by any declared alignment.
+
+### PPU_A_IN_REG PASSES: A into the mma fragment from gmem, shared memory untouched, bit-exact
+
+    non-finite: gold=0 got=0   |gold|max=21.72  |got|max=21.72
+    gold[0..3]=1.5752 2.87695 2.33789 -4.1875   got[0..3]= identical
+    MOEG_CHECK: |ref|max=21.72 non-finite=0
+    cross-build vs /tmp/d_off.bin: max_rel=0.000e+00 bad=0 -> MATCH
+
+The reference came from a build WITHOUT the macro, so this is not the same collective judging itself. Three
+attempts at A's shared memory: stride-0 layout faulted, CUBE_H=1 returned NaN, and not staging A at all is right.
+
+Why this one works where those did not: it uses no A copy atom. partition_A on the global tile equals what
+partition_fragment_A allocated, and the AIU write composed with the swzl read is a byte identity for fp16, so the
+fragment's logical map IS the mma's. The other two tried to keep the swzl instruction and change its geometry.
+
+Default path proven untouched by preprocessing both ways: tCgA_all and a_tile_iter appear 0 times without the
+macro, and each original A construct loses exactly one instance with it (storage.smem_a 30->29,
+copy(smem_tiled_copy_A 49->47, gmem_tiled_copy_A/tAgA 27->25) -- the remainder belong to the 2plane and
+overlap_prologue collectives, which are not touched.
+
+Unmeasured: timing. Expect ~0 from occupancy at decode (work-bound at 16 warps/CU, measured 14.2) and read the
+mainloop instruction count instead -- A's AIU write and swzl read are gone, a per-atom gmem load is added.
+
+Also settled while checking: split-K is NOT a separate loader. Same kernel, runtime `int splitk = 1`, and every
+site degenerates at 1 -- the iterator's step is 1 from idx 0 (identical to a plain coord iterator), the grid's z is
+L*1 or 1, expert = z/1, slice = 0, epilogue plane = expert + 0. make_splitk_coord_iterator is vendor code
+(ppu_stride.hpp, last touched by 'ACTLIZE v1.0.0 for PPU'), already used by ppu_aiu_gemm_parallel.hpp. The one real
+cost on the default path is that S is a runtime int, so blockIdx.z/S and %S are runtime divisions -- once per
+block, in the prologue, not in the k loop.
