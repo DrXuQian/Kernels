@@ -758,3 +758,23 @@ load, the fix is to hoist it to one load per k-tile, not to restore the smem sta
 
 Unmeasured on hardware. Correctness first: test_moe_grouped_verify 8 1, with MOEG_CHECK against a dump from a
 build without the macro.
+
+### The first PPU_A_IN_REG run faulted, and the cause was my one-element placeholder for smem_a
+
+    Exception AIU_ld TSM size out of range
+    Got bad device status: an illegal memory access was encountered
+
+Not A's load -- A no longer touches shared memory. It was B's AIU load, broken by A's leftover member.
+cute::array_aligned's default alignment is 16 B and smem_b sits immediately after smem_a in SharedStorage. At the
+real size (cosize_v<SmemLayoutA> * 2 B, always a multiple of 32) smem_b happens to land 32-B aligned, which is what
+PPU0010's AIU load requires (align_bytes = 32 in gemm_operands.hpp). My 2-byte placeholder put smem_b at offset 2
+and the descriptor became invalid.
+
+The user's question was the fix: why is smem_a still there at all? It is gone now -- the member is compiled out
+entirely, so smem_b is at offset 0 and inherits the smem allocation's alignment, which is stronger than before.
+sA survives as a NULL-pointer tensor carrying only SmemLayoutA, used by the shape asserts and
+partition_fragment_A, neither of which touches the pointer.
+
+Worth keeping in mind beyond this bug: shrinking a shared-memory member is not a smaller version of removing it.
+Everything after it moves, and on this hardware the AIU's 32-B alignment is load-bearing and silent -- it held by
+arithmetic coincidence, not by any declared alignment.
