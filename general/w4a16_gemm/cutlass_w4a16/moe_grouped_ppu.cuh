@@ -29,6 +29,9 @@
 #include "cutlass/epilogue/fusion/operations.hpp"
 #include "cutlass/detail/layout.hpp"
 
+#define PPU_MOEG_STR2(x) #x
+#define PPU_MOEG_STR(x) PPU_MOEG_STR2(x)
+
 namespace moe_grouped_ppu {
 using namespace cute;
 
@@ -147,6 +150,30 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // code instantiates nothing.) device_kernel is what cutlass::kernel_launch would reference anyway.
   { [[maybe_unused]] void const* _probe = (void const*) cutlass::device_kernel<GemmKernel>; }
 #endif
+
+  // MOEG_SMEM=1: report the block's shared-memory budget READ OFF THE TYPES, not recomputed from a formula.
+  // Two reasons this exists. (1) Whether PPU_A_CUBE_H was compiled in is otherwise invisible in a log -- the perf
+  // tag's abcast marker reads an env var, not the macro, so both builds print identically and a timing pair cannot
+  // be attributed. (2) "A's smem shrank" is exactly the kind of claim I have twice asserted from arithmetic and had
+  // the hardware refute; SharedStorageSize and cosize_v<SmemLayoutA> are the objects the compiler actually sized.
+  if (std::getenv("MOEG_SMEM")) {
+    static bool once = false;
+    if (!once) {
+      once = true;
+      constexpr int a_elems = int(cute::cosize_v<typename CollectiveMainloop::SmemLayoutA>);
+      constexpr int a_bytes = a_elems * int(sizeof(ElementA));
+      std::printf("[moe_grouped] smem/block = %d B  (A = %d B = %d elems, %.0f%%)  PPU_A_CUBE_H %s\n",
+                  int(GemmKernel::SharedStorageSize), a_bytes, a_elems,
+                  100.0 * a_bytes / double(GemmKernel::SharedStorageSize),
+#if defined(PPU_A_CUBE_H)
+                  "= " PPU_MOEG_STR(PPU_A_CUBE_H)
+#else
+                  "undefined"
+#endif
+      );
+      std::printf("[moe_grouped]   blocks/CU at 256 KB = %d\n", 262144 / int(GemmKernel::SharedStorageSize));
+    }
+  }
 
   using StrideA = typename GemmKernel::StrideA;  using StrideB = typename GemmKernel::StrideB;
   using StrideC = typename CollectiveEpilogue::StrideC;  using StrideD = typename CollectiveEpilogue::StrideD;
