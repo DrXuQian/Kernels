@@ -1215,3 +1215,18 @@ instead of a plausible-looking set of timings.
 Next session, in order: (1) that self-report check plus host/device consistency in build.sh, (2) re-measure
 PPU_A_PACK for real, (3) redo #11 passing the second scale fragment as NAMED parameters -- appending to the
 cute::tuple<Ts...> would not deduce.
+
+### The packed path faulted because the read's pitch and the write's were two separate literals
+
+Symbol name from the box: PPU0010_TSM_LD_SWZL<half_t, 64, 64, true, false, 2, 16> -- CubePitch 16, while the
+collective's writer had moved to 64. Written at one spacing, read at another, "invalid VA". I had flagged this exact
+coupling when adding the parameter ("the builder's kCubePitchA must match the collective's kAPackPitch -- that's a
+coupling risk, let me add a static_assert") and then did not add it.
+
+Both now come from ONE macro, PPU_A_PACK_PITCH, defined identically in the two files. Not a static_assert -- the
+first attempt at one named a member that does not exist (Copy_Struct) and failed to compile. A single definition is
+stronger than a comparison anyway: there is nothing left to compare.
+
+Confirmed from the same run that the packing IS active: smem/block 61,840 -> 21,520 B and blocks/CU 4 -> 12. The
+banner's "A = 49152 B" is the LAYOUT's cosize, which PPU_A_PACK deliberately leaves alone -- only the allocation
+moves -- so that number staying put is correct and the 228% it prints is the two being different things.
