@@ -807,3 +807,34 @@ L*1 or 1, expert = z/1, slice = 0, epilogue plane = expert + 0. make_splitk_coor
 (ppu_stride.hpp, last touched by 'ACTLIZE v1.0.0 for PPU'), already used by ppu_aiu_gemm_parallel.hpp. The one real
 cost on the default path is that S is a runtime int, so blockIdx.z/S and %S are runtime divisions -- once per
 block, in the prologue, not in the k loop.
+
+### PPU_A_IN_REG is CORRECT and 1.14-1.85x SLOWER. Quantified: A's delivery goes from 4 instructions to 64
+
+Same sweep, S=1, both builds (sk_off.log / sk_reg.log):
+
+    16x128:256 s2   22.07 -> 38.46 us   1.74x     16x32:256 s2   22.86 -> 34.53   1.51x
+    16x64:256 s2    22.34 -> 36.20      1.62x     64x128:64 s4   40.42 -> 74.91   1.85x
+    16x128:256 s3   22.91 -> 38.46      1.68x     16x128:256 s4  23.57 -> 39.20   1.66x
+
+Two predictions held. wkwrp/CU did not move at all (14.2 / 7.1 in both), confirming the shape is work-bound at
+1024 warp-tiles / 64 CUs = 16 warps/CU, so smem 57,344 -> 40,960 bought exactly nothing. And the allocation really
+did shrink by 8192*Stages bytes at every row.
+
+The cost is instruction count, measured locally (l79_a_gmem_vector.cu): max_common_vector for the
+(gmem partition, fragment) pair is 2. The fragment is 128 elements per thread per k-tile, so the replacement copy
+is 64 loads where the swzl atom delivered the same 4096 bits in InstNum = 4. 16x more instructions, in the
+innermost loop, immediately before the mma. The vector is 2 and not 8 because m-stride 0 makes fragment slots that
+differ in m share an address, so the common contiguous run breaks at 2.
+
+THE STRUCTURAL REASON, which closes the line rather than inviting a tuning attempt: A's 16x redundancy is
+BETWEEN THREADS, not within one. A warp's 4096 fragment slots cover 256 distinct addresses (row 0, k = 0..255), but
+each thread's m is fixed by the mma's A layout, so a thread cannot fill its own slots from fewer loads. The only
+hardware that shares one value across threads is shared memory -- which is exactly what the AIU write plus swzl
+read exist to exploit. Taking A out of smem discards a 16x reuse to save a footprint that nothing was waiting on.
+
+Kept, off by default and proven inert by preprocessing, as the measurement's record. Not a candidate.
+
+So all three A-smem routes are closed, and the reasons are now different and specific: stride-0 layout faults
+(coordinate addressing), CUBE_H=1 corrupts (permutation, not footprint), gmem-to-register is correct but pays 16x
+the instructions (inter-thread reuse lost). What remains for decode is not A: it is the 15/16 of the mma work spent
+on padding rows (TileM >= 16 against one row per expert) and the per-element op count.

@@ -160,8 +160,15 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
     static bool once = false;
     if (!once) {
       once = true;
+      // cosize_v<SmemLayoutA> is the layout's extent, NOT the allocation: under PPU_A_IN_REG the layout survives
+      // for partition_fragment_A while SharedStorage has no member at all, and reporting the layout there printed
+      // 'A = 16384 B, 160%' of a 10240 B block.
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+      constexpr int a_elems = 0, a_bytes = 0;
+#else
       constexpr int a_elems = int(cute::cosize_v<typename CollectiveMainloop::SmemLayoutA>);
       constexpr int a_bytes = a_elems * int(sizeof(ElementA));
+#endif
       std::printf("[moe_grouped] smem/block = %d B  (A = %d B = %d elems, %.0f%%)  A path: %s\n",
                   int(GemmKernel::SharedStorageSize), a_bytes, a_elems,
                   100.0 * a_bytes / double(GemmKernel::SharedStorageSize),
