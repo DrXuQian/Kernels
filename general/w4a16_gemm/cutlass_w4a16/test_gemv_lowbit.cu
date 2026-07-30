@@ -21,13 +21,10 @@
 #include <random>
 #include <algorithm>
 
-#include <cuda_runtime.h>
 #include "gemv_lowbit/gemv_launcher.hpp"
+#include "gemv_lowbit/gemv_rt.hpp"      // one source, both runtimes -- see the header for why
 
 using namespace ppu_gemv;
-
-#define CHECK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) { \
-  std::printf("CUDA error %s at %s:%d\n", cudaGetErrorString(_e), __FILE__, __LINE__); std::exit(1); } } while (0)
 
 static int g_pass = 0, g_fail = 0;
 
@@ -72,8 +69,8 @@ static void gate_converter(const char* tag) {
   std::mt19937 gen(0xC0FFEE ^ (Bits * 131 + int(SubOffset)));
   std::vector<uint32_t> h_src(N * Bits / 32);
   uint32_t *d_src; float *d_f, *d_r; int* d_m;
-  CHECK(cudaMalloc(&d_src, h_src.size() * 4));
-  CHECK(cudaMalloc(&d_f, N * 4)); CHECK(cudaMalloc(&d_r, N * 4)); CHECK(cudaMalloc(&d_m, N * 4));
+  d_src = (uint32_t*)rt_malloc(h_src.size() * 4);
+  d_f = decltype(d_f)(rt_malloc(N * 4)); d_r = decltype(d_r)(rt_malloc(N * 4)); d_m = decltype(d_m)(rt_malloc(N * 4));
 
   bool ok = true;
   int bad_first = -1;
@@ -81,12 +78,12 @@ static void gate_converter(const char* tag) {
   std::vector<int> h_m(N);
   for (int trial = 0; trial < 64 && ok; ++trial) {
     for (auto& w : h_src) w = gen();
-    CHECK(cudaMemcpy(d_src, h_src.data(), h_src.size() * 4, cudaMemcpyHostToDevice));
+    rt_h2d(d_src, h_src.data(), h_src.size() * 4);
     cvt_probe<FP16DetailsA, Bits, SubOffset, N><<<1, 1>>>(d_src, d_f, d_r, d_m);
-    CHECK(cudaDeviceSynchronize());
-    CHECK(cudaMemcpy(h_f.data(), d_f, N * 4, cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpy(h_r.data(), d_r, N * 4, cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpy(h_m.data(), d_m, N * 4, cudaMemcpyDeviceToHost));
+    rt_sync("probe");
+    rt_d2h(h_f.data(), d_f, N * 4);
+    rt_d2h(h_r.data(), d_r, N * 4);
+    rt_d2h(h_m.data(), d_m, N * 4);
     for (int l = 0; l < N; ++l) {
       // ref is in logical order; fast is in slot order. Compare THROUGH the mapper.
       if (h_f[h_m[l]] != h_r[l]) { ok = false; bad_first = l; break; }
@@ -106,10 +103,10 @@ static void gate_converter(const char* tag) {
       std::fill(h_src.begin(), h_src.end(), 0u);
       int const w = l / (32 / Bits), b = (l % (32 / Bits)) * Bits;
       h_src[w] = 1u << b;
-      CHECK(cudaMemcpy(d_src, h_src.data(), h_src.size() * 4, cudaMemcpyHostToDevice));
+      rt_h2d(d_src, h_src.data(), h_src.size() * 4);
       cvt_probe<FP16DetailsA, Bits, SubOffset, N><<<1, 1>>>(d_src, d_f, d_r, d_m);
-      CHECK(cudaDeviceSynchronize());
-      CHECK(cudaMemcpy(h_f.data(), d_f, N * 4, cudaMemcpyDeviceToHost));
+      rt_sync("probe");
+      rt_d2h(h_f.data(), d_f, N * 4);
       float base = SubOffset ? 0.f : 1024.f;
       int found = -1;
       for (int s = 0; s < N; ++s) if (h_f[s] == base + 1.f) { found = s; break; }
@@ -118,7 +115,7 @@ static void gate_converter(const char* tag) {
     std::printf("\n");
     ++g_fail;
   }
-  CHECK(cudaFree(d_src)); CHECK(cudaFree(d_f)); CHECK(cudaFree(d_r)); CHECK(cudaFree(d_m));
+  rt_free(d_src); rt_free(d_f); rt_free(d_r); rt_free(d_m);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -241,15 +238,15 @@ static bool run_case(CaseSpec const& c, uint32_t seed) {
 
   void *dA, *dS, *dZ = nullptr, *dB = nullptr, *dW, *dWh = nullptr, *dO;
   int* dOff = nullptr;
-  CHECK(cudaMalloc(&dA, hA.size() * 2));   CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
-  CHECK(cudaMalloc(&dS, hS.size() * 2));   CHECK(cudaMemcpy(dS, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
-  if (has_zero(c.qop)) { CHECK(cudaMalloc(&dZ, hZ.size() * 2)); CHECK(cudaMemcpy(dZ, hZ.data(), hZ.size() * 2, cudaMemcpyHostToDevice)); }
-  if (c.bias)          { CHECK(cudaMalloc(&dB, hB.size() * 2)); CHECK(cudaMemcpy(dB, hB.data(), hB.size() * 2, cudaMemcpyHostToDevice)); }
-  CHECK(cudaMalloc(&dW, pk_lo.size()));    CHECK(cudaMemcpy(dW, pk_lo.data(), pk_lo.size(), cudaMemcpyHostToDevice));
-  if (TwoPlane) { CHECK(cudaMalloc(&dWh, pk_hi.size())); CHECK(cudaMemcpy(dWh, pk_hi.data(), pk_hi.size(), cudaMemcpyHostToDevice)); }
-  CHECK(cudaMalloc(&dO, size_t(total_rows) * N * 2));
-  CHECK(cudaMemset(dO, 0, size_t(total_rows) * N * 2));
-  if (L > 0) { CHECK(cudaMalloc(&dOff, offs.size() * 4)); CHECK(cudaMemcpy(dOff, offs.data(), offs.size() * 4, cudaMemcpyHostToDevice)); }
+  dA = rt_malloc(hA.size() * 2);   rt_h2d(dA, hA.data(), hA.size() * 2);
+  dS = rt_malloc(hS.size() * 2);   rt_h2d(dS, hS.data(), hS.size() * 2);
+  if (has_zero(c.qop)) { dZ = rt_malloc(hZ.size() * 2); rt_h2d(dZ, hZ.data(), hZ.size() * 2); }
+  if (c.bias)          { dB = rt_malloc(hB.size() * 2); rt_h2d(dB, hB.data(), hB.size() * 2); }
+  dW = rt_malloc(pk_lo.size());    rt_h2d(dW, pk_lo.data(), pk_lo.size());
+  if (TwoPlane) { dWh = rt_malloc(pk_hi.size()); rt_h2d(dWh, pk_hi.data(), pk_hi.size()); }
+  dO = rt_malloc(size_t(total_rows) * N * 2);
+  rt_memset0(dO, size_t(total_rows) * N * 2);
+  if (L > 0) { dOff = (int*)rt_malloc(offs.size() * 4); rt_h2d(dOff, offs.data(), offs.size() * 4); }
 
   Params p;
   p.act = dA; p.weight = dW; p.weight_hi = dWh; p.scales = dS; p.zeros = dZ; p.bias = dB; p.out = dO;
@@ -265,14 +262,13 @@ static bool run_case(CaseSpec const& c, uint32_t seed) {
 
   int const fail0 = gemv_fail_count();
   bool const launched = launch_gemv<Details, CtaN, Chunk>(p, 0);
-  CHECK(cudaDeviceSynchronize());
-  CHECK(cudaGetLastError());
+  rt_sync("probe");
 
   bool ok = launched && gemv_fail_count() == fail0;
   double max_rel = 0.0; int bad = 0; int bad_at = -1;
   if (ok) {
     std::vector<__half> hO(size_t(total_rows) * N);
-    CHECK(cudaMemcpy(hO.data(), dO, hO.size() * 2, cudaMemcpyDeviceToHost));
+    rt_d2h(hO.data(), dO, hO.size() * 2);
     double maxg = 1e-9;
     for (auto v : G) maxg = std::max(maxg, double(std::fabs(v)));
     for (size_t i = 0; i < hO.size(); ++i) {
@@ -309,11 +305,11 @@ static bool run_case(CaseSpec const& c, uint32_t seed) {
     ++g_fail;
   }
 
-  cudaFree(dA); cudaFree(dS); cudaFree(dW); cudaFree(dO);
-  if (dZ) cudaFree(dZ);
-  if (dB) cudaFree(dB);
-  if (dWh) cudaFree(dWh);
-  if (dOff) cudaFree(dOff);
+  rt_free(dA); rt_free(dS); rt_free(dW); rt_free(dO);
+  if (dZ) rt_free(dZ);
+  if (dB) rt_free(dB);
+  if (dWh) rt_free(dWh);
+  if (dOff) rt_free(dOff);
   return ok;
 }
 
