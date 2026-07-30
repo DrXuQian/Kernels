@@ -1143,3 +1143,43 @@ s.csel 0.41 + s.cbr 0.56 + s.shra 0.09 + s.mull 0.16 = 1.8 per mma, about 5%.
 Now templated as KBlockT, all four inner loops use for_each so the index is Int<i>, the guard folds to if constexpr
 and disappears, and the division and modulo fold away. Constant folding only -- numerics unchanged. Four harnesses
 compile clean both with and without PPU_A_CPASYNC.
+
+### PPU_A_PACK: overlap the swzl cubes so A's smem is ~7x smaller with the ldmatrix read UNCHANGED
+
+The user's idea, and it is the only one of the seven that leaves the read instruction alone. Row 0 of a cube owns
+just 32 of its 512 words; the rest only has to be READABLE, and its garbage lands in accumulator rows the epilogue
+masks. So pack the cube BASES together instead of changing anything about the cube.
+
+Measured locally first, in this order:
+  l84  row 0 owns 32 of 512 words, at word offsets 0-7 | 144-151 | 264-271 | 408-415  (CUBE_H=16, 4 slices)
+  l85  packing the bases 8 words apart is COLLISION-FREE for 8 sub-tiles; span 568 words against 4096 unpacked
+  l86  the logical->physical map for row 0 is FOUR CONTIGUOUS RUNS and k advances with the word inside each run,
+       so the writer needs no shuffle at all -- four plain 32-byte copies per cube
+
+Numbers for 16x128:256 s2 (8 sub-tiles = 4 cubes x 2 stages): A goes 16,384 B -> 2,272 B, about 7.2x.
+
+What made this workable where six earlier attempts failed: only the DISTANCE between cube bases changes. The cube
+geometry, the swizzle, the write/read pairing and the read's 4-instruction cost are all untouched. PPU_A_CUBE_MN
+changed the geometry and corrupted the data; PPU_A_CPASYNC replaced the read and paid 64 loads plus 17 address ops
+per mma.
+
+The one thing that forces a new writer: the AIU write is .padz, so it writes the whole 2048-byte cube including 15
+rows of zeros, and packed cubes would erase each other's row 0. A's write is therefore a cp.async of row 0's four
+runs -- one 128-bit transfer per thread over kACubes * kASlices * 2 threads, so one instruction on one warp, cheaper
+than the AIU it replaces. B keeps the AIU untouched.
+
+Implementation, five places:
+  - PPU0010_TSM_LD_SWZL gains a CubePitch template parameter (0 = natural CUBE_H*CUBE_W). A parameter and NOT a
+    macro because B reads through the same atom and must keep its natural pitch
+  - Copy_Traits follows the new parameter
+  - MixGemm_AIU_Operand passes pitch 16 for A's atom under the macro
+  - SharedStorage sizes smem_a to the packed span
+  - copy_A_packed_row0 writes the four runs; the run offsets are COMPUTED from the sim's arithmetic
+    (2*(CUBE_H*8*s + ssv(s)*4), ssv = 0,4,2,6), which reproduces l86's table exactly and generalises over CUBE_H --
+    the first draft hardcoded CUBE_H=16 and the compiler caught it on a 64x64x128 config
+
+Guards: l85's collision check is now a constexpr static_assert over (cube, stage) pairs, plus asserts that
+AiuContElemSize is 64 and CUBE_H is TileM. launch() refuses Mmax > 1.
+
+Expected: no gain at decode (work-bound, four measurements) -- this banks the capability and the geometry knowledge.
+Unmeasured on hardware.

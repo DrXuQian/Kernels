@@ -168,7 +168,9 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
       std::printf("[moe_grouped] smem/block = %d B  (A = %d B = %d elems, %.0f%%)  A path: %s\n",
                   int(GemmKernel::SharedStorageSize), a_bytes, a_elems,
                   100.0 * a_bytes / double(GemmKernel::SharedStorageSize),
-#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+                  "A in smem, PACKED cubes, cp.async row0 + swzl read"
+#elif defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
                   "A in smem, ONE row, plain cp.async + DefaultCopy"
 #else
                   "A in smem via AIU + swzl"
@@ -216,6 +218,15 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k_full, L));
   // PPU_A_CPASYNC needs Mmax == 1: A's SMEM tile has a stride-0 M mode there, so every row of the tile aliases onto
   // the one real row. At M_e > 1 rows 1..M_e-1 are real and would read row 0's data instead.
+  // PPU_A_PACK: A's cubes overlap in smem and only row 0 of each carries data, so rows 1..TileM-1 read a
+  // neighbour's bytes. Sound only where those rows are discarded, i.e. Mmax == 1.
+#if defined(PPU_A_PACK) && (PPU_A_PACK != 0)
+  if (m > 1) {
+    std::printf("[moe_grouped] PPU_A_PACK requires Mmax <= 1, got %d (packed cubes: only row 0 is real)\n", m);
+    ++moeg_fail_count();
+    return;
+  }
+#endif
 #if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
   if (m > 1) {
     std::printf("[moe_grouped] PPU_A_CPASYNC requires Mmax <= 1, got %d (A's smem tile is one row, aliased in M)\n", m);
