@@ -498,3 +498,42 @@ forms of spending that, in increasing generality -- and they are not interchange
 None of the three touches shared-memory FOOTPRINT, so none of them changes occupancy. Occupancy needs either
 fewer bytes per block or more warps per block; the TileN ladder now in _SPLITK_CFGS is the second, and it is
 free of A's padding because A's smem term does not grow with TileN.
+
+### CORRECTION: the smem saving IS available, and it is the biggest lever found so far
+
+The entry above says none of the three forms changes shared-memory FOOTPRINT. That is true only of the one
+implemented -- stride 0 on A's GMEM m-stride, which still copies TM rows into a TM x TK smem tile. It is false
+of the idea itself, and the code says so:
+
+    ppu_mma_aiu_multistage_mixed_input.hpp:271
+      cute::ArrayEngine<RealInternalElementA, cute::cosize_v<SmemLayoutA>> smem_a;
+    :205
+      using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(TM, TK, Stages)));
+
+A's allocation is sized by cosize_v<SmemLayoutA>, NOT by TM*TK. So a stride-0 M mode in that layout shrinks the
+allocation 16x automatically, with no change to SharedStorage. The obstacle is only that tile_to_shape produces a
+compact (bijective) layout, so the decode case needs its SmemLayoutA written directly instead.
+
+    config                    A      B     scale+zero  x Stages  blk/CU  warps/CU  theoretical occ
+    16x32:256 s2 (now)      8192   4096      1024       26,624      9       18          28%
+    + A smem stride-0        512   4096      1024       11,264     23       46          72%
+    + TN=64  w16x16          512   8192      2048       21,504     12       48          75%
+    + TN=128 w16x16          512  16384      4096       41,984      6       48          75%
+
+2.6x, against 1.78x for the TileN ladder alone. And a useful bound falls out: once A's padding is gone B is the
+dominant term, so the occupancy ceiling from smem work is ~48 warps/CU (75%) and raising TileN further does not
+move it -- all three combinations land on 48.
+
+Work, and where the risk is:
+  1. an alternative SmemLayoutA with a stride-0 M mode for Mmax == 1, bypassing tile_to_shape. cosize does the
+     rest.
+  2. the A COPY must become 1 x TK as well. Left as TM x TK it writes 16 rows into the same 512 B -- values
+     identical (gmem is stride-0 too) so the race is benign, but it wastes 16x the stores AND its interaction
+     with the swizzle is the part most likely to be wrong: SmemLayoutAtomA is a bank-conflict swizzle atom and a
+     stride-0 mode composed with a swizzle is not obviously safe.
+  3. the tsm.ld.swzl side needs nothing: 16 rows reading the same 512 B is the intent.
+
+DO THE TileN LADDER FIRST. Both changes test the same hypothesis -- that occupancy is the lever -- and TileN
+already buys 28% -> 50% with code that is already written and gated. If 1.78x of occupancy does not convert into
+time, 2.6x will not either, and there is already one counter-example on record: 16x32:64 s4 reaches 38 warps/CU
+and measures 19% SLOWER than 16x32:256 s2 at 18. One number decides whether the swizzle work is worth starting.
