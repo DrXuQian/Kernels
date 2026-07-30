@@ -188,6 +188,28 @@ ScaleZero oracle exactly. Payoff: half the scale channel gone *and* one fewer sm
 Note the synergy with Phase 2: Q4_K's zero is `-dmin·mn + 8·scale` (the int4 `-8` folded in). With `kBias` generalised the
 `+8·scale` term moves into the converter and the zero decode becomes purely `-dmin·mn` — one `hfma` per group.
 
+**kBias IS GENERALISED AND GATED (first half of phase 1 done).** `MixGemmChunkEmit` gained a `Bias` template
+parameter defaulting to `(Bits == 4) ? 8 : 0`, and `add()`'s mantissa field became `kBias << bpos` -- the old
+`1 << (bpos+3)` was the `kBias == 8` special case written out. Exactness is a static_assert
+(`kBias << bpos_max < 1024`), not an assumption.
+
+`fold_derivation/l92_kbias_general.cu` verifies the magic-number identity NUMERICALLY rather than by reproducing
+constants: for every (Bits, Bias, bpos, code) it checks `x*mul + add == c - Bias` with `x = 1024 + c*2^bpos`, in
+double, which decides it because every intermediate is an exactly-representable fp16 integer or power of two in the
+ranges used.
+
+    int4 Bias=8   0 bad,  add[0]=0xE408 add[1]=0xD480   bit-identical to the shipped FP16_TOP_MAGIC_NUM / NEG_72
+    int2 Bias=0   0 bad     int1 Bias=0  0 bad           int4 Bias=0  0 bad
+    int2 Bias=4   0 bad,  0xE404 / 0xDC10 / 0xD440 / 0xCD00 -- the four constants this plan derived by hand
+    int1 Bias=1   0 bad                                  the mechanism generalises past the two cases needed
+
+Five harnesses compile clean, so the shipped converter is untouched.
+
+**Still open in phase 1**, and it is the part that needs the box: thread `Bias` through the two-plane path so Q3_K's
+int2 plane can name 4, then flip Q3/Q6 to `FinegrainedScaleOnly` and gate on `test_lowbit_grouped`'s Q3/Q6 rows
+matching their ScaleZero oracle exactly. The arithmetic for it is now proven; what remains is plumbing plus a
+hardware gate.
+
 ### Phase 2 — `ElementScale` becomes a packed type, decoded through the Layouts
 
 * `SmemLayoutScale` carries **bytes** instead of `half_t`; the g2s copy shrinks by the ratio in the table.
