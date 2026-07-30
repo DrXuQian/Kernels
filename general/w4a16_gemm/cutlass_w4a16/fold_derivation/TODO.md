@@ -838,3 +838,25 @@ So all three A-smem routes are closed, and the reasons are now different and spe
 (coordinate addressing), CUBE_H=1 corrupts (permutation, not footprint), gmem-to-register is correct but pays 16x
 the instructions (inter-thread reuse lost). What remains for decode is not A: it is the 15/16 of the mma work spent
 on padding rows (TileM >= 16 against one row per expert) and the per-element op count.
+
+### acu on the A-in-register build: issue-bound on the vector memory pipe, and NOT a coalescing problem
+
+    Stall Vector Memory Pipe Busy   0.596   <- dominant
+    Stall Pipe Busy                 0.628
+    Memory Dependency               0.233
+    Instruction Fetch               0.207
+    Stall AIU Pipe Busy             0
+    Stall Shared Memory Pipe Busy   0.003
+    Memory Throttle                 0
+
+Memory Throttle at 0 rules out the coalescing story: the memory system is not being flooded with sectors. It could
+not be -- m-stride 0 collapses the whole warp onto one 512-B row, so these are about the most sector-efficient
+loads in the kernel. What saturates is the vector memory PIPE, i.e. instruction issue, exactly as
+max_common_vector = 2 predicted (64 loads per thread per k-tile against the swzl atom's 4).
+
+The pair worth keeping is AIU Pipe Busy 0 and Shared Memory Pipe Busy 0.003. The swzl/AIU route does not merely use
+fewer instructions -- it uses a DEDICATED engine that nothing else contends for, and this change moved A onto the
+general vector memory pipe and filled it. That second effect was missing from my instruction-count argument.
+
+Ceiling check, so this is not revisited as a tuning task: even at a perfect 8-element vector it would be 16 loads
+against 4, still on the contended pipe. Closed.
