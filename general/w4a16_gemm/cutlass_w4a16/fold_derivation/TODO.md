@@ -1331,3 +1331,32 @@ format (test_moe_grouped_real.cu: mode 0 -> FinegrainedScaleOnly), so:
 GPTQ escapes BOTH the 11.5% zero and the 7.3% reload, and it already does -- no kernel change involved. So every
 decode figure here overstates GPTQ by roughly 19%, and the 18.8% belongs to Q4_K specifically. The bench's default
 should be selectable per format, or the effort keeps landing on costs only one format pays.
+
+### Q4_K's scale channel, split into its two parts (acu, sz against pc on the same tile)
+
+    Shared Load instructions   441,344  (+133%)   -> the scale/zero reads are the +272k, exactly tsm.ld's count
+    Shared Load transactions 1,908,736  (+35.9%)  -> +504k
+    Bank Conflicts             278,528  (+946%)   -> +252k, about 1.02 per scale read
+    Duration                     19.40  (+19.85%)
+    % Peak                       28.36            -> shared memory is NOT saturated
+
+So the channel costs +272k instructions (2.08 per mma) and an almost equal number of conflicts, and the conflicts
+double its transactions. Per (group, warp, k-tile) a group's scale takes about FOUR shared-load instructions for a
+64-half row -- narrow. And with % Peak at 28 it is transactions x latency, not a bandwidth ceiling, which is why
+prefetching the wait away (#11) recovered only 0.7% while removing the loads recovered 18.8%.
+
+Q4_K cannot change gs=32 or drop the zero. Two things it CAN change, both layout-level:
+  1. widen the scale read -- four instructions per group per warp for 128 bytes says the copy atom is 32-bit-ish;
+     this cuts instructions AND transactions, and is the main term
+  2. pad SmemLayoutScale to break the bank period -- removes ~252k conflicts, halving the channel's transactions
+
+### PPU_MAXREG: cap registers via __launch_bounds__
+
+device_kernel.h feeds MinBlocksPerMultiprocessor into __launch_bounds__, and the kernel had it at 1. PPU_MAXREG now
+sets a REGISTER target and derives the block count as 131072 / (regs * MaxThreadsPerBlock) -- expressed that way
+because a hardcoded block count means 102 registers at 128 threads and 51 at 256, which would silently
+over-constrain the wider tiles.
+
+Expectation on the record before measuring: at S=1 with a 16x64 tile the grid supplies 4 blocks/CU while 106
+registers already allow 9, so registers are not the binding limit and this should do nothing. The S=2 experiment
+already showed occupancy rising 14 -> 26.8 for no gain.

@@ -84,7 +84,21 @@ public:
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
   static constexpr uint32_t MaxThreadsPerBlock = cute::size(TiledMma{});
+  // PPU_MAXREG: cap registers per thread by asking __launch_bounds__ for more resident blocks. device_kernel.h
+  // passes MinBlocksPerMultiprocessor straight into __launch_bounds__, so the compiler must fit
+  // 131072 / (blocks * threads) registers. Expressed as a REGISTER target and converted here, because the block
+  // count that implies depends on MaxThreadsPerBlock -- 10 blocks means 102 registers at 128 threads and 51 at 256,
+  // and hardcoding the block count would silently over-constrain the wider tiles.
+  //
+  // Whether it pays is a separate question: at S=1 the grid supplies 4 blocks/CU for a 16x64 tile while 106
+  // registers already allow 9, so registers are NOT the binding limit there. Measured, not assumed.
+#if defined(PPU_MAXREG) && (PPU_MAXREG > 0)
+  static constexpr uint32_t MinBlocksPerMultiprocessor =
+      (131072u / (uint32_t(PPU_MAXREG) * MaxThreadsPerBlock)) > 0
+          ? (131072u / (uint32_t(PPU_MAXREG) * MaxThreadsPerBlock)) : 1u;
+#else
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
+#endif
   static constexpr uint32_t NumMmaWarpGroups = 1;
   static constexpr int MinWorkspaceAlignment = 16;   // [Q1] array_group takes this from an outer scope; define locally
 
