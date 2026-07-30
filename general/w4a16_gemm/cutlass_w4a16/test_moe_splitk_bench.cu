@@ -118,7 +118,25 @@ int main(int argc, char** argv) {
   bd.pd = pd.get(); bd.sd = sd.get(); bd.rdev = rdev.get(); bd.gm = gm.get(); bd.offdev = offdev.get();
   bd.ws = ws.get(); bd.wsb = ws.size();
 
-  SkCtx cx{ &dPart, &pdAll, &dD, &gsdSlice, &gshSlice, S_MAX };
+  // CONCURRENT SLICES ARE OFF BY DEFAULT, and that is the honest state rather than a preference. S launches on
+  // one stream SERIALISE: the grid at any instant is unchanged, so split-K measures nothing but S times the
+  // launch cost -- which is what the 23.49 -> 44.51 -> 69.70 -> 121.37 us ladder for S = 1,2,4,8 is. Fixing it
+  // needs the slices on separate streams, but hggcStreamCreate appears only in fold_derivation/stub_inc as a
+  // no-op that returns success WITHOUT setting the stream, and nowhere in actlize -- so it cannot be validated
+  // locally. SPLITK_STREAMS=1 turns it on for a box run that is prepared to check the API first.
+  std::vector<hggcStream_t> streams;
+  SkCtx cx{};
+  if (std::getenv("SPLITK_STREAMS")) {
+    streams.resize(S_MAX);
+    for (int i = 0; i < S_MAX; ++i) CUTLASS_PPU_CHECK(hggcStreamCreate(&streams[i]));
+    cx.streams = streams.data(); cx.num_streams = S_MAX;
+    std::printf("   SPLITK_STREAMS=1: %d streams, slices run concurrently\n", S_MAX);
+  } else {
+    std::printf("   slices SERIALISE on the default stream (SPLITK_STREAMS=1 to overlap them). Any S>1 row below\n"
+                "   therefore has the SAME concurrent grid as S=1 and is not a test of split-K.\n");
+  }
+  cx.dPart = &dPart; cx.pdAll = &pdAll; cx.dD = &dD; cx.gsdSlice = &gsdSlice; cx.gshSlice = &gshSlice;
+  cx.S_max = S_MAX;
 
   SkBest b1, bS;
   std::printf("\n-- %d generated config units (TileK=256 rows: a slice of 2048/8 is exactly one "

@@ -39,9 +39,17 @@ static constexpr int    CU      = 72;
 
 inline const char* only_filter() { return std::getenv("GEMV_ONLY"); }
 inline bool acu_mode() { return std::getenv("GEMV_ACU") != nullptr; }
+// GEMV_ONLY is a substring of the whole tag, which means counting the spaces a "%-7s %-6s" pads out -- fragile
+// for an acu capture, where selecting the wrong number of rows wastes the whole run. GEMV_FMT and GEMV_CFG match
+// the two halves independently, so `GEMV_FMT=int4 GEMV_CFG="s16/t128 N2 C2"` picks exactly one row.
 inline bool row_selected(const char* tag) {
   const char* f = only_filter();
-  return !f || std::strstr(tag, f) != nullptr;
+  if (f && std::strstr(tag, f) == nullptr) return false;
+  const char* fmt = std::getenv("GEMV_FMT");
+  if (fmt && std::strncmp(tag, fmt, std::strlen(fmt)) != 0) return false;   // format name starts the tag
+  const char* cfg = std::getenv("GEMV_CFG");
+  if (cfg && std::strstr(tag, cfg) == nullptr) return false;
+  return true;
 }
 
 // chrono + a device sync: the same timing shape lowbit_moe_bench.hpp uses, so it works under both runtimes.

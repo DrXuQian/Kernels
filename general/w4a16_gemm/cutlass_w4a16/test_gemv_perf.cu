@@ -24,6 +24,8 @@ int main(int argc, char** argv) {
   std::printf("   rev %d, %d generated units, %d format groups | HBM peak %.0f GB/s, %d CU, CtaM max %d\n",
               GEMV_PERF_REV, GEMV_UNIT_COUNT, GEMV_GROUP_COUNT, HBM_GBS, CU, GEMV_CTAM_MAX);
   if (only_filter()) std::printf("   GEMV_ONLY=\"%s\"\n", only_filter());
+  if (std::getenv("GEMV_FMT")) std::printf("   GEMV_FMT=\"%s\"\n", std::getenv("GEMV_FMT"));
+  if (std::getenv("GEMV_CFG")) std::printf("   GEMV_CFG=\"%s\"\n", std::getenv("GEMV_CFG"));
   if (acu_mode()) std::printf("   *** GEMV_ACU: ONE COLD LAUNCH PER ROW. These are captures, not timings. ***\n");
 
   Shape const shapes[] = {

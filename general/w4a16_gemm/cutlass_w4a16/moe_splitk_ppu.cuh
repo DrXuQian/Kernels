@@ -1,5 +1,19 @@
 // Split-K for the GROUPED mixed-input GEMM, done as S ordinary grouped launches plus one light reduce.
 //
+// THE SLICES MUST RUN CONCURRENTLY, OR THIS BUYS NOTHING. S launches on ONE stream serialise, so the grid at
+// any instant is unchanged and the only effect is S times the launch cost -- measured: time grew ~linearly in S
+// (23.49 -> 44.51 -> 69.70 -> 121.37 us for S = 1,2,4,8) which is exactly what serialisation predicts. The whole
+// point of split-K is that all S slices' CTAs are resident AT THE SAME TIME. So launch_splitk takes an array of
+// streams and the caller joins them; the alternative, one launch with the slice on gridDim.z, needs a new
+// GemmUniversal specialisation and is the thing to write only if the stream form shows the idea has legs.
+//
+// Two things had to move for streams to overlap at all:
+//   * the ragged m-tile prefix write in launch() is a BLOCKING hggcMemcpy, which serialises the host and with it
+//     every stream. It depends only on the per-expert M values, which K-slicing does not touch, so the caller
+//     writes it once and passes prefix_ready=true.
+//   * the workspace is shared by all slices. Safe here because the non-persistent grouped kernel only READS the
+//     prefix from it; it is not scratch.
+//
 // WHY THIS FORM AND NOT cutlass::Semaphore. The serial split-K kernel that already exists
 // (ppu_aiu_gemm_mixed_input_splitk_serial.hpp) is dense-only, and its epilogue chains the slices through
 // gmem in fp16: slice s+1 reads slice s's output, adds, writes back. That serialises the tail and rounds S
@@ -50,7 +64,8 @@ void launch_splitk(const cutlass::half_t* A, const ElementB* B, const cutlass::h
                    std::vector<GroupShape>& gsh_slice,            // scratch: host shapes with the slice k
                    GroupShape* gsd_slice,                         // device copy of gsh_slice
                    int const* group_row_offsets, int64_t total_rows,
-                   char* ws, size_t ws_bytes, hggcStream_t stream,
+                   char* ws, size_t ws_bytes,
+                   hggcStream_t const* streams, int num_streams,   // slice s runs on streams[s % num_streams]
                    const PlaneB2* B2 = nullptr) {
   const char* why = "";
   if (!splitk_ok(k, slices, group_size, TK, &why)) {
@@ -59,10 +74,16 @@ void launch_splitk(const cutlass::half_t* A, const ElementB* B, const cutlass::h
     return;
   }
 
+  // num_streams <= 0 (or a null array) means the DEFAULT stream for every slice, i.e. the serialised form.
+  // That is the current default on purpose: hggcStreamCreate exists in fold_derivation/stub_inc as a no-op that
+  // returns success WITHOUT setting the stream, and nowhere in actlize -- so the concurrent form cannot be
+  // validated locally at all, and shipping it as the default would repeat the cuda_fp16.h mistake.
+  bool const have_streams = (streams != nullptr && num_streams > 0);
+  hggcStream_t const s0 = have_streams ? streams[0] : hggcStream_t(0);
   if (slices == 1) {
     moe_grouped_ppu::filter_and_run<QuantOp, TM, TN, TK, WM, WN, Stages, ElementB, PlaneB2>(
         A, B, scales, zeros, ptr_D_all, stride_D, group_M, m, n, k, L, group_size,
-        gsd, gsh_full, group_row_offsets, ws, ws_bytes, stream, B2);
+        gsd, gsh_full, group_row_offsets, ws, ws_bytes, s0, B2);
     return;
   }
 
@@ -75,6 +96,17 @@ void launch_splitk(const cutlass::half_t* A, const ElementB* B, const cutlass::h
   for (int e = 0; e < L; ++e)
     gsh_slice[e] = cute::make_shape(int(cute::get<0>(gsh_full[e])), n, ks);
   hggcMemcpy(gsd_slice, gsh_slice.data(), sizeof(GroupShape) * L, hggcMemcpyHostToDevice);
+
+  // The ragged m-tile prefix, written ONCE. Identical for every slice (K-slicing leaves the M values alone),
+  // and blocking, so leaving it inside the per-slice launch would serialise the streams it exists to overlap.
+  {
+    int const TMv = TM;
+    std::vector<int> pfx(L + 1);
+    pfx[0] = 0;
+    for (int e = 0; e < L; ++e)
+      pfx[e + 1] = pfx[e] + int((int(cute::get<0>(gsh_full[e])) + TMv - 1) / TMv);
+    if (ws) hggcMemcpy(ws, pfx.data(), sizeof(int) * (L + 1), hggcMemcpyHostToDevice);
+  }
 
   // Element offsets of slice s. B's offline layout is tile-major in K, so a whole number of 256-tiles is a
   // flat element offset; A is row-major so the slice is a COLUMN range, which is why launch() needs k_full
@@ -91,17 +123,20 @@ void launch_splitk(const cutlass::half_t* A, const ElementB* B, const cutlass::h
         ptr_D_all + int64_t(s) * L, stride_D, group_M,
         m, n, ks, L, group_size,
         gsd_slice, gsh_slice.data(), group_row_offsets,
-        ws, ws_bytes, stream,
+        ws, ws_bytes, have_streams ? streams[s % num_streams] : hggcStream_t(0),
         B2 ? (B2 + int64_t(s) * b_slice_elems) : nullptr,
-        /*k_full=*/k);
+        /*k_full=*/k, /*prefix_ready=*/true);
   }
+
+  // Join before the merge: the reduce reads every slice's partials.
+  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
 
   int64_t const elems = total_rows * int64_t(n);
   int const threads = 256;
   int const blocks  = int(std::min<int64_t>((elems + threads - 1) / threads, 4096));
   // cutlass::half_t wraps __half with the same layout; the merge is typed on the raw type so it stays
   // locally testable (see moe_splitk_reduce.cuh).
-  moeg_splitk_reduce<<<blocks, threads, 0, stream>>>(
+  moeg_splitk_reduce<<<blocks, threads, 0, s0>>>(
       reinterpret_cast<__half*>(D), reinterpret_cast<__half const*>(partials), elems, slices);
 }
 

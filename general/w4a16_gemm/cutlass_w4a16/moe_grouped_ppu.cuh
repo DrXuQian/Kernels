@@ -70,7 +70,11 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
             // for. Every STRIDE has to come from k_full while every PROBLEM SHAPE comes from k: the A row
             // pitch, the B batch pitch and the scale row pitch all belong to the undivided matrix, and only
             // the pointers move. -1 means "not sliced", i.e. k_full == k.
-            int k_full = -1) {
+            int k_full = -1,
+            // RAGGED PREFIX ALREADY IN THE WORKSPACE. It depends only on the per-expert M values, which K-slicing
+            // does not touch, so S slices would each redo the same write -- and it is a BLOCKING hggcMemcpy, which
+            // serialises the host and with it any attempt to overlap the slices. The caller writes it once.
+            bool prefix_ready = false) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   // ElementB is now a template param (default int4b_t; uint2b_t for W2A16). AlignmentB below auto-adjusts.
@@ -220,7 +224,7 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // Ragged O(log L) decode: write the m-tile prefix [L+1] into the workspace (the non-persistent kernel does
   // NOT use the scheduler workspace, so it's free). AFTER initialize (no clobber), BEFORE run. Uniform path
   // (mtiles_uniform>0) uses blockIdx.z and ignores this. Blocking copy -> ordered before run; L+1 ints, tiny.
-  if (args.mtiles_uniform == 0 && workspace != nullptr) {
+  if (args.mtiles_uniform == 0 && workspace != nullptr && !prefix_ready) {
     std::vector<int> pfx(L + 1); pfx[0] = 0;
     int const TMv = int(cute::size<0>(TileShape{}));
     for (int e = 0; e < L; ++e) pfx[e + 1] = pfx[e] + int(cute::ceil_div(int(cute::get<0>(group_shapes_host[e])), TMv));
@@ -238,7 +242,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
                     int m, int n, int k, int L, int group_size,
                     GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
                     char* ws, size_t ws_bytes, hggcStream_t stream,
-                    const PlaneB2* B2 = nullptr, int k_full = -1) {
+                    const PlaneB2* B2 = nullptr, int k_full = -1, bool prefix_ready = false) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
@@ -252,7 +256,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   #define MOEG_SCHED(SCH) std::conditional_t<(MOEG_FOLD > 1), \
       cutlass::gemm::KernelAiuFold<(MOEG_FOLD > 1 ? MOEG_FOLD : 2), SCH>, SCH>
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, MOEG_SCHED(SCH), TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
-      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full)
+      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full,prefix_ready)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
   //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K

@@ -53,6 +53,8 @@ inline void sk_upd(SkBest& b, const char* t, double us, int S) {
 }
 
 struct SkCtx {
+  hggcStream_t const* streams = nullptr;   // S_MAX streams so the slices actually overlap
+  int num_streams = 0;
   cutlass::DeviceAllocation<half_t>* dPart;     // S_max * total * N partials
   cutlass::DeviceAllocation<half_t*>* pdAll;    // L * S_max output pointers
   cutlass::DeviceAllocation<half_t>* dD;        // final output
@@ -84,7 +86,7 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
           bd.Mmax, bd.N, bd.K, bd.L, bd.gs, slices,
           bd.rdev, bd.rsh.data(), *cx.gshSlice, cx.gsdSlice->get(),
           bd.mode ? bd.offdev : nullptr, bd.total,
-          bd.ws, bd.wsb, nullptr);
+          bd.ws, bd.wsb, cx.streams, cx.num_streams, nullptr);
     };
 
     int const f0 = moe_grouped_ppu::moeg_fail_count();
@@ -106,13 +108,18 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
     double const bytes = double(bd.active) * (wb + sb) + ab + pb + db;
     double const gbs = bytes / (us * 1e-6) / 1e9;
 
+    // TWO CTA NUMBERS, KEPT APART. `cta/L` is the grid of ONE launch -- unchanged by S, because slicing K does
+    // not add CTAs to a launch -- and it is the only one occupancy depends on. `tot` sums across the S launches.
+    // The first version of this printed only the sum, which made the grid look like it grew 8x with S when the
+    // concurrent grid was constant; that is the number that made a serialised implementation look plausible.
     int mt = 0;
     for (int e = 0; e < bd.L; ++e) mt += (bd.me[e] + TM - 1) / TM;
-    int64_t const ctas = int64_t(mt) * ((bd.N + TN - 1) / TN) * slices;
-    double const wkwrp_cu = double(ctas) * (double(TM / WM) * (TN / WN)) / 72.0;
+    int64_t const cta_per_launch = int64_t(mt) * ((bd.N + TN - 1) / TN);
+    int64_t const cta_total = cta_per_launch * slices;
+    double const wkwrp_cu = double(cta_per_launch) * (double(TM / WM) * (TN / WN)) / 72.0;
 
-    std::printf("  %-34s %8.2f us | %7.1f GB/s | %5.1f%% HBM | cta %6lld | wkwrp/CU %6.1f%s\n",
-                tag, us, gbs, pct_of(gbs), (long long)ctas, wkwrp_cu,
+    std::printf("  %-34s %8.2f us | %7.1f GB/s | %5.1f%% HBM | cta/L %5lld tot %6lld | wkwrp/CU %5.1f%s\n",
+                tag, us, gbs, pct_of(gbs), (long long)cta_per_launch, (long long)cta_total, wkwrp_cu,
                 gbs > HBM_GBS ? "  <-- IMPLIES > HBM PEAK, excluded" : "");
     if (gbs > HBM_GBS) return;
     sk_upd(slices == 1 ? b1 : bS, tag, us, slices);
