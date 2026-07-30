@@ -168,7 +168,11 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
       std::printf("[moe_grouped] smem/block = %d B  (A = %d B = %d elems, %.0f%%)  A path: %s\n",
                   int(GemmKernel::SharedStorageSize), a_bytes, a_elems,
                   100.0 * a_bytes / double(GemmKernel::SharedStorageSize),
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+                  "A in smem, ONE row, plain cp.async + DefaultCopy"
+#else
                   "A in smem via AIU + swzl"
+#endif
       );
       std::printf("[moe_grouped]   blocks/CU at 256 KB = %d\n", 262144 / int(GemmKernel::SharedStorageSize));
     }
@@ -210,7 +214,16 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // STRIDES FROM k_full, SHAPES FROM k -- see the k_full parameter. Getting this backwards makes every
   // slice after the first walk gmem with a shrunken row pitch and read the wrong rows entirely.
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k_full, L));
-  // A's m-stride is NEVER zeroed here, and the parameter that used to do it is gone. It looked like a way to say
+  // PPU_A_CPASYNC needs Mmax == 1: A's SMEM tile has a stride-0 M mode there, so every row of the tile aliases onto
+  // the one real row. At M_e > 1 rows 1..M_e-1 are real and would read row 0's data instead.
+#if defined(PPU_A_CPASYNC) && (PPU_A_CPASYNC != 0)
+  if (m > 1) {
+    std::printf("[moe_grouped] PPU_A_CPASYNC requires Mmax <= 1, got %d (A's smem tile is one row, aliased in M)\n", m);
+    ++moeg_fail_count();
+    return;
+  }
+#endif
+  // A's GMEM m-stride is NEVER zeroed here, and the parameter that used to do it is gone. It looked like a way to say
   // 'read one row of A' at decode, where TileM >= 16 against one row per expert makes 15/16 of the tile padding --
   // but AiuDesc::init (cute/arch/copy_aiu_base.hpp) takes dim_w, the row PITCH, from exactly that stride, while
   // dim_h, the row EXTENT, comes from the problem's M. So it produced a descriptor claiming TileM rows spaced zero

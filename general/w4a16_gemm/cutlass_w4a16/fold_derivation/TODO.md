@@ -1051,3 +1051,34 @@ Worth nothing at decode (work-bound, measured) and worth the 16x at prefill. Imp
 A's gmem->smem via plain cp.async (the scale/zero path in the same collective is the existing template), A's
 smem->reg via a plain load into the m == 0 fragment slots, then a register broadcast. No cube, no swizzle, no
 descriptor -- every one of the four earlier failure mechanisms is inapplicable by construction.
+
+### PPU_A_CPASYNC: A in shared memory, ONE row, plain cp.async in and a plain load out
+
+The swzl route is closed for a reason l82 nails down: the read's 16 rows are the instruction's lane/vreg structure
+(m16n16 in the mnemonic) and the asm has NO stride operand, so a stride-0 layout has nowhere to be expressed. A
+plain copy is addressed from the layout, so there the zero works.
+
+Five parts, all in the mixed-input collective, all behind the macro:
+  1. SmemLayoutA gets a stride-0 M mode -> cosize_v = TileK * Stages, so SharedStorage allocates ONE row.
+     16x128:256 s2: 16,384 B -> 1,024 B; the verify's 64x64x128 s3: 49,152 B -> 768 B. Both multiples of 32, so
+     smem_b keeps the 32-B alignment its AIU descriptor needs (that alignment holds by arithmetic, not declaration).
+  2. SmemLayoutAFrag, a compact twin that is never allocated, shapes the mma fragment. partition_fragment_A on the
+     stride-0 layout would INHERIT the zero and allocate fewer registers than the mma reads -- measured on the gmem
+     variant, which came back ((2,2,2),1):((1,2,0),0), cosize 4 against 8.
+  3. gA is built PLAIN, not make_mix_tensor_like: that wrapper carries (ptr, coordinate) for the AIU and has no
+     addressable strides (l74), and cp.async needs real ones.
+  4. gmem->smem for A is GmemTiledCopyACp, a 1-D cp.async over TileK elements at 8 per thread, atom and
+     thread_idx % n slicing copied from GmemTiledCopyScale, which already moves a small operand this way in this
+     same collective and rides the same cp_async_fence. Surplus threads are guarded out rather than re-issuing.
+     B keeps the AIU, now through the single-operand copy_aiu overload.
+  5. smem->reg for A is make_tiled_copy_A(Copy_Atom<DefaultCopy, ...>, tiled_mma) over the PLAIN sA. DefaultCopy
+     rather than AssumedAlignment<128> because a per-thread offset that is not 16-B aligned would fault.
+
+launch() refuses Mmax > 1: the stride-0 M mode aliases every row onto the real one, which is only correct there.
+
+Compile-checked both ways on four harnesses with PPU_FORCE_INSTANTIATE=1, so the mainloop instantiates and the
+CPY_M / CPY_K static asserts on the new partitioning actually fired.
+
+Expected: A's smem 16x smaller, tsm.ld.swzl 0.26 per mma replaced by roughly 2 smem.ld per mma (+2.6% instructions)
+on the shared-memory pipe, which measures 0.003 busy. Nothing at decode, since that shape is work-bound; the 16x is
+for prefill. Unmeasured -- correctness first.
