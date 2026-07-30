@@ -952,3 +952,36 @@ What survives from three routes and five box round trips, as facts rather than c
   - shrinking a shared-memory member is not a weaker form of removing it (smem_b's 32-B alignment held by
     arithmetic coincidence)
   - a comparison-based checker reports MATCH on all-NaN buffers, on both sides at once
+
+### RETRACTION: the PPU_A_CUBE_H NaN was a ONE-SIDED edit, not a hardware limit. The route is open again.
+
+l81_aiu_pair.cu prints the write and read parameters side by side. MixGemm_AIU_Operand derives THREE things from
+Block_MN, and both asm forms carry .swzl, so write-then-read is a byte identity only while all three agree:
+
+    write payload   bits_per_aiu = Block_MN * AiuContElemSize * bits   ->  PPU0010_AIU_LOAD<C<16384>, ...>
+    write cube      GmemTiledCopy's value layout (Block_MN, AiuCont)   ->  Tiler_MN (16,64), hence desc_.cube_h
+    read cube       PPU0010_TSM_LD_SWZL<Element, Block_MN, AiuCont>    ->  CUBE_H = 16
+
+PPU_A_CUBE_H changed the READ leg alone. A 16-row swizzled cube was written and reinterpreted as a 1-row cube. That
+is the NaN, and my recorded conclusion -- 'CUBE_H is not a footprint knob, the route is structurally dead' -- is
+WITHDRAWN. It was dead because I only moved one leg of a matched triple.
+
+PPU_A_CUBE_MN now moves all three, verified locally:
+
+                write bits   write cube M   cosize A   CPY_M   CPY_K   frag
+    default        16384          16          8192       1       4      128
+    CUBE_MN=1       1024           1          8192       1       4      128
+
+CPY_M staying 1 matters: cute does NOT tile a 1-row read atom 16x in M, so the read issue count is unchanged and
+the change cannot lose on read instructions. That was the obvious way for this to be a net loss and it is not.
+
+Deliberately split into two steps, because step 2 is where attempt #1 faulted:
+  step 1 (this commit)  the triple at Cube_MN = 1. Only the smem WRITE shrinks, 16384 -> 1024 bits per instruction.
+                        The allocation is untouched, so smem rows 1..15 go stale; they feed accumulator rows the
+                        epilogue masks at Mmax == 1, which is what makes it harmless.
+  step 2 (next)         SmemLayoutA down to one row, for the 16x allocation saving. The m >= 1 read coordinates are
+                        what went out of bounds before.
+
+What I cannot check locally: whether write-then-read is still a byte identity at Cube_MN = 1. Three legs agreeing
+is NECESSARY -- the old attempt lacked it -- and not sufficient. test_moe_grouped_verify 8 1 with MOEG_CHECK against
+a default-build dump decides it.
