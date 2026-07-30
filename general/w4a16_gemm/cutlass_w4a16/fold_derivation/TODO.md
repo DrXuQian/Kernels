@@ -1447,3 +1447,38 @@ not 8x.
 Next step, now a bounded task: build the scale probe THROUGH partition_extra_inputs / retile_extra_mma_info, and read
 the per-thread fragment size and the lane->n map off it. Everything else about this channel is speculation until that
 exists.
+
+### The scale read, read off the kernel's own construction (l90_scale_tv.cu) -- and why the channel is closed
+
+Built through the collective's scale_fragment_layout (the host twin of make_scale_fragment) and the same
+make_tiled_copy_B, so these are what the kernel asks for, not a hand-rolled partition:
+
+    SmemLayoutScale = (128, 8, 2) : (1, 128, 1024)
+    scale fragment  = ((2,2,2), 1, 4) : ((1,2,4), 0, 8)          32 compact registers, cosize 32
+    source TV       = ((4,8,8), (1,(2,2,2,4))) : ((256,1,16), (0,(128,1024,8,2048)))
+
+From the thread mode, offset(t) = 256*t0 + t1 + 16*t2 with t0 = t%4, t1 = (t/4)%8, t2 = t/32. Warp 0 therefore reads
+{0..7, 256..263, 512..519, 768..775}, and in banks ((offset/2) % 32, two halfs per 4-byte bank):
+
+    0..7      -> 0,0,1,1,2,2,3,3
+    256..263  -> the same, because 256 halfs = 512 B is a multiple of the 128 B bank period
+    512..519  -> the same
+    768..775  -> the same
+
+So a WARP'S 32 LANES LAND ON FOUR BANKS. The concentrating stride is the THREAD stride 256, not the group stride --
+which is why padding the group stride did nothing useful. It would have helped in principle (G=72 shifts t0 by 8
+banks, 8-way down to 2-way) and still measured 9.7% SLOWER, because inside a 7.3% envelope the conflict share is
+worth a couple of points and the pad's non-power-of-two multiply in the inner reload path costs more.
+
+Q4_K's scale channel is therefore closed, with every layer either measured or derived:
+
+    copy calls          16 per k-tile per thread (8 groups x 2 arrays)   fixed by gs=32 and affine
+    loads per call      about 2                                          cute asks 32 slots, the compiler CSEs to 8
+                                                                         addresses; a hand-built stride-0 layout was
+                                                                         tried before and acu called it a no-op
+    bank concentration  32 lanes on 4 banks                              changeable, but measured cost > benefit
+    total               18.8%  (zero 11.5 + reload 7.3)                  SK_QUANT
+
+All three layout-level routes are now spent: widening (prior work, no-op), padding (-9.7% here), prefetching
+(+0.7% here). What is left changes the algorithm (affine on the accumulator, computed 2x worse at gs=32) or the
+format. The 18.8% is intrinsic to (gs=32, affine, this mma's B TV layout).
