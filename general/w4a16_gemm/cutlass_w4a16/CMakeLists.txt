@@ -258,6 +258,15 @@ set(_SPLITK_CFGS
   "16,128,256,16,16,2"   # 8 warps/blk, 32 warps/CU
   "16,128,256,16,32,2"   # same smem, 4 warps/blk -- isolates warps/block from smem
   "16,64,256,16,32,2"
+  # STAGES LADDER at the S=1 winner's tile. The bench's own banner says occupancy here is bounded by WORK, and the
+  # measured row proves it: cta/L 128 over 64 CUs is 2 blocks/CU, 8 warps each, achieved 14.2 of a 16-warp ceiling.
+  # So freeing shared memory cannot buy warps -- but it means each block may spend up to 128 KB, and s2 at this
+  # tile uses only 57 KB. Depth is the one thing a latency-bound kernel can still buy with that budget, and unlike
+  # PPU_A_CUBE_H it needs no change to the delivery contract. Footprints: s3 = 86,016 B, s4 = 114,688 B, both
+  # still admitting the 2 blocks/CU the grid actually supplies.
+  "16,128,256,16,16,3"
+  "16,128,256,16,16,4"
+  "16,64,256,16,16,4"    # 4 warps/blk at depth 4, in case 8 warps/blk is what limits the pipeline
   "16,32,64,16,16,4"     # the smem-for-occupancy trade that LOST: 19 blk/CU and 19% slower
   "32,64,64,32,32,4"
   "64,128,64,32,32,4"    # prefill-shaped, for contrast
