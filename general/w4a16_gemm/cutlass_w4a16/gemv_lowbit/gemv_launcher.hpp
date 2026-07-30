@@ -125,6 +125,8 @@ bool launch_gemv(Params const& p, gemv_stream_t s) {
   if (p.layout != Details::kLayout) { gemv_refuse("layout mismatch"); return false; }
   if (p.is_bf16 != Details::ADetails::kIsBF16) { gemv_refuse("A type mismatch"); return false; }
   if (p.act_scale) { gemv_refuse("act_scale is not instantiated"); return false; }
+  // n % CtaN also carries the ALIGNMENT the vectorised scale load needs: a group row starts at row*n + n0 with
+  // n0 a multiple of CtaN, so row*n being a multiple of CtaN makes the whole index CtaN-aligned.
   if (p.n % CtaN) { gemv_refuse("n must be a multiple of CtaN"); return false; }
   if (p.k % Details::kCtaK) {
     // CtaK = StepK*Threads. GGUF guarantees k % 256 == 0, so this only bites for a deliberately odd shape.

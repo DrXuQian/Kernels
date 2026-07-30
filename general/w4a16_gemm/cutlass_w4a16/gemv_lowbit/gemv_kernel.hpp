@@ -134,23 +134,47 @@ __global__ void gemv_kernel(KernelArgs args) {
 
   for (int iter = 0; iter < iters; ++iter) {
     // ---- scales / zeros for this step ----
+    //
+    // ONE VECTOR LOAD PER GROUP ROW, NOT CtaN SCALAR LOADS. acu on the decode winner put the scale/zero channel
+    // at ~134 MB of the 214.56 MB moving between L1(KVD) and L2, against 21.04 MB of DRAM and 4.19 MB of unique
+    // scale data -- and it named the constraint: Mem Busy 40.88% with Mem Pipes Busy only 2.43%, i.e. REQUEST
+    // COUNT, not bandwidth. Each thread was issuing CtaN scalar 2-byte loads for scale plus CtaN for zero.
+    //
+    // In the [k/gs][n] layout a group row's CtaN columns are CONTIGUOUS, so they are one CtaN*2-byte access. This
+    // is what TRT-LLM's MoE cuda-core GEMV does (moe_cuda_core_gemv.cu:88, `scale_zero_ldg128` gated on CtaN==8
+    // for a 128-bit access); PackedAccess generalises it to CtaN in {2,4,8,16}. At CtaN=8 the scale requests per
+    // CTA drop from 128*8 to 128.
+    //
+    // I first went after the ROW direction instead -- 64 group rows n*2 bytes apart, one cache line each -- and
+    // concluded the fix was to transpose the scales to [n][k/gs]. It is not: the GEMM's tile is wide in N and
+    // short in K-groups, so row-major is what IT wants (its 64x128:32 winner reads one 256-byte run), and with a
+    // single copy of the weights in device memory the transpose is a net loss. The column direction was the one
+    // that was fixable all along.
+    using SAcc = PackedAccess<CtaN * int(sizeof(T))>;
+    static_assert(CtaN * int(sizeof(T)) >= 4, "CtaN too small for a vector scale load");
     T2 s2[kSub * Pairs], z2[kSub * Pairs];
     {
       int const krow = (GS == 0) ? 0 : (iter * CtaK + tid * StepK) / GS;
 #pragma unroll
       for (int g = 0; g < kSub; ++g) {
         int64_t const row_off = (GS == 0) ? 0 : int64_t(krow + g) * n;
+        T sbuf[CtaN], zbuf[CtaN];
+        {
+          auto const* src = reinterpret_cast<typename SAcc::Vec const*>(scales + row_off + n0);
+#pragma unroll
+          for (int j = 0; j < SAcc::kCount; ++j) reinterpret_cast<typename SAcc::Vec*>(sbuf)[j] = src[j];
+        }
+        if constexpr (HasZero) {
+          auto const* src = reinterpret_cast<typename SAcc::Vec const*>(zeros + row_off + n0);
+#pragma unroll
+          for (int j = 0; j < SAcc::kCount; ++j) reinterpret_cast<typename SAcc::Vec*>(zbuf)[j] = src[j];
+        }
 #pragma unroll
         for (int cp = 0; cp < Pairs; ++cp) {
-          T const sa = scales[row_off + n0 + 2 * cp + 0];
-          T const sb = scales[row_off + n0 + 2 * cp + 1];
-          T2 const sv = M::pack2(sa, sb);
-          T2 zv = M::to_vec2(M::from_float(0.f));
-          if constexpr (HasZero) {
-            zv = M::pack2(zeros[row_off + n0 + 2 * cp + 0], zeros[row_off + n0 + 2 * cp + 1]);
-          }
-          s2[g * Pairs + cp] = sv;
-          z2[g * Pairs + cp] = zv;   // the converter already removed the magic offset, in the integer domain
+          s2[g * Pairs + cp] = M::pack2(sbuf[2 * cp + 0], sbuf[2 * cp + 1]);
+          // the converter already removed the magic offset, in the integer domain
+          z2[g * Pairs + cp] = HasZero ? M::pack2(zbuf[2 * cp + 0], zbuf[2 * cp + 1])
+                                       : M::to_vec2(M::from_float(0.f));
         }
       }
     }
