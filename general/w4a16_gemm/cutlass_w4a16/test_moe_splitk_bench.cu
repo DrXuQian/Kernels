@@ -23,7 +23,10 @@ int main(int argc, char** argv) {
   bd.total = 0; bd.Mmax = 0; bd.active = 0;
   for (int e = 0; e < bd.L; ++e) {
     if (bd.mode == 0)      bd.me[e] = bd.Rows;
-    else if (bd.mode == 3) bd.me[e] = (e < bd.Rows || bd.Rows >= bd.L) ? 1 : 0;
+    // MODE 3: `Rows` IS THE TOP-K, NOT ROWS PER EXPERT. Same convention as test_lowbit_moe_bench.cu, and the
+    // trap that produced a 1-expert measurement: `8 1 ...` reads like "8 experts, 1 row each" and means "8
+    // experts, 1 of them active". The recorded decode band is L=64 with top-k=8, i.e. `64 8 ...`.
+    else if (bd.mode == 3) bd.me[e] = (e < bd.Rows) ? 1 : 0;
     else {
       unsigned h = (unsigned)e * 2654435761u >> 13;
       if ((h % 8) == 0)      bd.me[e] = 0;
@@ -34,12 +37,33 @@ int main(int argc, char** argv) {
     bd.offs[e] = bd.total; bd.total += bd.me[e]; bd.Mmax = std::max(bd.Mmax, bd.me[e]);
   }
   if (bd.Mmax == 0) { std::printf("all experts empty\n"); return 1; }
+  if (bd.mode == 3 && bd.Rows > bd.L) {
+    std::printf("mode 3: top-k=%d exceeds L=%d\n", bd.Rows, bd.L); return 1;
+  }
 
   std::printf("== grouped mixed-input GEMM: splitk=1 vs splitk>1 ==\n");
   std::printf("   L=%d rows=%d mode=%d N=%d K=%d gs=%d | total=%d Mmax=%d active=%d | HBM %.0f GB/s\n",
               bd.L, bd.Rows, bd.mode, bd.N, bd.K, bd.gs, bd.total, bd.Mmax, bd.active, HBM_GBS);
   if (sk_only()) std::printf("   SPLITK_ONLY=\"%s\"\n", sk_only());
   if (sk_acu())  std::printf("   *** SPLITK_ACU: ONE COLD LAUNCH PER ROW. Captures, not timings. ***\n");
+
+  // A GRID BELOW ONE WAVE CANNOT ANSWER ANYTHING, and this has now cost two rounds: a dense m=8 ladder ran 64
+  // CTAs on 72 CUs (acu: DRAM 4.43%) and was withdrawn, then a mode-3 run with top-k misread as rows-per-expert
+  // did the same thing at 64 CTAs and produced a split-K "speedup" of 0.517x. The smallest TileN swept is 32, so
+  // the most CTAs any row here can launch is mt*(N/32)*S; if even that is short of the machine, say so before the
+  // numbers scroll past rather than leaving it to be noticed in a screenshot.
+  {
+    int mt_min = 0;
+    for (int e = 0; e < bd.L; ++e) mt_min += (bd.me[e] + 63) / 64;   // the largest TileM swept
+    int const cta_best = mt_min * ((bd.N + 31) / 32);                 // the smallest TileN swept, at S=1
+    if (bd.active < 2 || cta_best < 72) {
+      std::printf("\n  *** THIS GEOMETRY CANNOT ANSWER ANYTHING ***\n"
+                  "      active experts = %d, and the widest row here launches only %d CTAs on 72 CUs at S=1.\n"
+                  "      Every number below is latency on an empty machine. In mode 3, `Rows` is the TOP-K:\n"
+                  "      the recorded decode band is  %s 64 8 %d %d %d 3\n\n",
+                  bd.active, cta_best, "$BIN/test_moe_splitk_bench", bd.N, bd.K, bd.gs);
+    }
+  }
 
   // int4 memory roof: weights + scale/zero once per active expert, plus A and D.
   double const roof = double(bd.active) * (double(bd.N) * bd.K * 4 / 8.0 + double(bd.scale_k) * bd.N * 4.0)
