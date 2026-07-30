@@ -46,6 +46,12 @@ int main(int argc, char** argv) {
   int total = 0, Mmax = 0;
   for (int e = 0; e < L; ++e) { me[e] = ragged ? Mb * ((e % 4) + 1) : Mb; offs[e] = total; total += me[e]; Mmax = std::max(Mmax, me[e]); }
 
+  // A REFUSED LAUNCH IS NOT A PASS, and until now it read as one. With PPU_A_CUBE_H=1 every launch here was
+  // refused (a_row_broadcast requires Mmax<=1, and the default Mb is 128), so BOTH the run and its same-kernel
+  // L=1 oracle left their buffers untouched -- identical, rel=0 everywhere, worst_e never assigned, "bad=0 ->
+  // MATCH", exit 0. The tell was `worst e=-1`: no element ever became the worst, i.e. nothing was compared.
+  int const fails_before = moe_grouped_ppu::moeg_fail_count();
+
   srand(1234);
   std::vector<float>  hA((size_t)total * K), hSc((size_t)L * N * scale_k);
   std::vector<int8_t> rawB((size_t)L * N * K);
@@ -123,9 +129,55 @@ int main(int argc, char** argv) {
         if (rel > 5e-2) ++bad;
       }
   }
+  // Oracle liveness: an all-zero golden makes every rel exactly 0 and the comparison vacuous. Independent of the
+  // refusal count, because a silently-not-launched kernel is not the only way to get an untouched buffer.
+  bool const oracle_dead = (worst_e < 0);
+
   std::printf("verify(grouping+contiguous): L=%d %s Mb=%d N=%d K=%d gs=%d total=%d Mmax=%d\n",
               L, ragged ? "ragged" : "uniform", Mb, N, K, gs, total, Mmax);
   std::printf("  grouped-L=%d(contiguous D[total][N]) vs grouped-L=1 oracle: max_rel=%.3e (worst e=%d) bad=%d -> %s\n",
               L, max_rel, worst_e, bad, bad == 0 ? "MATCH" : "MISMATCH");
+
+  int const refused = moe_grouped_ppu::moeg_fail_count() - fails_before;
+  if (refused) {
+    std::printf("  *** %d LAUNCH(ES) REFUSED -- NOTHING WAS VERIFIED. This is a FAILURE, not a match. ***\n"
+                "      PPU_A_CUBE_H=1 needs Mmax==1: run with Mb=1, e.g. ./test_moe_grouped_verify 8 1\n", refused);
+    return 2;
+  }
+  if (oracle_dead) {
+    std::printf("  *** VACUOUS: the oracle never produced a nonzero value, so rel==0 everywhere. FAILURE. ***\n");
+    return 3;
+  }
+
+  // Cross-build oracle. The L=1 comparison above shares this binary's collective, so a defect common to both
+  // sides is invisible to it -- exactly the hole PPU_A_CUBE_H sits in. Dump from a build without the macro, check
+  // from a build with it, and the reference is a DIFFERENT compilation rather than the same one twice.
+  if (const char* f = std::getenv("MOEG_DUMP")) {
+    FILE* fp = std::fopen(f, "wb");
+    if (!fp) { std::printf("  MOEG_DUMP: cannot open %s\n", f); return 4; }
+    std::fwrite(hD.data(), sizeof(half_t), hD.size(), fp);
+    std::fclose(fp);
+    std::printf("  MOEG_DUMP: %zu halfs -> %s\n", hD.size(), f);
+  }
+  if (const char* f = std::getenv("MOEG_CHECK")) {
+    FILE* fp = std::fopen(f, "rb");
+    if (!fp) { std::printf("  MOEG_CHECK: cannot open %s\n", f); return 4; }
+    std::vector<half_t> ref(hD.size());
+    size_t const rd = std::fread(ref.data(), sizeof(half_t), ref.size(), fp);
+    std::fclose(fp);
+    if (rd != ref.size()) { std::printf("  MOEG_CHECK: %s has %zu halfs, expected %zu\n", f, rd, ref.size()); return 4; }
+    int xbad = 0; double xmax = 0; size_t xi = 0; bool ref_live = false;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      double g = (double)float(ref[i]), o = (double)float(hD[i]);
+      if (g != 0) ref_live = true;
+      double r = std::abs(o - g) / (std::abs(g) + 1e-3);
+      if (r > xmax) { xmax = r; xi = i; }
+      if (r > 5e-2) ++xbad;
+    }
+    if (!ref_live) { std::printf("  *** MOEG_CHECK: the reference dump is ALL ZERO -- it verifies nothing. ***\n"); return 3; }
+    std::printf("  cross-build vs %s: max_rel=%.3e (worst idx=%zu) bad=%d -> %s\n",
+                f, xmax, xi, xbad, xbad == 0 ? "MATCH" : "MISMATCH");
+    if (xbad) return 1;
+  }
   return bad == 0 ? 0 : 1;
 }
