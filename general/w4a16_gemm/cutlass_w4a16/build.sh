@@ -53,6 +53,21 @@ _overlay_files=("$HERE"/*.cu "$HERE"/*.cpp "$HERE"/*.cuh "$HERE"/*.hpp "$HERE"/*
 shopt -u nullglob
 cp "${_overlay_files[@]}" "$EX_DIR/"
 
+# SOURCE SUBDIRECTORIES that must be overlaid whole. This list is separate from the extension whitelist above
+# because most tracked subdirectories (fold_derivation/, real_weight/, low_bit/) are local harnesses that must
+# NOT reach the box -- but a library split across a subdirectory has to. The completeness check below covers
+# these paths instead of skipping them; before this list existed it skipped ALL subdirectories, which meant a
+# library moved into one would be dropped silently by the very check written to catch dropped source.
+_overlay_dirs=(gemv_lowbit)
+for _d in "${_overlay_dirs[@]}"; do
+  [ -d "$HERE/$_d" ] || continue
+  mkdir -p "$EX_DIR/$_d"
+  shopt -s nullglob
+  _sub=("$HERE/$_d"/*.cu "$HERE/$_d"/*.cpp "$HERE/$_d"/*.cuh "$HERE/$_d"/*.hpp "$HERE/$_d"/*.h "$HERE/$_d"/*.inc)
+  shopt -u nullglob
+  [ ${#_sub[@]} -gt 0 ] && cp "${_sub[@]}" "$EX_DIR/$_d/"
+done
+
 # ...and then ASSERT THE WHITELIST IS COMPLETE. The criterion is GIT TRACKING, and the two earlier attempts show why it
 # has to be something this specific:
 #
@@ -70,7 +85,13 @@ _ignored='sh|md|py|log|bin|json|patch|pyc|txt'
 _missing=""
 if _tracked=$(git -C "$HERE" ls-files . 2>/dev/null) && [ -n "$_tracked" ]; then
   while IFS= read -r _b; do
-    case "$_b" in */*) continue ;; esac                       # subdirectories are deliberately not overlaid
+    # Subdirectories are skipped UNLESS they are in _overlay_dirs, in which case their files are checked like
+    # any other -- see the comment on that list.
+    case "$_b" in
+      */*) _dir="${_b%%/*}"; _keep=0
+           for _od in "${_overlay_dirs[@]}"; do [ "$_dir" = "$_od" ] && _keep=1; done
+           [ "$_keep" = 1 ] || continue ;;
+    esac
     echo "$_b" | grep -qE "\.($_ignored)\$" && continue
     [ -f "$EX_DIR/$_b" ] || _missing="$_missing $_b"
   done <<< "$_tracked"
@@ -94,6 +115,17 @@ for _f in "$EX_DIR"/*; do
     echo "  ERROR: the overlaid $_b differs from the checked-out one -- the build would not compile your tree."
     exit 1
   fi
+done
+for _d in "${_overlay_dirs[@]}"; do
+  [ -d "$EX_DIR/$_d" ] || continue
+  for _f in "$EX_DIR/$_d"/*; do
+    [ -f "$_f" ] || continue
+    _b="$_d/$(basename "$_f")"
+    if [ -f "$HERE/$_b" ] && ! cmp -s "$_f" "$HERE/$_b"; then
+      echo "  ERROR: the overlaid $_b differs from the checked-out one -- the build would not compile your tree."
+      exit 1
+    fi
+  done
 done
 
 # register it in the foreach list (idempotent: only if absent)
