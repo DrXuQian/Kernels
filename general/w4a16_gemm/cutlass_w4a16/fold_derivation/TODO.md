@@ -1230,3 +1230,25 @@ stronger than a comparison anyway: there is nothing left to compare.
 Confirmed from the same run that the packing IS active: smem/block 61,840 -> 21,520 B and blocks/CU 4 -> 12. The
 banner's "A = 49152 B" is the LAYOUT's cosize, which PPU_A_PACK deliberately leaves alone -- only the allocation
 moves -- so that number staying put is correct and the 228% it prints is the two being different things.
+
+### PPU_A_PACK measured: the winner does not move, but it removes smem from the constraint list
+
+Verified active first (banner "PACKED cubes", smem/block down on every row), per the checklist.
+
+    16x64:256 s2  (winner)  22.36 -> 22.12   -1.1%      smem 36,864 -> 23,424
+    16x128:256 s2           22.40 -> 22.33   -0.3%      smem 57,344 -> 43,904
+    16x128:256 s4           23.84 -> 23.34   -2.1%      smem 114,688 -> 85,888   (2 -> 3 blocks/CU)
+    16x64:256 s4            32.48 -> 23.56  -27.5%      smem 73,728 -> 44,928    (3 -> 5 blocks/CU)
+    32x64:64 s4             32.05 -> 32.83   +2.4%
+    64x128:64 s4            40.58 -> 41.54   +2.4%
+
+Everything is drift except 16x64:256 s4, and that row is the point: it was the ONE decode config genuinely
+smem-limited, and packing bought 1.38x there. The rest were work-bound already (wkwrp/CU 14.2 and 7.1 unchanged
+across the whole table, the fifth measurement saying the same thing), so freeing space could not help them.
+
+The two prefill-shaped rows LOSE 2.4%: at TileM 32 and 64 A is a smaller share, so the packing saves less while
+the cp.async writer's threads still cost. This path should gate on TileM == 16 as well as Mmax == 1.
+
+So PPU_A_PACK is not a speedup, it is an enabler -- 'A's shared memory' is no longer a reason a config is
+unaffordable. Its immediate consequence is that the Stages ladder is worth revisiting: s3 and s4 all lost to s2
+before, and s4 is now 1.2 us behind instead of 10.
