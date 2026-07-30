@@ -150,6 +150,29 @@ byte and shift Layouts above, and whether a min exists. Plus:
 
 This phase is where the plan can still be wrong, so it produces evidence before any kernel work.
 
+**PHASE 0 IS DONE AND GREEN.** Deliverables: `gguf_scale_layout.hpp` (new file beside the fp16 path, nothing touched)
+and `fold_derivation/l91_gguf_scale_gate.cu` plus `real_weight/dump_scale_blocks.py`.
+
+    Q4_K/Q3_K/Q2_K/Q6_K  bits tile exactly: yes            static_assert, not a test
+    exhaustive            zero + all 96/128 unit vectors + 20000 random, 0 mismatches
+    known answers         6/6 hand-computed values
+    real GGUF             4096 Q4_K blocks x 8 groups against get_scale_min_k4 -> 0 bad
+
+Three things worth keeping from doing it:
+
+* **The tiling check is stronger than the injectivity the plan asked for.** Every K-quant's scale block is exactly
+  full -- Q4_K/Q5_K 8*6+8*6 = 96 = 12 B, Q3_K 16*6 = 96, Q2_K 16*4+16*4 = 128 = 16 B, Q6_K 16*8 = 128 -- so "every
+  bit claimed exactly once" is necessary AND sufficient, and it catches a MISS as well as a collision.
+* **The comparison is a proof, not a sample.** Each decode is a selection of bits, hence linear over GF(2) in the
+  input bits, so agreement on the zero block and on every single-bit block settles all 2^96 inputs. The random
+  blocks only exist to falsify that argument if it is wrong.
+* **The first version of the real-file check was vacuous and I caught it from the output**, not from the code: it read
+  `real_q3k_concat.bin` at offset 96 as a raw Q3_K record, and the decoded scales came out `0 32 0 10 0 40 0 20`, every
+  other one zero. Those .bin files are the already-decoded harness inputs for `test_moe_grouped_real.cu` and
+  286736 % 110 != 0 gives it away. Replaced by `dump_scale_blocks.py`, which imports `dump_real_weights` (so the
+  reference stays the regressed one) and dumps raw bytes plus its own decode from a real q4_k_m file. The distinction
+  matters: **the exhaustive sweep proves the BIT MAP, only the real-GGUF block proves the RECORD OFFSETS.**
+
 ### Phase 1 — generalise `kBias`, then run Q3_K/Q6_K as ScaleOnly
 
 Independent of Phases 2–3 and the only part with a confident MoE payoff.
