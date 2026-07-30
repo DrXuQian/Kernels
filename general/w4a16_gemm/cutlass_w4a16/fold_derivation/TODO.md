@@ -723,3 +723,38 @@ That is TODO #22, promoted from a sweep point to the principled next step. Const
 = ceil(TK/gs) <= 2) and the AIU 32B contiguous-K run, TK*bits/8 >= 32, which at int4 means TK >= 64.
 
 PPU_A_CUBE_H stays in the tree, off, and now prints a KNOWN-WRONG banner whenever it is compiled in.
+
+### PPU_A_CUBE_H removed from the tree; the route that survives is PPU_A_IN_REG (A never enters shared memory)
+
+The user's instruction: do not keep code that produces NaN when switched on. All four sites are gone -- the
+SmemLayoutA #if in the collective, the CubeH constant in the builder's MixGemm_AIU_Operand, the four
+DefaultOperandA call sites, and the ninth template parameter of DefaultGemm_AIU_Operand. l76 and l77, which only
+existed to drive that macro, are deleted; the numbers they produced are recorded above. What stays is prose at
+each site saying why the knob cannot exist, so the next person does not re-derive it from scratch.
+
+PPU_A_IN_REG replaces it, and it is a different KIND of change: it uses no A copy atom at all, so nothing about
+any instruction's delivery contract moves.
+  - load_init builds gA as a PLAIN tensor, not make_mix_tensor_like. That wrapper carries (ptr, coordinate) for the
+    AIU descriptor and has no addressable strides (l74), so partitioning it for a register load would have been the
+    same error as the stride-0 attempt: allocation right, addressing wrong.
+  - Both copy_aiu calls drop to the B-only overload; A's gmem->smem stage and its AIU partitions are gone.
+  - SharedStorage allocates ONE element for A. sA survives only as a layout, for the shape asserts and
+    partition_fragment_A, and is never dereferenced.
+  - tCgA_all = thr_mma.partition_A(gA) sources the fragment. That partitioning equals what partition_fragment_A
+    allocated -- three CUTE_STATIC_ASSERT_V check it and they fire locally, since syntax_check.sh compiles with
+    PPU_FORCE_INSTANTIATE=1 and instantiates the whole mainloop. The equivalence holds because the AIU write
+    composed with the swzl read is a byte identity for fp16, which is also why fp16 A needs no offline relayout.
+    Sub-byte B could NOT be sourced this way.
+  - a_tile_iter lags the prefetch iterator and names the tile being CONSUMED. The main loop runs exactly K_TILES
+    iterations -- (K_TILES-(Stages-1)) live plus (Stages-1) drain -- so it advances K_TILES-1 times and is never
+    dereferenced past the end.
+  - launch() forces a_row_broadcast (A m-stride 0) and keeps the Mmax==1 refusal. Here that is not about footprint
+    -- there is no tile to alias -- but because the fragment spans TileM rows while the expert owns one: stride 0
+    points every slot at the real row, removing both the read past the last expert and any dependence on padding.
+
+Not pipelined: A's load sits in the innermost loop with no second buffer. The bet is that it needs none, since
+every slot reads the same TileK-long row and it is L1-resident after the first touch. If acu shows a stall on that
+load, the fix is to hoist it to one load per k-tile, not to restore the smem stage.
+
+Unmeasured on hardware. Correctness first: test_moe_grouped_verify 8 1, with MOEG_CHECK against a dump from a
+build without the macro.

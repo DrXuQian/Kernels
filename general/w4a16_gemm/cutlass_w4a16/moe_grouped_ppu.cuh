@@ -152,23 +152,23 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
 #endif
 
   // MOEG_SMEM=1: report the block's shared-memory budget READ OFF THE TYPES, not recomputed from a formula.
-  // Two reasons this exists. (1) Whether PPU_A_CUBE_H was compiled in is otherwise invisible in a log -- the perf
+  // Two reasons this exists. (1) Which A path a binary was built with is otherwise invisible in a log -- the perf
   // tag's abcast marker reads an env var, not the macro, so both builds print identically and a timing pair cannot
-  // be attributed. (2) "A's smem shrank" is exactly the kind of claim I have twice asserted from arithmetic and had
-  // the hardware refute; SharedStorageSize and cosize_v<SmemLayoutA> are the objects the compiler actually sized.
+  // be attributed. (2) "A's smem shrank" is exactly the kind of claim I twice asserted from arithmetic and had the
+  // hardware refute; SharedStorageSize and cosize_v<SmemLayoutA> are the objects the compiler actually sized.
   if (std::getenv("MOEG_SMEM")) {
     static bool once = false;
     if (!once) {
       once = true;
       constexpr int a_elems = int(cute::cosize_v<typename CollectiveMainloop::SmemLayoutA>);
       constexpr int a_bytes = a_elems * int(sizeof(ElementA));
-      std::printf("[moe_grouped] smem/block = %d B  (A = %d B = %d elems, %.0f%%)  PPU_A_CUBE_H %s\n",
+      std::printf("[moe_grouped] smem/block = %d B  (A = %d B = %d elems, %.0f%%)  A path: %s\n",
                   int(GemmKernel::SharedStorageSize), a_bytes, a_elems,
                   100.0 * a_bytes / double(GemmKernel::SharedStorageSize),
-#if defined(PPU_A_CUBE_H)
-                  "= " PPU_MOEG_STR(PPU_A_CUBE_H)
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
+                  "PPU_A_IN_REG=1 (A never enters smem)"
 #else
-                  "undefined"
+                  "off"
 #endif
       );
       std::printf("[moe_grouped]   blocks/CU at 256 KB = %d\n", 262144 / int(GemmKernel::SharedStorageSize));
@@ -211,20 +211,11 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   // STRIDES FROM k_full, SHAPES FROM k -- see the k_full parameter. Getting this backwards makes every
   // slice after the first walk gmem with a shrunken row pitch and read the wrong rows entirely.
   StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k_full, L));
-  // PPU_A_CUBE_H=1 shrinks A's smem to one row, and that needs the GMEM m-stride at 0 as well: the collective's
-  // partition_D writes every tile row to the same place, so the sources must all BE the same row. Forced here so
-  // the two halves cannot be enabled separately.
-#if defined(PPU_A_CUBE_H) && (PPU_A_CUBE_H == 1)
-  // KNOWN WRONG ON HARDWARE -- kept only so the probe can be re-run, never to be trusted. l78 reads it off the
-  // types: shrinking CUBE_H drops cosize_v<SmemLayoutA> 8192 -> 512 while the copy op's SrcLayout/DstLayout stay
-  // at 4096 bits, size(tCsA) stays 256 and size(tCrA) stays 128. CUBE_H is the instruction cube's M extent, so
-  // changing it changes the swzl permutation: the same bits land in different registers, the fragment is filled
-  // from the wrong positions, and the result is wrong (NaN once uninitialised registers are in the mix) WITHOUT
-  // faulting, because the addresses now fold into the one row. At CUBE_H=16 the same 512-element allocation
-  // faults instead, since the instruction still sources 16 rows. Two faults and one silent-NaN round, one cause.
-  { static bool warned = false;
-    if (!warned) { warned = true;
-      std::printf("[moe_grouped] *** PPU_A_CUBE_H=1 IS KNOWN TO PRODUCE WRONG RESULTS (see fold_derivation/l78) ***\n"); } }
+  // PPU_A_IN_REG: the mainloop reads A gmem->fragment with no shared-memory stage, so A's m-stride must be 0.
+  // Not for the footprint -- with no smem tile there is nothing to alias -- but because the fragment covers TileM
+  // rows while the expert owns one: stride 0 points every slot at the real row, which removes both the read past
+  // the last expert's rows and any dependence on what the padding rows happen to contain. Same Mmax==1 gate.
+#if defined(PPU_A_IN_REG) && (PPU_A_IN_REG != 0)
   a_row_broadcast = true;
 #endif
   if (a_row_broadcast) {
