@@ -45,6 +45,8 @@ int main(int argc, char** argv) {
   std::printf("   L=%d rows=%d mode=%d N=%d K=%d gs=%d | total=%d Mmax=%d active=%d | HBM %.0f GB/s\n",
               bd.L, bd.Rows, bd.mode, bd.N, bd.K, bd.gs, bd.total, bd.Mmax, bd.active, HBM_GBS);
   if (sk_only()) std::printf("   SPLITK_ONLY=\"%s\"\n", sk_only());
+  if (std::getenv("SPLITK_CFG")) std::printf("   SPLITK_CFG=\"%s\"\n", std::getenv("SPLITK_CFG"));
+  if (std::getenv("SPLITK_S"))   std::printf("   SPLITK_S=\"%s\"\n", std::getenv("SPLITK_S"));
   if (sk_acu())  std::printf("   *** SPLITK_ACU: ONE COLD LAUNCH PER ROW. Captures, not timings. ***\n");
 
   // A GRID BELOW ONE WAVE CANNOT ANSWER ANYTHING, so this REFUSES rather than warns. A printed warning was not

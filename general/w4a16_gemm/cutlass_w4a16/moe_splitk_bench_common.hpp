@@ -44,9 +44,25 @@ inline bool sk_acu() { return std::getenv("SPLITK_ACU") != nullptr; }
 // for any expert with more than one row, and launch() refuses it above Mmax == 1.
 inline bool sk_abcast() { return std::getenv("SPLITK_ABCAST") != nullptr; }
 inline double pct_of(double gbs) { return 100.0 * gbs / HBM_GBS; }
+// SPLITK_ONLY matches the whole tag, which means counting the spaces the format string pads out -- and that
+// already cost an acu run ("No kernels were profiled") after the abcast marker changed the spacing from two to
+// three. SPLITK_CFG and SPLITK_S match the two halves independently, so a capture never depends on whitespace.
+// Same fix as GEMV_FMT / GEMV_CFG on the GEMV side, which this should have copied in the first place.
 inline bool sk_selected(const char* tag) {
   const char* f = sk_only();
-  return !f || std::strstr(tag, f) != nullptr;
+  if (f && std::strstr(tag, f) == nullptr) return false;
+  const char* cfg = std::getenv("SPLITK_CFG");          // e.g. "16x128:256 w16x16 s2"
+  if (cfg && std::strstr(tag, cfg) == nullptr) return false;
+  const char* sv = std::getenv("SPLITK_S");             // e.g. "2"
+  if (sv) {
+    char want[16];
+    std::snprintf(want, sizeof(want), "S=%s", sv);
+    size_t const n = std::strlen(want);
+    const char* p = std::strstr(tag, want);
+    // exact match on the S value: "S=1" must not select "S=16"
+    if (!p || (p[n] != '\0' && p[n] != ' ')) return false;
+  }
+  return true;
 }
 
 // Two winners, kept apart: the whole question is whether S>1 beats S==1, and one combined "best" would hide it.
