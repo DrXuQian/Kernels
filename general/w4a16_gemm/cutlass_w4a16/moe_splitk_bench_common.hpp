@@ -53,13 +53,13 @@ inline void sk_upd(SkBest& b, const char* t, double us, int S) {
 }
 
 struct SkCtx {
-  hggcStream_t const* streams = nullptr;   // S_MAX streams so the slices actually overlap
-  int num_streams = 0;
   cutlass::DeviceAllocation<half_t>* dPart;     // S_max * total * N partials
   cutlass::DeviceAllocation<half_t*>* pdAll;    // L * S_max output pointers
   cutlass::DeviceAllocation<half_t>* dD;        // final output
-  cutlass::DeviceAllocation<GS>* gsdSlice;      // device per-expert shapes with the slice K
-  std::vector<GS>* gshSlice;                    // host scratch for the same
+  cutlass::DeviceAllocation<half_t>* dRef;      // this config's S=1 output, for the S>1 comparison
+  cutlass::DeviceAllocation<half_t*>* pdOne;    // the plain L-entry ptr_D, for slices == 1
+  cutlass::DeviceAllocation<DStride>* sdAll;    // L*S_MAX strides (the L strides repeated)
+  cutlass::DeviceAllocation<DStride>* sdOne;    // the plain L-entry stride_D
   int S_max;
 };
 
@@ -73,7 +73,7 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
     std::snprintf(tag, sizeof(tag), "i4 %dx%d:%d w%dx%d s%d  S=%d", TM, TN, TK, WM, WN, Stages, slices);
     if (!sk_selected(tag)) return;
     const char* why = "";
-    if (!moe_splitk_ppu::splitk_ok(bd.K, slices, bd.gs, TK, &why)) {
+    if (!moe_splitk_ppu::splitk_ok(bd.K, slices, TK, &why)) {
       std::printf("  %-34s %10s | ILLEGAL: %s\n", tag, "-", why);
       return;
     }
@@ -82,11 +82,15 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
       moe_splitk_ppu::launch_splitk<QM::FinegrainedScaleZero, TM, TN, TK, WM, WN, Stages, int4_t>(
           bd.dA, dB.get(), bd.dSc, bd.dZr,
           cx.dD->get(), cx.dPart->get(),
-          slices == 1 ? bd.pd : cx.pdAll->get(), bd.sd, bd.gm,
+          slices == 1 ? cx.pdOne->get() : cx.pdAll->get(),
+          slices == 1 ? cx.sdOne->get() : cx.sdAll->get(), bd.gm,
           bd.Mmax, bd.N, bd.K, bd.L, bd.gs, slices,
-          bd.rdev, bd.rsh.data(), *cx.gshSlice, cx.gsdSlice->get(),
+          bd.rdev, bd.rsh.data(),
           bd.mode ? bd.offdev : nullptr, bd.total,
-          bd.ws, bd.wsb, cx.streams, cx.num_streams, nullptr);
+          // B2 IS LEFT TO ITS DEFAULT ON PURPOSE. Passing `nullptr` explicitly makes deduction of PlaneB2 from
+          // std::nullptr_t fail, and a failed deduction is not rescued by the parameter's default template
+          // argument -- so the call stops matching. The single-TU version worked only because it never named B2.
+          bd.ws, bd.wsb, hggcStream_t(0));
     };
 
     int const f0 = moe_grouped_ppu::moeg_fail_count();
@@ -98,11 +102,43 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
       return;
     }
 
-    // Traffic. Weights are read ONCE regardless of S (each slice reads its own K-range), but A, scales and
-    // zeros are read once PER SLICE, and the partials are written then read back by the merge.
+    // CORRECTNESS, NOT JUST TIME. The split is STRIDED in k-tiles, so the per-group scale has to be addressed
+    // from the k-tile coordinate rather than by advancing a pointer per tile -- and nothing here had checked
+    // that. S=1 stashes this config's output as the reference; every S>1 row is compared against it, and a row
+    // that fails is EXCLUDED from the winner rather than reported as fast (the same net as moe_row_ran).
+    {
+      // A NAMED COUNT, because `std::vector<half_t> got(size_t(nelem))` is the most vexing parse: it declares a
+      // FUNCTION taking size_t and returning a vector, and the errors it produces name copy_to_host instead.
+      size_t const nelem = size_t(bd.total) * size_t(bd.N);
+      std::vector<half_t> got(nelem);
+      cutlass::device_memory::copy_to_host(got.data(), cx.dD->get(), nelem);
+      if (slices == 1) {
+        cutlass::device_memory::copy_to_device(cx.dRef->get(), got.data(), nelem);
+      } else {
+        std::vector<half_t> ref(nelem);
+        cutlass::device_memory::copy_to_host(ref.data(), cx.dRef->get(), nelem);
+        double maxr = 1e-30, worst = 0.0; int bad = 0;
+        for (size_t i = 0; i < nelem; ++i) maxr = std::max(maxr, std::fabs(double(float(ref[i]))));
+        for (size_t i = 0; i < nelem; ++i) {
+          double const d = std::fabs(double(float(got[i])) - double(float(ref[i])));
+          worst = std::max(worst, d);
+          if (d / maxr > 4e-3) ++bad;
+        }
+        if (bad) {
+          std::printf("  %-34s %8.2f us | NUMERICS: %d/%lld differ from S=1 by >4e-3 rel "
+                      "(worst abs %.3g, |ref|max %.3g) -- EXCLUDED\n",
+                      tag, us, bad, (long long)nelem, worst, maxr);
+          return;
+        }
+      }
+    }
+
+    // Traffic. Weights, scales and A are each read ONCE in total regardless of S: the slices partition the
+    // k-tiles, they do not repeat them. Only the partial buffer is new -- written by the epilogue and read back
+    // by the merge. (The host-slicing form did re-read A per slice; the in-kernel form does not.)
     double const wb = double(bd.N) * bd.K * 4 / 8.0;                      // int4 codes
     double const sb = double(bd.scale_k) * bd.N * 2.0 * 2.0;              // scale + zero, whole matrix
-    double const ab = double(bd.total) * bd.K * 2.0 * slices;             // A re-read per slice
+    double const ab = double(bd.total) * bd.K * 2.0;
     double const pb = (slices > 1) ? (2.0 * double(slices) * bd.total * bd.N * 2.0) : 0.0;  // write + read back
     double const db = double(bd.total) * bd.N * 2.0;
     double const bytes = double(bd.active) * (wb + sb) + ab + pb + db;
@@ -114,8 +150,9 @@ inline void sk_row(Band const& bd, SkCtx const& cx, cutlass::DeviceAllocation<in
     // concurrent grid was constant; that is the number that made a serialised implementation look plausible.
     int mt = 0;
     for (int e = 0; e < bd.L; ++e) mt += (bd.me[e] + TM - 1) / TM;
-    int64_t const cta_per_launch = int64_t(mt) * ((bd.N + TN - 1) / TN);
-    int64_t const cta_total = cta_per_launch * slices;
+    // ONE launch now, with the slice on gridDim.z, so the concurrent grid IS mt*ntile*S.
+    int64_t const cta_per_launch = int64_t(mt) * ((bd.N + TN - 1) / TN) * slices;
+    int64_t const cta_total = cta_per_launch;
     double const wkwrp_cu = double(cta_per_launch) * (double(TM / WM) * (TN / WN)) / 72.0;
 
     std::printf("  %-34s %8.2f us | %7.1f GB/s | %5.1f%% HBM | cta/L %5lld tot %6lld | wkwrp/CU %5.1f%s\n",

@@ -32,50 +32,56 @@ static int pass = 0, fail = 0;
 
 // ---------------------------------------------------------------------------------------------------
 // (A) legality
-struct OkCase { int k, S, gs, tk; bool want; const char* note; };
+struct OkCase { int k, S, tk; const char* note; };
 
 static void gate_legality() {
-  // Every row names the ONE condition it exercises. The `want == true` rows are the neighbours that keep a
-  // rule from being vacuously strict; the `false` rows each trip exactly one clause.
+  // THE RULE CHANGED WITH THE IMPLEMENTATION, and the table has to change with it or it tests a dead spec. The
+  // host-slicing form moved the B pointer, so a slice had to start on a 256-element offline tile and cover whole
+  // scale groups. The in-kernel form walks k-tiles z, z+S, z+2S with gA/gB untouched, so what remains is that the
+  // k-tile count divides by S -- the kernel's k_tile_count is a ceil, and an indivisible count would let the last
+  // slice step past the end of the coordinate space.
+  //
+  // Every clause still gets a case that trips it AND a neighbour that does not, and every verdict is checked
+  // against a recomputation written out here rather than a call back into the function under test.
   OkCase const cs[] = {
-    {2048, 1,  32,  64, true,  "S=1 always legal"},
-    {2048, 2,  32,  64, true,  "clean: 1024 per slice"},
-    {2048, 4,  32,  64, true,  "clean: 512 per slice"},
-    {2048, 8,  32,  64, true,  "clean: 256 per slice, exactly one offline tile"},
-    {2048, 16, 32,  64, false, "slice K 128 < the 256-element offline tile"},
-    {2048, 3,  32,  64, false, "K not divisible by S"},
-    {2048, 0,  32,  64, false, "S < 1"},
-    {2048, 2,  32, 256, true,  "slice 1024 is a whole number of Block_K=256"},
-    {1536, 2,  32, 256, false, "slice 768 is not a whole number of Block_K=256"},
-    {2048, 8,  16,  64, true,  "gs=16 divides the 256 slice"},
-    {2560, 5,  32,  64, false, "slice 512 ok but 2560/5=512 -> 512%256==0; kept legal"},
-    {2048, 2, 512,  64, false, "slice 1024 ok, gs=512 divides it; legal"},
+    {2048, 1,  256, "S=1 always legal"},
+    {2048, 2,  256, "kt=8, divides"},
+    {2048, 8,  256, "kt=8, exactly one tile per slice"},
+    {2048, 16, 256, "kt=8 < S -- does not divide"},
+    {2048, 3,  256, "kt=8 not divisible by 3"},
+    {2048, 0,  256, "S < 1"},
+    {2048, 8,   64, "kt=32, divides"},
+    {2048, 32,  64, "kt=32, one tile per slice"},
+    {2048, 64,  64, "kt=32 < S"},
+    {1536, 2,  256, "kt=6, divides -- the 256-BOUNDARY rule would have REFUSED this (768 per slice)"},
+    {1536, 4,  256, "kt=6 not divisible by 4"},
+    {2048, 2,    0, "Block_K unknown"},
   };
-  // The last two rows are deliberately self-contradicting notes -- recompute the truth instead of trusting me.
   for (auto& c : cs) {
     const char* why = "";
-    bool const got = splitk_ok(c.k, c.S, c.gs, c.tk, &why);
-    // independent recomputation of the rule, written out rather than called
+    bool const got = splitk_ok(c.k, c.S, c.tk, &why);
     bool ref;
-    if (c.S < 1) ref = false;
-    else if (c.S == 1) ref = true;
-    else {
-      int ks = (c.k % c.S) ? -1 : c.k / c.S;
-      ref = (ks > 0) && (ks % 256 == 0) && (c.gs <= 0 || ks % c.gs == 0) && (c.tk <= 0 || ks % c.tk == 0);
-    }
+    if (c.S < 1)        ref = false;
+    else if (c.S == 1)  ref = true;
+    else if (c.tk <= 0) ref = false;
+    else                ref = (((c.k + c.tk - 1) / c.tk) % c.S) == 0;
     if (got == ref) { ++pass; }
     else {
-      std::printf("  [FAIL] legality k=%d S=%d gs=%d tk=%d: got %d ref %d (%s) -- %s\n",
-                  c.k, c.S, c.gs, c.tk, int(got), int(ref), why, c.note);
+      std::printf("  [FAIL] legality k=%d S=%d tk=%d: got %d ref %d (%s) -- %s\n",
+                  c.k, c.S, c.tk, int(got), int(ref), why, c.note);
       ++fail;
     }
   }
-  // Coverage assertion: the table must actually contain both verdicts, or it proves nothing.
   int t = 0, f = 0;
-  for (auto& c : cs) { const char* w = ""; (splitk_ok(c.k, c.S, c.gs, c.tk, &w) ? t : f)++; }
-  if (t > 0 && f > 0) { std::printf("  [ok]   legality  %zu rows, %d legal / %d refused, all match an independent recomputation\n",
-                                    sizeof(cs)/sizeof(cs[0]), t, f); ++pass; }
-  else { std::printf("  [FAIL] legality table is one-sided (%d legal, %d refused) -- it cannot detect a vacuous rule\n", t, f); ++fail; }
+  for (auto& c : cs) { const char* w = ""; (splitk_ok(c.k, c.S, c.tk, &w) ? t : f)++; }
+  if (t > 0 && f > 0) {
+    std::printf("  [ok]   legality  %zu rows, %d legal / %d refused, all match an independent recomputation\n",
+                sizeof(cs)/sizeof(cs[0]), t, f);
+    ++pass;
+  } else {
+    std::printf("  [FAIL] legality table is one-sided (%d legal, %d refused) -- it cannot detect a vacuous rule\n", t, f);
+    ++fail;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------

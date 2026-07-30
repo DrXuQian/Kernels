@@ -74,7 +74,10 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
             // RAGGED PREFIX ALREADY IN THE WORKSPACE. It depends only on the per-expert M values, which K-slicing
             // does not touch, so S slices would each redo the same write -- and it is a BLOCKING hggcMemcpy, which
             // serialises the host and with it any attempt to overlap the slices. The caller writes it once.
-            bool prefix_ready = false) {
+            bool prefix_ready = false,
+            // IN-KERNEL SPLIT-K: slice the K loop across gridDim.z so all S slices are resident in ONE launch.
+            // ptr_D/stride_D must then hold L*splitk entries (slice z of expert e writes plane e + z*L).
+            int splitk = 1) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   // ElementB is now a template param (default int4b_t; uint2b_t for W2A16). AlignmentB below auto-adjusts.
@@ -156,6 +159,7 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
                                     cute::size<0>(WarpShape{}), cute::size<1>(WarpShape{})>::ok,
                 "second B plane: swzl over-delivers at this TileShape");
   if (k_full <= 0) k_full = k;
+  if (splitk < 1) splitk = 1;
   const int scale_k      = (k + group_size - 1) / group_size;        // this slice
   const int scale_k_full = (k_full + group_size - 1) / group_size;   // the whole matrix
   // STRIDES FROM k_full, SHAPES FROM k -- see the k_full parameter. Getting this backwards makes every
@@ -200,6 +204,19 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
     }
   }
   args.group_M = group_M;
+  // THE K-TILE COUNT MUST DIVIDE BY splitk. The kernel's k_tile_count is a ceil, so an indivisible count lets the
+  // last slice step past the end of the coordinate space -- refused here rather than left to mainloop predication.
+  {
+    int const TKv = int(cute::size<2>(TileShape{}));
+    int const kt = (k + TKv - 1) / TKv;
+    if (splitk > 1 && kt % splitk != 0) {
+      std::printf("[moe_grouped] splitk=%d does not divide the k-tile count %d (K=%d, Block_K=%d)\n",
+                  splitk, kt, k, TKv);
+      ++moeg_fail_count();
+      return;
+    }
+  }
+  args.splitk = splitk;
   // O(1) decode hint: if every expert has the SAME #m-tiles (ceil(M_e/TM)), the kernel uses blockIdx.z (no scan).
   // MOEG_FORCE3D (diagnostic): force the 3D Mmax grid + blockIdx.z decode even for ragged (small experts idle)
   // to isolate whether the ragged gap is the O(L) scan (jumps -> yes) or load-imbalance (unchanged -> no).
@@ -242,7 +259,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
                     int m, int n, int k, int L, int group_size,
                     GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
                     char* ws, size_t ws_bytes, hggcStream_t stream,
-                    const PlaneB2* B2 = nullptr, int k_full = -1, bool prefix_ready = false) {
+                    const PlaneB2* B2 = nullptr, int k_full = -1, bool prefix_ready = false, int splitk = 1) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
@@ -256,7 +273,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   #define MOEG_SCHED(SCH) std::conditional_t<(MOEG_FOLD > 1), \
       cutlass::gemm::KernelAiuFold<(MOEG_FOLD > 1 ? MOEG_FOLD : 2), SCH>, SCH>
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, MOEG_SCHED(SCH), TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
-      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full,prefix_ready)
+      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full,prefix_ready,splitk)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
   //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K

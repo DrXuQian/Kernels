@@ -37,20 +37,19 @@ static __global__ void moeg_splitk_reduce(__half* __restrict__ D,
   }
 }
 
-// Is S a legal split for this problem? Every slice must still satisfy the constraints the collective and the
-// offline layout impose on K, so the answer is not "any divisor".
-inline bool splitk_ok(int k, int slices, int group_size, int tile_k, const char** why = nullptr) {
+// Is S a legal split? WITH IN-KERNEL SPLIT-K THE RULE COLLAPSED. The host-slicing form needed a slice to start
+// on a 256-element offline tile (its B pointer moved) and to cover whole scale groups; the in-kernel form walks
+// k-tiles z, z+S, z+2S with gA/gB untouched, so neither applies. What is left is that the k-tile count divides by
+// S, because the kernel's k_tile_count is a ceil and an indivisible count would let the last slice step past the
+// end of the coordinate space. A whole k-tile always covers whole scale groups (the collective already requires
+// gs <= Block_K), so the group size does not enter.
+inline bool splitk_ok(int k, int slices, int tile_k, const char** why = nullptr) {
   auto no = [&](const char* m) { if (why) *why = m; return false; };
   if (slices < 1) return no("slices < 1");
   if (slices == 1) { if (why) *why = ""; return true; }
-  if (k % slices) return no("K not divisible by the slice count");
-  int const ks = k / slices;
-  // The AIU offline interleave is [K/256][N][256], so a slice boundary must fall on a 256-element tile or the
-  // slice's B pointer lands mid-tile.
-  if (ks % 256) return no("slice K not a multiple of the 256-element offline tile");
-  // A slice must still be a whole number of scale groups, and at least one K-tile of the mainloop.
-  if (group_size > 0 && ks % group_size) return no("slice K not a whole number of scale groups");
-  if (tile_k > 0 && ks % tile_k) return no("slice K not a whole number of Block_K");
+  if (tile_k <= 0) return no("Block_K unknown");
+  int const kt = (k + tile_k - 1) / tile_k;
+  if (kt % slices) return no("k-tile count not divisible by the slice count");
   if (why) *why = "";
   return true;
 }

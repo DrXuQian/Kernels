@@ -98,6 +98,17 @@ public:
     int probe = 0;   // debug: 0=normal; 1=ROUTING probe (skip GEMM, write expert+1 to every output element)
     int const* group_M = nullptr;   // device [L] per-expert M_e; O(L) decode of blockIdx.x -> (expert,m_tile)
     int mtiles_uniform = 0;         // >0: all experts have this many m-tiles -> O(1) decode; 0: ragged, scan group_M
+    // IN-KERNEL SPLIT-K. >1 slices the K loop across gridDim.z so all S slices' CTAs are resident in ONE launch.
+    // Doing it on the host instead -- S launches on a stream -- serialises them and raises no occupancy at all:
+    // measured 23.49 / 44.51 / 69.70 / 121.37 us for S = 1,2,4,8, i.e. linear in S.
+    //
+    // The split is STRIDED (slice z takes k-tiles z, z+S, z+2S ...), which is what cute's SplitkCoordIterator
+    // does, so the B pointer never moves and there is NO constraint that a slice fall on the 256-element offline
+    // tile boundary -- that constraint belonged to the host-slicing form and is gone.
+    //
+    // With splitk > 1 the epilogue's ptr_D/stride_D arrays must hold L*splitk entries: slice z of expert e writes
+    // plane e + z*L, so the S partials are contiguous for the merge kernel.
+    int splitk = 1;
   };
   struct Params {
     GemmUniversalMode mode;
@@ -110,6 +121,7 @@ public:
     int probe = 0;
     int const* group_M = nullptr;
     int mtiles_uniform = 0;
+    int splitk = 1;
   };
 
   static Params
@@ -139,7 +151,8 @@ public:
       problem_shapes,
       CollectiveMainloop::to_underlying_arguments(rep_mnkl, args.mainloop, /*workspace=*/nullptr),
       CollectiveEpilogue::to_underlying_arguments(rep_mnkl, args.epilogue, /*workspace=*/nullptr),
-      hw_info, scheduler, workspace, args.probe, args.group_M, args.mtiles_uniform
+      hw_info, scheduler, workspace, args.probe, args.group_M, args.mtiles_uniform,
+      args.splitk < 1 ? 1 : args.splitk
     };
   }
 
@@ -179,8 +192,12 @@ public:
     bool const force3d = std::getenv("MOEG_FORCE3D") != nullptr;   // diagnostic: force 3D Mmax grid for ragged
     // UNIFORM (or forced): 3D grid (mt_max, N_tiles, L), blockIdx.z=expert, O(1) decode. small experts' extra
     // m-tiles early-exit (idle). RAGGED default: flat grid (total,N,1), no idle blocks but O(L) decode scan.
-    if (uni || force3d) return dim3(uni ? mt0 : mt_max, Nt, L);
-    return dim3(total_m_tiles, Nt, 1);
+    int const S = params.splitk < 1 ? 1 : params.splitk;
+    // THE SLICE LIVES ON z. The ragged (flat) path leaves z unused, so it is free there; the uniform path already
+    // spends z on the expert, so the two are packed as z = expert*S + slice -- the same packing
+    // ppu_aiu_gemm_parallel.hpp uses for (l, slice).
+    if (uni || force3d) return dim3(uni ? mt0 : mt_max, Nt, L * S);
+    return dim3(total_m_tiles, Nt, S);
   }
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
 
@@ -203,16 +220,19 @@ public:
     // (num_groups is small). Every block maps to a REAL tile of some expert -> no idle blocks (vs the old
     // Mmax-sized (.,.,L) grid). l_coord = expert selects this expert's A/B/scale/zero plane in the collective.
     int const TM = int(size<0>(blk_shape));
+    int const S = params.splitk < 1 ? 1 : params.splitk;
     int flat = int(blockIdx.x), n_idx = int(blockIdx.y);
-    int expert = -1, m_idx = 0;
+    int expert = -1, m_idx = 0, slice = 0;
     if (params.mtiles_uniform > 0) {
       // UNIFORM: 3D grid (mt0, N_tiles, L) -> expert = blockIdx.z (O(1)), m_idx = blockIdx.x (local m-tile).
       // Same grid/raster as the old fast path; recovers the ~5% the flat grid lost on the balanced case.
-      expert = int(blockIdx.z);  m_idx = flat;
+      // z = expert*S + slice
+      expert = int(blockIdx.z) / S;  slice = int(blockIdx.z) % S;  m_idx = flat;
     } else {
       // A (O(log L) ragged): binary-search the m-tile prefix [L+1] (written by launch into the scheduler-unused
       // workspace) for the largest e with prefix[e] <= flat. Replaces the O(L) linear scan (the ~5% the flat
       // grid lost at high expert count -- avg ~64 iters at L=128 -> now ~7).
+      slice = int(blockIdx.z);        // flat path: z carries the slice alone
       int const* pfx = reinterpret_cast<int const*>(params.workspace);
       int lo = 0, hi = num_groups;
       while (lo + 1 < hi) { int const mid = (lo + hi) >> 1; if (pfx[mid] <= flat) lo = mid; else hi = mid; }
@@ -240,8 +260,11 @@ public:
     TiledMma tiled_mma;
     Tensor accumulators = make_fragment_like<ElementCompute>(partition_fragment_C(tiled_mma, take<0,2>(blk_shape)));
     clear(accumulators);
-    auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
-    int  k_tile_count = size<2>(gA);
+    // STRIDED K SPLIT. slice z walks k-tiles z, z+S, z+2S ... so gA/gB are untouched and only the traversal
+    // changes. k_tile_count uses ceil, so an indivisible tile count would let the last slice step past the end;
+    // the host refuses that case (see moe_grouped_ppu::launch) rather than relying on mainloop predication.
+    auto k_tile_iter  = cute::make_splitk_coord_iterator(shape<2>(gA), slice, S);
+    int  k_tile_count = (size<2>(gA) + S - 1) / S;
 
     if (params.probe == 1) {
       // ROUTING PROBE: skip the GEMM, tag every output element with (expert+1). See test_moe_grouped_probe.
@@ -250,9 +273,14 @@ public:
       collective_mainloop(params.mainloop, load_inputs, accumulators, k_tile_iter, k_tile_count, thread_idx, smem_buf);
     }
 
+    // EACH SLICE WRITES ITS OWN D PLANE, e + slice*L, so the S partials are contiguous for the merge. The L
+    // EXTENT has to grow with them or the epilogue's own bounds check would reject the shifted coordinate -- the
+    // mainloop above already ran with the unshifted expert, which is what selects the right B/scale plane.
+    auto problem_shape_epi = make_shape(M, N, K, num_groups * S);
+    auto blk_coord_epi     = make_coord(m_idx, n_idx, _, expert + slice * num_groups);
     CollectiveEpilogue epilogue{params.epilogue, shared_storage.tensors.epilogue};
-    epilogue(problem_shape_MNKL, blk_shape, blk_coord_mnkl, accumulators, tiled_mma, residue_mnk,
-             thread_idx, (char*)&shared_storage.tensors.epilogue);   // writes this expert's D plane (L-strided)
+    epilogue(problem_shape_epi, blk_shape, blk_coord_epi, accumulators, tiled_mma, residue_mnk,
+             thread_idx, (char*)&shared_storage.tensors.epilogue);
   }
 };
 

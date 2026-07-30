@@ -110,37 +110,26 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<int> gm(bd.L);             gm.copy_from_host(gmh.data());
   cutlass::DeviceAllocation<int> offdev(bd.L);         offdev.copy_from_host(bd.offs.data());
   cutlass::DeviceAllocation<half_t*> pdAll((size_t)bd.L * S_MAX); pdAll.copy_from_host(pdAllh.data());
-  cutlass::DeviceAllocation<GS> gsdSlice(bd.L);
-  std::vector<GS> gshSlice(bd.L);
+  // The epilogue indexes ptr_D AND stride_D with the shifted coordinate e + slice*L, so the stride array has to
+  // be L*S long too -- the same L strides repeated, since slicing K does not change any output stride.
+  std::vector<DStride> sdAllh((size_t)bd.L * S_MAX);
+  for (int s = 0; s < S_MAX; ++s)
+    for (int e = 0; e < bd.L; ++e) sdAllh[(size_t)s * bd.L + e] = sdh[e];
+  cutlass::DeviceAllocation<DStride> sdAll((size_t)bd.L * S_MAX); sdAll.copy_from_host(sdAllh.data());
+  cutlass::DeviceAllocation<half_t> dRef((size_t)bd.total * bd.N);   // each config's S=1 output
   cutlass::DeviceAllocation<char> ws(1 << 20);
 
   bd.dA = dA.get(); bd.dSc = dSc.get(); bd.dZr = dZr.get();
   bd.pd = pd.get(); bd.sd = sd.get(); bd.rdev = rdev.get(); bd.gm = gm.get(); bd.offdev = offdev.get();
   bd.ws = ws.get(); bd.wsb = ws.size();
 
-  // CONCURRENT SLICES ARE OFF BY DEFAULT, and that is the honest state rather than a preference. S launches on
-  // one stream SERIALISE: the grid at any instant is unchanged, so split-K measures nothing but S times the
-  // launch cost -- which is what the 23.49 -> 44.51 -> 69.70 -> 121.37 us ladder for S = 1,2,4,8 is. Fixing it
-  // needs the slices on separate streams, but hggcStreamCreate appears only in fold_derivation/stub_inc as a
-  // no-op that returns success WITHOUT setting the stream, and nowhere in actlize -- so it cannot be validated
-  // locally. SPLITK_STREAMS=1 turns it on for a box run that is prepared to check the API first.
-  std::vector<hggcStream_t> streams;
   SkCtx cx{};
-  if (std::getenv("SPLITK_STREAMS")) {
-    streams.resize(S_MAX);
-    for (int i = 0; i < S_MAX; ++i) CUTLASS_PPU_CHECK(hggcStreamCreate(&streams[i]));
-    cx.streams = streams.data(); cx.num_streams = S_MAX;
-    std::printf("   SPLITK_STREAMS=1: %d streams, slices run concurrently\n", S_MAX);
-  } else {
-    std::printf("   slices SERIALISE on the default stream (SPLITK_STREAMS=1 to overlap them). Any S>1 row below\n"
-                "   therefore has the SAME concurrent grid as S=1 and is not a test of split-K.\n");
-  }
-  cx.dPart = &dPart; cx.pdAll = &pdAll; cx.dD = &dD; cx.gsdSlice = &gsdSlice; cx.gshSlice = &gshSlice;
-  cx.S_max = S_MAX;
-
+  cx.dPart = &dPart; cx.pdAll = &pdAll; cx.pdOne = &pd; cx.sdAll = &sdAll; cx.sdOne = &sd; cx.dRef = &dRef;
+  cx.dD = &dD; cx.S_max = S_MAX;
+  std::printf("   in-kernel split-K: ONE launch, the slice on gridDim.z, so the concurrent grid is mt*ntile*S\n");
   SkBest b1, bS;
-  std::printf("\n-- %d generated config units (TileK=256 rows: a slice of 2048/8 is exactly one "
-              "offline tile) --\n", SPLITK_UNIT_COUNT);
+  std::printf("\n-- %d generated config units, S in {1,2,4,8} (legal when S divides the k-tile count) --\n",
+              SPLITK_UNIT_COUNT);
   splitk_run_all(bd, cx, b1, bS);
 
   if (!sk_acu()) {
