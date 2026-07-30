@@ -1382,3 +1382,34 @@ demonstrably one group.
 
 Also settled: PPU_MAXREG raised occupancy and changed nothing, the third independent confirmation that warp count is
 not this shape's constraint (after the TileN ladder at 1.066x and split-K's 14 -> 26.8 warps for -4%).
+
+### PPU_SCALE_PAD REFUTED: padding the group stride makes it slower
+
+Back-to-back, same filter:
+
+    PPU_A_PACK=1                    21.10 us
+    PPU_A_PACK=1 PPU_SCALE_PAD=8    23.15 us   +9.7%
+    PPU_A_PACK=1 PPU_SCALE_PAD=16   21.32 us   +1.0%   (noise)
+
+So "consecutive groups start on the same bank" is not the cause of the conflicts, or not the main one. And the pad
+has its own cost: the group stride stops being a power of two, so g*72 or g*80 needs a MULTIPLY where 64 was a
+shift, and that arithmetic sits in the inner reload path. The knob stays off; it is kept only as the record of the
+refutation.
+
+What the refutation leaves: the conflicts must come from the INTRA-GROUP access pattern -- how the mma's B layout
+maps lanes onto N -- not from the distance between groups.
+
+### The one blocking unknown, and why nothing else should be attempted before it
+
+    probe:  max_common_vector = 1 over 32 elements  ->  32 reads
+    acu:    about 4 reads per (group, warp, k-tile)
+    an 8x disagreement
+
+l89's slice of tCsS did not reduce to a single group -- the printed strides still carried the 512 stage stride -- so
+at least one of those two numbers describes something other than what I labelled it. BOTH remaining Q4_K items
+(widen the read, remove the conflicts) depend on the lane->N mapping inside one group, which is exactly what that
+disagreement is about.
+
+Resolve it first, from a slice that is demonstrably one group. This session already paid twice for changing code on
+top of a relation I had written down rather than read off: PPU_SCALE_PAD here, and the four "two places must agree"
+faults before it.
