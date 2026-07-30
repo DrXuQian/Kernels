@@ -65,7 +65,12 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
             GroupShape* group_shapes_dev, GroupShape const* group_shapes_host,
             int const* group_row_offsets,   // ragged: per-expert cumulative A row start; null=uniform
             char* workspace, size_t workspace_bytes, hggcStream_t stream,
-            const PlaneB2* B2 = nullptr) {   // bit-plane concat: 2nd (high) plane; ignored when PlaneB2 is void
+            const PlaneB2* B2 = nullptr,     // bit-plane concat: 2nd (high) plane; ignored when PlaneB2 is void
+            // SPLIT-K SLICING. `k` is this launch's slice; `k_full` is the whole K the buffers were built
+            // for. Every STRIDE has to come from k_full while every PROBLEM SHAPE comes from k: the A row
+            // pitch, the B batch pitch and the scale row pitch all belong to the undivided matrix, and only
+            // the pointers move. -1 means "not sliced", i.e. k_full == k.
+            int k_full = -1) {
   using ElementA = cutlass::half_t;  using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   // ElementB is now a template param (default int4b_t; uint2b_t for W2A16). AlignmentB below auto-adjusts.
@@ -146,15 +151,19 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
                                     cute::size<1>(TileShape{}), cute::size<2>(TileShape{}),
                                     cute::size<0>(WarpShape{}), cute::size<1>(WarpShape{})>::ok,
                 "second B plane: swzl over-delivers at this TileShape");
-  const int scale_k = (k + group_size - 1) / group_size;
-  StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, L));   // mainloop: single L-strided base
+  if (k_full <= 0) k_full = k;
+  const int scale_k      = (k + group_size - 1) / group_size;        // this slice
+  const int scale_k_full = (k_full + group_size - 1) / group_size;   // the whole matrix
+  // STRIDES FROM k_full, SHAPES FROM k -- see the k_full parameter. Getting this backwards makes every
+  // slice after the first walk gmem with a shrunken row pitch and read the wrong rows entirely.
+  StrideA sA = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k_full, L));
   // N-FOLD: a folded weight buffer is physically (N/FoldF) rows x (FoldF*K) codes -- one physical row carries TWO
   // logical N columns -- so its ROW PITCH is FoldF*K, not K. Computing the stride from (n,k) makes the kernel walk
   // gmem with the unfolded pitch and read scrambled bytes no matter how the offline placed them (this is why three
   // structurally different placements all measured ~72% = random).
   StrideB sB = cutlass::make_cute_packed_stride(
-      StrideB{}, cute::make_shape(n / MOEG_FOLD, k * MOEG_FOLD, L));
-  StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k, L));
+      StrideB{}, cute::make_shape(n / MOEG_FOLD, k_full * MOEG_FOLD, L));
+  StrideS sS = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(n, scale_k_full, L));
   // C/D strides now come from the caller (per-expert ptr_D + stride_D arrays) -> contiguous output.
 
   GroupProblemShape ps; ps.num_groups = L; ps.problem_shapes = group_shapes_dev; ps.host_problem_shapes = group_shapes_host;
@@ -182,7 +191,7 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
     constexpr int P2_FOLD   = P2_CONTIG >= 32 ? 1 : 32 / P2_CONTIG;
     if constexpr (P2_FOLD > 1) {
       args.mainloop.dB2 = cutlass::make_cute_packed_stride(
-          StrideB{}, cute::make_shape(n / P2_FOLD, k * P2_FOLD, L));
+          StrideB{}, cute::make_shape(n / P2_FOLD, k_full * P2_FOLD, L));
       args.mainloop.dB2_valid = true;
     }
   }
@@ -229,7 +238,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
                     int m, int n, int k, int L, int group_size,
                     GroupShape* gsd, GroupShape const* gsh, int const* group_row_offsets,
                     char* ws, size_t ws_bytes, hggcStream_t stream,
-                    const PlaneB2* B2 = nullptr) {
+                    const PlaneB2* B2 = nullptr, int k_full = -1) {
   using TileShape = cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::Int<TK>>;
   using WarpShape = cute::Shape<cute::Int<WM>, cute::Int<WN>, cute::Int<TK>>;
   const bool il = (n % 256 == 0 && k % 256 == 0);
@@ -243,7 +252,7 @@ void filter_and_run(const cutlass::half_t* A, const ElementB* B, const cutlass::
   #define MOEG_SCHED(SCH) std::conditional_t<(MOEG_FOLD > 1), \
       cutlass::gemm::KernelAiuFold<(MOEG_FOLD > 1 ? MOEG_FOLD : 2), SCH>, SCH>
   #define MOEG_CALL(SCH, STK, IL) launch<QuantOp, MOEG_SCHED(SCH), TileShape, cute::Shape<cute::Int<TN>, STK>, WarpShape, Stages, IL, ElementB, PlaneB2>( \
-      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2)
+      A,B,scales,zeros,ptr_D,stride_D,group_M,m,n,k,L,group_size,gsd,gsh,group_row_offsets,ws,ws_bytes,stream,B2,k_full)
   // COLLECTIVE CONSTRAINT (SK = Scale_TileK = ceil(TK/gs) = #scale groups per K-tile):
   //   Scale_TileK <= mma_K_atoms (= TK/16), i.e. gs >= 16, so each scale group covers >=1 mma atom. The collective
   //   applies scale per mma-atom (FINE path) when a B copy step (64-K) straddles >1 group, so gs < the copy-step K
