@@ -1082,3 +1082,24 @@ CPY_M / CPY_K static asserts on the new partitioning actually fired.
 Expected: A's smem 16x smaller, tsm.ld.swzl 0.26 per mma replaced by roughly 2 smem.ld per mma (+2.6% instructions)
 on the shared-memory pipe, which measures 0.003 busy. Nothing at decode, since that shape is work-bound; the 16x is
 for prefill. Unmeasured -- correctness first.
+
+### PPU_A_CPASYNC PASSES: A's shared tile is ONE ROW and the result is bit-exact against a separate compilation
+
+    A path: A in smem, ONE row, plain cp.async + DefaultCopy
+    smem/block = 13456 B   (A = 768 B = 384 elems, 6%)      blocks/CU at 256 KB = 19
+    non-finite: gold=0 got=0     |gold|max = |got|max = 21.72
+    cross-build vs /tmp/d_off.bin: max_rel=0.000e+00 bad=0 -> MATCH
+
+384 elems = TileK 128 x Stages 3, exactly one row. A goes 49,152 -> 768 B (64x), the block 61,840 -> 13,456 B
+(4.6x), blocks/CU 4 -> 19. The reference came from a build WITHOUT the macro, so this is not the collective judging
+itself.
+
+Six attempts; the one that works is the one that stops using the AIU/swzl pair for A. Every earlier failure
+mechanism is inapplicable by construction here: no cube, no swizzle to cancel, no descriptor (dim_w/cube_h never
+enter), no 16-row footprint, and the data stays in shared memory so the inter-thread reuse that killed the
+gmem-to-register variant is preserved.
+
+Next: timing. Expect ~0 at decode -- that shape is work-bound at 16 warps/CU and freeing smem measurably bought no
+warps before -- and the 64x is for prefill, where the grid supplies far more blocks than the smem limit admits.
+Prefill also needs the Mmax > 1 case, which this path currently refuses because the M mode is stride-0; serving it
+means predicating per m rather than aliasing.
