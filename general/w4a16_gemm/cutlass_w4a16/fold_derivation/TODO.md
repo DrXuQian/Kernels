@@ -1103,3 +1103,43 @@ Next: timing. Expect ~0 at decode -- that shape is work-bound at 16 warps/CU and
 warps before -- and the 64x is for prefill, where the grid supplies far more blocks than the smem limit admits.
 Prefill also needs the Mmax > 1 case, which this path currently refuses because the M mode is stride-0; serving it
 means predicating per m rather than aliasing.
+
+### CORRECTED profile of the DEFAULT build, and where the mma's overhead actually is
+
+The earlier "unpack 27.5 per mma, 2.3x slack" table was measured on the A-IN-REGISTER build, not the default. It is
+withdrawn. The default build (cpa_off, v.mma = 131,072) is:
+
+    v.fma.f16 5.69   v.lop3.i 4.17   s.add 2.68   v.add.f16 2.56   tsm.ld 2.08   v.bfi.i 2.06   s.wait 1.93
+    tsm.ld.swzl 1.29   v.mov.i 1.21   s.mov 1.14   v.shrl.i 1.10   v.mma 1.00   s.shll 0.72   s.cbr 0.56
+    s.cmp 0.54   v.mul.f16 0.50   s.csel 0.41 ...        total ~34.3 per mma, of which v.shll.i is 0.09 not 12.11
+
+Every arithmetic block is AT ITS FLOOR for this scheme, and the numbers close exactly:
+
+    unpack            4 lop3 + 1 shrl per atom       floor 5      measured 5.27
+    converter fp16    2 sub + 2 fma per atom         floor 4      part of add 2.56 + fma 5.69
+    group affine      4 hfma2 per atom               floor 4      the rest of fma 5.69
+                      (the separate multiplies{}/plus{} passes ARE fused by the compiler --
+                       v.mul.f16 is only 0.50 per mma, which is the proof)
+
+So per half2: 1 lop3 + 2 fma = about 3.3 ops against a floor of 2, and the missing 1 is exactly the fold that fp16
+cancellation kills. Moving affine to the accumulator is 2x WORSE at gs=32 (8 floats x 2 fma x 8 groups = 128 per
+k-tile against 64) and 2x better only at gs >= 64.
+
+Structural point worth keeping: B's dequant work is proportional to TileN * TileK and INDEPENDENT of M, so TileM=16's
+15/16 padding wastes only the 1 mma in 34 and does not inflate dequant. Decode pays the same dequant per useful
+output as prefill because M=1 has no reuse -- decode is dequant-bound, and the only lever is ops per weight element.
+
+That leaves the ~36% that is not arithmetic on data: scalar overhead 9.05, v.bfi.i 2.06, v.mov.i 1.21.
+
+### First cut at it: transform_B_kblock took k_block as a runtime int and erased the caller's Int<x>
+
+    void transform_B_kblock(..., int const k_block, ...)
+
+The callers already hold static values -- for_each hands out Int<x>, and k_block_next is (Int<x> + _1) % K_BLOCK_MAX,
+also static. Taking it as an int meant atom_idx, g = atom_idx / APG_ and the `atom_idx % APG_ == 0` guard all became
+runtime work despite APG_ and K_ATOM_PER_COPY being constants. The profile shows the shape of it: s.cmp 0.54 +
+s.csel 0.41 + s.cbr 0.56 + s.shra 0.09 + s.mull 0.16 = 1.8 per mma, about 5%.
+
+Now templated as KBlockT, all four inner loops use for_each so the index is Int<i>, the guard folds to if constexpr
+and disappears, and the division and modulo fold away. Constant folding only -- numerics unchanged. Four harnesses
+compile clean both with and without PPU_A_CPASYNC.
