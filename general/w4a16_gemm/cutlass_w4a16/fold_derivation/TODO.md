@@ -322,3 +322,82 @@ build if any CMake-built source includes that header.
 
 **#14 -- re-measure at gs=16.** Done; `APG = MMA_KA_/Scale_TileK = gs/16` is tile-independent, so gs=16 forces APG=1
 and costs 2.6% on Q3 (int4 pays 10.8%: densest mma, least conversion, so the reload is relatively most visible).
+
+---
+
+## Stream-K: Marlin already IS stream-K, and what that costs us (from the user's Marlin notes, 2026-07-30)
+
+**Marlin's scheduler is stream-K.** The notes quote it directly, and even use the word "stripe":
+
+```c
+int iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);  // stripe length per CTA (in K-tiles)
+int slice_row     = (iters * blockIdx.x) % k_tiles;            // where in K this CTA starts
+int slice_col_par = (iters * blockIdx.x) / k_tiles;            // which (N, M-region) it starts in
+```
+
+The work unit is one K-tile of one output tile; the total `k_tiles * n_tiles * parallel` is divided into
+equal CONSECUTIVE stripes, one per CTA. A stripe may start mid-slice, end mid-slice, cross N-tile boundaries
+and cross M regions (the notes note CTA=9 crossing two `rest M`). Tiles split across CTAs are combined with
+`locks[] + barrier_acquire/release + global_reduce`, ordered by `slice_idx` among `slice_count` contributors.
+That is Stream-K (Osama et al.) under a different name.
+
+### Why the recorded persistent-scheduler failure does NOT refute stream-K here
+
+`ppu_aiu_gemm_mixed_input_group.hpp:160` records: the persistent GroupScheduler launched `grid=(72,1,1)` =
+one block per CU and measured 2 active warps/CU, 3.1% achieved occupancy, 16% CU throughput. That is a real
+measurement and it kills ONE block per CU -- not stream-K.
+
+The difference is CTA WIDTH. Marlin runs 256 threads = 8 warps per CTA, so one CTA fills an SM and
+grid = #SMs is a full wave. Our mixed-input collective runs 64-128 threads = 2-4 warps, so grid = #CU is
+2 warps/CU by construction -- exactly the 3.1% that was rejected. Stream-K on this collective needs
+
+    gridDim = CU_count * blk,    blk from fold::warps_per_cu_chunked
+
+i.e. 72 * 9 = 648 CTAs at the decode winner, which is 648 * 2 = 1296 warps = **18 warps/CU** -- precisely the
+theoretical occupancy acu reported for that config (28.13%). Untried, and distinct from what failed.
+
+### The ceiling, so nobody expects more than is there
+
+Decode today: 512 CTAs * 2 warps = 1024 warps = 14.2 warps/CU, and acu measured 13.65 achieved -- every warp
+of the launch resident at once, no second wave. Stream-K at grid=648 raises the resident count to 18/CU.
+That is **1.27x, and it is the whole ceiling**, because 18 warps/CU IS the theoretical occupancy. 20.74 us
+would become ~16.3 us, still ~2.1x off the memory roof.
+
+The GEMV committed this session is in a different regime, not a better constant: 2048 CTAs * 4 warps = 8192
+warps of work = ~7 waves, no shared memory in the main loop. For decode, GEMV replaces this question.
+
+**Where stream-K actually pays for us is #10** -- the prefill/MoE band's ~11% last-wave tail, which is load
+imbalance across a grid that ALREADY exceeds one wave. That is what stream-K exists to fix and what tile
+tuning provably cannot reach.
+
+### Fitting Marlin's scheduler into actlize: what exists, what it costs
+
+Already present:
+  * `make_splitk_coord_iterator(shape, start_k, k_step)` -- an arbitrary K start and stride in the mainloop
+    (dense split-K serial path). This is Marlin's `slice_row` and it is the key primitive.
+  * `cutlass::Semaphore` -- Marlin's `locks[]`.
+  * The flat `blockIdx.x -> (expert, m_tile)` prefix-scan decode -- the same shape of computation as Marlin's
+    `slice_col_par / n_tiles` M-region switch.
+  * As of f103c8d: the fp32 fixup reduce and the `k_full` stride/shape separation, both gated (l71).
+
+Missing, and the honest cost:
+  1. **Flat work-unit decode** over `SUM_e mt_e * n_tiles * k_tiles`. ~15 lines, Marlin's `init_slice` plus the
+     expert dimension. Cheap.
+  2. **Mid-stripe re-entry into a NEW n-tile.** This is the expensive part and it is specific to mixed input:
+     crossing an N-tile boundary means re-priming the B swzl/AIU base, the per-group SCALE iterator, and the
+     fold/interleave offsets. In an fp16 GEMM this is a pointer bump; here the scale tile and the fold factor
+     make it a real re-initialisation. Marlin pays it too, but its B layout has neither.
+  3. **A choice.** Allow N-crossing stripes (maximum balance, pay 2) or restrict a stripe to one output tile
+     (= split-K with a DERIVED S, which is what f103c8d already is). The restricted form gets most of the
+     balance for K-divisible shapes at none of the re-prime cost, so it is the thing to measure first.
+
+### Take Marlin's SCHEDULER, not Marlin's TILE SHAPE
+
+Separable decisions, and the tile shape is already known to be wrong for us: Marlin caps `thread_m_blocks` at
+4 (64 rows) because larger blows up registers, and splits warps over n and k only, never m. For MoE the
+quantity to minimise is the TOTAL m-tile count (weights are the bottleneck), so a 32-64 row m-tile is the
+wrong shape -- recorded in ppu-moe-gemm-design. The scheduler carries none of that.
+
+One thing in our favour that Marlin does not have: PPU's 256 KB of shared memory against Marlin's 96 KB. A
+bigger tile or a deeper pipeline means FEWER work units, which makes the tail relatively larger -- an argument
+FOR stream-K, not against.
