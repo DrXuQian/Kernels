@@ -779,3 +779,38 @@ TiledCopy, or the larger Params, and looking at the decode again would be wasted
 If it IS the state, the structural fix is to decode all Scale_TileK groups ONCE per k-tile into a fragment-shaped
 register array indexed by a compile-time group -- about 64 extra registers per lane on top of ~140, which is a real
 trade-off to price, not an obvious win.
+
+## F IS CORRECT ON HARDWARE, AND COSTS 24.17 vs 20.2 -- the remaining gap is one exposed LDG
+
+rowA/rowB/rowC all MATCH in the packed build with the native plane, so the gguf's own scale/zero form runs end to end
+through a decode-at-load-time design. rowA and rowB are the control: they keep the fp16 path even in the packed build and
+still match, which is what says the read side really is untouched.
+
+    decode band winner, same config both sides (16x128:256 w16x16 s2 S=1)
+      baseline            20.12 / 20.22 / 20.36 us   (three runs)
+      E, register decode  26.89   -- and TK=256 fell off the board entirely
+      F, loader decode    24.17   -- TK=256 back at the top, i.e. the inner loop is clean
+
+E -> F recovered 2.7 us and the inner loop is now byte-identical to fp16, so the remaining +19% is almost entirely the
+LDG that F exposes: the loader does load -> wait -> decode -> store in one thread, at the point where a cp.async used to
+be ISSUED. cp.async returns immediately; a plain load does not.
+
+TWO INDEX BUGS ON THE WAY, both the same shape -- one quantity, two derivations, only one of them checked:
+  * the store used SmemCopyLayoutScale's flattened (n, 1, stage*SK+g) while the tensor it got was SmemLayoutScale's
+    (n, group, stage). Two functions build a tensor called `sS` with different layouts. The hardware caught it as
+    "Exception TSM out of range", which is the good failure: a fault, not a wrong number.
+  * `scale_load_k` is already a TILE index -- partition_S leaves the last mode selecting which block of Scale_TileK
+    groups a call loads -- so dividing it by Scale_TileK folded all 19 superblocks onto 0..2. The k bound written a few
+    lines earlier (scale_residue_k = nsb * Scale_TileK) already encoded the correct reading, so the file disagreed with
+    itself and only the bound was right.
+
+### F' (chosen): cp.async the raw bytes into staging, decode at the barrier that already exists
+
+The gmem side goes back to async and the decode stays amortised per column. The decode slot is the pipeline's own
+`cp_async_wait` + `__syncthreads` at the last k_block: after the wait the staged bytes have landed, before the sync the
+planes are private, and the sync publishes them -- no new barrier. mma() already holds shared_tensors and thread_idx, so
+this needs no tuple plumbing at all.
+
+Cost, stated because it is a real trade and the register route was rejected on exactly this basis: staging is
+TN * 16 * Stages bytes, which at Scale_TileK == 8 equals ONE scale tile, so the channel goes from two smem tiles to
+three. At TN=128/Stages=2 that is 4 KB against A's 49 KB and B's 12 KB.
