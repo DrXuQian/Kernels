@@ -47,7 +47,20 @@ int main(int argc, char** argv) {
   if (f.mode != 1 || f.ktype != 4) { std::printf("expected a Q4_K scale+zero fixture\n"); return 64; }
   int const L = f.L, M = f.M, N = f.N, K = f.K, gs = f.gs, sb = f.sb;
   int const scale_k = f.scale_k(), nsb = f.nsb(), gpsb = sb / gs;      // groups per superblock, 8 for Q4_K
-  if (K % 256 || N % 64) { std::printf("need K%%256==0 and N%%64==0 for this gate (got K=%d N=%d)\n", K, N); return 64; }
+  // BOTH must be %256, and this is what the last three failing runs were about. moe_grouped_ppu.cuh:352 selects the
+  // interleaved B layout by `n % 256 == 0 && k % 256 == 0`; below that it takes ColumnMajor instead. The B here is
+  // preprocessed with interleave-256, so an N that is not a multiple of 256 hands an interleaved buffer to a kernel
+  // reading it as plain column-major -- deterministic garbage, and INDEPENDENT of the scale mode and the tile, which is
+  // exactly the signature that showed up: rowA, rowB and rowC produced bit-identical wrong output.
+  //
+  // The signature is worth remembering: output that does not change when you change the quant mode or the tile is not a
+  // scale bug. It is upstream of both.
+  if (K % 256 || N % 256) {
+    std::printf("need K%%256==0 AND N%%256==0: moe_grouped_ppu.cuh:352 picks the interleaved layout only then, and this\n"
+                "  harness preprocesses B with interleave-256 (got K=%d N=%d) -- regenerate the fixture with --ncols 256\n",
+                K, N);
+    return 64;
+  }
   std::printf("[q4k-packed] L=%d M=%d N=%d K=%d gs=%d nsb=%d groups/superblock=%d\n", L, M, N, K, gs, nsb, gpsb);
 
   // ---- THE PACKED PLANE, [L][nsb][N][16] bytes, through the kernel's own put_code -------------------------------
