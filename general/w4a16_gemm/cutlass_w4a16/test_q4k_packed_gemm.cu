@@ -104,6 +104,38 @@ int main(int argc, char** argv) {
         hZr[gi] = half_t(8.f * s - float(f.dmin[bi]) * float(int(f.mn[gi])));
       }
 
+  int const total = L * M;
+
+  // ---- HOST GOLDENS, so the kernel is compared against a model this file can defend --------------------------
+  // hAff must agree with the fixture's own golden; if it does not, the disagreement is in this file's understanding of
+  // the fixture and nothing about the kernel is implicated. hSco is the SAME data with the zero forced to 0, which is the
+  // only configuration the grouped int4 path has ever been validated in (bench_cutlass_w4a16's xcheck_grouped runs
+  // ScaleOnly with zeros=nullptr). Having both separates "affine is broken" from "my layout is wrong".
+  std::vector<float> hAff((size_t)total * N, 0.f), hSco((size_t)total * N, 0.f);
+  for (int e = 0; e < L; ++e)
+    for (int m = 0; m < M; ++m)
+      for (int k = 0; k < K; ++k) {
+        float const a = float(f.A[((size_t)e * M + m) * K + k]);
+        if (a == 0.f) continue;
+        size_t const grow = (size_t)e * scale_k * N + (size_t)(k / gs) * N;
+        for (int n = 0; n < N; ++n) {
+          float const q = float(f.q[(size_t)e * N * K + (size_t)n * K + k]);   // q is [N][K]
+          float const sv = float(hSc[grow + n]);
+          hAff[((size_t)e * M + m) * N + n] += a * (sv * q + float(hZr[grow + n]));
+          hSco[((size_t)e * M + m) * N + n] += a * (sv * q);
+        }
+      }
+  {
+    double mr = 0;
+    for (size_t i = 0; i < (size_t)total * N; ++i) {
+      double const g = double(float(f.gold[i]));
+      mr = std::max(mr, std::abs(hAff[i] - g) / (std::abs(g) + 1e-3));
+    }
+    std::printf("  host affine model vs the fixture's golden: max_rel=%.3e %s\n", mr,
+                mr < 5e-2 ? "ok" : "  <-- THIS FILE misreads the fixture; the kernel is not implicated");
+    if (mr >= 5e-2) return 3;
+  }
+
   // ---- B: nibbles then preprocess, exactly as the other real-weight harnesses --------------------------------
   std::vector<int8_t> Bbuf((size_t)L * K * N / 2);
   for (int e = 0; e < L; ++e) {
@@ -125,7 +157,6 @@ int main(int argc, char** argv) {
         QuantTypeClass::PACKED_INT4_WEIGHT_ONLY);
   }
 
-  int const total = L * M;
   cutlass::DeviceAllocation<half_t> dA((size_t)total * K), dD((size_t)total * N);
   cutlass::DeviceAllocation<int4_t> dB((size_t)L * K * N);
   cutlass::DeviceAllocation<uint8_t> dPlane(plane.size());
@@ -168,7 +199,7 @@ int main(int argc, char** argv) {
   //
   // The first version ran ONE row at 64,64,256,32,32,3 -- a tile no harness has ever validated -- so when it failed there
   // was no way to tell a bad tile from a bad channel. Both rows print their own verdict.
-  auto run_and_check = [&](char const* tag, auto&& launch) {
+  auto run_and_check = [&](char const* tag, float const* ref, auto&& launch) {
     CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)total * N));
     int const before = moe_grouped_ppu::moeg_fail_count();
     launch();
@@ -181,7 +212,7 @@ int main(int argc, char** argv) {
     dD.copy_to_host(hD.data());
     int bad = 0, nonfinite = 0; double mr = 0, gmax = 0;
     for (size_t i = 0; i < (size_t)total * N; ++i) {
-      double const g = double(float(f.gold[i])), d = double(float(hD[i]));
+      double const g = double(ref[i]), d = double(float(hD[i]));
       if (!std::isfinite(d)) { ++nonfinite; continue; }        // NaN compares false against everything; count it
       gmax = std::max(gmax, std::abs(g));
       double const rel = std::abs(d - g) / (std::abs(g) + 1e-3);
@@ -195,18 +226,28 @@ int main(int argc, char** argv) {
   };
 
   int fail = 0;
-  fail += run_and_check("row1 64x64:64 w32x32 s3", [&]{
-    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3>(
-        dA.get(), dB.get(), dSc.get(), dZr.get(), pdd.get(), sdd.get(), gmd.get(),
-        M, N, K, L, gs, shpd.get(), shp.data(), offd.get(), ws.get(), wsb, nullptr);
+  // rowA is bench_cutlass_w4a16::xcheck_grouped's configuration EXACTLY -- ScaleOnly, zeros=nullptr, offsets=nullptr,
+  // 64x64:128 w32x32 s3 -- the only single-plane int4 setup ever checked against an external golden. Compared against
+  // the host's scale-only model. If rowA fails, the fault is in A/B/scale layout and has nothing to do with the zero.
+  fail += run_and_check("rowA scale-only 64x64:128", hSco.data(), [&]{
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleOnly, 64, 64, 128, 32, 32, 3>(
+        dA.get(), dB.get(), dSc.get(), nullptr, pdd.get(), sdd.get(), gmd.get(),
+        M, N, K, L, gs, shpd.get(), shp.data(), nullptr, ws.get(), wsb, nullptr);
   });
-  fail += run_and_check("row2 16x128:256 w16x16 s2", [&]{
+  // rowB adds ONLY the zero channel. rowA ok + rowB bad isolates the affine path itself.
+  fail += run_and_check("rowB affine   64x64:128", hAff.data(), [&]{
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 128, 32, 32, 3>(
+        dA.get(), dB.get(), dSc.get(), dZr.get(), pdd.get(), sdd.get(), gmd.get(),
+        M, N, K, L, gs, shpd.get(), shp.data(), nullptr, ws.get(), wsb, nullptr);
+  });
+  // rowC is the only tile where Scale_TileK == 8, i.e. the one the packed channel runs in.
+  fail += run_and_check("rowC affine   16x128:256", hAff.data(), [&]{
     moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 16, 128, 256, 16, 16, 2>(
         dA.get(), dB.get(), scale_arg, dZr.get(), pdd.get(), sdd.get(), gmd.get(),
-        M, N, K, L, gs, shpd.get(), shp.data(), offd.get(), ws.get(), wsb, nullptr);
+        M, N, K, L, gs, shpd.get(), shp.data(), nullptr, ws.get(), wsb, nullptr);
   });
 
-  std::printf("== %s ==   (row1 is the validated TK=64 tile: it checks the harness, NOT the packed channel; row2 is\n"
-              "             where Scale_TileK == 8 and %s)\n", fail ? "FAIL" : "PASS", which);
+  std::printf("== %s ==   (rowA = the only validated single-plane int4 setup; rowB adds the zero channel; rowC is the\n"
+              "             Scale_TileK == 8 tile, and %s)\n", fail ? "FAIL" : "PASS", which);
   return fail ? 1 : 0;
 }
