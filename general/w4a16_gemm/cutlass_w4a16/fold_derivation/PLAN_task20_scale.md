@@ -814,3 +814,25 @@ this needs no tuple plumbing at all.
 Cost, stated because it is a real trade and the register route was rejected on exactly this basis: staging is
 TN * 16 * Stages bytes, which at Scale_TileK == 8 equals ONE scale tile, so the channel goes from two smem tiles to
 three. At TN=128/Stages=2 that is 4 KB against A's 49 KB and B's 12 KB.
+
+### F' REFUTES THE LATENCY HYPOTHESIS
+
+    decode band winner, SK_QUANT=2       baseline 20.12-20.36    F 24.17    F' 25.00 / 24.79
+
+Restoring async on the scale channel did not help, and the 4 KB of staging it costs made it marginally worse. So the
+exposed LDG in F was NOT the main term -- which was my hypothesis and it is now refuted.
+
+What both versions share is the decode itself, and the part I had not priced is the STORES: per CTA per k-tile the loader
+writes 64 columns x 8 groups x 2 planes = 1024 STS.16, where the fp16 path has cp.async write the same two tiles with
+ZERO instructions. Plus 512 decodes x ~11 instructions. Roughly 208 added warp-instructions per CTA per k-tile, ~426K
+over the kernel -- an order less than E's ~3M, consistent with F being much better than E, and still real.
+
+So the trade is not "ALU for LDS" as in E; it is "explicit stores plus decode ALU for a free cp.async". With LSU at 6%
+busy that is again the wrong direction, and the honest reading is that this optimisation does not pay in the decode band
+at gs=32. What it buys -- gmem halved, the zero tile gone, no offline pre-multiplication, bank conflicts gone -- only
+becomes visible where smem capacity or occupancy is the binding constraint.
+
+acu next, same config both sides, in this order: smem/block and measured blocks/CU (F' adds 4 KB per CTA and 4 blocks/CU
+means 16 KB, which could cross a threshold and alone explain 4-5 us), then tsm.st, then the instruction totals, then the
+stall mix. If occupancy is the cause, staging only needs ONE stage rather than Stages -- the decode runs immediately
+after the wait -- which is a small change worth trying.
