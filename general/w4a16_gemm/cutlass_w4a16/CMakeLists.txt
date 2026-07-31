@@ -270,6 +270,25 @@ set(_SPLITK_CFGS
   "16,32,64,16,16,4"     # the smem-for-occupancy trade that LOST: 19 blk/CU and 19% slower
   "32,64,64,32,32,4"
   "64,128,64,32,32,4"    # prefill-shaped, for contrast
+  # TILEK = 128, THE UNTESTED MIDDLE (TODO #22). The TK ladder had exactly two rungs and both are confounded: TK=256
+  # wins, TK=64 lost 19% but sits with WN*TK*bits = 16*64*4 = 4096 EXACTLY ON the swzl delivery bound, so that row
+  # measured "small TK" and "starved delivery" at once. TK=128 is 8192, twice the bound, so it separates them.
+  #
+  # WHAT IT IS FOR, stated before the numbers exist so the result can disagree. Little's Law on the measured band:
+  # 21 MB of necessary traffic in 20.11 us is 1.04 TB/s against a ~2.77 TB/s peak, i.e. 38%. In-flight bytes per CU
+  # are blocks/CU * Stages * bytes-per-stage = 2 * 57,344 = 114,688 of the 256 KB shared memory allows (45%), and only
+  # 73% of those bytes are useful because 15/16 of the A tile is padding at Mmax == 1. 45% * 73% = 33%, which is the
+  # 38% that was measured. So the model says: raise in-flight USEFUL bytes and the bandwidth follows.
+  # The catch, also recorded: 16,64,256 already doubles blocks/CU to 4 and did NOT win, so something serial (A re-read
+  # per n-tile, or the last-wave tail of TODO #10) absorbs it. If these rows also fail to move, the honest reading is
+  # that this kernel is not memory-latency-bound in this band and the whole occupancy line of attack is finished.
+  # smem/CTA: 16x128:128 s2 = 28,672 (9 blk/CU), s4 = 57,344; 16x64:128 s2 = 16,384 (16 blk/CU). Splitk is where these
+  # pay -- S=4 wants 8 blocks/CU, which TK=256's 57,344 B/CTA cannot supply and these can.
+  # NOTE these rows keep the fp16 scale path: at gs=32, TK=128 gives Scale_TileK = 4, so kPackedScaleOn is false.
+  "16,128,128,16,16,2"
+  "16,128,128,16,16,4"
+  "16,64,128,16,16,2"
+  "16,64,128,16,16,4"
 )
 if(SPLITK_CFGS)
   set(_SPLITK_CFGS ${SPLITK_CFGS})
