@@ -348,3 +348,34 @@ really expanded there, which is the check that would have caught the `GRP <= 2` 
 
 Box gate still owed: run `test_q3_bconcat_real` and `test_q65_bconcat_real` and require rungs 6/7 and the two
 ScaleOnly Q6 rungs to MATCH.
+
+**PHASE 3 DONE (offline), in a new file: `real_weight/dump_packed_scale.py`.** It imports `dump_real_weights` so the
+unpackers, the golden and `get_scale_min_k4` stay single-source; what is new is only the output form. Magic bumped to
+`RWMOEP\0\0`, header extended with `ktype`, `sb`, `z_mul`, `cvt_bias`. Planes: `sc`/`mn` int8 `[L][scale_k][N]`,
+`d`/`dmin` fp16 `[L][K/256][N]`. Scope Q4_K -- the format with a min, i.e. the hard case, and the one carrying the
+measured 18.8%.
+
+Four local gates, on real `blk.11.ffn_down.weight` out of qwen2.5-0.5b-instruct-q4_k_m.gguf:
+* (a) the vectorised (d,dmin,sc,mn) extraction vs `get_scale_min_k4`, 512 superblocks, **0 bad**
+* (b) `f16(f32(d)*f32(sc)) == f16(d)*f16(sc)`, 136192 groups, **0 bad** -- EQUAL, not 1 ulp, because sc <= 63 needs
+  6 bits and d is already fp16, so the product is exact in fp32 and both forms round the same real number once
+* (c) the weight against fp64 truth, in units of the QUANTISATION STEP
+* (d) `d*sc` plane == the reference scale plane element for element (catches a transposed or off-by-one-superblock
+  pairing, which a per-block check cannot see), **0 bad**
+
+**(c) corrected two of my own claims, so record the numbers, not the story.** First version compared the two ZEROs to
+each other and reported "max_ulp=196, catastrophic fp16 cancellation". Those were ulps *of the zero*, which is small --
+the wrong denominator. Second version normalised by |W| instead, which is also wrong: W passes through zero, so
+max_rel was dominated by weights that are essentially zero and the CANCELLING form scored best on it. In steps:
+
+    current pipeline, fp32-precomputed zero      max 0.0085 step   mean 0.00089
+    packed, Bias=0, zero = -dmin*mn              max 0.0148 step   mean 0.00223
+    packed, Bias=8, zero = 8*scale - dmin*mn     max 0.0128 step   mean 0.00194
+
+So: forming the zero on device costs +0.00135 step of mean error (the offline's fp32 zero rounds once, AFTER the
+cancellation, and is the most accurate of the three); the two on-device forms differ by 0.00029 step. **Accuracy does
+not choose between them.** `Bias=0` is chosen because it is one product instead of a product plus an fma, and needs no
+dependency on `scale` -- a cost argument, stated as one. Everything is 30x inside a quantisation step either way.
+
+Note what does NOT change: the B bytes, the packing, `preprocess_weights_for_mixed_gemm`. The stored 4-bit codes are
+already the unsigned nib, so `Bias=0` is purely the converter's immediate.
