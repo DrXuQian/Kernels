@@ -418,6 +418,18 @@ ppu_w4a16_executable(
 )
 target_compile_options(test_q3_concat_real PRIVATE -w)
 
+# NATIVE Q4_K SCALE/ZERO, LOADED AND DECODED ON THE DEVICE. Everything else on this path consumes fp16 planes that the
+# offline pre-multiplied; this loads the gguf's own form (6-bit sc/mn as int8, one fp16 d and dmin per 256 k) and runs
+# gguf_scale_decode.hpp on the hardware. The decode is the only new device arithmetic the packed scale channel needs, so
+# gating it in isolation means the collective change inherits a verified decode instead of debugging two things at once.
+#   fixture: python3 real_weight/dump_packed_scale.py <file.gguf> --tensor blk.11.ffn_down.weight --out real_weight/q4k_packed.bin
+#   Build: TARGET=test_q4k_native_scale ./build.sh ; run: ./<bin> real_weight/q4k_packed.bin
+ppu_w4a16_executable(
+  test_q4k_native_scale
+  test_q4k_native_scale.cu
+)
+target_compile_options(test_q4k_native_scale PRIVATE -w)
+
 # Q3_K B-CONCAT: ONE GEMM with TWO B bit planes (dedicated 2-plane mainloop), vs the native Q3_K golden.
 #   Build: TARGET=test_q3_bconcat_real ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
 ppu_w4a16_executable(
