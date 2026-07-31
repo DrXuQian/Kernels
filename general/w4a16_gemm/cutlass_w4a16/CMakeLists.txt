@@ -418,6 +418,16 @@ ppu_w4a16_executable(
 )
 target_compile_options(test_q3_concat_real PRIVATE -w)
 
+# END TO END with the gguf's OWN scale/zero form: the plane is built host-side with the kernel's own put_code, so the bit
+# map exists once, and the GEMM is compared against the fixture's golden. Build it BOTH ways -- with the macro the device
+# reads 16 B units, without it the same codes as fp16 planes -- and both must MATCH.
+#   PPU_DEFS=PPU_PACKED_SCALE=1 TARGET=test_q4k_packed_gemm ./build.sh ; run: ./<bin> real_weight/q4k_packed.bin
+ppu_w4a16_executable(
+  test_q4k_packed_gemm
+  test_q4k_packed_gemm.cu
+)
+target_compile_options(test_q4k_packed_gemm PRIVATE -w)
+
 # NATIVE Q4_K SCALE/ZERO, LOADED AND DECODED ON THE DEVICE. Everything else on this path consumes fp16 planes that the
 # offline pre-multiplied; this loads the gguf's own form (6-bit sc/mn as int8, one fp16 d and dmin per 256 k) and runs
 # gguf_scale_decode.hpp on the hardware. The decode is the only new device arithmetic the packed scale channel needs, so

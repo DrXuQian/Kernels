@@ -1,0 +1,184 @@
+// END TO END: real Q4_K weights whose scale/zero reach the device in the GGUF's OWN form. Plan #20 option E, step 4.
+//
+// Everything else on this path feeds the kernel two pre-multiplied fp16 planes. Here the device gets one 16 B unit per
+// (superblock, column) -- d, dmin and the 8+8 six-bit codes -- and the mainloop decodes it in registers. This is the
+// gate for the whole packed channel: if it matches the fixture's golden, then the offline layout, the cp.async, the smem
+// tile, the per-lane unit load and the register decode are all right together.
+//
+// THE PLANE IS BUILT HERE, IN C++, WITH THE KERNEL'S OWN put_code. Not in python: the bit map would then exist twice,
+// and every defect this work has hit came from one relation living in two places. dump_packed_scale.py stays as it is,
+// emitting sc/mn as int8 and d/dmin as fp16 (RWMOEP); this file only rearranges those into the unit the kernel reads.
+//
+// WHY TileK MUST BE 256 HERE: the packed path is applicable only when Scale_TileK == 8 (kPackedScaleOn), which at gs=32
+// means TileK == 256 -- one superblock per k-tile. At smaller Scale_TileK the unit still carries eight groups' codes
+// while the tile needs fewer, and l94 (4) measured that as a LOSS. A build with a different TileK silently keeps the
+// fp16 path, so this harness pins the one shape that exercises the new code.
+//
+//   fixture: python3 real_weight/dump_packed_scale.py <file.gguf> --tensor blk.11.ffn_down.weight --ncols 128 --m 16 \
+//                       --out real_weight/q4k_packed.bin
+//   build:   PPU_DEFS=PPU_PACKED_SCALE=1 TARGET=test_q4k_packed_gemm ./build.sh
+//   run:     $BIN real_weight/q4k_packed.bin
+//
+// Built WITHOUT the macro it must still MATCH -- the fp16 planes are then rebuilt on the host from the same codes, so a
+// failure there is the fixture or this file, not the packed channel. That A/B is the point: same data, same golden, two
+// paths through the kernel.
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include "cutlass/util/device_memory.h"
+#include "cutlass/util/packed_stride.hpp"
+#include "helper.h"
+#include "unfused_weight_dequantize.hpp"
+#include "moe_grouped_ppu.cuh"
+#include "cutlass/gguf_packed_scale.h"
+#include "rwmoep_loader.hpp"
+
+using cutlass::half_t;
+using int4_t  = cutlass::int4b_t;
+using QM      = moe_grouped_ppu::QuantMode;
+using DStride = moe_grouped_ppu::DStride;
+using GS      = moe_grouped_ppu::GroupShape;
+
+int main(int argc, char** argv) {
+  char const* path = argc > 1 ? argv[1] : "real_weight/q4k_packed.bin";
+  rwmoep::File f;
+  if (!f.load(path)) return 64;
+  if (f.mode != 1 || f.ktype != 4) { std::printf("expected a Q4_K scale+zero fixture\n"); return 64; }
+  int const L = f.L, M = f.M, N = f.N, K = f.K, gs = f.gs, sb = f.sb;
+  int const scale_k = f.scale_k(), nsb = f.nsb(), gpsb = sb / gs;      // groups per superblock, 8 for Q4_K
+  if (K % 256 || N % 64) { std::printf("need K%%256==0 and N%%64==0 for this gate (got K=%d N=%d)\n", K, N); return 64; }
+  std::printf("[q4k-packed] L=%d M=%d N=%d K=%d gs=%d nsb=%d groups/superblock=%d\n", L, M, N, K, gs, nsb, gpsb);
+
+  // ---- THE PACKED PLANE, [L][nsb][N][16] bytes, through the kernel's own put_code -------------------------------
+  std::vector<uint8_t> plane((size_t)L * nsb * N * cutlass::gguf_packed::kUnitBytes, 0);
+  for (int e = 0; e < L; ++e)
+    for (int b = 0; b < nsb; ++b)
+      for (int n = 0; n < N; ++n) {
+        uint8_t* unit = plane.data()
+                      + ((size_t)(e * nsb + b) * N + n) * cutlass::gguf_packed::kUnitBytes;
+        uint16_t const dbits  = f.d   [(size_t)e * nsb * N + (size_t)b * N + n].raw();
+        uint16_t const dmbits = f.dmin[(size_t)e * nsb * N + (size_t)b * N + n].raw();
+        std::memcpy(unit + 0, &dbits,  2);
+        std::memcpy(unit + 2, &dmbits, 2);
+        for (int g = 0; g < gpsb; ++g) {
+          size_t const gi = (size_t)e * scale_k * N + (size_t)(b * gpsb + g) * N + n;
+          cutlass::gguf_packed::put_code(unit, g, 0, int(f.sc[gi]));
+          cutlass::gguf_packed::put_code(unit, g, 1, int(f.mn[gi]));
+        }
+      }
+  // Read it straight back with the DECODE the mainloop uses, and require the fp16 planes it yields to equal what the
+  // host would have computed. A wrong offline arrangement then fails HERE, with a group index, instead of surfacing as a
+  // wrong GEMM result with nothing to point at.
+  {
+    int bad = 0;
+    for (int e = 0; e < L && bad < 5; ++e)
+      for (int b = 0; b < nsb && bad < 5; ++b)
+        for (int n = 0; n < N && bad < 5; ++n) {
+          uint8_t const* unit = plane.data() + ((size_t)(e * nsb + b) * N + n) * cutlass::gguf_packed::kUnitBytes;
+          for (int g = 0; g < gpsb; ++g) {
+            size_t const gi = (size_t)e * scale_k * N + (size_t)(b * gpsb + g) * N + n;
+            auto const got = cutlass::gguf_packed::group_of<0, true, 8>(unit, g);
+            float const ws = float(f.d[(size_t)e*nsb*N + (size_t)b*N + n]) * float(int(f.sc[gi]));
+            float const wz = 8.f * ws - float(f.dmin[(size_t)e*nsb*N + (size_t)b*N + n]) * float(int(f.mn[gi]));
+            if (float(got.scale) != float(half_t(ws)) || std::abs(float(got.zero) - wz) > 1e-2f * (std::abs(wz) + 1.f)) {
+              std::printf("  [plane] e=%d b=%d n=%d g=%d scale %.6g/%.6g zero %.6g/%.6g\n",
+                          e, b, n, g, float(got.scale), ws, float(got.zero), wz);
+              ++bad;
+            }
+          }
+        }
+    std::printf("  plane round trip through group_of<0,true,8>: %s\n", bad ? "MISMATCH" : "ok");
+    if (bad) return 3;
+  }
+
+  // ---- the fp16 planes, for the build WITHOUT the macro (same data, so the A/B is honest) -----------------------
+  std::vector<half_t> hSc((size_t)L * scale_k * N), hZr((size_t)L * scale_k * N);
+  for (int e = 0; e < L; ++e)
+    for (int g = 0; g < scale_k; ++g)
+      for (int n = 0; n < N; ++n) {
+        size_t const gi = (size_t)e * scale_k * N + (size_t)g * N + n;
+        size_t const bi = (size_t)e * nsb * N + (size_t)(g / gpsb) * N + n;
+        float const s = float(f.d[bi]) * float(int(f.sc[gi]));
+        hSc[gi] = half_t(s);
+        hZr[gi] = half_t(8.f * s - float(f.dmin[bi]) * float(int(f.mn[gi])));
+      }
+
+  // ---- B: nibbles then preprocess, exactly as the other real-weight harnesses --------------------------------
+  std::vector<int8_t> Bbuf((size_t)L * K * N / 2);
+  for (int e = 0; e < L; ++e) {
+    std::vector<int8_t> packed((size_t)K * N / 2);
+    // f.q is [N][K] (the writer transposes); the packer wants {K,N}, so transpose back while packing nibbles.
+    for (int k = 0; k < K; ++k)
+      for (int n = 0; n < N; n += 2) {
+        int8_t const lo = f.q[(size_t)e * N * K + (size_t)n * K + k] & 0xF;
+        int8_t const hi = f.q[(size_t)e * N * K + (size_t)(n + 1) * K + k] & 0xF;
+        packed[((size_t)k * N + n) / 2] = int8_t((hi << 4) | lo);
+      }
+    preprocess_weights_for_mixed_gemm<false, 256>(
+        (int8_t*)&Bbuf[(size_t)e * K * N / 2], packed.data(), {(size_t)K, (size_t)N},
+        QuantTypeClass::PACKED_INT4_WEIGHT_ONLY);
+  }
+
+  int const total = L * M;
+  cutlass::DeviceAllocation<half_t> dA((size_t)total * K), dD((size_t)total * N);
+  cutlass::DeviceAllocation<int4_t> dB((size_t)L * K * N);
+  cutlass::DeviceAllocation<uint8_t> dPlane(plane.size());
+  cutlass::DeviceAllocation<half_t> dSc((size_t)L * scale_k * N), dZr((size_t)L * scale_k * N);
+  dA.copy_from_host(f.A.data());
+  dB.copy_from_host(reinterpret_cast<int4_t const*>(Bbuf.data()));
+  dPlane.copy_from_host(plane.data());
+  dSc.copy_from_host(hSc.data());
+  dZr.copy_from_host(hZr.data());
+
+  std::vector<GS> shp(L); std::vector<half_t*> pd(L); std::vector<DStride> sd(L); std::vector<int> gm(L), offs(L);
+  auto out_stride = [&](int m) { return cutlass::make_cute_packed_stride(DStride{}, cute::make_shape(m, N, 1)); };
+  for (int e = 0; e < L; ++e) {
+    shp[e] = cute::make_shape(M, N, K); pd[e] = dD.get() + (size_t)e * M * N;
+    sd[e] = out_stride(M); gm[e] = M; offs[e] = e * M;
+  }
+  cutlass::DeviceAllocation<GS> shpd(L);        shpd.copy_from_host(shp.data());
+  cutlass::DeviceAllocation<half_t*> pdd(L);    pdd.copy_from_host(pd.data());
+  cutlass::DeviceAllocation<DStride> sdd(L);    sdd.copy_from_host(sd.data());
+  cutlass::DeviceAllocation<int> gmd(L);        gmd.copy_from_host(gm.data());
+  cutlass::DeviceAllocation<int> offd(L);       offd.copy_from_host(offs.data());
+  size_t const wsb = (size_t)cutlass::ceil_div(M,16) * cutlass::ceil_div(N,64) * (size_t)L * 64;
+  cutlass::DeviceAllocation<char> ws(wsb);
+  CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)total * N));
+
+  // WHICH POINTER GOES IN depends on the build, and it has to: with PPU_PACKED_SCALE the collective reinterprets ptr_S
+  // as the byte plane, and without it the same pointer is an fp16 plane. Passing the wrong one is not a subtle error --
+  // it reads 8x too little or too much -- so it is selected by the same macro the collective uses.
+#if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
+  half_t const* scale_arg = reinterpret_cast<half_t const*>(dPlane.get());
+  char const*   which     = "PACKED (gguf's own 16 B units)";
+#else
+  half_t const* scale_arg = dSc.get();
+  char const*   which     = "fp16 planes (reference path)";
+#endif
+  std::printf("  scale channel: %s | TileK=256 so Scale_TileK=%d\n", which, 256 / gs);
+
+  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3>(
+      dA.get(), dB.get(), scale_arg, dZr.get(), pdd.get(), sdd.get(), gmd.get(),
+      M, N, K, L, gs, shpd.get(), shp.data(), offd.get(), ws.get(), wsb, nullptr);
+  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+  if (moe_grouped_ppu::moeg_fail_count()) { std::printf("  REFUSED to launch -- nothing was computed\n"); return 2; }
+
+  std::vector<half_t> hD((size_t)total * N);
+  dD.copy_to_host(hD.data());
+  int bad = 0, nonfinite = 0; double mr = 0, gmax = 0;
+  for (size_t i = 0; i < (size_t)total * N; ++i) {
+    double const g = double(float(f.gold[i])), d = double(float(hD[i]));
+    if (!std::isfinite(d)) { ++nonfinite; continue; }          // NaN compares false against everything; count it
+    gmax = std::max(gmax, std::abs(g));
+    double const rel = std::abs(d - g) / (std::abs(g) + 1e-3);
+    if (rel > mr) mr = rel;
+    if (std::abs(d - g) > 2e-2 + 6e-2 * std::abs(g)) { if (bad < 6) std::printf("    i=%zu got=%.4f gold=%.4f\n", i, d, g); ++bad; }
+  }
+  std::printf("  vs the fixture's golden: bad=%d/%d max_rel=%.3e |gold|max=%.4g%s\n",
+              bad, total * N, mr, gmax, gmax == 0 ? "  <-- VACUOUS, the golden is all zero" : "");
+  if (nonfinite) std::printf("  NON-FINITE outputs: %d\n", nonfinite);
+  int const fail = bad + nonfinite + (gmax == 0 ? 1 : 0);
+  std::printf("== %s ==\n", fail ? "FAIL" : "PASS");
+  return fail ? 1 : 0;
+}
