@@ -478,3 +478,28 @@ So the whole job is on the READ path, and it is three things:
 The zero disappears as a CHANNEL (its gmem stream, its smem tile, its per-group read). What it does NOT do is fix the
 bank conflicts: the concentration comes from the THREAD stride being a multiple of the 128 B bank period, and an int8
 element leaves 256 B, still a multiple. `PPU_SCALE_PAD` is the knob for that and has never been timed.
+
+### HARDWARE-VERIFIED (ppu001): the native Q4_K scale/zero loads and decodes bit-exactly
+
+    [rwmoep] q4k_packed.bin: L=1 M=8 N=16 K=4864 gs=32 mode=1 ktype=4 sb=256 z_mul=0 cvt_bias=0
+    device decode vs host fp16 reference: 2432 groups | scale 0 bad (max_abs 0.000e+00) | zero 0 bad (max_abs 0.000e+00)
+    scale channel bytes: native 6080 vs fp16 9728 (1.60x smaller)     == PASS: 0 ==
+
+First time the gguf's own form reaches the device. The decode the mainloop will call is now verified on hardware, on real
+weights, in isolation -- so the collective change gates one thing, not two.
+
+**1.60x, not the 2.67x quoted from bytes_per_group_per_col().** That function counts the 12 raw scale bytes (1.5 B per
+group per column) and ignores d/dmin. The fixture stores sc/mn WIDENED TO int8, so it is 2 + 0.5 = 2.5 B against fp16's
+4.0. Truly packed 6-bit would be 1.5 + 0.5 = 2.0 B, i.e. 2.0x. The int8 form is a deliberate trade and the reason the
+collective change is small: two int8s occupy exactly one fp16 slot, so the scale tile's size, SmemLayoutScale, the
+gmem->smem copy, the fragment partitioning and Params are all unchanged while the Z channel disappears outright. The
+remaining 0.5 B needs a byte-granular tile -- the expensive route -- and Superblock<KType>::decode already supports that
+form (l93 gates it on raw blocks), so it stays available.
+
+Also fixed getting here: build.sh overlays only _overlay_dirs=(gemv_lowbit), so a compiled header under real_weight/ is
+absent at box build time while the local front-end check resolves it against the real tree and passes. Compiled headers
+live flat next to the harnesses.
+
+NEXT (the mainloop, in this order): (1) the scale tile carries 2 bytes of (sc,mn) -- no layout/copy/fragment/Params
+change; (2) d/dmin per k-tile in registers, Z smem tile removed; (3) the four transform arms call rwmoep/gguf_scale_
+decode instead of multiplies{}/plus{}.
