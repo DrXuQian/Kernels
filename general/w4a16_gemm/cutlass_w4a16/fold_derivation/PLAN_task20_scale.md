@@ -682,3 +682,34 @@ The element must stay `uint8_t` with a `(_1,_16)` value layout, which is what l9
 `copy(gmem_tiled_copy_scale, ...)` sites. With a byte element the tile's second mode is BYTES, not k, so the
 `scale_residue_k` / `scale_valid` arithmetic around `tScS(0,0,0)` has to be re-derived rather than inherited -- that is
 the one place where the fp16 path's logic does not carry over unchanged.
+
+### PHASE 1 IS VALIDATED ON HARDWARE (ppu001). Both gates green.
+
+    [q3-bconcat-real] real_q3k_concat.bin M=128 N=256 K=256 gs=16
+      1..5 (ScaleZero ladder)                       bad=0/32768   MATCH
+      6 (64,128,128) w64x64  ScaleOnly, bias in converter   bad=0/32768 max_rel=5.440e-02 MATCH
+      7 (64,128, 64) w64x64  ScaleOnly + F1=2 F2=4          bad=0/32768 max_rel=5.440e-02 MATCH
+      last rung (7) vs native Q3_K golden: bad=0/32768 MATCH
+    [q65-bconcat] Q6 two ScaleOnly bias 32 rows and Q5 one ScaleOnly bias 16 row: bad=0/32768 MATCH
+      => 0 failing configuration(s)
+
+So `kSymBias2Plane` (Q3 4, Q6 32, Q5 16), the `kCvtBias` mode rule, and the `detail::NoZero` slot that made 2-plane
+ScaleOnly reachable at all are all correct against an INDEPENDENT golden -- for Q3_K, the native one straight out of the
+gguf. The redundant zero channel is gone for the symmetric formats.
+
+### THE PACKED-SCALE SMEM GATE I WROTE WAS UNMEASURABLE, twice over
+
+`MOEG_SMEM=1 test_moe_grouped_verify` printed 61840 B with and without PPU_PACKED_SCALE. Neither number is wrong:
+
+1. that binary was a STEP 1 build, which is types-only and changes SharedStorage by design not at all; and
+2. more fundamentally, `test_moe_grouped_verify` runs `FinegrainedScaleOnly`, where `elements_per_smem_zero()` already
+   returns 0 -- **there is no zero tile to remove**, and the packed tile is exactly the same size as the fp16 scale tile
+   it replaces (16 B carries 8 groups = 2 B per group, which is one fp16 per group).
+
+So the smem saving is ENTIRELY the zero tile, and only a ScaleZero run can show it. The gate has to be
+`SK_QUANT=2` (ScaleZero) at `gs=32 / TileK=256`, where the delta is `TN*SK*2*Stages` = 128*8*2*2 = 4096 B.
+
+And a second thing that config exposed: at `gs=128 / TileK=128`, `Scale_TileK == 1` -- a k-tile needs ONE group while the
+packed unit carries eight, so packed costs 3072 B against fp16's 384 B. **Packed only pays when Scale_TileK is large**;
+gs=32/TileK=256 (8 groups per tile) is the sweet spot and gs=128/TileK=128 is the worst case. That belongs in the static
+gate next to the TileK==64 fallback: require `Scale_TileK * gs == TileK` AND `Scale_TileK >= 4`.
