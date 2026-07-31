@@ -753,3 +753,29 @@ that does not move when you change the quant mode or the tile is not a scale bug
 Reverse-engineering in python did rule out the relabelling explanations before the real cause was found: no combination of
 A as [M][K] or [K][M], q as [N][K] or [K][N], and the scale plane as [scale_k][N] or [N][scale_k], with or without the
 zero, reproduces the observed D[0,:4]. The harness now refuses N % 256 != 0 and prints why.
+
+### PACKED PERF, ROUND 2: the register decode bought 9.4 us and left +43%
+
+Same config, decode band L=64 top-k=8 N=K=2048 gs=32 SK_QUANT=2, macro verified on the compile command both times:
+
+    16x64:256 w16x16 s4 S=4    baseline 33.88    packed 57.83 (byte-pointer decode)    48.40 (register decode)
+    16x64:256 w16x16 s4 S=8    baseline 47.90    packed 78.05                          67.02
+    winner splitk=1            baseline 20.22    packed's best is a TK=64 row at 27.36
+    control 16x32:64 S=1       baseline 25.51    packed 27.36   (+1.85, the unconditional construction, not yet fixed)
+
+So byte-addressing the register array was real and worth 9.4 us on that row, and something else still costs +43%.
+
+**The next suspect, and it is not to be settled by reasoning:** `PackedLaneState` is passed BY REFERENCE through two or
+three calls. If it is not fully inlined and SROA'd, the struct itself lives in local memory and every `st.u[S][w]` is a
+local access again -- i.e. removing the byte pointer may only have moved the local traffic from the extraction to the
+state. acu answers that directly (local load/store counts, registers per thread, actual blocks/CU), so the same-config
+A/B against the profiler comes before any further edit.
+
+A timing-only ablation is in place as a cross-check: `PPU_PACKED_SCALE_NOP=1` makes the decode return constants and skips
+the unit read entirely, so the numbers are deliberately wrong and only the clock matters. Back to baseline means the cost
+is the state and the decode; still slow means it is the unconditional tensor construction, the byte-element g2s
+TiledCopy, or the larger Params, and looking at the decode again would be wasted.
+
+If it IS the state, the structural fix is to decode all Scale_TileK groups ONCE per k-tile into a fragment-shaped
+register array indexed by a compile-time group -- about 64 extra registers per lane on top of ~140, which is a real
+trade-off to price, not an obvious win.
