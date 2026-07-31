@@ -214,20 +214,12 @@ int main() {
   // A half is 4 sc + 4 mn as 6-bit fields = 48 bits = 6 bytes exactly, so nothing grows: still 16 B per (superblock,
   // column) = 2.0 B per group per column. Bit position as ONE Layout over (i, h, which), i = g%4, h = g/4,
   // which = 0 for sc and 1 for mn:  bit = 32 + 6*i + 48*h + 24*which.
-  using PackBits = Layout<Shape<_4,_2,_2>, Stride<_6,_48,_24>>;
-  constexpr int kPackBase = 32;                                   // d and dmin occupy the first 4 bytes
-  auto bit_of = [&](int g, int which) {
-    return kPackBase + int(PackBits{}(g % 4, g / 4, which));
-  };
-  auto put6 = [](uint8_t* p, int bit, int v) {
-    for (int b = 0; b < 6; ++b) if ((v >> b) & 1) p[(bit + b) >> 3] |= uint8_t(1u << ((bit + b) & 7));
-  };
-  auto get6 = [](uint8_t const* p, int bit) {
-    int v = 0;
-    for (int b = 0; b < 6; ++b) v |= ((p[(bit + b) >> 3] >> ((bit + b) & 7)) & 1) << b;
-    return v;
-  };
-  print("  (4) PackBits (i,h,which)->bit : "); print(PackBits{}); printf("  base=%d\n", kPackBase);
+  // THE SHIPPED functions, not local copies: gguf_scale_decode.hpp owns PackBits, packed_put and packed_code, so this
+  // gate covers the code the mainloop will call. A second implementation here would be the exact failure this file
+  // keeps recording -- one relation in two places.
+  using gguf_scale::PackBits; using gguf_scale::kPackBitBase;
+  auto bit_of = [](int g, int which) { return gguf_scale::packed_bit_of(g, which); };
+  print("  (4) PackBits (i,h,which)->bit : "); print(PackBits{}); printf("  base=%d\n", kPackBitBase);
   {
     // native block -> reference sc/mn (the l91-gated path) -> new 16 B -> decode -> must equal the reference
     int bad_rt = 0, span_bad = 0;
@@ -237,12 +229,12 @@ int main() {
       *reinterpret_cast<uint16_t*>(nw + 0) = dv[n].raw();
       *reinterpret_cast<uint16_t*>(nw + 2) = dmv[n].raw();
       for (int g = 0; g < kG; ++g) {
-        put6(nw, bit_of(g, 0), gguf_scale::scale_of<KType::Q4_K>(col, g));
-        put6(nw, bit_of(g, 1), gguf_scale::min_of  <KType::Q4_K>(col, g));
+        gguf_scale::packed_put(nw, g, 0, gguf_scale::scale_of<KType::Q4_K>(col, g));
+        gguf_scale::packed_put(nw, g, 1, gguf_scale::min_of  <KType::Q4_K>(col, g));
       }
       for (int g = 0; g < kG; ++g) {
-        if (get6(nw, bit_of(g, 0)) != gguf_scale::scale_of<KType::Q4_K>(col, g) ||
-            get6(nw, bit_of(g, 1)) != gguf_scale::min_of  <KType::Q4_K>(col, g)) {
+        if (gguf_scale::packed_code(nw, g, 0) != gguf_scale::scale_of<KType::Q4_K>(col, g) ||
+            gguf_scale::packed_code(nw, g, 1) != gguf_scale::min_of  <KType::Q4_K>(col, g)) {
           if (bad_rt < 4) std::printf("    [reorder] n=%d g=%d round trip differs\n", n, g);
           ++bad_rt;
         }
