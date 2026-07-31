@@ -379,3 +379,40 @@ dependency on `scale` -- a cost argument, stated as one. Everything is 30x insid
 
 Note what does NOT change: the B bytes, the packing, `preprocess_weights_for_mixed_gemm`. The stored 4-bit codes are
 already the unsigned nib, so `Bias=0` is purely the converter's immediate.
+
+### PHASE 0's C++ GATE IS NOW GREEN ON REAL DATA
+`l91` against `real_weight/scale_blocks_q4k.bin`: **4096 superblocks x 8 groups, 0 bad** against
+`get_scale_min_k4`, on top of the exhaustive GF(2) checks (96/128 unit vectors + zero + 20000 random per format) and
+the four known-answer decodes. The gate that was written in phase 0 and never run has now run.
+
+### PHASE 2 -- the decode unit is DONE and gated; the collective plumbing is NOT landed
+
+**Delivered (new files, fp16 path untouched):**
+* `gguf_scale_decode.hpp` -- native GGUF scale bytes -> the `(scale, zero)` an mma atom needs. `Superblock<KType>` is
+  the object that replaces eight strided fp16 reads with one contiguous read plus a register decode.
+* `Traits::kScaleBias` / `kSigned` added to `gguf_scale_layout.hpp`, and this is where a guess would have been wrong:
+  **Q3_K's scale is `d*(sc6 - 32)`**, not `d*sc6` (`unpack_q3k_expert`). Q4_K and Q2_K have no centre; Q6_K's scales are
+  signed int8. One constant per format, read off `dump_real_weights.py`, checked in l93 against those formulas.
+* ONE conversion rule for all four formats: `int_to_half_small(v)` puts `v+128` in the mantissa of `0x6400` and
+  subtracts 1152. The `+128` is what makes the SAME instruction pair cover Q6_K's signed codes -- no second path.
+* `fold_derivation/l93_scale_decode.cu`: (1) the conversion exact over its whole claimed range [-128, 895] and DIFFERENT
+  at 896, so the bound is real; (2) the four centres against the reference formulas + Q6_K's signed range; (3) 32768
+  real Q4_K groups -- field extraction 0 bad, and `(scale, zero)` **bit-identical** to the host's fp32-then-round.
+  The first version of (3) drove `d` with powers of two only, which made `max_rel` come out 0.000 because nothing ever
+  rounded -- a strong-looking number testing nothing. With non-dyadic `d` it is 3.87e-4 (fp16 eps) and the bit-identity
+  still holds; that identity is the claim, and it now actually enters the rounding path.
+* Traffic, off the object: Q4_K native **1.5 B/group/col vs 4.0 fp16 (2.67x)**; Q3_K 0.75 vs 2.0 (also 2.67x).
+
+**NOT landed: the collective.** What it takes, so the next attempt starts from the sites and not from scratch:
+`SmemLayoutScale`'s element (l353/359), the `ArrayEngine` members (l430/431), `GmemTiledCopyScale`'s and
+`SmemCopyAtomScale`'s Copy_Atom element (l159/163/172/494/499), `Params::ptr_S/ptr_Z` (l456), the three s2r sites
+(l1173 coarse, l1286 FINE, l1334 prefetch) and both transform branches (l1263-1300, l1301-1345, each with a coarse and
+a FINE arm). Plus new gmem plumbing for `d`/`dmin` all the way out through `moe_grouped_ppu.cuh` and the harnesses.
+That is ~10 sites in the collective and 3 driver layers, and none of it compiles locally beyond the nvcc front end --
+so it is a box-loop change, and landing it blind is how the pitch/gA faults happened.
+
+**One design option is already RULED OUT, which is worth more than a guess.** "Interleave (scale, zero) in N so one read
+gets both" does not work: `tCrS` is `make_fragment_like(partition_fragment_B(...))`, so each slot is bound to a specific
+`n` of the mma B operand. Interleaving in N makes a lane's 8 halfs into 4 scales and 4 zeros of DIFFERENT n. Any
+co-location has to be at `[group][n][2]` granularity (a 32-bit read yielding both for the same n) and then de-interleave
+in registers -- which is a different change from the packed-int8 one, not a cheaper version of it.

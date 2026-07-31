@@ -42,7 +42,9 @@ template <KType> struct Traits;
 //     h=1:  sc[g] = (q[g+4] & 0xF) | ((q[g-4] >> 6) << 4)      mn[g] = (q[g+4] >> 4) | ((q[g] >> 6) << 4)
 template <> struct Traits<KType::Q4_K> {
   static constexpr int  kScaleBits = 6, kMinBits = 6, kGroupSize = 32, kGroups = 8, kBlockBytes = 12;
-  static constexpr bool kHasMin = true;
+  static constexpr bool kHasMin = true, kSigned = false;
+  // THE CODE'S OWN CENTRE, per dump_real_weights.py: Q4_K is scale = d*sc6 with sc6 unsigned, so nothing to subtract.
+  static constexpr int  kScaleBias = 0;
   using GroupShape = cute::Shape<cute::_4, cute::_2>;                               // (t, h)
   using ScLo = Field<cute::Layout<GroupShape, cute::Stride<cute::_1, cute::_8>>, 0,  // byte t + 8h
                      cute::Layout<GroupShape, cute::Stride<cute::_0, cute::_0>>, 0, 4>;   // shift 0
@@ -64,7 +66,10 @@ template <> struct Traits<KType::Q5_K> : Traits<KType::Q4_K> {};                
 //     sc6[12+t] = ((s[4+t] >> 4) & 0xF) | (((s[8+t] >> 6) & 0x3) << 4)
 template <> struct Traits<KType::Q3_K> {
   static constexpr int  kScaleBits = 6, kMinBits = 0, kGroupSize = 16, kGroups = 16, kBlockBytes = 12;
-  static constexpr bool kHasMin = false;
+  static constexpr bool kHasMin = false, kSigned = false;
+  // Q3_K is scale = d*(sc6 - 32) (dump_real_weights.py:unpack_q3k_expert, `dl = d * (sc6[is_full] - 32)`). This is
+  // the ONE per-format constant that is not zero and not derivable from the width, so it is read off that file.
+  static constexpr int  kScaleBias = 32;
   using GroupShape = cute::Shape<cute::_4, cute::_2, cute::_2>;                     // (t, q0, q1)
   using ScLo = Field<cute::Layout<GroupShape, cute::Stride<cute::_1, cute::_4, cute::_0>>, 0,  // t + 4q0
                      cute::Layout<GroupShape, cute::Stride<cute::_0, cute::_0, cute::_4>>, 0, 4>;  // 4q1
@@ -77,7 +82,9 @@ template <> struct Traits<KType::Q3_K> {
 // Q2_K: 16 bytes, gs = 16.  byte = g, sc at shift 0 (4 bits), min at shift 4 (4 bits). One plane each.
 template <> struct Traits<KType::Q2_K> {
   static constexpr int  kScaleBits = 4, kMinBits = 4, kGroupSize = 16, kGroups = 16, kBlockBytes = 16;
-  static constexpr bool kHasMin = true;
+  static constexpr bool kHasMin = true, kSigned = false;
+  // Q2_K: dl = d*(sc & 0xF), ml = dmin*(sc >> 4), zero = -ml -- both codes unsigned.
+  static constexpr int  kScaleBias = 0;
   using GroupShape = cute::Shape<cute::_16>;
   using ScLo = Field<cute::Layout<GroupShape, cute::Stride<cute::_1>>, 0,
                      cute::Layout<GroupShape, cute::Stride<cute::_0>>, 0, 4>;
@@ -92,6 +99,8 @@ template <> struct Traits<KType::Q2_K> {
 template <> struct Traits<KType::Q6_K> {
   static constexpr int  kScaleBits = 8, kMinBits = 0, kGroupSize = 16, kGroups = 16, kBlockBytes = 16;
   static constexpr bool kHasMin = false, kSigned = true;
+  // Q6_K's scales are SIGNED int8 and scale_of() already sign-extends, so the centre is carried by the code itself.
+  static constexpr int  kScaleBias = 0;
   using GroupShape = cute::Shape<cute::_16>;
   using ScLo = Field<cute::Layout<GroupShape, cute::Stride<cute::_1>>, 0,
                      cute::Layout<GroupShape, cute::Stride<cute::_0>>, 0, 8>;
