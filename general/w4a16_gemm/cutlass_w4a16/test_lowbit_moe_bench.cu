@@ -77,8 +77,9 @@ int main(int argc, char** argv) {
                     : bd.mode == 1 ? "ragged-coarse(multiples of TM: masked path NEVER entered)"
                     : bd.mode == 3 ? "DECODE batch=1 (top-k experts x 1 row, rest empty)"
                                    : "skewed(arbitrary counts + zero-row experts)";
-  std::printf("[lowbit-moe] %s  hdr_rev=%d  MOE_TK=%d  L=%d rows/expert=%d mode=%s N=%d K=%d gs=%d\n",
-              PPU_CHUNK_STR, LOWBIT_MOE_BENCH_REV, MOE_TK, bd.L, bd.Rows, mname, bd.N, bd.K, bd.gs);
+  std::printf("[lowbit-moe] %s  hdr_rev=%d  MOE_TK=%d  quant=%s  L=%d rows/expert=%d mode=%s N=%d K=%d gs=%d\n",
+              PPU_CHUNK_STR, LOWBIT_MOE_BENCH_REV, MOE_TK, LOWBIT_QMODE_STR, bd.L, bd.Rows, mname,
+              bd.N, bd.K, bd.gs);
   std::printf("             total=%d Mmax=%d Mmin=%d zero-row experts=%d active=%d  PEAK=%.0f TFLOP/s\n",
               bd.total, bd.Mmax, mn, zeros, bd.active, PEAK / 1e12);
   std::printf("             MFU is on the REAL rows (2*total*N*K), so wasting rows cannot buy MFU.\n");

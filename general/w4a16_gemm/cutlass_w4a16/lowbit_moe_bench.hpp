@@ -26,6 +26,19 @@
 #include "moe_grouped_ppu.cuh"
 
 using half_t  = cutlass::half_t;
+// THE QUANT MODE, and it used to be hardcoded ScaleZero at BOTH launch sites -- so every low-bit number this harness
+// has ever produced, decode band included, was an affine run. That was invisible because the 2-plane driver ignored
+// QuantOp anyway (fixed: moe_grouped_ppu's NoZero slot), so asking for ScaleOnly changed nothing and nobody noticed.
+// Default is unchanged; LOWBIT_QMODE=1 selects ScaleOnly. The mode goes in the header line, because a row that cannot
+// be told apart from the other mode is how "(ScaleOnly)" ended up labelling affine runs for months.
+#if defined(LOWBIT_QMODE) && (LOWBIT_QMODE == 1)
+#  define LOWBIT_QMODE_SEL QM::FinegrainedScaleOnly
+#  define LOWBIT_QMODE_STR "ScaleOnly"
+#else
+#  define LOWBIT_QMODE_SEL QM::FinegrainedScaleZero
+#  define LOWBIT_QMODE_STR "ScaleZero"
+#endif
+
 using int4_t  = cutlass::int4b_t;
 using uint2_t = cutlass::uint2b_t;
 using uint1_t = cutlass::uint1b_t;
@@ -372,7 +385,7 @@ constexpr bool moe_ok() {
                               moe_abcast() ? " B" : "");                                                            \
     if (moe_row_selected(_t)) {                                                                                    \
       auto _go = [&]{                                                                                              \
-        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,LOELEM,HIELEM>(            \
+        moe_grouped_ppu::filter_and_run<LOWBIT_QMODE_SEL,TMv,TNv,TKv,WMv,WNv,Sv,LOELEM,HIELEM>(            \
             (BD).dA, _b1.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
             (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr, _b2.get(),                                \
@@ -417,7 +430,7 @@ constexpr bool moe_ok() {
         /* PlaneB2 is NAMED (void) on purpose: passing nullptr for B2 while letting PlaneB2 deduce makes the    \
            deduction fail on std::nullptr_t, and a failed deduction is NOT rescued by the default template       \
            argument -- the call simply stops matching. */                                                        \
-        moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero,TMv,TNv,TKv,WMv,WNv,Sv,ELEM,void>(                \
+        moe_grouped_ppu::filter_and_run<LOWBIT_QMODE_SEL,TMv,TNv,TKv,WMv,WNv,Sv,ELEM,void>(                \
             (BD).dA, _db.get(), (BD).dSc, (BD).dZr, (BD).pd, (BD).sd, (BD).gm,                                     \
             (BD).Mmax, (BD).N, (BD).K, (BD).L, (BD).gs, (BD).rdev, (BD).rsh.data(),                                \
             (BD).mode ? (BD).offdev : nullptr, (BD).ws, (BD).wsb, nullptr,                                          \
