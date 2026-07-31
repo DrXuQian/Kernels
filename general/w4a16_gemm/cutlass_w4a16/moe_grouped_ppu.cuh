@@ -108,8 +108,14 @@ void launch(const cutlass::half_t* A, const ElementB* B, const cutlass::half_t* 
   using LayoutB  = std::conditional_t<AiuInterleaved, cutlass::layout::ColumnMajorInterleaved<256>, cutlass::layout::ColumnMajor>;
   constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
   using ElementScale = cutlass::half_t;  using ElementZero = cutlass::half_t;
+  // THE 2-PLANE BRANCH USED TO IGNORE QuantOp. It built the 4-tuple unconditionally, so
+  // QuantMode::FinegrainedScaleOnly on a 2-plane format silently ran as ScaleZero -- for as long as the path has
+  // existed, including every bench row labelled "(ScaleOnly)". The second plane is deduced positionally at index 3 and
+  // cute::tuple cannot hold `void`, so "no zero" is said with detail::NoZero in slot 2 (see that type's comment).
   using ElementBInfo = std::conditional_t<!std::is_void_v<PlaneB2>,
-      cute::tuple<ElementB, ElementScale, ElementZero, PlaneB2>,
+      std::conditional_t<has_zero(QuantOp),
+          cute::tuple<ElementB, ElementScale, ElementZero, PlaneB2>,
+          cute::tuple<ElementB, ElementScale, cutlass::gemm::collective::detail::NoZero, PlaneB2>>,
       std::conditional_t<has_zero(QuantOp),
           cute::tuple<ElementB, ElementScale, ElementZero>, cute::tuple<ElementB, ElementScale>>>;
   using ElementC = cutlass::half_t;  using LayoutC = cutlass::layout::RowMajor;
