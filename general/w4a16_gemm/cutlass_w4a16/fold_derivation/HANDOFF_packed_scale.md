@@ -132,8 +132,34 @@ SPLITK_CFG="16x128:256 w16x16 s2" SPLITK_S=1 SPLITK_ACU=1 $EX/test_moe_splitk_be
 #   step 2 -- same env under acu, both builds
 SPLITK_CFG="16x128:256 w16x16 s2" SPLITK_S=1 SPLITK_ACU=1 acu -o X.report --set full -f $EX/test_moe_splitk_bench 64 8 2048 2048 32 3
 # THE FINGERPRINT IS grid x block, not the tag: this row is (8,16,1)x(256,1,1) -- grid.y = N/TN = 16, 8 warps,
-# grid.z = slices = 1. A capture showing (8,32,4)x(128,1,1) is TN=64 at S=4, a different kernel; its vmem.st is
-# 300x the baseline's because S=4 writes partials, which has nothing to do with the scale channel.
+# grid.z = slices = 1. A capture showing (8,32,4)x(128,1,1) is TN=64 at S=4: 1024 CTAs instead of 128 and 4 slices
+# instead of 1, so EVERY per-CTA and per-store count in it is 8x-32x the baseline's for reasons that have nothing
+# to do with the scale channel.
+```
+
+**Expected values for the pinned row, both sides.** These are what make a pinned capture readable, and each equality
+was checked against the baseline capture before being written here -- they are a criterion, not a model:
+
+| quantity | value | derivation |
+|---|---|---|
+| grid x block | `(8,16,1)x(256,1,1)` | 8 active experts (batch 1, top-k 8) x N/TN = 16 x slices = 1; 8 warps |
+| `v.mma.f32.f16.m16n16k16` | **131,072** | 128 CTA x 8 warps x K/16 = 128 mma per warp |
+| `vmem.st` | **512** | 16,384 halfs / 32 halfs per warp store |
+| bytes written | **32,768** | total(8) x N(2048) x 2 -- REAL rows only; padded rows are not written |
+| per-thread register demand | identical | depends only on (WM,WN,TK) = (16,16,256): accum 8, A frag 128, B frag 128 |
+
+That last row is the one quantity that IS comparable across the two mismatched captures, and it says the `Regs 116`
+vs `102` difference is attributable to the build rather than the shape.
+
+**A retracted reading of the mismatched pair.** Its `vmem.ld = 135,168` against a blank baseline column looked like
+register spill. It is not attributable: local-memory traffic and the grouped GEMM's own per-CTA expert metadata (a
+cumsum scan over L=64 plus ptr/stride) both scale with CTA count, and 135,168/1024 = 132 loads per CTA is the size of
+that scan. `u[]` in `packed_decode_stage` was audited for the actual spill mechanism -- a runtime index into a
+register array -- and every index in `code_from_words`/`group_of_words` is compile-time (`w = Bit >> 5` constexpr,
+`u[0]` literal, `u[w+1]` constexpr), so that array does not spill. Two different kernels cannot answer this; only the
+pinned pair can.
+
+```bash
 
 # local gates (no box)
 A=../../../../third_party/actlize/include
