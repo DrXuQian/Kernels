@@ -874,11 +874,21 @@ concurrency -- 8x the warps bought no bandwidth at all. So the kernel is neither
 memory-latency-bound, and Little's Law was right about the headroom and wrong about the lever. Three independent
 ladders now say so: TN (32/64/128), TK (64/128/256), S (1/2/4/8).
 
-## What it actually is: the converter, at 14.5 instructions per mma
+## What it actually is: the dequant pipeline, at 14.5 instructions per mma
 
 From the pinned base acu, `v.lop3.i 546,816 + v.bfi.i 270,336 + v.fma.f16 745,472 + v.add.f16 335,872 = 1,898,496`
-against `v.mma.f32.f16.m16n16k16 = 131,072`. That is **14.5 int4->fp16 converter instructions per mma instruction, and
-43% of the whole kernel**. It also lands on the closed form already in fold_derivation/README.md:
+against `v.mma.f32.f16.m16n16k16 = 131,072`. That is **14.5 instructions per mma instruction, and 43% of the whole
+kernel**.
+
+CALL IT THE DEQUANT PIPELINE, NOT THE CONVERTER, because I first wrote the latter and it does not survive its own
+arithmetic. `v.fma.f16` is shared: per warp per k-tile there are `8*(WN/16)*(TK/16)` = 128 B elements = 64 half2, and
+each half2 takes ONE fma for the converter's magic correction and ONE for the scale/zero application. So the 745,472 is
+split roughly half and half (the per-element model predicts 1,048,576, i.e. it overcounts 1.4x, so "roughly" is the
+strongest word available). The consequence is a size, not a quibble: **TODO #18 attacks only the scale-application
+half of the fma, so it reaches at most about a quarter of the 43%** -- call it ~10% of instructions -- while `WM`
+attacks the element COUNT and therefore both halves plus the lop3 and bfi.
+
+It lands on the closed form already in fold_derivation/README.md:
 `cvt elems per mma = 128/WM` -- WN and TK cancel EXACTLY, only WM survives. At WM=16 that is 8 elements per mma at ~2
 instructions each.
 
