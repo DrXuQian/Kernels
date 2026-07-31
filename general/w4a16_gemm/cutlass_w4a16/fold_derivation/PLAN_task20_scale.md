@@ -713,3 +713,43 @@ And a second thing that config exposed: at `gs=128 / TileK=128`, `Scale_TileK ==
 packed unit carries eight, so packed costs 3072 B against fp16's 384 B. **Packed only pays when Scale_TileK is large**;
 gs=32/TileK=256 (8 groups per tile) is the sweet spot and gs=128/TileK=128 is the worst case. That belongs in the static
 gate next to the TileK==64 fallback: require `Scale_TileK * gs == TileK` AND `Scale_TileK >= 4`.
+
+## THE PACKED CHANNEL RUNS END TO END ON ppu001, ON REAL Q4_K WEIGHTS
+
+    PPU_DEFS verified on test_q4k_packed_gemm's compile command: -DPPU_PACKED_SCALE=1
+    plane round trip through group_of<0,true,8>: ok
+    host affine model vs the fixture's golden: max_rel=4.789e-04 ok
+    row2 reads the gguf's own 16 B units
+    rowA scale-only 64x64:128    bad=0/4096 max_rel=1.211e-01 MATCH
+    rowB affine   64x64:128      bad=0/4096 max_rel=3.476e-01 MATCH
+    rowC affine   16x128:256     bad=0/4096 max_rel=1.457e+00 MATCH        <-- the packed row
+    == PASS ==
+
+The device now receives the gguf's OWN scale form -- one 16 B unit per (superblock, column) holding d, dmin and the 8+8
+six-bit codes -- and decodes it in registers. rowA and rowB are a built-in CONTROL: their Scale_TileK is 4, so
+kPackedScaleOn is false and they stay on the fp16 path even in the packed build. They still MATCH, so the macro is not
+leaking into units it should not touch.
+
+**A second result, independent of this work:** rowB is the first check of the single-plane int4 AFFINE path against an
+external golden on hardware. Everything validated before it was ScaleOnly (`bench_cutlass_w4a16::xcheck_grouped` passes
+zeros=nullptr), and the plan file recorded test_moe_grouped_real's Q4_K fixture as box-pending. The affine path is correct.
+
+**Not yet explained:** rowC's max_rel is 1.457 against rowB's 0.348 on the same math. bad=0 because the tolerance has an
+absolute floor and the large ratios sit on near-zero goldens, but the 4x wants attributing: either the tile's different
+fp16 accumulation order, or the extra rounding the packed path takes by forming the zero on device (measured offline at
+0.0128 step versus 0.0085 for the offline-precomputed zero). The reference build's rowC number settles it in one read.
+
+### THE BUG THAT COST THREE ROUNDS, and the signature that should have caught it in one
+
+`moe_grouped_ppu.cuh:352` selects the interleaved B layout with `n % 256 == 0 && k % 256 == 0`. The fixture was N=128, so
+the driver took plain ColumnMajor while the harness had preprocessed B with interleave-256: an interleaved buffer read as
+if it were not one.
+
+The signature was there from the first run and I did not read it: the output was **invariant under the quant mode AND the
+tile** -- rowA (ScaleOnly, zeros=nullptr), rowB (affine) and rowC (a completely different tile) were bit-identical. Output
+that does not move when you change the quant mode or the tile is not a scale bug; it is upstream of both. Instead I read
+"1991/2048 bad" as numerics and spent three rounds on the scale channel, the zero channel and B's nibble packing.
+
+Reverse-engineering in python did rule out the relabelling explanations before the real cause was found: no combination of
+A as [M][K] or [K][M], q as [N][K] or [K][N], and the scale plane as [scale_k][N] or [N][scale_k], with or without the
+zero, reproduces the observed D[0,:4]. The harness now refuses N % 256 != 0 and prints why.
