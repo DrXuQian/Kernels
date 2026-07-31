@@ -53,7 +53,7 @@ template <> struct MMA_Traits<F16Atom> {
 }
 // the decode-band config: TileShape (16,128,256), warp 16x16, gs=32 -> Scale_TileK = 8 = ONE Q4_K superblock per k-tile
 static constexpr int kTN_ = 128, kSK_ = 8, kWON = 8;
-using Mma             = TiledMMA<MMA_Atom<F16Atom>, Layout<Shape<_1,Int<kWON>,_1>>, Tile<_16,Int<kWON*16>,Int<256>>>;
+using Mma             = TiledMMA<MMA_Atom<F16Atom>, Layout<Shape<_1,Int<kWON>,_1>>, Tile<_16,Int<kWON*16>,_64>>;
 using SmemLayoutScale = decltype(tile_to_shape(Layout<Shape<_8,_1>>{},
                                                make_shape(Int<kTN_>{}, Int<kSK_>{}, Int<2>{})));
 using SmemCopyAtomS   = Copy_Atom<DefaultCopy, half_t>;
@@ -270,6 +270,41 @@ int main() {
                 double(bytes) / groups_per_tile,
                 double(bytes) / groups_per_tile > 4.0 ? "   <-- WORSE than fp16, gate this TileK off" : "");
   }
+
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // (5) THE OTHER FORMATS. 16 B is a COINCIDENCE of Q4_K's header (d+dmin+12 = 16); it does not carry. Everything below
+  // is computed from Traits<T>, so a format's numbers cannot be inherited from Q4_K by accident.
+  auto format_row = [](char const* name, int G, int sbits, int mbits, bool has_min, int gs_) {
+    double const code_bytes = double(G) * double(sbits + mbits) / 8.0;      // all groups' codes, one column
+    double const hdr        = 2.0 + (has_min ? 2.0 : 0.0);                  // d, and dmin where there is one
+    double const total      = code_bytes + hdr;
+    double const per_group  = total / double(G);
+    double const fp16       = has_min ? 4.0 : 2.0;                          // today: scale (+ zero) as fp16 per group
+    bool   const fits16     = total <= 16.0;
+    // a TileK=128 tile covers 128/gs groups; is that many codes a whole number of bytes?
+    int const gpt = 128 / gs_;
+    double const half_bytes = double(gpt) * double(sbits + mbits) / 8.0;
+    bool const half_whole   = (double(int(half_bytes)) == half_bytes);
+    std::printf("      %-5s G=%2d %d+%d bit  codes %5.1f B + hdr %.0f = %5.1f B/superblock/col -> %.3f B/(group,col)"
+                "  vs fp16 %.1f = %.2fx | %s | TileK=128 half %5.1f B %s\n",
+                name, G, sbits, mbits, code_bytes, hdr, total, per_group, fp16, fp16 / per_group,
+                fits16 ? "fits one 16 B read" : "does NOT fit 16 B -> split d out, keep codes aligned",
+                half_bytes, half_whole ? "(whole bytes)" : "(NOT whole bytes -- needs its own arrangement)");
+  };
+  std::printf("  (5) per-format, from Traits:\n");
+  format_row("Q4_K", gguf_scale::Traits<KType::Q4_K>::kGroups, gguf_scale::Traits<KType::Q4_K>::kScaleBits,
+             gguf_scale::Traits<KType::Q4_K>::kMinBits, gguf_scale::Traits<KType::Q4_K>::kHasMin,
+             gguf_scale::Traits<KType::Q4_K>::kGroupSize);
+  format_row("Q3_K", gguf_scale::Traits<KType::Q3_K>::kGroups, gguf_scale::Traits<KType::Q3_K>::kScaleBits,
+             gguf_scale::Traits<KType::Q3_K>::kMinBits, gguf_scale::Traits<KType::Q3_K>::kHasMin,
+             gguf_scale::Traits<KType::Q3_K>::kGroupSize);
+  format_row("Q2_K", gguf_scale::Traits<KType::Q2_K>::kGroups, gguf_scale::Traits<KType::Q2_K>::kScaleBits,
+             gguf_scale::Traits<KType::Q2_K>::kMinBits, gguf_scale::Traits<KType::Q2_K>::kHasMin,
+             gguf_scale::Traits<KType::Q2_K>::kGroupSize);
+  format_row("Q6_K", gguf_scale::Traits<KType::Q6_K>::kGroups, gguf_scale::Traits<KType::Q6_K>::kScaleBits,
+             gguf_scale::Traits<KType::Q6_K>::kMinBits, gguf_scale::Traits<KType::Q6_K>::kHasMin,
+             gguf_scale::Traits<KType::Q6_K>::kGroupSize);
 
   int const fail = bad_code + bad_s + bad_z + (nz == 0 ? 1 : 0) + g_fail_extra;
   std::printf("== %s: %d ==\n", fail ? "FAIL" : "PASS", fail);

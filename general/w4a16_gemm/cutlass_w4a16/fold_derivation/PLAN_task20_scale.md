@@ -604,3 +604,30 @@ naturally aligned.
 
 **TileK=64 must be statically gated back to the fp16 path.** The decode band's winners are TileK=256 (16x128:256 and
 16x64:256, where the second number is TN), so they land in the best row; the MoE/prefill sweeps with TileK=64 fall back.
+
+### l95: THE STUB IS THE COLLECTIVE'S OBJECT -- and checking it caught a wrong tile
+
+`fold_derivation/l95_stub_vs_real.cu` asserts TYPE IDENTITY rather than comparing maps: if `SmemLayoutScale`,
+`SmemCopyAtomScale` and the mma's `layoutB_TV` / `ThrLayoutVMNK` are the same types, every derived quantity -- including
+the lane->n map l94 computes -- is identical by construction. Nothing is called and nothing is printed: every cute entry
+point instantiates a device path that references namespace-scope constants nvcc cannot see under `-D__HGGCCC__`, while
+`static_assert(is_same_v<decltype(...)>)` is an unevaluated context. **Compiling clean IS the pass condition.**
+
+It immediately caught a real error in l94: I had written the permutation tile as `Tile<_16, 128, 256>`, taking K from
+TileK. The collective's is `Tile<C<16>, C<128>, C<64>>` -- **K is 64, not 256**, and the compiler printed both types side
+by side. Fixed in both probes. The bank rows happen to be unchanged (warp 0 still touches 8 consecutive columns, still
+1-way on 32 banks), but they were previously resting on the wrong object.
+
+`TiledShape_MNK` is not a member of this cute's TiledMMA -- `layoutB_TV` identity covers it.
+
+### l94 (5): the per-format table, computed from Traits and NOT inherited from Q4_K
+
+    Q4_K  G= 8 6+6 bit  12.0 B codes + 4 hdr = 16.0 B/superblock/col -> 2.000 B/(group,col)  vs fp16 4.0 = 2.00x
+    Q3_K  G=16 6+0 bit  12.0 B codes + 2 hdr = 14.0 B                -> 0.875               vs fp16 2.0 = 2.29x
+    Q2_K  G=16 4+4 bit  16.0 B codes + 4 hdr = 20.0 B                -> 1.250               vs fp16 4.0 = 3.20x
+    Q6_K  G=16 8+0 bit  16.0 B codes + 2 hdr = 18.0 B                -> 1.125               vs fp16 2.0 = 1.78x
+    TileK=128 halves: 6.0 / 6.0 / 8.0 / 8.0 B -- WHOLE BYTES for all four, so separability holds everywhere
+
+Q4_K and Q3_K fit one 16 B read (Q3_K with 2 B slack). Q2_K and Q6_K do NOT -- their codes alone are already 16 B, so
+`d`/`dmin` must be a separate small plane, keeping the code read 16 B aligned. **Q2_K has the largest saving (3.20x), not
+Q4_K**: 4+4 bit codes still carry two fp16 today. Q6_K has the smallest (1.78x).
