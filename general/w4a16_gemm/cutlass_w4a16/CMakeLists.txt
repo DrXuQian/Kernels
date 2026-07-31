@@ -488,6 +488,16 @@ ppu_w4a16_executable(
 )
 target_compile_options(test_q4k_native_scale PRIVATE -w)
 
+# DO THE TWO f16x2 ASM OPS EQUAL THE SCALAR OPS THEY REPLACE? The one question the host gate structurally cannot ask,
+# because it compiles under nvcc where CUTLASS_GGUF_PACKED_F16X2_ASM selects the fallback. No GEMM, no shared memory,
+# no mma -- so a failure here cannot be confused with tile plumbing.
+#   Build: TARGET=test_ppu_f16x2_probe ./build.sh ; run: ./<bin> [real_weight/q4k_packed.bin]
+ppu_w4a16_executable(
+  test_ppu_f16x2_probe
+  test_ppu_f16x2_probe.cu
+)
+target_compile_options(test_ppu_f16x2_probe PRIVATE -w)
+
 # Q3_K B-CONCAT: ONE GEMM with TWO B bit planes (dedicated 2-plane mainloop), vs the native Q3_K golden.
 #   Build: TARGET=test_q3_bconcat_real ./build.sh ; run: ./<bin> real_weight/real_q3k_concat.bin
 ppu_w4a16_executable(
