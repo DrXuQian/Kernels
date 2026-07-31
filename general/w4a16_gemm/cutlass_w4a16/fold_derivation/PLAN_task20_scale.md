@@ -631,3 +631,25 @@ by side. Fixed in both probes. The bank rows happen to be unchanged (warp 0 stil
 Q4_K and Q3_K fit one 16 B read (Q3_K with 2 B slack). Q2_K and Q6_K do NOT -- their codes alone are already 16 B, so
 `d`/`dmin` must be a separate small plane, keeping the code read 16 B aligned. **Q2_K has the largest saving (3.20x), not
 Q4_K**: 4+4 bit codes still carry two fp16 today. Q6_K has the smallest (1.78x).
+
+### l94 (6): THE GMEM SIDE IS NOT THE HARD PART AFTER ALL
+
+I called the gmem reshape the one high-risk site. Measured, it is the easiest. Today's scale g2s is
+`make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, half_t>, Layout<(TN/8, SK)>, Layout<(_8,_1)>)` --
+128 threads x 8 halfs = 16 B each, covering TN*SK*2 = **2048 B**. The native tile is TN columns x 16 B = **also 2048 B**,
+because the Z tile disappears. So the copy stays one uint128 per thread and only the shape changes:
+
+    Layout<(TN, _1)> threads, Layout<(_1, _16)> values, element uint8_t   ->  thread t reads bytes [16t, 16t+16)
+
+    (6) gmem g2s, native shape: 128 threads x 16 B = 2048 B (today's S tile is 2048 B)
+        contiguity 0 bad | 16 B alignment 0 bad | coalescing (t -> 16t) 0 bad | gaps 0 | overlaps 0
+
+That is 16 B aligned per thread AND consecutive threads on consecutive chunks -- one fully coalesced 2048 B burst, where
+today's map is strided (thread t covers N-offset 8*(t%16), K-offset t/16). The atom in the probe is DefaultCopy because
+what is checked is make_tiled_copy's algebra, which does not depend on the instruction; what the uint128 atom requires is
+16 B per thread, which the value layout gives.
+
+**So all three pre-collective unknowns are now closed, locally:** the stub is the collective's object (l95, and it caught
+a wrong tile), the per-format numbers come from Traits (l94 (5)), and the gmem reshape is a shape change with the same
+byte count and better coalescing (l94 (6)). What remains is wiring, and the largest single edit is now the fragment
+scatter -- value -> n, which is the map l94 already computes from partition_S(identity).

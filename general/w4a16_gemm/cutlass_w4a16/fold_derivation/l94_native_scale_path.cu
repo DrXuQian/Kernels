@@ -306,6 +306,54 @@ int main() {
              gguf_scale::Traits<KType::Q6_K>::kMinBits, gguf_scale::Traits<KType::Q6_K>::kHasMin,
              gguf_scale::Traits<KType::Q6_K>::kGroupSize);
 
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // (6) THE GMEM SIDE, the one piece I called high risk. Today's scale g2s is
+  //     make_tiled_copy(Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, half_t>, Layout<(TN/8, SK)>, Layout<(_8,_1)>)
+  // i.e. 128 threads x 8 halfs = 16 B each, covering TN*SK*2 = 2048 B.
+  //
+  // The native tile is TN columns x 16 B = 2048 B -- THE SAME BYTE COUNT, because the Z tile disappears (2.0 vs 4.0 B
+  // per (group,col)). So the copy stays one uint128 per thread and only the shape changes: one thread per COLUMN.
+  //     Layout<(TN, _1)> threads, Layout<(_1, _16)> values, element uint8_t
+  // Then thread t reads bytes [16t, 16t+16) -- 16 B aligned, and consecutive threads read consecutive chunks, i.e. one
+  // fully coalesced 2048 B burst. Today's map is strided instead (thread t covers N-offset 8*(t%16), K-offset t/16).
+  //
+  // The atom here is DefaultCopy, not the PPU cp.async: the check is make_tiled_copy's ALGEBRA -- who reads which bytes
+  // -- which does not depend on the instruction. What the uint128 atom requires is 16 bytes per thread, and that is
+  // exactly what the value layout gives.
+  {
+    auto gtc  = make_tiled_copy(Copy_Atom<DefaultCopy, uint8_t>{},
+                                Layout<Shape<Int<kTN>, _1>>{},
+                                Layout<Shape<_1, Int<kBB16>>>{});
+    auto cN   = make_identity_tensor(make_shape(Int<kTN>{}, Int<kBB16>{}));
+    int  cover[128 * 16] = {};
+    int  bad_align = 0, bad_contig = 0, bad_coal = 0;
+    int const nthr = int(size(gtc));
+    for (int t = 0; t < nthr; ++t) {
+      auto sl = gtc.get_thread_slice(t).partition_S(cN);
+      int first = -1, prev = -2, cnt = 0;
+      for (int i = 0; i < int(size(sl)); ++i) {
+        auto c   = sl(i);
+        int  off = int(get<0>(c)) * kBB16 + int(get<1>(c));
+        if (off < 0 || off >= kTN * kBB16) { ++bad_contig; continue; }
+        ++cover[off];
+        if (first < 0) first = off;
+        if (prev >= 0 && off != prev + 1) ++bad_contig;      // a thread's bytes must be one contiguous run
+        prev = off; ++cnt;
+      }
+      if (cnt != kBB16) ++bad_contig;                        // exactly 16 B per thread (what uint128 needs)
+      if (first % kBB16 != 0) ++bad_align;                   // 16 B aligned
+      if (first != t * kBB16) ++bad_coal;                    // consecutive threads -> consecutive chunks
+    }
+    int gaps = 0, dups = 0;
+    for (int i = 0; i < kTN * kBB16; ++i) { if (cover[i] == 0) ++gaps; if (cover[i] > 1) ++dups; }
+    std::printf("  (6) gmem g2s, native shape: %d threads x %d B = %d B (today's S tile is %d B)\n",
+                nthr, kBB16, nthr * kBB16, kTN * kSK * 2);
+    std::printf("      contiguity %d bad | 16 B alignment %d bad | coalescing (t -> 16t) %d bad | gaps %d | overlaps %d\n",
+                bad_contig, bad_align, bad_coal, gaps, dups);
+    g_fail_extra += bad_contig + bad_align + bad_coal + gaps + dups;
+  }
+
   int const fail = bad_code + bad_s + bad_z + (nz == 0 ? 1 : 0) + g_fail_extra;
   std::printf("== %s: %d ==\n", fail ? "FAIL" : "PASS", fail);
   return fail ? 1 : 0;
