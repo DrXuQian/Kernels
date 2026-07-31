@@ -539,3 +539,36 @@ want until you ask what the hardware actually does with it.
 
 Caveat: the lane->n map comes from l21's stub mma, i.e. the reconstruction the fold derivation was built on and the box
 later validated -- not from the CollectiveOp itself.
+
+### THE ARRANGEMENT IS DECIDED BY MEASUREMENT: 16 B per (superblock, column), all-in-one
+
+Offline reordering is allowed -- B already requires it (`ColumnMajorInterleaved<256>` +
+`preprocess_weights_for_mixed_gemm`, i.e. the HBM weights are ALREADY not the gguf's arrangement), so the constraint
+that killed option B was never "byte-identical arrangement", it was "do not grow and do not store a second copy".
+Reordering does neither.
+
+And a Q4_K block's FIRST 16 BYTES are exactly `d(2) + dmin(2) + scales(12)`. So the plane is `[K/256][N][16]`: one
+contiguous 16 B per (superblock, column) carries everything a lane needs, 16 B aligned, and wastes nothing -- 16/8
+groups = 2.0 B per group per column, identical to storing 12 and 4 apart. It deletes the (d,dmin) plane, its tile and
+`ptr_Z` outright.
+
+l94 measured DISTINCT addresses per bank over warp 0 (shared addresses broadcast; only distinct ones conflict):
+
+    today                    4-way on  4 banks (16 addrs)
+    A: 12 B codes only       1-way on 24 banks (24 addrs)   + a separate (d,dmin) plane
+    B: 16 B all-in-one       1-way on 32 banks (32 addrs)   one plane, 16 B aligned      <-- chosen
+
+My worry that a 16 B stride would alias (4 words, so n and n+8 share banks) did not happen, and the reason is only
+visible by measuring: warp 0's lane set touches **8 CONSECUTIVE columns**, each shared by 4 lanes as a broadcast, so
+8 x 4 words fill exactly all 32 banks. With 8 columns spaced 8 apart it WOULD have been 4-way. This is config-dependent:
+re-run l94 when the warp shape changes.
+
+Final shape of the change:
+    gmem   [K/256][N][16], folded into the existing offline B pass
+    smem   (TN, 16) bytes, one 16 B cp.async per column
+    reg    one 16 B read per lane per k-tile; per group a shift+mask and two hfma2
+    result s2r 16 -> 4 per k-tile, smem 4.0 -> 2.0 B/(group,col), banks 4-way -> 1-way, gmem halved, no extra bytes
+
+NOT transferable to the other formats without re-measuring: 16 is a coincidence of Q4_K's header. Q3_K is
+`scales(12) + d(2)` = 14 (pad to 16), Q6_K is `scales(16) + d(2)` = 18 (needs 32 B or two reads), and both have 16
+groups, not 8, so the group->superblock divisor and the register count change.

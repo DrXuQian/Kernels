@@ -70,6 +70,14 @@ static constexpr int kG   = Tr::kGroups;                // 8
 // prefer the unpadded stride -- check (2) below is what decides it rather than this comment.
 using NativeScaleTile = Layout<Shape<Int<kTN>, Int<kBB>>, Stride<Int<kBB>, _1>>;
 
+// ARRANGEMENT B, and the reason to prefer it: a Q4_K block's FIRST 16 BYTES are exactly d(2) + dmin(2) + scales(12).
+// So one contiguous 16 B per (superblock, column) carries everything a lane needs, is 16 B aligned (one cp.async, one
+// LDS.128), wastes nothing (16/8 groups = 2.0 B per group per column, the same as 12+4 stored apart) and removes the
+// (d,dmin) plane, its tile and ptr_Z outright. The open question is banks: stride 16 B is 4 words, so columns n and n+8
+// alias, whereas 12 B is 3 words and gcd(3,32) == 1. Measured below rather than argued.
+static constexpr int kBB16 = 16;
+using NativeScaleTile16 = Layout<Shape<Int<kTN>, Int<kBB16>>, Stride<Int<kBB16>, _1>>;
+
 int main() {
   std::printf("== l94: the native scale tile as a cute Layout, option E ==\n");
   std::printf("  ScaleTile=(%d,%d) threads=%d | Q4_K block=%d B, %d groups, gs=%d\n",
@@ -101,8 +109,8 @@ int main() {
   // lanes DO share addresses. My first version of this check counted lanes and would have reported a 4-way "conflict"
   // that is really a 4-way broadcast -- the metric has to be distinct addresses or it measures the wrong thing.
   {
-    std::set<int> today_w[32], native_w[32];
-    std::set<int> today_addr, native_addr;
+    std::set<int> today_w[32], native_w[32], n16_w[32];
+    std::set<int> today_addr, native_addr, n16_addr;
     for (int t = 0; t < 32 && t < kThr; ++t) {
       auto thr  = tiled_s.get_thread_slice(t);
       auto tCsC = thr.partition_S(cS);
@@ -111,10 +119,15 @@ int main() {
       int const tw = (int(SmemLayoutScale{}(n, g, 0)) * 2) / 4;      // halfs -> bytes -> words
       today_w[tw & 31].insert(tw);
       today_addr.insert(tw);
-      for (int w = 0; w < (kBB + 3) / 4; ++w) {                       // the native read is 3 words of one column
+      for (int w = 0; w < (kBB + 3) / 4; ++w) {                       // arrangement A: 3 words of codes
         int const nw = (kBB * n) / 4 + w;
         native_w[nw & 31].insert(nw);
         native_addr.insert(nw);
+      }
+      for (int w = 0; w < kBB16 / 4; ++w) {                            // arrangement B: 4 words, d+dmin+codes
+        int const nw = (kBB16 * n) / 4 + w;
+        n16_w[nw & 31].insert(nw);
+        n16_addr.insert(nw);
       }
     }
     auto worst = [](std::set<int> const* h) {
@@ -122,12 +135,14 @@ int main() {
       for (int b = 0; b < 32; ++b) { if (!h[b].empty()) ++used; if (int(h[b].size()) > mx) mx = int(h[b].size()); }
       return std::pair<int,int>{mx, used};
     };
-    auto a = worst(today_w), b = worst(native_w);
-    std::printf("  (2) DISTINCT addresses per bank over warp0: today %d-way on %d banks (%zu addrs) | native %d-way on %d banks (%zu addrs)\n",
-                a.first, a.second, today_addr.size(), b.first, b.second, native_addr.size());
-    std::printf("      -> %s\n", b.first < a.first
-                ? "the conflict shrinks; the native column stride is 3 words and gcd(3,32)==1, so consecutive columns spread"
-                : "NO improvement -- do not claim one");
+    auto a = worst(today_w), b = worst(native_w), c = worst(n16_w);
+    std::printf("  (2) DISTINCT addresses per bank over warp0 (a conflict, unlike shared addresses which broadcast):\n");
+    std::printf("      today                        %d-way on %2d banks (%2zu addrs)\n", a.first, a.second, today_addr.size());
+    std::printf("      A: 12 B codes only           %d-way on %2d banks (%2zu addrs)  + a separate (d,dmin) plane\n",
+                b.first, b.second, native_addr.size());
+    std::printf("      B: 16 B = d+dmin+codes       %d-way on %2d banks (%2zu addrs)  no second plane, 16 B aligned\n",
+                c.first, c.second, n16_addr.size());
+    std::printf("      distinct columns a warp0 lane set touches: %zu\n", native_addr.size() / ((kBB + 3) / 4));
   }
 
   // ---- (1) THE DECODE, driven through the PLACED bytes. Synthetic full-range codes: every sc and mn in [0,64) so no
