@@ -78,6 +78,8 @@ using NativeScaleTile = Layout<Shape<Int<kTN>, Int<kBB>>, Stride<Int<kBB>, _1>>;
 static constexpr int kBB16 = 16;
 using NativeScaleTile16 = Layout<Shape<Int<kTN>, Int<kBB16>>, Stride<Int<kBB16>, _1>>;
 
+static int g_fail_extra = 0;
+
 int main() {
   std::printf("== l94: the native scale tile as a cute Layout, option E ==\n");
   std::printf("  ScaleTile=(%d,%d) threads=%d | Q4_K block=%d B, %d groups, gs=%d\n",
@@ -198,7 +200,78 @@ int main() {
               2 * kSK, kSK, (kBB + 3) / 4);
   std::printf("      smem bytes per (group,column): today 4.0 -> native %.2f\n", double(kBB) / kG + 4.0 / kG);
 
-  int const fail = bad_code + bad_s + bad_z + (nz == 0 ? 1 : 0);
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // (4) THE REORDERED 16 B, made SEPARABLE, and why it has to be reordered at all.
+  //
+  // In the native packing the two halves are not separable: get_scale_min_k4 takes sc[4..7] from bytes 8-11's low
+  // nibbles PLUS bytes 0-3's top 2 bits, and mn[4..7] from bytes 8-11's high nibbles PLUS bytes 4-7's top 2 bits. So
+  // groups 0-3 need bytes 0-7 and groups 4-7 need ALL twelve -- a k-tile covering half a superblock (TileK=128) would
+  // have to read the whole block. Since the offline order is ours to choose, make each half self-contained:
+  //
+  //     byte 0-1  d          byte 2-3  dmin        byte 4-9  half0 (groups 0-3)     byte 10-15  half1 (groups 4-7)
+  //
+  // A half is 4 sc + 4 mn as 6-bit fields = 48 bits = 6 bytes exactly, so nothing grows: still 16 B per (superblock,
+  // column) = 2.0 B per group per column. Bit position as ONE Layout over (i, h, which), i = g%4, h = g/4,
+  // which = 0 for sc and 1 for mn:  bit = 32 + 6*i + 48*h + 24*which.
+  using PackBits = Layout<Shape<_4,_2,_2>, Stride<_6,_48,_24>>;
+  constexpr int kPackBase = 32;                                   // d and dmin occupy the first 4 bytes
+  auto bit_of = [&](int g, int which) {
+    return kPackBase + int(PackBits{}(g % 4, g / 4, which));
+  };
+  auto put6 = [](uint8_t* p, int bit, int v) {
+    for (int b = 0; b < 6; ++b) if ((v >> b) & 1) p[(bit + b) >> 3] |= uint8_t(1u << ((bit + b) & 7));
+  };
+  auto get6 = [](uint8_t const* p, int bit) {
+    int v = 0;
+    for (int b = 0; b < 6; ++b) v |= ((p[(bit + b) >> 3] >> ((bit + b) & 7)) & 1) << b;
+    return v;
+  };
+  print("  (4) PackBits (i,h,which)->bit : "); print(PackBits{}); printf("  base=%d\n", kPackBase);
+  {
+    // native block -> reference sc/mn (the l91-gated path) -> new 16 B -> decode -> must equal the reference
+    int bad_rt = 0, span_bad = 0;
+    for (int n = 0; n < kTN; ++n) {
+      uint8_t const* col = tile.data() + (size_t)NativeScaleTile{}(n, 0);
+      uint8_t nw[16] = {};
+      *reinterpret_cast<uint16_t*>(nw + 0) = dv[n].raw();
+      *reinterpret_cast<uint16_t*>(nw + 2) = dmv[n].raw();
+      for (int g = 0; g < kG; ++g) {
+        put6(nw, bit_of(g, 0), gguf_scale::scale_of<KType::Q4_K>(col, g));
+        put6(nw, bit_of(g, 1), gguf_scale::min_of  <KType::Q4_K>(col, g));
+      }
+      for (int g = 0; g < kG; ++g) {
+        if (get6(nw, bit_of(g, 0)) != gguf_scale::scale_of<KType::Q4_K>(col, g) ||
+            get6(nw, bit_of(g, 1)) != gguf_scale::min_of  <KType::Q4_K>(col, g)) {
+          if (bad_rt < 4) std::printf("    [reorder] n=%d g=%d round trip differs\n", n, g);
+          ++bad_rt;
+        }
+      }
+      // SEPARABILITY, checked rather than asserted: every bit of half h must lie inside that half's 6 bytes.
+      for (int g = 0; g < kG; ++g)
+        for (int w = 0; w < 2; ++w) {
+          int const lo = bit_of(g, w) >> 3, hi = (bit_of(g, w) + 5) >> 3, h = g / 4;
+          if (lo < 4 + 6 * h || hi > 4 + 6 * h + 5) ++span_bad;
+        }
+    }
+    std::printf("      round trip over %d columns x %d groups -> %d bad | bits outside their own half: %d\n",
+                kTN, kG, bad_rt, span_bad);
+    g_fail_extra += bad_rt + span_bad;
+  }
+  // Sub-reads and their alignment, per TileK. A half is 6 B at byte 4 or 10, so it is 4B+2B or 2B+4B, every piece
+  // naturally aligned; padding a half to 8 B would make it one load but cost 20 B per superblock, +25%.
+  for (int TK : {256, 128, 64}) {
+    int const groups_per_tile = TK / Tr::kGroupSize;
+    int const halves = (groups_per_tile + 3) / 4;
+    int const bytes  = (TK >= 256) ? 16 : (4 + 6 * halves);
+    std::printf("      TileK=%3d: %d group(s)/tile, read %2d B (%s) -> %.2f B per (group,col)%s\n",
+                TK, groups_per_tile, bytes,
+                TK >= 256 ? "one LDS.128, 16 B aligned" : "LDS.32 at 4 + LDS.16 at 8 (or 10/12), all aligned",
+                double(bytes) / groups_per_tile,
+                double(bytes) / groups_per_tile > 4.0 ? "   <-- WORSE than fp16, gate this TileK off" : "");
+  }
+
+  int const fail = bad_code + bad_s + bad_z + (nz == 0 ? 1 : 0) + g_fail_extra;
   std::printf("== %s: %d ==\n", fail ? "FAIL" : "PASS", fail);
   return fail ? 1 : 0;
 }

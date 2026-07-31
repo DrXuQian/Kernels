@@ -572,3 +572,35 @@ Final shape of the change:
 NOT transferable to the other formats without re-measuring: 16 is a coincidence of Q4_K's header. Q3_K is
 `scales(12) + d(2)` = 14 (pad to 16), Q6_K is `scales(16) + d(2)` = 18 (needs 32 B or two reads), and both have 16
 groups, not 8, so the group->superblock divisor and the register count change.
+
+### THE 16 B MUST BE REORDERED TO BE SEPARABLE, and that is now gated too
+
+The native packing's two halves are NOT separable, which a k-tile covering half a superblock exposes:
+`get_scale_min_k4` builds `sc[4..7]` from bytes 8-11's low nibbles PLUS bytes 0-3's top 2 bits, and `mn[4..7]` from
+bytes 8-11's high nibbles PLUS bytes 4-7's top 2 bits. So groups 0-3 need bytes 0-7 and groups 4-7 need ALL twelve --
+at TileK=128 a lane would have to read the whole block for half the groups. There is no contiguous 6-byte half to read.
+
+Since the offline order is ours, make each half self-contained. Still 16 B, nothing grows:
+
+    byte 0-1 d | byte 2-3 dmin | byte 4-9 half0 (groups 0-3) | byte 10-15 half1 (groups 4-7)
+
+A half is 4 sc + 4 mn as 6-bit fields = 48 bits = 6 bytes exactly. ONE Layout gives every position --
+`PackBits = Layout<Shape<_4,_2,_2>, Stride<_6,_48,_24>>` with base 32, i.e. bit = 32 + 6*(g%4) + 48*(g/4) + 24*which.
+
+l94 (4), all local:
+
+    PackBits (i,h,which)->bit : (_4,_2,_2):(_6,_48,_24)  base=32
+    round trip over 128 columns x 8 groups -> 0 bad | bits outside their own half: 0
+    TileK=256: 8 groups/tile, read 16 B (one LDS.128, 16 B aligned) -> 2.00 B per (group,col)
+    TileK=128: 4 groups/tile, read 10 B (LDS.32 at 4 + LDS.16 at 8, all aligned) -> 2.50 B per (group,col)
+    TileK= 64: 2 groups/tile, read 10 B -> 5.00 B per (group,col)   <-- WORSE than fp16, gate this TileK off
+
+The round trip is the honest chain: native 12 B -> reference sc/mn (the l91-gated `scale_of`/`min_of`) -> new 16 B ->
+decode -> must equal the reference. So l91's gate stays valid for the offline leg and the new leg is gated as well.
+
+Padding a half to 8 B would make it one load instead of two, but that is 20 B per superblock, +25% on the channel --
+refused. The 6-byte halves sit at byte 4 and byte 10, so every sub-read (4 B at 4, 2 B at 8; 2 B at 10, 4 B at 12) is
+naturally aligned.
+
+**TileK=64 must be statically gated back to the fp16 path.** The decode band's winners are TileK=256 (16x128:256 and
+16x64:256, where the second number is TN), so they land in the best row; the MoE/prefill sweeps with TileK=64 fall back.
