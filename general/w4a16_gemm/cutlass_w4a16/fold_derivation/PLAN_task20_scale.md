@@ -456,3 +456,25 @@ interleave belongs in `dump_packed_scale.py` (it already emits sc/mn/d/dmin sepa
 Verify before writing code, since this note is itself a written-down relation: that `NonVoidElementScale` reaches nothing
 but sizing/copies/fragment-element (grep says l159/163/172/385-430/456/1034), and that no arithmetic outside the four
 transform arms touches `tCrS`/`tCrZ`.
+
+### THE NATIVE-FORMAT READ NEEDS NO CONVERTER CHANGE. Retracting a prerequisite I invented.
+
+I wrote earlier that Q4_K's packed form needs the converter's `Bias` set to 0 so the zero collapses to `-dmin*mn`, and
+started to add `kCvtBias` to the SINGLE-plane collective for it. That path uses `MixGemmNumericArrayConverter`'s
+hand-written specializations (hardcoded FP16_TOP_MAGIC_NUM / NEG_72), not the width-templated `MixGemmChunkEmit`, so it
+would have meant editing the shipped int4 converter -- which is exactly the code the user said not to touch.
+
+It is also unnecessary, and my own measurement says so: keeping Bias=8 and forming `zero = 8*(d*sc) - dmin*mn` on device
+scores **0.0128 step** against fp64 truth, while Bias=0 with `zero = -dmin*mn` scores **0.0148**. The cancelling form is
+if anything slightly better. Bias=0 was only ever "one product instead of a product plus an fma".
+
+So the whole job is on the READ path, and it is three things:
+1. the smem tile holds 2 bytes of `(sc, mn)` per (group, n) instead of one pre-multiplied fp16 -- IDENTICAL SIZE, so
+   SmemLayoutScale, the gmem->smem copy, the fragment partitioning and Params::ptr_S do not change at all;
+2. `d`/`dmin` arrive per k-tile in registers (one pair per 256 k, an eighth of the scale plane); the Z smem tile goes;
+3. the four transform arms swap `multiplies{}`/`plus{}` for "split two int8s -> gguf_scale_decode.hpp -> the same two
+   passes".
+
+The zero disappears as a CHANNEL (its gmem stream, its smem tile, its per-group read). What it does NOT do is fix the
+bank conflicts: the concentration comes from the THREAD stride being a multiple of the 128 B bank period, and an int8
+element leaves 256 B, still a multiple. `PPU_SCALE_PAD` is the knob for that and has never been timed.
