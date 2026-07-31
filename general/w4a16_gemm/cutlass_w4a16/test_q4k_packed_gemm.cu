@@ -108,13 +108,18 @@ int main(int argc, char** argv) {
   std::vector<int8_t> Bbuf((size_t)L * K * N / 2);
   for (int e = 0; e < L; ++e) {
     std::vector<int8_t> packed((size_t)K * N / 2);
-    // f.q is [N][K] (the writer transposes); the packer wants {K,N}, so transpose back while packing nibbles.
-    for (int k = 0; k < K; ++k)
-      for (int n = 0; n < N; n += 2) {
-        int8_t const lo = f.q[(size_t)e * N * K + (size_t)n * K + k] & 0xF;
-        int8_t const hi = f.q[(size_t)e * N * K + (size_t)(n + 1) * K + k] & 0xF;
-        packed[((size_t)k * N + n) / 2] = int8_t((hi << 4) | lo);
-      }
+    // LINEAR PAIRS OVER THE FILE'S OWN ORDER, then dims {K,N} -- byte for byte what test_moe_grouped_real.cu does, and
+    // that path is validated against real GPTQ and Q4_K weights.
+    //
+    // My first version "transposed back" because the writer stores q.T as [N][K] and the packer is told {K,N}, which
+    // looks like a contradiction. It is not one to undo: the packer consumes the BUFFER, and the validated convention
+    // pairs consecutive file elements. Transposing produced bad=2005/2048 on the REFERENCE path, i.e. before the packed
+    // channel was even involved -- which is exactly why the reference build runs first.
+    for (size_t i = 0; i < (size_t)K * N / 2; ++i) {
+      int8_t const lo = f.q[(size_t)e * K * N + 2 * i] & 0xF;
+      int8_t const hi = f.q[(size_t)e * K * N + 2 * i + 1] & 0xF;
+      packed[i] = int8_t((hi << 4) | lo);
+    }
     preprocess_weights_for_mixed_gemm<false, 256>(
         (int8_t*)&Bbuf[(size_t)e * K * N / 2], packed.data(), {(size_t)K, (size_t)N},
         QuantTypeClass::PACKED_INT4_WEIGHT_ONLY);
