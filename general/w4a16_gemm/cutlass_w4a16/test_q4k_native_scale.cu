@@ -25,7 +25,7 @@
 #include "cutlass/util/device_memory.h"
 #include "ppu_include.hpp"
 #include "helper.h"                        // CUTLASS_PPU_CHECK
-#include "real_weight/rwmoep_loader.hpp"
+#include "rwmoep_loader.hpp"
 
 using cutlass::half_t;
 

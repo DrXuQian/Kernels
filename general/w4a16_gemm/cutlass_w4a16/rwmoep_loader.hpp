@@ -1,5 +1,10 @@
 // Plan #20: LOAD THE NATIVE scale/zero. New file; the fp16 path is untouched.
 //
+// FLAT, next to the harnesses, not under real_weight/. build.sh overlays the harness directory's *.hpp into the actlize
+// example dir but only descends into the ONE subdirectory listed in _overlay_dirs (gemv_lowbit), so a compiled header
+// parked in real_weight/ vanishes at build time -- which is exactly what happened. real_weight/ holds fixtures and the
+// python that writes them; anything the box compiles belongs up here.
+//
 // Today every consumer loads pre-multiplied fp16 planes: the offline computes d*sc and -dmin*mn + 8*scale in fp32 and
 // rounds each to one fp16, so the kernel never sees what the gguf actually stores. RWMOEP (dump_packed_scale.py) keeps
 // the native form instead -- int8 codes plus the superblock's fp16 -- and this header is its C++ side:
@@ -22,7 +27,7 @@
 #include <cstring>
 #include <vector>
 #include "cutlass/half.h"
-#include "../gguf_scale_decode.hpp"
+#include "gguf_scale_decode.hpp"
 
 namespace rwmoep {
 
