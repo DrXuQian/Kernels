@@ -836,3 +836,61 @@ acu next, same config both sides, in this order: smem/block and measured blocks/
 means 16 KB, which could cross a threshold and alone explain 4-5 us), then tsm.st, then the instruction totals, then the
 stall mix. If occupancy is the cause, staging only needs ONE stage rather than Stages -- the decode runs immediately
 after the wait -- which is a small change worth trying.
+
+---
+
+## The occupancy line of attack is closed, three ladders deep (measured)
+
+`64 8 2048 2048 32 3`, `SK_QUANT=2`, one run so the rows are comparable. Reference: `16x64:256 s2 S=1` = **20.52 us**
+(the previous run put `16x128:256 s2 S=1` at 20.11 -- within the ~13% same-config spread, so TN=64 and TN=128 are
+TIED, and my earlier "fewest blocks wins" was reading noise).
+
+**TileK = 128 lost, so the prologue hypothesis is refuted by its own pre-committed falsifier.** The prediction written
+into CMakeLists before the run: fill share is `Stages/(K/TK + Stages)`, 20% at TK=256 against 11% at TK=128, so if the
+pipeline fill were the term these rows should win ~9% (≈18.7 us).
+
+| row | S=1 | S=2 | S=4 | S=8 |
+|---|---|---|---|---|
+| `16x128:128 s2` | 24.16 | 24.55 | 27.87 | 29.41 |
+| `16x128:128 s4` | **22.06** | 23.63 | 27.35 | 31.51 |
+| `16x64:128 s2` | 22.94 | 22.48 | 26.64 | 27.79 |
+| `16x64:128 s4` | **21.85** | 27.11 | 28.27 | 33.34 |
+
+Best TK=128 row is 21.85, i.e. **6.5% WORSE** than 20.52. And the data refutes the hypothesis a second time from the
+inside: **s4 beats s2 at both TileN** (22.06 vs 24.16; 21.85 vs 22.94). s4 has MORE prologue (20% against 11%), so if
+fill were a cost term s4 would lose. It wins by 8-9%. Fill is not a cost; depth is a benefit.
+
+**Therefore the persistent kernel is off the table for this band**, on the falsifier recorded next to those config
+rows. It would not have bought the usual thing either -- 128 tiles against 128 CTAs is exactly one wave, no tail.
+
+**Split-K lost everywhere, and occupancy is monotonically harmful past 28 warps/CU:**
+
+| warps/CU | 14.2 | 28.4 | 56.9 | 113.8 |
+|---|---|---|---|---|
+| `16x64:128 s2` | 22.94 | 22.48 | 26.64 | 27.79 |
+
+The bench's own line: `speedup from split-K: 0.938x`. And **HBM sits at 31-35% in every single row** regardless of
+concurrency -- 8x the warps bought no bandwidth at all. So the kernel is neither bandwidth-bound nor
+memory-latency-bound, and Little's Law was right about the headroom and wrong about the lever. Three independent
+ladders now say so: TN (32/64/128), TK (64/128/256), S (1/2/4/8).
+
+## What it actually is: the converter, at 14.5 instructions per mma
+
+From the pinned base acu, `v.lop3.i 546,816 + v.bfi.i 270,336 + v.fma.f16 745,472 + v.add.f16 335,872 = 1,898,496`
+against `v.mma.f32.f16.m16n16k16 = 131,072`. That is **14.5 int4->fp16 converter instructions per mma instruction, and
+43% of the whole kernel**. It also lands on the closed form already in fold_derivation/README.md:
+`cvt elems per mma = 128/WM` -- WN and TK cancel EXACTLY, only WM survives. At WM=16 that is 8 elements per mma at ~2
+instructions each.
+
+This explains every measurement above at once: the chain is per-warp ALU, so more warps cannot shorten it (splitk),
+more CTAs cannot shorten it (TN), and more k-tiles cannot shorten it (TK). And `moe_ok` requires `WM <= TM`, so
+**decode's TM=16 pins WM at 16, the worst value of the only surviving variable.**
+
+Three ways in, and only one is cheap:
+1. `WM = 32` -- halves it, and needs `TM >= 32`, i.e. 31/32 of the A tile padding at batch 1. Worth measuring against
+   the padding cost rather than assumed dead.
+2. **Fewer instructions per converted element** -- TODO #18, fold `(-1024, zero-point, 2^-b)` into one `(s', b')` pair
+   so the dequant is a single `hfma2`. This is the one that attacks the 43% directly and does not fight `moe_ok`.
+3. Don't convert in this band at all: the CUDA-core GEMV is already 22.27 us against the tensor-core 20.74 us, i.e.
+   the same place. Consistent with "GEMV is ALU-bound, not bandwidth-bound" -- both kernels are ALU-bound and both land
+   at 20-22 us, which is what a 43%-converter kernel and a no-tensor-core kernel converging looks like.
