@@ -274,16 +274,27 @@ set(_SPLITK_CFGS
   # wins, TK=64 lost 19% but sits with WN*TK*bits = 16*64*4 = 4096 EXACTLY ON the swzl delivery bound, so that row
   # measured "small TK" and "starved delivery" at once. TK=128 is 8192, twice the bound, so it separates them.
   #
-  # WHAT IT IS FOR, stated before the numbers exist so the result can disagree. Little's Law on the measured band:
-  # 21 MB of necessary traffic in 20.11 us is 1.04 TB/s against a ~2.77 TB/s peak, i.e. 38%. In-flight bytes per CU
-  # are blocks/CU * Stages * bytes-per-stage = 2 * 57,344 = 114,688 of the 256 KB shared memory allows (45%), and only
-  # 73% of those bytes are useful because 15/16 of the A tile is padding at Mmax == 1. 45% * 73% = 33%, which is the
-  # 38% that was measured. So the model says: raise in-flight USEFUL bytes and the bandwidth follows.
-  # The catch, also recorded: 16,64,256 already doubles blocks/CU to 4 and did NOT win, so something serial (A re-read
-  # per n-tile, or the last-wave tail of TODO #10) absorbs it. If these rows also fail to move, the honest reading is
-  # that this kernel is not memory-latency-bound in this band and the whole occupancy line of attack is finished.
-  # smem/CTA: 16x128:128 s2 = 28,672 (9 blk/CU), s4 = 57,344; 16x64:128 s2 = 16,384 (16 blk/CU). Splitk is where these
-  # pay -- S=4 wants 8 blocks/CU, which TK=256's 57,344 B/CTA cannot supply and these can.
+  # TILEK IS NOT AN OCCUPANCY LEVER, and saying otherwise is the mistake this comment exists to prevent. The grid is
+  # ppu_tile_scheduler_group.hpp's total_ctas = SUM_e ceil(M_e/TileM) * ceil(N/TileN), times slices on gridDim.z --
+  # TileK does not appear in it. Shrinking TileK lowers smem per CTA and so raises the CAPACITY for blocks/CU, but the
+  # grid supplies what it supplies, and capacity is not occupancy. An earlier version of this comment quoted "9
+  # blocks/CU at TK=128" as though the grid would deliver them; it delivers 2. What TK=128 actually tests is (a) the
+  # delivery bound in isolation, since TK=64's 4096 sat exactly on it, and (b) DEPTH: 28,672 B at s2 leaves room for
+  # stages that TK=256's 57,344 B does not, and it is what lets splitk's block count fit at all -- S=4 wants 8
+  # blocks/CU and TK=256 admits 4.
+  #
+  # AND THE OCCUPANCY STORY IS ALREADY REFUTED BY THE TN LADDER, which IS the lever that moves the grid:
+  #     16,32,256  -> 512 CTAs, 8 blocks/CU, 2 warps/blk   (once the recorded winner; now loses)
+  #     16,64,256  -> 256 CTAs, 4 blocks/CU, 4 warps/blk   (does not win)
+  #     16,128,256 -> 128 CTAs, 2 blocks/CU, 8 warps/blk   (WINS, 20.11 us)
+  # The row with the FEWEST blocks wins, and it is the row with the MOST warps per block. So the Little's Law
+  # arithmetic -- 21 MB of necessary traffic in 20.11 us is 1.04 TB/s of a ~2.77 TB/s peak (38%); in-flight bytes per
+  # CU are blocks/CU * Stages * bytes-per-stage = 2 * 57,344 = 114,688 of the 256 KB smem allows (45%); only 73% of
+  # those are useful because 15/16 of the A tile is padding at Mmax == 1; and 45% * 73% = 33% lands on the measured
+  # 38% -- is right about the HEADROOM and wrong about the lever. Three points of the TN ladder pulled that lever and
+  # it moved the other way. What TN=128 winning with 8 warps/block points at instead is the per-CTA DEPENDENT CHAIN:
+  # more warps per loaded B tile, not more tiles in flight. So the levers left in this band are depth (Stages), the
+  # scale reload chain (TODO #11) and the last-wave tail (TODO #10) -- not block count.
   # NOTE these rows keep the fp16 scale path: at gs=32, TK=128 gives Scale_TileK = 4, so kPackedScaleOn is false.
   "16,128,128,16,16,2"
   "16,128,128,16,16,4"
