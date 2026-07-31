@@ -121,8 +121,19 @@ TARGET=test_q65_bconcat_real ./build.sh >/dev/null 2>&1 && $EX/test_q65_bconcat_
 PPU_DEFS="SK_QUANT=2"                        TARGET=test_moe_splitk_bench ./build.sh && $EX/test_moe_splitk_bench 64 8 2048 2048 32 3
 PPU_DEFS="SK_QUANT=2 PPU_PACKED_SCALE=1"     TARGET=test_moe_splitk_bench ./build.sh && $EX/test_moe_splitk_bench 64 8 2048 2048 32 3
 
-# acu, one config, both sides
-SPLITK_ONLY="16x128:256" SPLITK_S=1 SPLITK_ACU=1 acu -o X.report --set full -f $EX/test_moe_splitk_bench 64 8 2048 2048 32 3
+# acu, ONE config, both sides. SPLITK_ONLY is the WRONG knob: it matches the whole tag as a substring, so
+# "16x128:256" selects every warp shape, every Stages and every slice count -- ~228 rows, one cold launch each,
+# and the two reports then hold different kernel sets in different order. moe_splitk_bench_common.hpp:70-73
+# documents the fix and I handed out the knob it warns about. SPLITK_CFG matches the config half (whitespace-safe),
+# SPLITK_S matches the slice count exactly.
+#   step 1 -- prove the selection is ONE row, WITHOUT acu. Exactly one "[acu] ONE COLD launch" line must print,
+#             and the banner must echo the two variables back (if it does not, they never reached the child).
+SPLITK_CFG="16x128:256 w16x16 s2" SPLITK_S=1 SPLITK_ACU=1 $EX/test_moe_splitk_bench 64 8 2048 2048 32 3
+#   step 2 -- same env under acu, both builds
+SPLITK_CFG="16x128:256 w16x16 s2" SPLITK_S=1 SPLITK_ACU=1 acu -o X.report --set full -f $EX/test_moe_splitk_bench 64 8 2048 2048 32 3
+# THE FINGERPRINT IS grid x block, not the tag: this row is (8,16,1)x(256,1,1) -- grid.y = N/TN = 16, 8 warps,
+# grid.z = slices = 1. A capture showing (8,32,4)x(128,1,1) is TN=64 at S=4, a different kernel; its vmem.st is
+# 300x the baseline's because S=4 writes partials, which has nothing to do with the scale channel.
 
 # local gates (no box)
 A=../../../../third_party/actlize/include
