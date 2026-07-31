@@ -653,3 +653,32 @@ what is checked is make_tiled_copy's algebra, which does not depend on the instr
 a wrong tile), the per-format numbers come from Traits (l94 (5)), and the gmem reshape is a shape change with the same
 byte count and better coalescing (l94 (6)). What remains is wiring, and the largest single edit is now the fragment
 scatter -- value -> n, which is the map l94 already computes from partition_S(identity).
+
+### STEPS 1-3b ARE IN (default-off, front-end clean both ways). One shortcut is RULED OUT.
+
+* **1** `SmemLayoutScalePacked` + `GmemTiledCopyScalePacked` as types.
+* **2** SharedStorage's scale member becomes bytes over the packed tile and **the zero tile drops to zero elements** --
+  `mn` rides in the same unit. Gate: `MOEG_SMEM=1`'s SharedStorageSize must fall by exactly the zero tile.
+* **3a** the decode moved INTO actlize as `cutlass/gguf_packed_scale.h` (PackBits, code_of, put_code,
+  int_to_half_small, `group_of<ScaleBias, HasMin>`), because the mainloop needs it and the mainloop is there; the harness
+  header re-exports it, so l94 still gates the shipped code and the bit map exists once. Plus `load_packed_units`,
+  `decode_packed_group`, `packed_fill`, and `(sSp, tCcS)` APPENDED to the extra-info tuple (never inserted -- every
+  consumer reads it positionally).
+* **3b** all three per-group `copy` sites become `packed_fill`: the coarse site (where `scale_k_idx` is flattened over
+  (stage, group) and has to be split), the FINE ConvertAndScale arm, and the FINE ConvertAndScaleWithZero arm where BOTH
+  reads vanish. `PPU_SCALE_PREFETCH` is forced off -- it hides a read that no longer happens.
+
+`decode_packed_group` looks each element's column up in the coordinate tensor instead of using l94 (7)'s measured run
+length. The run length is real (period 8, two slots) but it moves with the warp shape, and a read-off-the-object version
+was available for free.
+
+**RULED OUT, do not retry: making the 16 B unit ONE `uint128_t` element.** It would have kept the gmem tensor at
+(N, nsb, L) and every residue/predication line unchanged, which is why it was attractive. cute rejects it:
+`Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, uint128_t>` with a `(_1,_1)` value layout fails
+`copy_traits.hpp`'s "dst failed to vectorize into registers" -- an element as wide as the whole vector is not modelled.
+The element must stay `uint8_t` with a `(_1,_16)` value layout, which is what l94 (6) verified anyway.
+
+**Still open (step 3c):** the g2s wiring itself -- `Params::ptr_S`, the `mS_nkl`/`gS` construction and the two
+`copy(gmem_tiled_copy_scale, ...)` sites. With a byte element the tile's second mode is BYTES, not k, so the
+`scale_residue_k` / `scale_valid` arithmetic around `tScS(0,0,0)` has to be re-derived rather than inherited -- that is
+the one place where the fp16 path's logic does not carry over unchanged.
