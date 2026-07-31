@@ -904,3 +904,63 @@ Three ways in, and only one is cheap:
 3. Don't convert in this band at all: the CUDA-core GEMV is already 22.27 us against the tensor-core 20.74 us, i.e.
    the same place. Consistent with "GEMV is ALU-bound, not bandwidth-bound" -- both kernels are ALU-bound and both land
    at 20-22 us, which is what a 43%-converter kernel and a no-tensor-core kernel converging looks like.
+
+---
+
+## rowC's regression: subnormal d, and the fix that costs no mainloop instructions
+
+**The bisect.** `PPU_PACKED_PAIR=0` (scalar `group_of_words`, everything else identical) makes rowC MATCH again. So
+the native transport, the shared stores and the loop are clean and the defect is inside `group_pair_of_words`, whose
+only device-specific content is two inline-asm instructions with zero local coverage -- the host gate l96 compiles
+under nvcc, where `CUTLASS_GGUF_PACKED_F16X2_ASM` selects the scalar fallback.
+
+**The measurement, on `real_weight/q4k_packed.bin` (blk.11.ffn_down.weight, L=1 N=256 K=4864 gs=32, nsb=19):**
+
+| quantity | range | subnormal |
+|---|---|---|
+| `d` | 1.585e-05 .. 9.484e-04 | **3914 / 4864 = 80.5%** |
+| `dmin` | 1.096e-04 .. 1.117e-02 | 0 |
+| `d*sc` (what the fp16-plane offline stores) | 5.65e-04 .. 5.98e-02 | **0 / 38912** |
+| `dmin*mn` | 0 .. 0.704 | 0 / 38912 |
+
+fp16's smallest normal is 6.104e-05. So **Q4_K's `d` is subnormal for most superblocks, `dmin` never is, and neither
+product ever is.** That last row is why the shipped path has never met this: the offline forms `d*sc` in fp32 and
+stores only the normal product, so no subnormal fp16 has ever reached an instruction. The packed decode is the first
+thing on this path to multiply BY `d` on the device.
+
+**Why that is the leading hypothesis.** This ISA carries an explicit `.noftz` qualifier on an f16x2 op
+(`cutlass/functional.h:830`, `ppu.atom.gpu.global.add.noftz.f16x2`), which only makes sense if the DEFAULT flushes. A
+flushed subnormal multiplier zeroes the SCALE lane while the zero lane -- whose `dmin` is normal -- survives, and each
+output sums over 19 superblocks so only the subnormal ones are lost. That predicts a PARTIAL failure dominated by
+scale, which is what rowC shows (bad=128 then 724 of 4096, not everything). It is a hypothesis until the probe runs.
+
+**The gate that settles it**: `test_ppu_f16x2_probe` -- no GEMM, no shared memory, no mma, so a failure cannot be
+confused with tile plumbing. It compares each asm op against the scalar op it claims to equal, with a subnormal
+multiplier in one lane and a normal one in the other (the asymmetry is the signature), and reports the per-group
+decode split by group, because Q4_K has exactly two straddling fields -- group 1's min at bit 62 and group 6's scale
+at bit 92 -- so FTZ and a straddle bug produce different tables.
+
+**The decision tree.**
+1. `PPU_F16X2_NOFTZ=1` assembles AND the probe goes clean -> keep the packed decode, done.
+2. The mnemonic is rejected -> the fallback below.
+3. It assembles and does NOT fix it -> the hypothesis is wrong; the probe's per-group table says whether it is the
+   straddle instead.
+
+**The fallback, and it costs ZERO mainloop instructions.** Multiply `d` and `dmin` by one per-tensor `2^k` offline and
+undo it once in the epilogue: `moe_grouped_ppu.cuh` already uses `LinearCombination` with a scalar `alpha` (its fusion
+args default to alpha=1, beta=0), so the inverse is a launch parameter, and `2^-k` is a power of two, so it introduces
+no rounding at all. The headroom on this tensor, both ends computed rather than assumed:
+
+* lower bound `min(d) * 2^k >= 6.104e-05` gives **k >= 2**;
+* upper bound comes from the dequantised B value `scale*q + zero`, at most ~1.6 today against fp16's 65504, giving
+  **k <= 14**;
+* **k = 8** sits in the middle: `min d` becomes 4.06e-03 (66x above the threshold), `max dmin` 2.86, `max B` ~410.
+
+`k` must be computed per tensor from that pair of bounds and carried in the fixture header, not hardcoded -- the
+margin is a property of the weights, and on this tensor k=2 clears the floor by only 4%.
+
+**What this says about the native format generally.** The obstacle is not the implementation: it is that the gguf's
+`d` is routinely subnormal in fp16, so ANY device path that multiplies by it is one FTZ qualifier away from silent
+zeros. The load-time conversion kernel of the handoff's section 10 avoids it by construction, since it forms the
+product in fp32 and stores the normal result. That is now a correctness argument for that design, not only a
+performance one.
