@@ -989,3 +989,33 @@ margin is a property of the weights, and on this tensor k=2 clears the floor by 
 zeros. The load-time conversion kernel of the handoff's section 10 avoids it by construction, since it forms the
 product in fp32 and stores the normal result. That is now a correctness argument for that design, not only a
 performance one.
+
+### The probe ran, and it clears the decode entirely
+
+`test_ppu_f16x2_probe` on ppu001, all four sections:
+
+    (3) CUTLASS_GGUF_PACKED_F16X2_ASM = 1        the device build really does execute the asm, not the fallback
+    (1) sub.f16x2   29 cases -> 0 disagree       incl. subnormal multipliers, signed zeros, the decode's constants
+    (1) fma.f16x2   29 cases -> 0 disagree
+    (2) packed vs scalar decode on device: 0 of 38912 (unit, group) disagree, per group g0..g7 all 0
+    (4) destination/input aliasing changes the answer in 0 of 5 aliased forms
+
+**So `group_pair_of_words` is bit-for-bit correct on the hardware, over the real fixture, in every group including the
+two that straddle a word.** Three hypotheses die at once: FTZ (already refuted by simulation, now also by measurement),
+the `"=r"` aliasing one, and any suspicion of operand order or the straddle. Section (3) also retires a doubt worth
+naming: the asm really is what runs, so the timing conclusions drawn from the packed path are about the thing they
+claim to be about.
+
+**Which makes the bisect result the interesting fact, not the answer.** `PPU_PACKED_PAIR` selects between two
+functions now proven to produce identical bits, so it cannot change the result through arithmetic -- yet it does. What
+it also changes is instruction count, register pressure and scheduling inside a mainloop that has a `cp_async_wait`, a
+`__syncthreads` and 256 threads running a 128-thread copy. A defect that is invisible in isolation and appears only
+under that context is a race or an out-of-range partition, not a formula.
+
+**Next, in order.** First rerun rowC on the current tree: `"=&r"` is in place, and an aliasing hazard can be real in
+the mainloop (where the allocator is under pressure) while invisible in a probe with three live values. If it still
+fails, the first suspect is the one flagged in review and never resolved: `GmemTiledCopyScalePacked`'s thread layout is
+`Layout<Shape<Int<Scale_TileN>,_1>>` -- 128 threads at Scale_TileN=128 -- while `get_slice(thread_idx)` is called by
+all `size(TiledMma)` = 256 threads, so threads 128..255 partition outside their own stage of `smem_scale_raw`. That is
+independent of `PPU_PACKED_PAIR`, which is an argument against it, but it is the only unexamined write into that
+buffer and it must be ruled in or out before anything else is tried.
