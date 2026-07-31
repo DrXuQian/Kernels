@@ -149,41 +149,64 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<int> offd(L);       offd.copy_from_host(offs.data());
   size_t const wsb = (size_t)cutlass::ceil_div(M,16) * cutlass::ceil_div(N,64) * (size_t)L * 64;
   cutlass::DeviceAllocation<char> ws(wsb);
-  CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)total * N));
-
-  // WHICH POINTER GOES IN depends on the build, and it has to: with PPU_PACKED_SCALE the collective reinterprets ptr_S
-  // as the byte plane, and without it the same pointer is an fp16 plane. Passing the wrong one is not a subtle error --
-  // it reads 8x too little or too much -- so it is selected by the same macro the collective uses.
+  // WHICH POINTER ROW 2 GETS depends on the build, and it has to: with PPU_PACKED_SCALE the collective reinterprets
+  // ptr_S as the byte plane, without it the same pointer is an fp16 plane. Row 1's tile has Scale_TileK == 2, so it is
+  // always on the fp16 path and always takes dSc.
 #if defined(PPU_PACKED_SCALE) && (PPU_PACKED_SCALE != 0)
   half_t const* scale_arg = reinterpret_cast<half_t const*>(dPlane.get());
-  char const*   which     = "PACKED (gguf's own 16 B units)";
+  char const*   which     = "row2 reads the gguf's own 16 B units";
 #else
   half_t const* scale_arg = dSc.get();
-  char const*   which     = "fp16 planes (reference path)";
+  char const*   which     = "row2 reads fp16 planes (reference build)";
 #endif
-  std::printf("  scale channel: %s | TileK=256 so Scale_TileK=%d\n", which, 256 / gs);
+  std::printf("  %s\n", which);
 
-  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 256, 32, 32, 3>(
-      dA.get(), dB.get(), scale_arg, dZr.get(), pdd.get(), sdd.get(), gmd.get(),
-      M, N, K, L, gs, shpd.get(), shp.data(), offd.get(), ws.get(), wsb, nullptr);
-  CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
-  if (moe_grouped_ppu::moeg_fail_count()) { std::printf("  REFUSED to launch -- nothing was computed\n"); return 2; }
+  // TWO ROWS, so a failure is attributable. Row 1 is the tile validated against real weights in
+  // test_moe_grouped_real.cu (TK=64 at gs=32) -- its Scale_TileK is 2, so kPackedScaleOn is FALSE there and it exercises
+  // only this harness, the fixture and the B packing. Row 2 is the decode band's winner (16x128:256 w16x16 s2), the tile
+  // the splitk bench validates numerically at TK=256, which is where Scale_TileK == 8 and the packed path turns on.
+  //
+  // The first version ran ONE row at 64,64,256,32,32,3 -- a tile no harness has ever validated -- so when it failed there
+  // was no way to tell a bad tile from a bad channel. Both rows print their own verdict.
+  auto run_and_check = [&](char const* tag, auto&& launch) {
+    CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)total * N));
+    int const before = moe_grouped_ppu::moeg_fail_count();
+    launch();
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    if (moe_grouped_ppu::moeg_fail_count() != before) {
+      std::printf("  %-28s REFUSED to launch -- nothing was computed\n", tag);
+      return 2;
+    }
+    std::vector<half_t> hD((size_t)total * N);
+    dD.copy_to_host(hD.data());
+    int bad = 0, nonfinite = 0; double mr = 0, gmax = 0;
+    for (size_t i = 0; i < (size_t)total * N; ++i) {
+      double const g = double(float(f.gold[i])), d = double(float(hD[i]));
+      if (!std::isfinite(d)) { ++nonfinite; continue; }        // NaN compares false against everything; count it
+      gmax = std::max(gmax, std::abs(g));
+      double const rel = std::abs(d - g) / (std::abs(g) + 1e-3);
+      if (rel > mr) mr = rel;
+      if (std::abs(d - g) > 2e-2 + 6e-2 * std::abs(g)) { if (bad < 4) std::printf("      i=%zu got=%.4f gold=%.4f\n", i, d, g); ++bad; }
+    }
+    std::printf("  %-28s bad=%d/%d max_rel=%.3e |gold|max=%.4g %s%s\n", tag, bad, total * N, mr, gmax,
+                bad || nonfinite ? "MISMATCH" : "MATCH", gmax == 0 ? "  <-- VACUOUS" : "");
+    if (nonfinite) std::printf("      NON-FINITE outputs: %d\n", nonfinite);
+    return bad + nonfinite + (gmax == 0 ? 1 : 0);
+  };
 
-  std::vector<half_t> hD((size_t)total * N);
-  dD.copy_to_host(hD.data());
-  int bad = 0, nonfinite = 0; double mr = 0, gmax = 0;
-  for (size_t i = 0; i < (size_t)total * N; ++i) {
-    double const g = double(float(f.gold[i])), d = double(float(hD[i]));
-    if (!std::isfinite(d)) { ++nonfinite; continue; }          // NaN compares false against everything; count it
-    gmax = std::max(gmax, std::abs(g));
-    double const rel = std::abs(d - g) / (std::abs(g) + 1e-3);
-    if (rel > mr) mr = rel;
-    if (std::abs(d - g) > 2e-2 + 6e-2 * std::abs(g)) { if (bad < 6) std::printf("    i=%zu got=%.4f gold=%.4f\n", i, d, g); ++bad; }
-  }
-  std::printf("  vs the fixture's golden: bad=%d/%d max_rel=%.3e |gold|max=%.4g%s\n",
-              bad, total * N, mr, gmax, gmax == 0 ? "  <-- VACUOUS, the golden is all zero" : "");
-  if (nonfinite) std::printf("  NON-FINITE outputs: %d\n", nonfinite);
-  int const fail = bad + nonfinite + (gmax == 0 ? 1 : 0);
-  std::printf("== %s ==\n", fail ? "FAIL" : "PASS");
+  int fail = 0;
+  fail += run_and_check("row1 64x64:64 w32x32 s3", [&]{
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 64, 64, 64, 32, 32, 3>(
+        dA.get(), dB.get(), dSc.get(), dZr.get(), pdd.get(), sdd.get(), gmd.get(),
+        M, N, K, L, gs, shpd.get(), shp.data(), offd.get(), ws.get(), wsb, nullptr);
+  });
+  fail += run_and_check("row2 16x128:256 w16x16 s2", [&]{
+    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, 16, 128, 256, 16, 16, 2>(
+        dA.get(), dB.get(), scale_arg, dZr.get(), pdd.get(), sdd.get(), gmd.get(),
+        M, N, K, L, gs, shpd.get(), shp.data(), offd.get(), ws.get(), wsb, nullptr);
+  });
+
+  std::printf("== %s ==   (row1 is the validated TK=64 tile: it checks the harness, NOT the packed channel; row2 is\n"
+              "             where Scale_TileK == 8 and %s)\n", fail ? "FAIL" : "PASS", which);
   return fail ? 1 : 0;
 }
