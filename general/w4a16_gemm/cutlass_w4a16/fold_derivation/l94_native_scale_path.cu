@@ -27,6 +27,7 @@
 #include <vector>
 #include <utility>
 #include <set>
+#include <algorithm>
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/copy_atom.hpp"
@@ -344,6 +345,57 @@ int main() {
     std::printf("      contiguity %d bad | 16 B alignment %d bad | coalescing (t -> 16t) %d bad | gaps %d | overlaps %d\n",
                 bad_contig, bad_align, bad_coal, gaps, dups);
     g_fail_extra += bad_contig + bad_align + bad_coal + gaps + dups;
+  }
+
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // (7) THE SCATTER MAP: value -> which of MY columns. This is the last unknown before the transform arms can be
+  // written, and it decides the register cost: a lane must hold one 16 B unit per DISTINCT column its scale fragment
+  // touches, so what matters is that count and whether it is the same for every lane.
+  //
+  // Derived from partition_S of an identity tensor -- never from the fragment's shape. l94 (1)-(6) all rest on the same
+  // source, and l95 proved that source is the collective's own object.
+  {
+    int  ndist_min = 1 << 30, ndist_max = 0;
+    bool same_pattern = true;
+    std::vector<int> ref_slot;
+    for (int t = 0; t < kThr; ++t) {
+      auto thr  = tiled_s.get_thread_slice(t);
+      auto tCsC = thr.partition_S(cS);
+      int const n0 = int(size<0>(tCsC)), n1 = int(size<1>(tCsC));
+      std::vector<int> cols, slot;
+      for (int v = 0; v < n0 * n1; ++v) {
+        auto c = tCsC(v % n0, v / n0, 0, 0);
+        int const n = int(get<0>(c));
+        int k = -1;
+        for (int i = 0; i < int(cols.size()); ++i) if (cols[i] == n) { k = i; break; }
+        if (k < 0) { k = int(cols.size()); cols.push_back(n); }
+        slot.push_back(k);
+      }
+      ndist_min = std::min(ndist_min, int(cols.size()));
+      ndist_max = std::max(ndist_max, int(cols.size()));
+      if (t == 0) ref_slot = slot;
+      else if (slot != ref_slot) same_pattern = false;
+    }
+    std::printf("  (7) distinct columns per lane: min %d max %d | v->slot pattern identical across all %d lanes: %s\n",
+                ndist_min, ndist_max, kThr, same_pattern ? "YES" : "NO");
+    std::printf("      registers per lane: %d units x 16 B = %d uint32 (plus the fp16 d/dmin inside them)\n",
+                ndist_max, ndist_max * 4);
+    std::printf("      v->slot, first 24 of %zu: ", ref_slot.size());
+    for (int i = 0; i < 24 && i < int(ref_slot.size()); ++i) std::printf("%d", ref_slot[i]);
+    std::printf("\n");
+    // Is the pattern expressible as a LAYOUT rather than a table? If slot(v) is periodic with a power-of-two period and
+    // linear in the value index, one Layout covers it and nothing has to be stored.
+    int period = 0;
+    for (int P = 1; P <= int(ref_slot.size()); ++P) {
+      bool ok = true;
+      for (int i = 0; i + P < int(ref_slot.size()); ++i) if (ref_slot[i] != ref_slot[i + P]) { ok = false; break; }
+      if (ok) { period = P; break; }
+    }
+    std::printf("      slot(v) period: %d %s\n", period,
+                (period && (period & (period - 1)) == 0) ? "(a power of two -> expressible as one Layout, no table)"
+                                                         : "(NOT a power of two -- needs a stored map)");
+    if (!same_pattern || ndist_min != ndist_max) ++g_fail_extra;
   }
 
   int const fail = bad_code + bad_s + bad_z + (nz == 0 ? 1 : 0) + g_fail_extra;

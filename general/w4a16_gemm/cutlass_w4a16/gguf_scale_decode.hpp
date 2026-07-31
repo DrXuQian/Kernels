@@ -26,6 +26,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/half.h"
 #include "gguf_scale_layout.hpp"
+#include "cutlass/gguf_packed_scale.h"
 
 namespace gguf_scale {
 
@@ -112,45 +113,20 @@ CUTLASS_HOST_DEVICE constexpr float bytes_per_group_per_col_fp16() {
 }
 
 
-// ---------------------------------------------------------------------------------------------------------------
-// THE PACKED UNIT: one 16 B run per (superblock, column), and the function the mainloop will call. Plan #20 option E.
-//
-// Layout, reordered offline so each half is self-contained (the gguf's own packing is NOT separable: get_scale_min_k4
-// takes sc[4..7] from bytes 8-11 AND bytes 0-3's top 2 bits, so groups 4-7 need all twelve bytes):
-//
-//     byte 0-1  d    byte 2-3  dmin    byte 4-9  half0 (groups 0-3)    byte 10-15  half1 (groups 4-7)
-//
-// A half is 4 sc + 4 mn as 6-bit fields = 48 bits = 6 bytes exactly, so nothing grows: 16 B / 8 groups = 2.0 B per
-// (group, column) against 4.0 for two fp16 planes. ONE Layout gives every bit position, so no shift arithmetic is
-// written down anywhere:
-//     bit(g, which) = 32 + 6*(g%4) + 48*(g/4) + 24*which          which = 0 for sc, 1 for mn
-// Gated in fold_derivation/l94 (4): native 12 B -> reference sc/mn -> this packing -> this decode -> reference, 0 bad
-// over 128 columns x 8 groups, and 0 bits falling outside their own half.
-using PackBits = cute::Layout<cute::Shape<cute::_4, cute::_2, cute::_2>,
-                              cute::Stride<cute::_6, cute::Int<48>, cute::Int<24>>>;
-static constexpr int kPackBitBase = 32;                       // d and dmin occupy the first 4 bytes
-
-CUTLASS_HOST_DEVICE constexpr int packed_bit_of(int g, int which) {
-  return kPackBitBase + int(PackBits{}(g % 4, g / 4, which));
-}
-// 6 bits may straddle a byte boundary (half0 starts at byte 4, so bit 32 + 6i), hence a 16-bit read and one shift.
-CUTLASS_HOST_DEVICE int packed_code(uint8_t const* unit, int g, int which) {
-  int const bit = packed_bit_of(g, which);
-  uint32_t const w = uint32_t(unit[bit >> 3]) | (uint32_t(unit[(bit >> 3) + 1]) << 8);
-  return int((w >> (bit & 7)) & 0x3Fu);
-}
-CUTLASS_HOST_DEVICE void packed_put(uint8_t* unit, int g, int which, int v) {   // offline side, same one rule
-  int const bit = packed_bit_of(g, which);
-  unit[bit >> 3]       |= uint8_t((uint32_t(v) << (bit & 7)) & 0xFFu);
-  unit[(bit >> 3) + 1] |= uint8_t((uint32_t(v) << (bit & 7)) >> 8);
-}
-// The mainloop's call: one 16 B unit in registers, one group out. d/dmin come from the unit's own first 4 bytes.
+// THE PACKED UNIT AND ITS DECODE NOW LIVE IN actlize: cutlass/gguf_packed_scale.h, because the mainloop needs them and
+// the mainloop is there. This header re-exports them so existing callers (fold_derivation/l94, the offline harnesses) are
+// unchanged, and so there is exactly ONE definition of the bit map -- copying it here is the failure this work keeps
+// recording. The Q4_K parameters are named where they are used, not baked into the re-export.
+using cutlass::gguf_packed::PackBits;
+using cutlass::gguf_packed::kUnitBytes;
+static constexpr int kPackBitBase = cutlass::gguf_packed::kBitBase;
+CUTLASS_HOST_DEVICE constexpr int packed_bit_of(int g, int which) { return cutlass::gguf_packed::bit_of(g, which); }
+CUTLASS_HOST_DEVICE int  packed_code(uint8_t const* u, int g, int which) { return cutlass::gguf_packed::code_of(u, g, which); }
+CUTLASS_HOST_DEVICE void packed_put (uint8_t* u, int g, int which, int v) { cutlass::gguf_packed::put_code(u, g, which, v); }
 template <KType T>
 CUTLASS_HOST_DEVICE GroupScale packed_group(uint8_t const* unit, int g) {
-  half_t const d    = half_t::bitcast(uint16_t(unit[0]) | uint16_t(uint16_t(unit[1]) << 8));
-  half_t const dmin = half_t::bitcast(uint16_t(unit[2]) | uint16_t(uint16_t(unit[3]) << 8));
-  return Traits<T>::kHasMin ? make_group_scale<T>(packed_code(unit, g, 0), packed_code(unit, g, 1), d, dmin)
-                            : GroupScale{make_group_scale_only<T>(packed_code(unit, g, 0), d), half_t(0.f)};
+  auto const g2 = cutlass::gguf_packed::group_of<Traits<T>::kScaleBias, Traits<T>::kHasMin>(unit, g);
+  return GroupScale{g2.scale, g2.zero};
 }
 
 }  // namespace gguf_scale
