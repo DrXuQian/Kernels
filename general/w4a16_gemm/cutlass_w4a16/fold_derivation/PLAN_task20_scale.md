@@ -429,8 +429,27 @@ int8s in one 16-bit slot, host-side, at `[group][n]` granularity. Then the smem 
 * `d`/`dmin` ride in on the pointer the zero used to use, at `[K/256][n]` granularity -- one eighth the rows.
 * the transform's `multiplies{}`/`plus{}` pair becomes a decode (`gguf_scale_decode.hpp`, already gated by l93) plus the
   same two passes. FOUR sites: ConvertAndScale coarse/FINE and ConvertAndScaleWithZero coarse/FINE.
-* the FINE path's TWO reads per group (scale and zero) become ONE, which is the "16 reloads -> 1" the re-pricing
-  predicted, and it costs no extra bytes because 2 int8s occupy exactly one fp16.
+* the FINE path's TWO reads per group (scale and zero) become ONE, and it costs no extra bytes because 2 int8s occupy
+  exactly one fp16.
+
+**Correction to the line above as first written: this is 16 reloads -> 8, NOT -> 1.** At TileK=256/gs=32 the FINE path
+does 8 groups x 2 channels = 16 s2r reads per k-tile; interleaving makes it 8. Getting to 1 needs the TRUE superblock
+form -- 12 raw bytes read once and decoded for all eight groups -- which requires a byte-granular or k-major scale tile,
+i.e. exactly the expensive route this note was trying to avoid. So the cheap route's payoff is: the Z channel's stream
+and tile gone (the measured 11.5%) plus half the FINE reload reads (7.3% -> ~3.7%), about 15% of the kernel, and NOT the
+full 18.8%. Writing "-> 1" was the same failure this file keeps recording: a relation restated from memory instead of
+recounted off the shape.
+
+**THE ONE DESIGN DECISION LEFT: where d/dmin come from.** They are per (superblock, n), i.e. one eighth the rows of the
+scale plane, so they do not fit the existing Z tile's granularity.
+  (a) a second smem tile at 1/8 the K rows -- needs its own SmemLayoutScale, its own partitioning and its own read
+      cadence (once per k-tile at TileK=256). ~4-6 sites, all in the collective.
+  (b) load them per lane straight from gmem into registers once per k-tile, no Z smem at all. The Z channel then
+      vanishes completely rather than shrinking, the read is tiny (2 fp16 per n-slot) and L2 serves the reuse across the
+      eight groups. Sites: one loader plus the four transform arms.
+(b) is the smaller change and the bigger saving; its one prerequisite is getting a lane's own `n` coordinates inside the
+mma loop, which the gmem side already has (`partition_S(cS)` at l985 exists for predication) but the register side does
+not yet -- READ how that partitioning maps before writing it, do not infer it from the fragment shape.
 
 So the change is four transform sites plus the Z tile's K-extent, not ten sites plus three driver layers. The host-side
 interleave belongs in `dump_packed_scale.py` (it already emits sc/mn/d/dmin separately) and in the synthetic harnesses.
