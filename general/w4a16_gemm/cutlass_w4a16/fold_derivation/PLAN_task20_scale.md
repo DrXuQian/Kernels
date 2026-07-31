@@ -1077,3 +1077,62 @@ Calling TileN and TileK occupancy experiments. Using launch-warps/CU as achieved
 latency-bound" from low HBM utilisation. Inferring a bottleneck from opcode share without stall or pipe evidence.
 Comparing sub-13% timings across runs or mixed shapes. Spending rounds on 0.6-4% packed micro-optimisations before the
 NOP decomposition runs.
+
+### l97's premise was wrong: the caller already wraps. Four hypotheses, four refutations, cause still unknown
+
+`mma()` calls `partition_extra_inputs(..., thread_idx % (Scale_GmemCopyThrLayoutH * Scale_GmemCopyThrLayoutW))` at
+line 715 -- **the thread index is already in [0, 128) before the packed slice ever sees it.** l97 measured
+`get_slice(t)` for t up to 255, a call that does not exist in the tree, and the modulo I then added is a no-op. Found
+by grepping the caller, which takes thirty seconds and which I did not do before committing a "fix".
+
+So rowC's intermittency has now survived four hypotheses: FTZ (refuted by simulating it -- 88.5% predicted damage
+against 17.7% observed), `"=r"` aliasing (refuted by rebuilding with `PPU_F16X2_EARLYCLOBBER=0` and still passing),
+out-of-range partition (refuted above), and the paired store race (real, but removed in fce4fa41 while bad went 128 ->
+724). **The cause is unknown and the current pass is not evidence of a fix.** Treat rowC as flaky until it has passed
+N times; keep `PPU_PACKED_PAIR` for bisecting when it returns.
+
+### Where the bank conflicts actually are, and they are not mine
+
+The decomposition is almost exact:
+
+    441,344 baseline shared loads  -  168,960 A/B tsm.ld.swzl  =  272,384 scalar scale/zero loads
+    278,528 conflicts / 272,384 loads = 1.0226
+
+**Essentially every scalar scale/zero load is conflicted**, and they are the FINE per-group reload pair in
+`transform_B_kblock` -- the shipped path, identical in both builds, so they explain NONE of the 2.59 us delta.
+
+The map, derived from the real TV layout rather than guessed: `h(t) = 256*(t mod 4) + floor(t/4) + C`. A 256-half
+thread stride is 128 bank words, exactly four 128-byte bank periods, so it vanishes mod 32 and the lanes land on banks
+`0,0,1,1,2,2,3,3` with **four distinct words on each of four banks** -- confirming l94's "4-way on 4 banks (16 addrs)"
+(l94 and l95 were both recompiled and rerun to check). Transactions reconcile too: 272,384 x 4 = 1,089,536 plus
+819,200 / 168,960 = 4.85 per swizzled load = 1,908,736 against the measured 1,945,600.
+
+**The packed raw read is clean**: +4,608 loads, +36,864 transactions = exactly 8 per load, **+0 conflicts**. The old
+claim that the native form "removes the conflicts" was true of the read-side register decode, not of this staged
+decode -- F' decodes into the same fp16 planes, so the consumers keep the old conflicts.
+
+**The packed STORE conflicts count out exactly**: `4 decoder warps x 8 groups x 2 planes x 9 passes x 128 CTAs =
+73,728`, the observed increment. Cause: 32 lanes store 32 adjacent 2-byte values, occupying 16 bank words, two
+halfword stores per bank, and stores cannot broadcast.
+
+**The ownership-safe store fix is not column pairing.** It is to store the same column's `(scale, zero)` as one 32-bit
+word in an INTERLEAVED decoded tile and give the consumers even/odd halfword views: every thread derives both halves
+from its own unit, and 32 consecutive 4-byte stores hit all 32 banks once. It changes the physical layout, so the read
+bank probe must be rerun -- not a free patch.
+
+**Worth attacking?** 278,528 / (128 CTAs x 8 warps) = 272 conflict events per warp against ~266 scalar loads;
+removing them saves roughly 272-798 bank-service cycles per warp path against 34,191, i.e. **0.8-2.3% (0.16-0.47 us)**
+-- second order, and zero help for the packed delta. Caveat: acu's conflict counter is 1.02 per instruction, which
+suggests it counts a conflicted instruction or replay rather than every excess word; its exact definition is unknown.
+
+### The experiment that is actually next, and it is cheap
+
+Threads `n` and `n+128` are **duplicate owners of the same column**: both issue the cp.async for it and each waits on
+its own copy, so both may legally read that unit. So split the groups instead of the columns -- threads 0-127 decode
+groups 0-3 of column `t`, threads 128-255 decode groups 4-7 of column `t-128`. **All eight warps decode four groups
+each instead of four warps decoding eight**, with the same number of decode operations, the same stores, the same
+conflicts and the same ownership. Cost: one extra 16 B shared read and header per column pair.
+
+If it improves materially, the slowest-warp/barrier placement is what costs; if it does not, aggregate issue demand
+is. That is a cleaner placement test than moving the wait, and unlike the 0.6% store fix it is also a real
+optimisation. Run it together with the NOP triple.
