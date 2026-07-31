@@ -36,7 +36,45 @@ Same-config A/B, decode band `L=64 top-k=8 N=K=2048 gs=32`, `SK_QUANT=2` (ScaleZ
 | **F** — decode in a synchronous loader, into the fp16 planes | 24.17 (TK=256 back on top → inner loop is clean) |
 | **F′** — cp.async raw bytes to staging, decode at the existing barrier | 25.00 / 24.79 |
 
-**Read this as a refutation, not as work in progress.** F′ restored async and got *worse*, so the exposed load latency was
+**The pinned A/B settled it (kernel #233, `(8,16,1)x(256,1,1)` on both sides, `v.mma` 131,072 / `v.lop3.i` 546,816 /
+`v.bfi.i` 270,336 / `tsm.ld.swzl` 168,960 / `smem.ld` 31,744 / `vmem.acp.commit.grp` 19,456 all identical -- the B
+channel and the mma are untouched):**
+
+| | base | packed |
+|---|---|---|
+| time | **20.11 us** | **22.70 us** (+12.9%) |
+| cycles | 34,191 | 38,588 |
+| registers | 102 | **98** -- LOWER, so no spill |
+
+The winner-row numbers above (24.17 / 25.00) mixed shapes; **+12.9% is the real cost**. Where it goes, all six added
+ALU opcodes landing on the same count:
+
+| term | delta instructions | verdict |
+|---|---|---|
+| convert ALU (`v.mul.f16`, `v.add.f16`, `v.shrl.i`, `v.or.i`, `v.and.i` ... each ~**+73,728**) | ~440K | **exactly one instruction per (column, group, field)** -- 73,728 = 4 warps x 16 x 9 passes x 128 CTAs, where 16 = 8 groups x 2 fields. Already the per-value floor. |
+| `tsm.st` (shared store) | +71,680 | improvable: 2 B per lane uses 16 of 32 banks, so 1.83 transactions per instruction and +73,728 conflicts |
+| `Shared Load` | +4,608 | **optimal** -- the four `uint32` reads vectorised into ONE 16 B `smem.ld` per lane per pass |
+| `Shared Store From Global Load` (cp.async) | **-9,216 (-38%)** | the traffic win, and it does show up |
+| scalar bookkeeping | ~150K | the loop and its `s.lop.emsk` |
+
+`Shared Load` bank conflicts moved **+0.00%**: the read side is byte-identical, as designed.
+
+**No redundancy left to remove.** The problem needs `8 experts x 2048 cols x 64 groups = 1,048,576` (column, group)
+pairs decoded; the kernel decodes `128 CTAs x 128 cols x 8 groups x 9 passes = 1,179,648`. Ratio **1.125** -- the 9
+passes for 8 k-tiles at Stages=2, nothing more.
+
+**Two micro-optimisations, with honest sizes.** (a) one thread per **two** adjacent columns storing `half2`: halves the
+store instructions, fills all 32 banks, conflicts to zero -- ~36K instructions, **~0.6%**. (b) pack `(sc, mn)` into one
+half2, `| 0x64006400`, one `hfma2` with multiplier `(d, dmin)` and addend `(-1152d, -1152dmin)` hoisted per column: 12
+instructions per pair down to ~8 -- ~150K, **~4%**. This is TODO #18. Both together take +12.9% to roughly +8%.
+
+**It cannot reach zero**, and that is the conclusion rather than a limitation: 1.05M pairs must be decoded, each costs
+~12 instructions, and the whole kernel is only 4.4M instructions. A 16% instruction increase does not buy a 0% time
+increase. So the in-GEMM decode is a **12.9% tax on every forward pass**, where the load-time conversion kernel of
+section 10 pays it **once**. Unless the 11% of weight bytes is worth more than 12.9% of decode-band GEMM time, the
+separate kernel is strictly better.
+
+**Two hypotheses this refuted along the way.** F′ restored async and got *worse*, so the exposed load latency was
 never the main term. What F and F′ share is the decode: per CTA per k-tile, 512 decodes (~11 instructions each) **and 1024
 `STS.16`** — where the fp16 path has cp.async write the same two tiles with **zero instructions**. With acu showing LSU at
 6% busy and IALU/FALU at 14%, trading a free async copy for explicit stores plus ALU is the wrong direction in this band.
