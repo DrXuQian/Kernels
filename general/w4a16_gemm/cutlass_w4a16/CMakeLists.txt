@@ -296,6 +296,24 @@ set(_SPLITK_CFGS
   # more warps per loaded B tile, not more tiles in flight. So the levers left in this band are depth (Stages), the
   # scale reload chain (TODO #11) and the last-wave tail (TODO #10) -- not block count.
   # NOTE these rows keep the fp16 scale path: at gs=32, TK=128 gives Scale_TileK = 4, so kPackedScaleOn is false.
+  #
+  # THEY ARE ALSO THE FALSIFIER FOR THE PERSISTENT-KERNEL IDEA, which is why they are worth more than a TK datapoint.
+  # The pipeline-fill share of a CTA's timeline is Stages/(K/TK + Stages): 2/(8+2) = 20% at TK=256 and 2/(16+2) = 11%
+  # at TK=128. Same total work, half the prologue share. So if the fill is the term that a persistent kernel would
+  # amortise, these rows should already show roughly 9%; if they do not move, the prologue is not the term and
+  # persistence cannot reach it either -- a one-build answer instead of a new dispatch tag.
+  #
+  # For the record on what persistence would and would not buy here. It would NOT buy the usual thing: 8 active
+  # experts x 16 n-tiles = 128 tiles against 64 CUs x 2 blocks/CU = 128 CTAs is EXACTLY one wave, so there is no tail
+  # to reclaim in this band (TODO #10's tail is a different shape). It would buy fill amortisation, and only if the
+  # grid is deliberately SMALLER than the tile count (grid = #CU * blk/CU) so a CTA chains tiles -- which is what the
+  # hand-written AIU MoE did to reach DeepGemm parity. The machinery exists in actlize already:
+  # ppu_aiu_gemm_array_persistent_overlap_prologue.hpp, selected by Schedule tag
+  # KernelAiuMultistageBatchArrayOverlapPrologue and requiring PersistentSchedulerPPU0015 (the only
+  # IsDynamicPersistent = true in the tree; ppu_tile_scheduler_group.hpp is false despite its class name). It is not a
+  # drop-in: our Schedule is KernelAiuMultistageMixedInputFinegrainedGs32, so it needs a new tag plus a builder
+  # specialisation, and the real work is in the mainloop -- load_init bakes n_coord/l_coord into the gmem tensors once
+  # (gSp = local_tile(..., make_coord(n_coord, 0, _))), and a persistent CTA must re-derive them per tile.
   "16,128,128,16,16,2"
   "16,128,128,16,16,4"
   "16,64,128,16,16,2"
