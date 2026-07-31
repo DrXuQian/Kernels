@@ -503,3 +503,39 @@ live flat next to the harnesses.
 NEXT (the mainloop, in this order): (1) the scale tile carries 2 bytes of (sc,mn) -- no layout/copy/fragment/Params
 change; (2) d/dmin per k-tile in registers, Z smem tile removed; (3) the four transform arms call rwmoep/gguf_scale_
 decode instead of multiplies{}/plus{}.
+
+### OPTION E WINS, and l94 gates it locally. The earlier B recommendation is withdrawn.
+
+B (widen sc/mn to int8 so two codes fill one fp16 slot) dies on a constraint I should have applied from the start: the
+device holds the gguf's bytes and nothing else, so an offline widening -- 12 B -> 16 B per Q4_K block, +2.8% model size,
+plus a preprocessing pass -- is not available. Online widening just moves the cost.
+
+C (llama.cpp's loader-side decode) is not portable to us either, and for a structural reason: our scale g2s is
+`Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, ElementScale>`, and **cp.async cannot do arithmetic between gmem and
+smem**. llama.cpp's MMQ is a synchronous tile loader with __syncthreads, so `dm * make_half2(sc8[l], m8[l])` in the
+loader costs it nothing; for us it means dropping async on that channel in a multistage pipeline.
+
+E: cp.async the gguf's OWN bytes, decode in registers. The observation that makes it cheap is that a Q4_K superblock's
+12 scale bytes are per COLUMN and cover all 8 of that column's groups -- so a lane owning column n reads 3 uint32 ONCE
+per k-tile and holds every group's sc and mn. The FINE per-group read does not halve, it DISAPPEARS.
+
+`fold_derivation/l94_native_scale_path.cu`, host-only on l21's stub mma (the CollectiveBuilder cannot be CALLED locally:
+that needs -D__HGGCCC__, and then cute's namespace-scope `_` is not device-visible under nvcc):
+
+    today's SmemLayoutScale : (_128,_8,_2):(_1,_128,_1024)      native tile: (_128,_12):(_12,_1)
+    (2) DISTINCT addresses per bank over warp0: today 4-way on 4 banks (16 addrs) | native 1-way on 24 banks (24 addrs)
+    (1) 1024 (n,group) pairs | codes 0 bad | scale 0 bad | zero 0 bad | non-zero refs 1008
+    (3) per lane per k-tile: 12 B of codes (3 uint32) + 1 half2 of (d,dmin) held across 8 groups
+        s2r reads per k-tile: today 16 -> native 3 | smem per (group,column): 4.0 B -> 2.00 B
+
+**The bank conflict disappears for free**: the native column stride is 12 B = 3 words and gcd(3,32) == 1, so consecutive
+columns spread over banks instead of aliasing. Today's 4-way matches the acu finding of 1.02 conflicts per scale read.
+
+**A metric bug worth recording.** The first version of check (2) counted LANES per bank and reported native as 4-way. But
+several lanes hitting the same address is a BROADCAST, and the scale fragment is deliberately k-broadcast (task #1's
+stride-0 view), so lanes do share addresses. Counting distinct ADDRESSES per bank is the only version that measures
+conflicts; with it, native is 1-way. Same failure family as the rest of this file: a quantity that looks like the one you
+want until you ask what the hardware actually does with it.
+
+Caveat: the lane->n map comes from l21's stub mma, i.e. the reconstruction the fold derivation was built on and the box
+later validated -- not from the CollectiveOp itself.
