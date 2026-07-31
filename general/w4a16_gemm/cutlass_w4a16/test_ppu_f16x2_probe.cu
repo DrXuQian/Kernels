@@ -113,6 +113,8 @@ static void report_ops(char const* name, std::vector<OpCase> const& cs,
 int main(int argc, char** argv) {
   std::printf("== ppu f16x2 probe: do the two asm ops equal the scalar ops they replace? ==\n");
   // (3) first, because everything else is conditional on it.
+  std::printf("  (3) f16x2 form compiled: sub=\"%s\" fma=\"%s\"\n",
+              CUTLASS_PPU_F16X2_SUB, CUTLASS_PPU_F16X2_FMA);
   std::printf("  (3) CUTLASS_GGUF_PACKED_F16X2_ASM = %d  -> the device build uses %s\n",
               CUTLASS_GGUF_PACKED_F16X2_ASM,
               CUTLASS_GGUF_PACKED_F16X2_ASM ? "the ppu.*.f16x2 ASM" : "the SCALAR FALLBACK (asm never runs!)");
@@ -133,9 +135,17 @@ int main(int argc, char** argv) {
   // asymmetric lanes, and a lane whose value is large while the other is small
   cs.push_back({P(1024.f, 0.0001f), P(0.5f, 4096.f),    P(-1.f, 2.f)});
   cs.push_back({P(-1152.f, 1152.f), P(1.f, 1.f),        gp::kNegZeroX2});
-  // denormals, where flush-to-zero would show
+  // SUBNORMALS, IN THE EXACT SHAPE Q4_K PRODUCES. On the real fixture d spans 1.585e-05 to 9.484e-04 against fp16's
+  // smallest normal 6.104e-05, so 3914 of 4864 superblock d values are SUBNORMAL while dmin (1.1e-04 to 1.1e-02) is
+  // not -- and the PRODUCTS d*sc are not either, which is why the fp16-plane baseline never meets this. If the f16x2
+  // ops flush a subnormal INPUT, the scale lane dies and the zero lane lives. That asymmetry is the signature.
+  cs.push_back({P(50.f, 40.f),   P(1.585e-05f, 1.096e-04f), gp::kNegZeroX2});   // smallest d, normal dmin
+  cs.push_back({P(63.f, 63.f),   P(3.0e-05f,  9.484e-04f),  gp::kNegZeroX2});   // mid subnormal d, largest dmin
+  cs.push_back({P(1.f, 1.f),     P(6.0e-05f,  6.2e-05f),    gp::kNegZeroX2});   // straddling the normal threshold
   cs.push_back({P(6e-8f, 1.f),  P(1.f, 6e-8f),          gp::kNegZeroX2});
   cs.push_back({P(6e-5f, 6e-5f), P(6e-5f, 1e-3f),       gp::kNegZeroX2});
+  // and the SUB, which also sees a subnormal if one ever reaches it
+  cs.push_back({P(3.0e-05f, 1.f), P(0.f, 0.f),          gp::kNegZeroX2});
   // the two whole ranges the identity claims, sampled at the ends
   for (int v = -128; v <= 895; v += 73)
     cs.push_back({uint32_t(0x6480 + v) | (uint32_t(0x6480 + (v % 64)) << 16), gp::kMagic1152x2, gp::kNegZeroX2});
