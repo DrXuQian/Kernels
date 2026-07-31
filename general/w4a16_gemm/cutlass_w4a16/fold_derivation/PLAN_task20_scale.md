@@ -416,3 +416,24 @@ gets both" does not work: `tCrS` is `make_fragment_like(partition_fragment_B(...
 `n` of the mma B operand. Interleaving in N makes a lane's 8 halfs into 4 scales and 4 zeros of DIFFERENT n. Any
 co-location has to be at `[group][n][2]` granularity (a 32-bit read yielding both for the same n) and then de-interleave
 in registers -- which is a different change from the packed-int8 one, not a cheaper version of it.
+
+**A MUCH CHEAPER ROUTE FOR THE COLLECTIVE, found while scoping it: reinterpret, do not resize.**
+
+The packed form's element does not have to be smaller than `half_t` -- it has to CARRY MORE. Interleave `(sc, mn)` as two
+int8s in one 16-bit slot, host-side, at `[group][n]` granularity. Then the smem element stays 2 bytes and
+`SmemLayoutScale`, `GmemTiledCopyScale`, `SmemCopyAtomScale`, `elements_per_smem_scale`, `make_scale_fragment`,
+`Params::ptr_S` and every partition are **byte-identical** -- nothing about the plumbing changes. What changes:
+
+* the ZERO channel disappears as a channel: no `ptr_Z` stream, no Z smem tile, no per-group Z s2r read. That is where
+  the measured 11.5% lives.
+* `d`/`dmin` ride in on the pointer the zero used to use, at `[K/256][n]` granularity -- one eighth the rows.
+* the transform's `multiplies{}`/`plus{}` pair becomes a decode (`gguf_scale_decode.hpp`, already gated by l93) plus the
+  same two passes. FOUR sites: ConvertAndScale coarse/FINE and ConvertAndScaleWithZero coarse/FINE.
+* the FINE path's TWO reads per group (scale and zero) become ONE, which is the "16 reloads -> 1" the re-pricing
+  predicted, and it costs no extra bytes because 2 int8s occupy exactly one fp16.
+
+So the change is four transform sites plus the Z tile's K-extent, not ten sites plus three driver layers. The host-side
+interleave belongs in `dump_packed_scale.py` (it already emits sc/mn/d/dmin separately) and in the synthetic harnesses.
+Verify before writing code, since this note is itself a written-down relation: that `NonVoidElementScale` reaches nothing
+but sizing/copies/fragment-element (grep says l159/163/172/385-430/456/1034), and that no arithmetic outside the four
+transform arms touches `tCrS`/`tCrZ`.
