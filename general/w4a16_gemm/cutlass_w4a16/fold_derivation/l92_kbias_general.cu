@@ -51,6 +51,35 @@ static void check(char const* name) {
   g_fail += bad;
 }
 
+// The 2-plane version: Bias comes from the ONE rule the collective quotes, and the code sweeps the concatenated width.
+template <int LowBits, int HiBits>
+static void check2(char const* name) {
+  constexpr int Bias = cutlass::kSymBias2Plane<LowBits, HiBits>;
+  using P = cutlass::MixGemm2Plane<LowBits, HiBits, -1, 1, true,
+                                   cutlass::MixGemm2PlaneDefaultFrag<LowBits>, Bias>;
+  using E = typename P::E;
+  constexpr int W = LowBits + HiBits;
+  int bad = 0;
+  cute::for_each(cute::make_int_sequence<E::kPairsPerVreg>{}, [&] (auto t_) {
+    constexpr int T    = decltype(t_)::value;
+    constexpr int bpos = E::template bpos<T>();
+    double const mul = h2d(uint16_t(E::template mul<T>() & 0xFFFF));
+    double const add = h2d(uint16_t(E::template add<T>() & 0xFFFF));
+    // The high plane lands at bpos+LowBits, so the top mantissa bit used is bpos+W-1; it must stay under 11 bits.
+    if (bpos + W > 11 && bad < 1) std::printf("  [FAIL] %s: field overflows the fp16 significand at bpos=%d\n", name, bpos);
+    for (int c = 0; c < (1 << W); ++c) {
+      double y = (1024.0 + double(c) * std::ldexp(1.0, bpos)) * mul + add;
+      if (y != double(c - Bias)) {
+        if (bad < 4) std::printf("  [FAIL] %s bpos=%d c=%d: got %g want %d\n", name, bpos, c, y, c - Bias);
+        ++bad;
+      }
+    }
+  });
+  std::printf("  %-10s W=%d Bias=%2d  %d codes x %d bpos -> %d bad\n",
+              name, W, Bias, 1 << W, int(E::kPairsPerVreg), bad);
+  g_fail += bad;
+}
+
 int main() {
   std::printf("== plan #20 phase 1: generalised kBias ==\n");
   check<4, 8>("int4 Bias=8");     // the SHIPPED path -- must be bit-identical to before
@@ -81,6 +110,29 @@ int main() {
     bool ok = (a0 == 0xE408) && (a1 == 0xD480);            // FP16_TOP_MAGIC_NUM's -1032 and NEG_72 from the int4 converter
     std::printf("  int4 Bias=8 add[0]=0x%04X add[1]=0x%04X (want 0xE408 / 0xD480) -> %s\n", a0, a1, ok?"ok":"FAIL");
     if (!ok) ++g_fail;
+  }
+  // ---- PHASE 1b: the SAME identity on the 2-plane path, over the CONCATENATED code -------------------------------
+  // emit_one does  x |= ((hreg >> hshift) & himask()) << (bpos + LowBits)  BEFORE the fma, so the mantissa holds
+  // c = low + 2^LowBits*high at position bpos and the low plane's single `add` biases the WHOLE code. Hence the
+  // range to sweep is [0, 2^(LowBits+HiBits)), not [0, 2^LowBits) -- if the bias did not commute with the OR this is
+  // the check that would catch it, because c now reaches 2^W-1 and any mantissa overflow shows up as an inexact y.
+  check2<2, 1>("Q3 i2+i1");     // ScaleOnly bias 4
+  check2<4, 2>("Q6 i4+i2");     // ScaleOnly bias 32
+  check2<4, 1>("Q5 i4+i1");     // bias 16 -- Q5_K has a min so it never runs ScaleOnly, but the mechanism must hold
+  // Regression: the DEFAULT 2-plane instantiations (what ScaleZero still uses) must keep the shipped bias.
+  {
+    bool ok = (cutlass::MixGemm2Plane<2,1>::kBias == 0) && (cutlass::MixGemm2Plane<4,2>::kBias == 8)
+           && (cutlass::MixGemm2Plane<4,1>::kBias == 8)
+           && (cutlass::MixGemm2Plane_uint2_uint1<>::kBias == 0)
+           && (cutlass::MixGemm2Plane_int4_uint2<>::kBias == 8)
+           && (int(cutlass::MixGemm2PlaneFor<cutlass::uint2b_t, cutlass::uint1b_t>::type::kBias) == 0);
+    std::printf("  default 2-plane Bias unchanged (0 / 8 / 8) -> %s\n", ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+    // And the rule the collective quotes is the one this file checks.
+    bool r = (cutlass::kSymBias2Plane<2,1> == 4) && (cutlass::kSymBias2Plane<4,2> == 32)
+          && (cutlass::kSymBias2Plane<4,1> == 16);
+    std::printf("  kSymBias2Plane = 4 / 32 / 16 -> %s\n", r ? "ok" : "FAIL");
+    if (!r) ++g_fail;
   }
   std::printf("== %s: %d mismatches ==\n", g_fail ? "FAIL" : "PASS", g_fail);
   return g_fail ? 1 : 0;

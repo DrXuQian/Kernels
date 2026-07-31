@@ -111,18 +111,22 @@ int main(int argc, char** argv) {
       hi[i] = uint8_t(q[i] >> 4);
     }
     // CPU golden in double: D = sum_k A * (dl * q)
-    std::vector<double> gold((size_t)M * N, 0.0);
+    // goldsym is the SAME data through the SYMMETRIC dequant D = sum_k A * dl * (q - qmax/2), which is what a real
+    // Q6_K is (d*sc*(q-32)) and what the ScaleOnly rungs must produce with the bias living in the converter's
+    // immediate instead of the zero channel. qmax/2 == kSymBias2Plane<4,HiBits>: 32 for Q6, 16 for Q5.
+    std::vector<double> gold((size_t)M * N, 0.0), goldsym((size_t)M * N, 0.0);
     for (int k = 0; k < K; ++k)
       for (int m = 0; m < M; ++m) {
         const double a = double(float(A[(size_t)m * K + k]));
         if (a == 0.0) continue;
         for (int n = 0; n < N; ++n) {
           const double dl = double(float(Sc[(size_t)(k / gs) * N + n]));
-          gold[(size_t)m * N + n] += a * dl * double(q[(size_t)k * N + n]);
+          gold   [(size_t)m * N + n] += a * dl * double(q[(size_t)k * N + n]);
+          goldsym[(size_t)m * N + n] += a * dl * double(q[(size_t)k * N + n] - qmax / 2);
         }
       }
     std::printf("  --- %s ---\n", fmt);
-    rungs(lo, hi, gold);
+    rungs(lo, hi, gold, goldsym);
   };
 
   auto check = [&](const char* tag, const std::vector<double>& gold) {
@@ -139,7 +143,7 @@ int main(int argc, char** argv) {
     return bad == 0;
   };
 
-#define RUNG65(TAG, HIB, HIELEM, TMv, TNv, TKv, WMv, WNv, Sv, F2v) do {                              \
+#define RUNG65(TAG, HIB, HIELEM, TMv, TNv, TKv, WMv, WNv, Sv, F2v, QMODEv, GOLDv) do {                              \
     std::vector<int8_t> blo((size_t)K * N / 2), bhi((size_t)K * N * (HIB) / 8);                       \
     xplane::place_derived<4, TMv, TNv, TKv, WMv, WNv, 1>(blo.data(), lo, N, K);                       \
     xplane::place_hi<4, HIB, TMv, TNv, TKv, WMv, WNv, F2v, 1>(bhi.data(), hi, N, K);                  \
@@ -148,31 +152,37 @@ int main(int argc, char** argv) {
     cutlass::DeviceAllocation<HIELEM> dbhi((size_t)K*N);                                               \
     dbhi.copy_from_host(reinterpret_cast<HIELEM const*>(bhi.data()));                                 \
     CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));                       \
-    moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMv, TNv, TKv, WMv, WNv, Sv,            \
+    moe_grouped_ppu::filter_and_run<QMODEv, TMv, TNv, TKv, WMv, WNv, Sv,                              \
                                     int4_t, HIELEM>(                                                  \
         dA.get(), dblo.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                     \
         M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr, dbhi.get());    \
     CUTLASS_PPU_CHECK(hggcDeviceSynchronize());                                                       \
-    check(TAG, gold);                                                                                 \
+    check(TAG, GOLDv);                                                                                \
   } while (0)
 
   // Q6 = int4 + int2. int4's run is 32 B at TK=64 already, so the LOW plane never folds; int2 folds by 2 at TK=64.
   // int2's delivery bound is WN >= 2048/TK, so TK=64 needs WN >= 32 -- w64x32 IS legal, the shape that paid +7 to +9
   // points on the single-plane sweeps.
-  run_format("Q6 = int4 + int2", 2, uint2_t{}, [&](auto& lo, auto& hi, auto& gold) {
-    RUNG65("(64,128,128) w32x32 s3  F1=1 F2=1", 2, uint2_t, 64, 128, 128, 32, 32, 3, 1);
-    RUNG65("(64,128,128) w64x32 s3  F1=1 F2=1", 2, uint2_t, 64, 128, 128, 64, 32, 3, 1);
-    RUNG65("(64,128, 64) w64x32 s3  F1=1 F2=2", 2, uint2_t, 64, 128,  64, 64, 32, 3, 2);
-    RUNG65("(64,128, 64) w64x64 s2  F1=1 F2=2", 2, uint2_t, 64, 128,  64, 64, 64, 2, 2);
-    RUNG65("(64, 64,128) w32x32 s3  F1=1 F2=1", 2, uint2_t, 64,  64, 128, 32, 32, 3, 1);
+  run_format("Q6 = int4 + int2", 2, uint2_t{}, [&](auto& lo, auto& hi, auto& gold, auto& goldsym) {
+    RUNG65("(64,128,128) w32x32 s3  F1=1 F2=1", 2, uint2_t, 64, 128, 128, 32, 32, 3, 1, QM::FinegrainedScaleZero, gold);
+    RUNG65("(64,128,128) w64x32 s3  F1=1 F2=1", 2, uint2_t, 64, 128, 128, 64, 32, 3, 1, QM::FinegrainedScaleZero, gold);
+    RUNG65("(64,128, 64) w64x32 s3  F1=1 F2=2", 2, uint2_t, 64, 128,  64, 64, 32, 3, 2, QM::FinegrainedScaleZero, gold);
+    RUNG65("(64,128, 64) w64x64 s2  F1=1 F2=2", 2, uint2_t, 64, 128,  64, 64, 64, 2, 2, QM::FinegrainedScaleZero, gold);
+    RUNG65("(64, 64,128) w32x32 s3  F1=1 F2=1", 2, uint2_t, 64,  64, 128, 32, 32, 3, 1, QM::FinegrainedScaleZero, gold);
+    // PLAN #20 PHASE 1 GATE: no zero channel, bias 32 in the converter, checked against the SYMMETRIC golden.
+    RUNG65("(64,128,128) w32x32 s3  ScaleOnly bias 32   ", 2, uint2_t, 64, 128, 128, 32, 32, 3, 1, QM::FinegrainedScaleOnly, goldsym);
+    RUNG65("(64,128, 64) w64x64 s2  ScaleOnly bias 32   ", 2, uint2_t, 64, 128,  64, 64, 64, 2, 2, QM::FinegrainedScaleOnly, goldsym);
   });
 
   // Q5 = int4 + int1. int1's bound is WN >= 4096/TK, so TK=256 allows w32x32, TK=128 needs WN >= 32, TK=64 needs 64.
-  run_format("Q5 = int4 + int1", 1, uint1_t{}, [&](auto& lo, auto& hi, auto& gold) {
-    RUNG65("(64,128,256) w32x32 s3  F1=1 F2=1", 1, uint1_t, 64, 128, 256, 32, 32, 3, 1);
-    RUNG65("(64,128,128) w32x32 s3  F1=1 F2=2", 1, uint1_t, 64, 128, 128, 32, 32, 3, 2);
-    RUNG65("(64,128,128) w64x32 s3  F1=1 F2=2", 1, uint1_t, 64, 128, 128, 64, 32, 3, 2);
-    RUNG65("(64,128, 64) w64x64 s2  F1=1 F2=4", 1, uint1_t, 64, 128,  64, 64, 64, 2, 4);
+  run_format("Q5 = int4 + int1", 1, uint1_t{}, [&](auto& lo, auto& hi, auto& gold, auto& goldsym) {
+    RUNG65("(64,128,256) w32x32 s3  F1=1 F2=1", 1, uint1_t, 64, 128, 256, 32, 32, 3, 1, QM::FinegrainedScaleZero, gold);
+    RUNG65("(64,128,128) w32x32 s3  F1=1 F2=2", 1, uint1_t, 64, 128, 128, 32, 32, 3, 2, QM::FinegrainedScaleZero, gold);
+    RUNG65("(64,128,128) w64x32 s3  F1=1 F2=2", 1, uint1_t, 64, 128, 128, 64, 32, 3, 2, QM::FinegrainedScaleZero, gold);
+    RUNG65("(64,128, 64) w64x64 s2  F1=1 F2=4", 1, uint1_t, 64, 128,  64, 64, 64, 2, 4, QM::FinegrainedScaleZero, gold);
+    // Q5_K itself has a min channel and so never runs ScaleOnly in production; this rung gates the MECHANISM at the
+    // third width, where kSymBias2Plane is 16, so a width-dependent mistake in the bias cannot hide.
+    RUNG65("(64,128,128) w32x32 s3  ScaleOnly bias 16   ", 1, uint1_t, 64, 128, 128, 32, 32, 3, 2, QM::FinegrainedScaleOnly, goldsym);
   });
 
   std::printf("\n  => %d failing configuration(s)\n", fails);

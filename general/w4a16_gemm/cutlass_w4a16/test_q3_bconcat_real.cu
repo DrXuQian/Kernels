@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
   // Every rung drives the high plane through xplane::place_int1, which is byte-identical to pack_plane's fold at
   // F1=1/F2=2 (l47, l53 at both K=512 and the box's K=256). So rung 1 is the known-MATCH configuration and also
   // double-checks that byte-identity on the box; if rung 1 breaks, place_int1 is the problem and nothing else matters.
-#define RUNG(TAG, TMv, TNv, TKv, WMv, WNv, Sv, F1v, F2v) do {                                        \
+#define RUNG(TAG, TMv, TNv, TKv, WMv, WNv, Sv, F1v, F2v, QMODEv) do {                                        \
   /* PLANE 1: once cols_per_word > 1 (WN=64) the whole-word packer cannot express the fragment, and it also    \
      groups the folded columns strided while the kernel's MmaView groups them adjacent. So drive plane 1 off the  \
      SAME derived map plane 2 already uses. Byte-identical to the whole-word packer wherever that one is          \
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
   cutlass::DeviceAllocation<cutlass::uint1b_t> dbhi_((size_t)K*N);                                   \
   dbhi_.copy_from_host(reinterpret_cast<cutlass::uint1b_t const*>(bhi_.data()));                     \
   CUTLASS_PPU_CHECK(hggcMemset(dD.get(), 0, sizeof(half_t) * (size_t)M * N));                        \
-  moe_grouped_ppu::filter_and_run<QM::FinegrainedScaleZero, TMv, TNv, TKv, WMv, WNv, Sv,             \
+  moe_grouped_ppu::filter_and_run<QMODEv, TMv, TNv, TKv, WMv, WNv, Sv,                                \
                                   cutlass::uint2b_t, cutlass::uint1b_t>(                             \
       dA.get(), dblo_.get(), dSc.get(), dZr.get(), pd.get(), sd.get(), gm.get(),                     \
       M, N, K, L, gs, shpd.get(), shp.data(), offdev.get(), ws.get(), wsb, nullptr, dbhi_.get());    \
@@ -207,11 +207,23 @@ int main(int argc, char** argv) {
   }
 
   int rung_no = 1, first_bad = -1;
-  RUNG("1 (64, 64,128) w32x32 F1=1 F2=2  BASE", 64,  64, 128, 32, 32, 3, 1, 2);
-  RUNG("2 (64,128,128) w32x32   TN 64->128 ", 64, 128, 128, 32, 32, 3, 1, 2);
-  RUNG("3 (64,128,128) w32x64   WN 32->64  ", 64, 128, 128, 32, 64, 3, 1, 2);
-  RUNG("4 (64,128,128) w64x64   WM 32->64  ", 64, 128, 128, 64, 64, 3, 1, 2);
-  RUNG("5 (64,128, 64) w64x64   TK 128->64, F1=2 F2=4", 64, 128, 64, 64, 64, 3, 2, 4);
+  RUNG("1 (64, 64,128) w32x32 F1=1 F2=2  BASE", 64,  64, 128, 32, 32, 3, 1, 2, QM::FinegrainedScaleZero);
+  RUNG("2 (64,128,128) w32x32   TN 64->128 ", 64, 128, 128, 32, 32, 3, 1, 2, QM::FinegrainedScaleZero);
+  RUNG("3 (64,128,128) w32x64   WN 32->64  ", 64, 128, 128, 32, 64, 3, 1, 2, QM::FinegrainedScaleZero);
+  RUNG("4 (64,128,128) w64x64   WM 32->64  ", 64, 128, 128, 64, 64, 3, 1, 2, QM::FinegrainedScaleZero);
+  RUNG("5 (64,128, 64) w64x64   TK 128->64, F1=2 F2=4", 64, 128, 64, 64, 64, 3, 2, 4, QM::FinegrainedScaleZero);
+  // PLAN #20 PHASE 1 GATE. Same real Q3_K weights, same native golden, but NO ZERO CHANNEL: the -4*dl that rungs 1-5
+  // carry in `zero` is now the converter's own additive immediate (kSymBias2Plane<2,1> == 4, l92). The zero buffer is
+  // still passed and still holds -4*dl, so if ScaleOnly wrongly consulted it the result would be off by exactly that
+  // and this rung would fail -- i.e. the check catches both a missing bias and a double-applied one.
+  //
+  // This, NOT test_lowbit_grouped, is the honest gate: that harness's oracle is the same kernel at L=1 (it isolates
+  // per-expert addressing), so it cannot see a wrong dequant constant at all. Only a harness with an INDEPENDENT
+  // golden can, and this file has one straight out of the gguf.
+  RUNG("6 (64,128,128) w64x64   ScaleOnly, bias in converter", 64, 128, 128, 64, 64, 3, 1, 2,
+       QM::FinegrainedScaleOnly);
+  RUNG("7 (64,128, 64) w64x64   ScaleOnly + F1=2 F2=4      ", 64, 128, 64, 64, 64, 3, 2, 4,
+       QM::FinegrainedScaleOnly);
 #undef RUNG
   std::printf("  => control %s; ladder: %s\n", ok256 ? "OK" : "BROKEN (look there first)",
               first_bad < 0 ? "all rungs MATCH" :

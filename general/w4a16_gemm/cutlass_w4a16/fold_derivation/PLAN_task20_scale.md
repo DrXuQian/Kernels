@@ -318,3 +318,33 @@ and its smem. All three are what native co-location removes.
 
 So for the decode band the expected payoff is a large fraction of 18.8%, and the mechanism is the reload COUNT, not
 traffic. Phase order is unchanged; only the expectation is.
+
+**PHASE 1 IS COMPLETE (1b: the two-plane path).** `MixGemm2Plane` gained `Bias` as parameter 7, defaulted to the
+shipped value, threaded into the low plane's `MixGemmChunkEmit`. The reason ONE constant suffices for a two-plane
+format is structural and worth writing down: `emit_one` ORs the high plane into the mantissa at `bpos + LowBits`
+*before* the fma, so the fma sees the concatenated code `c = low + 2^LowBits*high` and the low plane's single `add`
+biases the whole code. Hence `kSymBias2Plane<LowBits,HiBits> = 1 << (LowBits+HiBits-1)`: Q3_K 4, Q6_K 32.
+
+`kCvtBias` in the 2-plane collective picks that rule in `ConvertAndScale` and keeps the shipped constants in
+`ConvertAndScaleWithZero`. Deriving it from the MODE rather than adding a template parameter was checked, not assumed:
+every VERIFYING 2-plane caller today is ScaleZero, and the only ScaleOnly 2-plane callers were bench rows, where an
+fp16 immediate cannot move the instruction count.
+
+Two bugs this phase, both of the session's dominant shape:
+* `Cvt2Plane` (line ~300) is not a properties-only alias -- line 1455's unchunked path calls `Cvt2Plane::convert`. I
+  had biased only the chunked site and written a comment claiming the other was properties-only. Caught by grepping
+  every `::convert(` site rather than the one just edited; fixed by moving the alias below `kCvtBias` so there is one
+  biased type and no way to bias one path only.
+* **The plan's own gate was wrong.** It said "gate on `test_lowbit_grouped`'s Q3/Q6 rows". That harness's oracle is
+  the SAME KERNEL at L=1 -- it isolates per-expert addressing and is structurally blind to a wrong dequant constant.
+  The real gates are the harnesses with an INDEPENDENT golden: `test_q3_bconcat_real` (native Q3_K golden out of the
+  gguf; rungs 6-7 added, ScaleOnly, and the zero buffer is still passed still holding -4*dl so a double-applied bias
+  fails too) and `test_q65_bconcat_real` (rungs added against a new SYMMETRIC golden `dl*(q - qmax/2)`, qmax/2 being
+  kSymBias2Plane at both widths: Q6 32, Q5 16).
+
+Local evidence: `l92` extended to sweep the full concatenated range -- Q3 8 codes x 8 bpos, Q6 64 x 4, Q5 32 x 4, all
+0 bad, defaults unchanged. nvcc front end clean on all three edited harnesses (the ScaleOnly 2-plane instantiation is
+really expanded there, which is the check that would have caught the `GRP <= 2` class of failure).
+
+Box gate still owed: run `test_q3_bconcat_real` and `test_q65_bconcat_real` and require rungs 6/7 and the two
+ScaleOnly Q6 rungs to MATCH.
