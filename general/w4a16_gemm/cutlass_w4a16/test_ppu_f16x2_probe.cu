@@ -87,6 +87,36 @@ __global__ void probe_groups(uint32_t const* units, int nunits, half_t* s_pair, 
   }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// (4) IS THE DESTINATION ALLOWED TO ALIAS AN INPUT? This is the leading hypothesis for rowC's PARTIAL failure, and it
+// is the one thing "=r" versus "=&r" changes. In packed_decode_stage the multiplier m2 is live across all eight
+// unrolled groups and dies at the last one, so an allocator may pick dest == m2 for the FINAL fma only -- which
+// corrupts some groups and not others, and can differ between builds. That is the observed shape (bad=128 in one
+// build, 724 in another) and nothing else on the list predicts it.
+//
+// No hardcoded expected values: each op is run once with a separate destination and once with the destination tied to
+// each input in turn, and the results are compared to each other. If any aliased form differs, "=r" was never safe
+// here, whatever the reference uses in fast_numeric_conversion_for_mix_gemm.h happen to get away with.
+__global__ void probe_alias(uint32_t const* in3, uint32_t* out) {
+  uint32_t const x = in3[0], m = in3[1], z = in3[2];
+  uint32_t r;
+  asm volatile("ppu.fma.rtte.f16x2 %0, %1, %2, %3;\n" : "=&r"(r) : "r"(x), "r"(m), "r"(z));
+  out[0] = r;                                             // the reference: no overlap possible
+  uint32_t a1 = x; asm volatile("ppu.fma.rtte.f16x2 %0, %0, %1, %2;\n" : "+r"(a1) : "r"(m), "r"(z));
+  out[1] = a1;                                            // dest == source 1
+  uint32_t a2 = m; asm volatile("ppu.fma.rtte.f16x2 %0, %1, %0, %2;\n" : "+r"(a2) : "r"(x), "r"(z));
+  out[2] = a2;                                            // dest == source 2  <-- the m2 case
+  uint32_t a3 = z; asm volatile("ppu.fma.rtte.f16x2 %0, %1, %2, %0;\n" : "+r"(a3) : "r"(x), "r"(m));
+  out[3] = a3;                                            // dest == source 3
+  uint32_t s;
+  asm volatile("ppu.sub.f16x2 %0, %1, %2;\n" : "=&r"(s) : "r"(x), "r"(m));
+  out[4] = s;
+  uint32_t b1 = x; asm volatile("ppu.sub.f16x2 %0, %0, %1;\n" : "+r"(b1) : "r"(m));
+  out[5] = b1;                                            // dest == source 1 (what the reference uses)
+  uint32_t b2 = m; asm volatile("ppu.sub.f16x2 %0, %1, %0;\n" : "+r"(b2) : "r"(x));
+  out[6] = b2;                                            // dest == source 2
+}
+
 static int g_fail = 0;
 
 static void report_ops(char const* name, std::vector<OpCase> const& cs,
@@ -234,6 +264,29 @@ int main(int argc, char** argv) {
   for (int g = 0; g < 8; ++g) std::printf(" g%d=%d", g, bad_g[g]);
   std::printf("      (only g1's min and g6's scale straddle a word)\n");
   g_fail += bad;
+
+  // ---- (4) the aliasing question, on the decode's own operand shapes
+  {
+    uint32_t h3[3] = {0x00360032u,                      // an x2 as the sub would produce it
+                      0x89640172u,                      // an m2 = u[0] ^ 0x80000000 from the real fixture
+                      gp::kNegZeroX2};
+    cutlass::DeviceAllocation<uint32_t> d3(3), dOut(7);
+    d3.copy_from_host(h3);
+    probe_alias<<<1, 1>>>(d3.get(), dOut.get());
+    CUTLASS_PPU_CHECK(hggcDeviceSynchronize());
+    uint32_t o[7]; dOut.copy_to_host(o);
+    char const* nm[7] = {"fma dest separate", "fma dest==src1", "fma dest==src2", "fma dest==src3",
+                         "sub dest separate", "sub dest==src1", "sub dest==src2"};
+    int alias_bad = 0;
+    for (int i = 0; i < 7; ++i) {
+      uint32_t const ref = (i < 4) ? o[0] : o[4];
+      bool const ok = (o[i] == ref);
+      if (!ok) ++alias_bad;
+      std::printf("  (4) %-18s = %08X %s\n", nm[i], o[i], ok ? "" : "  <-- DIFFERS: \"=r\" was never safe here");
+    }
+    std::printf("  (4) destination/input aliasing changes the answer in %d of 5 aliased forms\n", alias_bad);
+    g_fail += alias_bad;
+  }
 
   std::printf("== probe %s (%d disagreements) ==\n", g_fail ? "FAIL" : "PASS", g_fail);
   return g_fail ? 1 : 0;

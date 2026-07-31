@@ -928,7 +928,32 @@ product ever is.** That last row is why the shipped path has never met this: the
 stores only the normal product, so no subnormal fp16 has ever reached an instruction. The packed decode is the first
 thing on this path to multiply BY `d` on the device.
 
-**Why that is the leading hypothesis.** This ISA carries an explicit `.noftz` qualifier on an f16x2 op
+**AND IT IS NOT THE CAUSE -- I refuted my own hypothesis by simulating it, which I should have done before writing it
+down.** Feed the fixture through the affine model twice, once whole and once with every subnormal-d superblock losing
+its scale term, and count outputs past the harness's own tolerance (`|d-g| > 2e-2 + 6e-2|g|`):
+
+    FTZ-on-d simulated:  bad = 3626 / 4096 = 88.5%          observed on hardware: 724 / 4096 = 17.7%
+
+Five times too much damage, and it could not be otherwise: 80.5% of superblocks losing their scale cannot leave 82% of
+outputs inside tolerance. **Subnormal d is a real latent hazard for any device path that multiplies by d -- it is not
+what broke rowC.** The `.noftz` probe stays because the exposure is real, but it is no longer the leading explanation.
+
+**The leading explanation now is the inline-asm CONSTRAINT.** Both wrappers used `"=r"`, which permits the destination
+to alias any input. In `packed_decode_stage` the multiplier `m2` is live across all EIGHT unrolled groups and dies at
+the last one, so an allocator may choose `dest == m2` for the FINAL fma only -- corrupting some groups and not others,
+and differing between builds. That is exactly the observed shape (bad=128 in one build, 724 in another), and it is the
+only candidate on the list that predicts a partial, build-sensitive failure; `volatile` prevents removal and CSE but
+says nothing about operand aliasing. `"=&r"` is already in the tree, so **the next build may simply pass**, and
+`test_ppu_f16x2_probe` section (4) asks the question directly by running each op with the destination tied to each
+input in turn and comparing against the non-aliased form -- no hardcoded expected values, so it cannot be wrong about
+the arithmetic.
+
+**Why that hypothesis fits and the other candidates do not.** Operand order matches the reference uses; the
+`+ 0x64806480` fold cannot carry between lanes (`0x6480 + 63 = 0x64BF`); every decode index is compile-time; the two
+straddles (group 1's min at bit 62, group 6's scale at bit 92) are handled by the same condition the long-standing
+scalar path uses; and the call site passes `ZMul=8`, `ScaleBias=0`, `HasMin=true` correctly.
+
+**The subnormal exposure, kept for the record.** This ISA carries an explicit `.noftz` qualifier on an f16x2 op
 (`cutlass/functional.h:830`, `ppu.atom.gpu.global.add.noftz.f16x2`), which only makes sense if the DEFAULT flushes. A
 flushed subnormal multiplier zeroes the SCALE lane while the zero lane -- whose `dmin` is normal -- survives, and each
 output sums over 19 superblocks so only the subnormal ones are lost. That predicts a PARTIAL failure dominated by
