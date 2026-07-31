@@ -1019,3 +1019,61 @@ fails, the first suspect is the one flagged in review and never resolved: `GmemT
 all `size(TiledMma)` = 256 threads, so threads 128..255 partition outside their own stage of `smem_scale_raw`. That is
 independent of `PPU_PACKED_PAIR`, which is an argument against it, but it is the only unexamined write into that
 buffer and it must be ruled in or out before anything else is tried.
+
+---
+
+## Corrections from an adversarial perf review. Six, and two of them void conclusions I committed here
+
+**1. TileN is NOT an occupancy axis, and neither is TileK. Warps per CTA is `(TM/WM)*(TN/WN)` = TN/16 here, and CTAs
+is `8 * 2048/TN`, so the product is 1024 launch warps for EVERY row of the TileN ladder:**
+
+    16x32:256   512 CTAs x 2 warps = 1024        16x64:256  256 x 4 = 1024        16x128:256  128 x 8 = 1024
+
+TileN redistributes the same work into fewer, wider CTAs; it does not change concurrency. TileK is not in the grid at
+all. **So "occupancy refuted three ways" is wrong: only split-K varies concurrency, and the three ladders are one.**
+And `lowbit_moe_bench.hpp:250` ALREADY SAYS "TileN and TileK CANCEL" -- the repo had derived this and I wrote the
+opposite into CMakeLists and into this file. Same defect as everywhere else in this task, in a file I was quoting from.
+
+**2. The part is 72 CUs, not 64** (`lowbit_moe_bench.hpp:193`, confirmed independently by acu's wave arithmetic,
+1024 - 3*288 = 160; the bench divides by 72 at `moe_splitk_bench_common.hpp:209`). Consequences: 128 CTAs is **1.78
+waves**, not one, so **"exactly one wave, no tail to reclaim" -- my argument against persistence -- is void**; a tail
+exists and the second wave fills 56 of 72 CUs. The bench's `warps/CU` column is launch-warps / 72, NOT achieved
+occupancy, so 14.2 -> 113.8 is not an occupancy measurement and I read it as one. Every blocks/CU figure I wrote used
+64 and is off by 1.125x.
+
+**3. The s4-versus-s2 result is 8.7% on one row and 4.75% on the other, not "8-9%" on both** (24.16 -> 22.06 and
+22.94 -> 21.85). Against a ~13% same-config spread the second is not usable on its own. The prologue conclusion is
+weakened accordingly: what the data disfavours is a LARGE fill-only bottleneck, not a 9% fill term. The fill model was
+wrong anyway -- the mainloop issues `Stages - 1` stages, not `Stages`, and has a drain loop, so
+`Stages/(K/TK + Stages)` was never the code's fill fraction.
+
+**4. "+12.9% fully accounted" is too strong.** The decomposition it rests on never ran: the E-era
+`PPU_PACKED_SCALE_NOP` was deleted by the F/F' rewrites and only reintroduced in `b5567944`. No baseline/NOP/full
+triple exists yet. Instruction share is also not cycle share -- those instructions can issue while memory operations
+are outstanding.
+
+**5. The floors, computed properly.** Compulsory traffic 21,037,056 B at 2766 GB/s = **7.606 us**, so 20.11 us is
+**2.64x** off it. MMA 131,072 x 2 x 16^3 = 1.074 GFLOP at the repo's 500 TF/s = **2.147 us**, i.e. **9.36x** off. The
+traffic floor is much the closer of the two, which points at a memory-dependency path rather than at issue.
+
+**6. "the +70% was local memory" overstates its own commit.** Byte pointer 57.83 us, register extraction 48.40,
+baseline 33.88: the fix recovered 9.43 of 23.95 us of excess, i.e. 39%, and left the kernel 42.9% slow. Local memory
+was one large subproblem, not the whole gap.
+
+### What the review says is actually the limiter, and the experiment that would settle it
+
+Not peak bandwidth: a **memory-dependency / request-latency path** in the mainloop, with dequant/issue work second.
+The in-tree acu pair at `TODO.md:1256` is better evidence for this than anything I produced -- achieved warps really
+rose 14.02 -> 26.84 while time went 20.18 -> 20.96 us and **Memory Dependency rose 0.98 -> 1.772**. That is a measured
+stall reason moving with concurrency, which is what "adding warps does not help this path" looks like.
+
+**The missing ablation is not the one I built.** `PPU_PACKED_SCALE_NOP` removes the ADDED packed decoder. What would
+test "dequant is the limiter" is a `PPU_B_DEQUANT_NOP` that keeps B loads, scale loads and the MMA count but removes
+the int4 conversion and affine chain from the BASELINE. That does not exist.
+
+### And what to stop doing
+
+Calling TileN and TileK occupancy experiments. Using launch-warps/CU as achieved occupancy. Inferring "not
+latency-bound" from low HBM utilisation. Inferring a bottleneck from opcode share without stall or pipe evidence.
+Comparing sub-13% timings across runs or mixed shapes. Spending rounds on 0.6-4% packed micro-optimisations before the
+NOP decomposition runs.
