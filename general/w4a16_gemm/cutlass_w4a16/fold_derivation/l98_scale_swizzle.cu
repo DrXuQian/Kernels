@@ -44,18 +44,22 @@ template <> struct MMA_Traits<F16Atom> {
   using CLayout=Layout<Shape<Shape<_4,_8>,Shape<_4,_2>>,Stride<Stride<_16,_1>,Stride<_64,_8>>>;
 };
 }
-static constexpr int kWON = 8;                                   // TileN 128 / WarpN 16
-using TMma        = TiledMMA<MMA_Atom<F16Atom>, Layout<Shape<_1,Int<kWON>,_1>>, Tile<_16,Int<kWON*16>,_64>>;
 using SmemCopyAtomS = Copy_Atom<DefaultCopy, half_t>;
 using AtomScale   = Layout<Shape<_8,_1>>;                        // the collective's SmemLayoutAtomScale
-using ScaleShape  = decltype(make_shape(_128{}, _8{}, _2{}));    // (Scale_TileN, Scale_TileK, Stages)
-using PlainScale  = decltype(tile_to_shape(AtomScale{}, ScaleShape{}));
+// EVERY WIDTH, not the one I first hardcoded. The conflict map runs through the mma B operand's TV layout, which
+// depends on Scale_TileN, so a swizzle chosen at TN=128 is not a swizzle for TN=32 -- and the first version of this
+// file swept only 128 and the collective then applied the winner to all three. WarpN is 16 throughout, so the warp
+// count is TN/16.
+template <int TN> struct Cfg {
+  using TMma  = TiledMMA<MMA_Atom<F16Atom>, Layout<Shape<_1,Int<TN/16>,_1>>, Tile<_16,Int<TN>,_64>>;
+  using Plain = decltype(tile_to_shape(AtomScale{}, make_shape(Int<TN>{}, _8{}, _2{})));
+};
 
 // distinct addresses per bank over warp 0, for a layout given as a callable offset map
-template <class LayoutT>
+template <int TN, class LayoutT>
 static std::pair<int,int> bank_profile(LayoutT const& lay, size_t* n_addr = nullptr) {
-  auto sS      = make_tensor(make_smem_ptr(static_cast<half_t*>(nullptr)), PlainScale{});
-  auto tiled_s = make_tiled_copy_B(SmemCopyAtomS{}, TMma{});
+  auto sS      = make_tensor(make_smem_ptr(static_cast<half_t*>(nullptr)), typename Cfg<TN>::Plain{});
+  auto tiled_s = make_tiled_copy_B(SmemCopyAtomS{}, typename Cfg<TN>::TMma{});
   auto cS      = make_identity_tensor(shape(sS));
   // ONE VALUE INDEX AT A TIME: a bank conflict is a property of ONE instruction, i.e. the 32 lanes' addresses for a
   // single element of the fragment. My first version aggregated every value of every lane and reported 64-way on 512
@@ -87,11 +91,11 @@ static std::pair<int,int> bank_profile(LayoutT const& lay, size_t* n_addr = null
 }
 
 // One swept candidate. B bits at position M+S are xored into the B bits at position M, on the HALF offset.
-template <int B, int M, int S>
+template <int TN, int B, int M, int S>
 static void try_one(int& best_way, int& best_b, int& best_m, int& best_s) {
-  auto lay = composition(Swizzle<B,M,S>{}, PlainScale{});
+  auto lay = composition(Swizzle<B,M,S>{}, typename Cfg<TN>::Plain{});
   size_t addrs = 0;
-  auto p = bank_profile(lay, &addrs);
+  auto p = bank_profile<TN>(lay, &addrs);
   bool const better = (p.first < best_way);
   if (better) { best_way = p.first; best_b = B; best_m = M; best_s = S; }
   if (p.first <= 2 || better)
@@ -99,23 +103,12 @@ static void try_one(int& best_way, int& best_b, int& best_m, int& best_s) {
                 B, M, S, (B<10&&M<10&&S<10)?2:0, "", p.first, p.second, addrs, better ? "   <-- best so far" : "");
 }
 
-int main() {
-  std::printf("== l98: sweep Swizzle<B,M,S> for the scale read ==\n");
-  std::printf("   layout "); print(PlainScale{}); std::printf("\n");
-
+template <int TN>
+static void sweep() {
   size_t base_addrs = 0;
-  auto base = bank_profile(PlainScale{}, &base_addrs);
-  std::printf("   (0) TODAY, unswizzled: %d-way on %d banks (%zu addrs)   -- l94 (2) reports 4-way on 4 banks\n",
-              base.first, base.second, base_addrs);
-  if (base.first != 4)
-    std::printf("       NOTE this disagrees with l94; one of the two is wrong and the swizzle choice below inherits it\n");
-
-  std::printf("   (1) candidates (only 2-way or better, plus every improvement, are printed):\n");
+  auto base = bank_profile<TN>(typename Cfg<TN>::Plain{}, &base_addrs);
   int bw = base.first, bb = -1, bm = -1, bs = -1;
-  // B is how many bits move, M where they land, S how far above M they come from. The bank selector is bits [1,6) of
-  // the half offset, so M in [0,5) is where a swizzle can reach; S walks the donor bits up through the group (stride
-  // 128 halfs = bit 7) and stage (1024 = bit 10) fields.
-#define TRY(b,m,s) try_one<b,m,s>(bw, bb, bm, bs);
+#define TRY(b,m,s) try_one<TN,b,m,s>(bw, bb, bm, bs);
   TRY(1,0,1)
   TRY(1,0,2)
   TRY(1,0,3)
@@ -212,65 +205,50 @@ int main() {
   TRY(3,4,4)
   TRY(3,4,5)
 #undef TRY
+  std::printf("   TN=%-3d  plain %d-way on %2d banks   ->  ", TN, base.first, base.second);
+  if (bb < 0) std::printf("NOTHING beats it (keep the plain layout)\n");
+  else        std::printf("Swizzle<%d,%d,%d>  %d-way\n", bb, bm, bs, bw);
+}
 
-  // ---- (2) THE TWO VIEWS MUST AGREE, BEFORE AND AFTER. partition_extra_inputs builds sS with SmemLayoutScale
-  // (n, group, stage) while partition_extra_mma_info builds a tensor ALSO called sS with SmemCopyLayoutScale
-  // (n, 1, stage*Scale_TileK + group) -- two layouts, one buffer, and this task has already faulted once by using the
-  // wrong one. A swizzle composes onto the OFFSET, so composition(Swz, L)(c) = Swz(L(c)) and the two stay equal iff
-  // they are equal today. That is checkable, so check it rather than reason about it.
+int main() {
+  std::printf("== l98: the best Swizzle<B,M,S> for the scale read, PER Scale_TileN ==\n");
+  std::printf("   (the metric is DISTINCT bank-word addresses per bank over one warp for ONE value index, worst over\n"
+              "    value indices -- lanes sharing an address broadcast, and l94 (2) reports 4-way on 4 banks at TN=128)\n");
+  sweep<32>();
+  sweep<64>();
+  sweep<128>();
+
+  // The two views must agree before AND after: partition_extra_inputs uses (n, group, stage) and
+  // partition_extra_mma_info uses (n, 1, stage*Scale_TileK + group) on the same buffer.
   {
-    using CopyScale = decltype(tile_to_shape(AtomScale{}, make_shape(_128{}, _1{}, Int<16>{})));
+    using P = Cfg<128>::Plain;
+    using C = decltype(tile_to_shape(AtomScale{}, make_shape(_128{}, _1{}, Int<16>{})));
     int bad_plain = 0, bad_swz = 0;
-    for (int s2 = 0; s2 < 2; ++s2)
-      for (int g = 0; g < 8; ++g)
-        for (int n = 0; n < 128; ++n) {
-          if (int(PlainScale{}(n, g, s2)) != int(CopyScale{}(n, 0, s2 * 8 + g))) ++bad_plain;
-          if (int(composition(Swizzle<2,3,5>{}, PlainScale{})(n, g, s2)) !=
-              int(composition(Swizzle<2,3,5>{}, CopyScale{})(n, 0, s2 * 8 + g))) ++bad_swz;
-        }
-    std::printf("   (2) SmemLayoutScale(n,g,s) == SmemCopyLayoutScale(n,0,8s+g): %d bad plain, %d bad under "
-                "Swizzle<2,3,5>  -> composing the SAME swizzle on both is %s\n",
-                bad_plain, bad_swz, (bad_plain == 0 && bad_swz == 0) ? "equivalent" : "NOT equivalent");
+    for (int s2 = 0; s2 < 2; ++s2) for (int g = 0; g < 8; ++g) for (int n = 0; n < 128; ++n) {
+      if (int(P{}(n,g,s2)) != int(C{}(n,0,s2*8+g))) ++bad_plain;
+      if (int(composition(Swizzle<2,3,5>{}, P{})(n,g,s2)) != int(composition(Swizzle<2,3,5>{}, C{})(n,0,s2*8+g))) ++bad_swz;
+    }
+    std::printf("   two views agree: %d bad plain, %d bad under Swizzle<2,3,5>\n", bad_plain, bad_swz);
   }
-
-  // ---- (3) DOES THE g2s cp.async SURVIVE IT? GmemTiledCopyScale moves 8 halfs (16 B) per thread with
-  // PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, which needs those 8 to be CONTIGUOUS and 16 B aligned in the destination.
-  // Swizzle<2,3,5> has MBase = 3, so the low three bits of the half offset are untouched and every 8-half aligned run
-  // should get the SAME xor -- staying contiguous. That is the whole reason M matters, and if it were false the copy
-  // would silently degrade to eight 2-byte stores while the timing merely looked like "the swizzle did not help".
+  // 16 B cp.async contiguity: MBase=3 leaves the low three bits alone, so 8-half runs keep one xor.
   {
-    auto swz = composition(Swizzle<2,3,5>{}, PlainScale{});
+    auto swz = composition(Swizzle<2,3,5>{}, Cfg<128>::Plain{});
     int broken = 0, misaligned = 0;
-    for (int s2 = 0; s2 < 2; ++s2)
-      for (int g = 0; g < 8; ++g)
-        for (int n0 = 0; n0 < 128; n0 += 8) {
-          int const base = int(swz(n0, g, s2));
-          if (base % 8 != 0) ++misaligned;                    // 8 halfs = 16 B
-          for (int j = 1; j < 8; ++j)
-            if (int(swz(n0 + j, g, s2)) != base + j) ++broken;
-        }
-    std::printf("   (3) 8-half aligned runs under Swizzle<2,3,5>: %d non-contiguous, %d misaligned  -> the 16 B "
-                "cp.async %s\n", broken, misaligned,
-                (broken == 0 && misaligned == 0) ? "still vectorises" : "WOULD DEGRADE -- pick a larger MBase");
+    for (int s2 = 0; s2 < 2; ++s2) for (int g = 0; g < 8; ++g) for (int n0 = 0; n0 < 128; n0 += 8) {
+      int const base = int(swz(n0,g,s2));
+      if (base % 8) ++misaligned;
+      for (int j = 1; j < 8; ++j) if (int(swz(n0+j,g,s2)) != base + j) ++broken;
+    }
+    std::printf("   16 B cp.async under Swizzle<2,3,5>: %d non-contiguous, %d misaligned\n", broken, misaligned);
   }
-
-  std::printf("\n   BEST: ");
-  if (bb < 0) std::printf("nothing beat the unswizzled map (%d-way)\n", base.first);
-  else        std::printf("Swizzle<%d,%d,%d> -> %d-way (from %d-way)\n", bb, bm, bs, bw, base.first);
-  // A swizzle is only usable if it is a bijection over the allocation, or the tile aliases itself and the g2s writes
-  // collide. cosize is a power of two here, which is the condition; checked rather than assumed.
-  std::printf("   cosize %d halfs = %d B, power of two: %s (required -- a swizzle must permute WITHIN the allocation)\n",
-              int(cosize(PlainScale{})), int(cosize(PlainScale{})) * 2,
-              (cosize(PlainScale{}) & (cosize(PlainScale{}) - 1)) == 0 ? "yes" : "NO -- do not swizzle this");
-  if (bb >= 0) {
-    // and that it really is a permutation: every offset must map somewhere distinct
-    auto lay = composition(Swizzle<1,1,1>{}, PlainScale{});
-    (void)lay;
+  // BIJECTION, on the swizzle actually selected. The first version spot-checked Swizzle<2,1,6> -- a constant left over
+  // from an earlier edit -- which proves nothing about the one that ships.
+  {
     std::set<int> img;
-    for (int s = 0; s < 2; ++s) for (int g = 0; g < 8; ++g) for (int n = 0; n < 128; ++n)
-      img.insert(int(composition(Swizzle<2,1,6>{}, PlainScale{})(n, g, s)));
-    std::printf("   (bijection spot-check on Swizzle<2,1,6>: %zu distinct images of %d coordinates)\n",
-                img.size(), 128 * 8 * 2);
+    for (int s2 = 0; s2 < 2; ++s2) for (int g = 0; g < 8; ++g) for (int n = 0; n < 128; ++n)
+      img.insert(int(composition(Swizzle<2,3,5>{}, Cfg<128>::Plain{})(n,g,s2)));
+    std::printf("   Swizzle<2,3,5> is a permutation of the allocation: %zu distinct images of %d coords, cosize %d\n",
+                img.size(), 128*8*2, int(cosize(Cfg<128>::Plain{})));
   }
-  return bb < 0 ? 1 : 0;
+  return 0;
 }
