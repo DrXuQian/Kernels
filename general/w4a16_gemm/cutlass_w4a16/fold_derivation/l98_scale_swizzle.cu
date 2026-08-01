@@ -233,6 +233,27 @@ int main() {
                 bad_plain, bad_swz, (bad_plain == 0 && bad_swz == 0) ? "equivalent" : "NOT equivalent");
   }
 
+  // ---- (3) DOES THE g2s cp.async SURVIVE IT? GmemTiledCopyScale moves 8 halfs (16 B) per thread with
+  // PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, which needs those 8 to be CONTIGUOUS and 16 B aligned in the destination.
+  // Swizzle<2,3,5> has MBase = 3, so the low three bits of the half offset are untouched and every 8-half aligned run
+  // should get the SAME xor -- staying contiguous. That is the whole reason M matters, and if it were false the copy
+  // would silently degrade to eight 2-byte stores while the timing merely looked like "the swizzle did not help".
+  {
+    auto swz = composition(Swizzle<2,3,5>{}, PlainScale{});
+    int broken = 0, misaligned = 0;
+    for (int s2 = 0; s2 < 2; ++s2)
+      for (int g = 0; g < 8; ++g)
+        for (int n0 = 0; n0 < 128; n0 += 8) {
+          int const base = int(swz(n0, g, s2));
+          if (base % 8 != 0) ++misaligned;                    // 8 halfs = 16 B
+          for (int j = 1; j < 8; ++j)
+            if (int(swz(n0 + j, g, s2)) != base + j) ++broken;
+        }
+    std::printf("   (3) 8-half aligned runs under Swizzle<2,3,5>: %d non-contiguous, %d misaligned  -> the 16 B "
+                "cp.async %s\n", broken, misaligned,
+                (broken == 0 && misaligned == 0) ? "still vectorises" : "WOULD DEGRADE -- pick a larger MBase");
+  }
+
   std::printf("\n   BEST: ");
   if (bb < 0) std::printf("nothing beat the unswizzled map (%d-way)\n", base.first);
   else        std::printf("Swizzle<%d,%d,%d> -> %d-way (from %d-way)\n", bb, bm, bs, bw, base.first);
