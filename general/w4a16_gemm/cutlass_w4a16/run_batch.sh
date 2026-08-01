@@ -33,7 +33,11 @@ VARIANTS=(
 )
 
 build_one() {  # $1 name  $2 defines  $3 target
-  local name="$1" defs="$2" tgt="$3" log="$OUT/build_$name.log"
+  # SEPARATE STATEMENTS. `local a=$1 log=...$a...` fails under `set -u` in bash 5.1: local declares every name first
+  # and only then assigns, so the self-reference is unbound. bash -n does not catch it -- only running does, which is
+  # why this script is now dry-run against a stubbed build.sh before it ships.
+  local name="$1" defs="$2" tgt="$3"
+  local log="$OUT/build_$name.log"
   printf '  %-10s %s\n' "$name" "$defs"
   ( cd "$HERE" && PPU_DEFS="$defs" TARGET="$tgt" ./build.sh ) >"$log" 2>&1
   if ! grep -q "PPU_DEFS verified on $tgt" "$log"; then
