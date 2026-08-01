@@ -1136,3 +1136,61 @@ conflicts and the same ownership. Cost: one extra 16 B shared read and header pe
 If it improves materially, the slowest-warp/barrier placement is what costs; if it does not, aggregate issue demand
 is. That is a cleaner placement test than moving the wait, and unlike the 0.6% store fix it is also a real
 optimisation. Run it together with the NOP triple.
+
+---
+
+## The full batch ran. Three of my four ideas are negative, and the swizzle is BROKEN
+
+One run, one binary set, six splitk binaries verified distinct. **base is 23.67 us here against 20.11 in the earlier
+pinned acu run -- a 17% gap between two runs that both claim the same pinned configuration, larger than the ~13%
+spread on record. Only WITHIN-run comparisons below are usable, and nothing here may be compared to earlier numbers.**
+
+| variant | us | GB/s | vs base |
+|---|---:|---:|---:|
+| base | 23.67 | 888.9 | -- |
+| swz | 25.33 | 830.5 | **+7.0%** |
+| bdqnop | **21.05** | 999.2 | **-11.1%** |
+| pack | 24.23 | 868.3 | +2.4% |
+| packnop | 24.78 | 848.9 | +4.7% |
+| packsplit | 26.92 | 781.4 | **+13.7%** |
+
+### 1. The swizzle is wrong, not just slow
+
+`test_moe_grouped_verify` with `PPU_SCALE_SWIZZLE=1` alone dies with a **device-side assert** -- `Assertion \`false\`
+failed`, block [0,10,7] thread [48,0,0], at line 104, inside `copy_B_and_extra_info`. So a view of that buffer does
+NOT carry the swizzle, or a copy's vectorisation contract is violated, in a configuration `test_q4k_packed_gemm` does
+not exercise. Both my local enumeration and the review concluded "every live address is swizzled"; **the hardware
+says otherwise**, and the local checks were all on the TN=128/Stages=2 shape while the verifier sweeps others.
+
+It is also 7% SLOWER where it does run. Two independent reasons to leave it off; the flag stays for diagnosis but the
+idea does not ship in this form. Fixing it means reproducing the assert on a named shape first -- `MOEG_*` narrows the
+verifier -- and only then hunting the view.
+
+### 2. The baseline dequant is 11.1%, not "43%"
+
+`base - bdqnop = 2.62 us = 11.1%`. That is the whole int4->fp16 pipeline: the conversion, the affine application, and
+(because the ablation leaves only one fragment element live) most of the scale/zero loads. So the 43%-of-dynamic-
+instructions figure is **11% of time** -- the instructions really do issue largely in the shadow of memory, exactly as
+the review argued and against what I wrote. **This is the honest ceiling for TODO #18 and for every dequant idea**, and
+it is still the largest single term anyone has measured on this kernel.
+
+### 3. The placement hypothesis is dead
+
+`packsplit` is **11% WORSE than pack** (26.92 vs 24.23). Eight warps decoding four groups each, with identical decode
+count, stores, conflicts and ownership, loses to four warps decoding eight. So the publication barrier's critical path
+is not what the packed path pays for; the extra 16 B unit read per column and the duplicated per-column setup cost
+more than the shortened chain saves. That also retires the persistent-kernel line for this band, which rested on the
+same "the critical path is the problem" reasoning.
+
+### 4. The packed decode's arithmetic costs nothing
+
+`packnop` (24.78) is **SLOWER** than `pack` (24.23). Removing the decode arithmetic while keeping the transport and
+the stores did not help. Within noise either way, but it certainly is not the term -- so `pack - base`, whatever it is
+in a given run, is transport and stores, not the f16x2 arithmetic I spent the day optimising.
+
+### What survives
+
+Only one thing here is both large and real: **the dequant pipeline at 11.1%**. Everything else measured today --
+swizzle, group split, packed arithmetic -- is zero or negative. And `pack - base` is +2.4% in this run against +12.9%
+in the pinned acu run, which says the native-format tax itself is not well determined and needs repeated interleaved
+runs before any deployment decision rests on it.
