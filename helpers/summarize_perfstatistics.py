@@ -13,7 +13,10 @@ its module (--full-attn-layers, --linear-attn-layers, --dense-ffn-layers,
 dedupes identical commands, the logical cases that share one measured kernel
 are listed as `deduped from <case>` rows, and the measured row also shows
 `kernel_calls` / `kernel_model_latency_us`, the totals over every logical case
-that kernel serves. Override single cases with
+that kernel serves. The TOTAL_prefill / TOTAL_decode / TOTAL rows weight
+every quantity by calls: cycles, latency, and bytes are summed as value x
+calls, and achieved_GBps is the call-weighted bytes over the call-weighted
+cycles of the cases that report bytes. Override single cases with
 --case-calls LABEL[@prefill|@decode]=N or a --calls-file with one entry per
 line; the model summary applies the same call counts.
 """
@@ -28,7 +31,6 @@ from model_latency_summary import (
     DEFAULT_MODEL_CONFIG,
     case_call_count,
     classify_phase,
-    expand_to_model_estimate_cases,
     load_case_calls,
     parse_case_log_metadata,
     write_model_latency_summary,
@@ -340,37 +342,55 @@ def main() -> int:
             headers.append("bw_util%")
     headers.append("report_dir")
 
-    if has_bandwidth:
-        total_read = sum(r["read_bytes"] for r in rows if isinstance(r["read_bytes"], int))
-        total_write = sum(r["write_bytes"] for r in rows if isinstance(r["write_bytes"], int))
-        total_all = total_read + total_write
-        total_cycles = sum(r["compute_cycles"] for r in rows if isinstance(r.get("read_bytes"), int))
-        summary_gbps = ""
-        summary_util = ""
-        if total_all > 0 and total_cycles > 0:
-            gbps = total_all * args.ghz / total_cycles
-            summary_gbps = f"{gbps:.3f}"
+    def weighted_total_row(label: str, phase: str, subset: list[dict[str, object]]) -> dict[str, object]:
+        """Model-level totals for `subset`; every quantity is weighted by calls."""
+
+        calls_sum = sum(int(r["calls"]) for r in subset)
+        cycles_w = sum(int(r["compute_cycles"]) * int(r["calls"]) for r in subset)
+        # Bandwidth uses only cases that report bytes, so numerator and
+        # denominator cover the same launches.
+        bw_rows = [r for r in subset if isinstance(r.get("read_bytes"), int)]
+        read_w = sum(int(r["read_bytes"]) * int(r["calls"]) for r in bw_rows)
+        write_w = sum(int(r["write_bytes"]) * int(r["calls"]) for r in bw_rows)
+        bytes_w = read_w + write_w
+        bw_cycles_w = sum(int(r["compute_cycles"]) * int(r["calls"]) for r in bw_rows)
+        gbps_text = ""
+        util_text = ""
+        if bytes_w > 0 and bw_cycles_w > 0:
+            gbps = bytes_w * args.ghz / bw_cycles_w
+            gbps_text = f"{gbps:.3f}"
             if args.peak_gbps > 0:
-                summary_util = f"{gbps / args.peak_gbps * 100.0:.2f}"
-        total_row: dict[str, object] = {
-            "case": "TOTAL",
+                util_text = f"{gbps / args.peak_gbps * 100.0:.2f}"
+        coverage = f"{len(subset)} cases"
+        if bw_rows and len(bw_rows) != len(subset):
+            coverage += f", bandwidth from {len(bw_rows)}"
+        row: dict[str, object] = {
+            "case": label,
             "executable": "",
-            "compute_cycles": total_cycles,
-            latency_header: f"{total_cycles / (args.ghz * 1000.0):.3f}",
-            "phase": "",
-            "calls": "",
-            "model_latency_us": f"{sum(float(r['_model_latency_us']) for r in rows):.3f}",
-            "kernel_calls": "",
-            "kernel_model_latency_us": f"{sum(float(r.get('_kernel_model_latency_us', 0.0)) for r in rows):.3f}",
-            "read_bytes": total_read,
-            "write_bytes": total_write,
-            "total_bytes": total_all,
-            "achieved_GBps": summary_gbps,
-            "report_dir": "",
+            "compute_cycles": cycles_w,
+            latency_header: f"{cycles_w / (args.ghz * 1000.0):.3f}",
+            "phase": phase,
+            "calls": calls_sum,
+            "model_latency_us": f"{sum(float(r['_model_latency_us']) for r in subset):.3f}",
+            "kernel_calls": sum(int(r["_kernel_calls"]) for r in subset if "_kernel_calls" in r),
+            "kernel_model_latency_us": f"{sum(float(r['_kernel_model_latency_us']) for r in subset if '_kernel_model_latency_us' in r):.3f}",
+            "read_bytes": read_w if bw_rows else "",
+            "write_bytes": write_w if bw_rows else "",
+            "total_bytes": bytes_w if bw_rows else "",
+            "achieved_GBps": gbps_text,
+            "report_dir": coverage,
         }
         if args.peak_gbps > 0:
-            total_row["bw_util%"] = summary_util
-        rows.append(total_row)
+            row["bw_util%"] = util_text
+        return row
+
+    total_rows: list[dict[str, object]] = []
+    for phase in ("prefill", "decode", "unknown"):
+        subset = [r for r in rows if r["phase"] == phase]
+        if subset:
+            total_rows.append(weighted_total_row(f"TOTAL_{phase}", phase, subset))
+    total_rows.append(weighted_total_row("TOTAL", "", rows))
+    rows.extend(total_rows)
 
     if args.tsv:
         print("\t".join(headers))
@@ -379,14 +399,6 @@ def main() -> int:
     else:
         print(format_table(rows, headers))
 
-    # Phase totals use the same expansion as the model summary, so sampling
-    # cases count once per prefill and once per decode step.
-    estimate_input = [
-        {"case": row["case"], "latency_us": row["_latency_us"]} for row in rows if row.get("case") != "TOTAL"
-    ]
-    phase_totals: dict[str, float] = {}
-    for case in expand_to_model_estimate_cases(estimate_input, effective_config, case_calls):
-        phase_totals[str(case["phase"])] = phase_totals.get(str(case["phase"]), 0.0) + float(case["latency_us"])
     print()
     print(
         "model calls per forward: "
@@ -403,14 +415,7 @@ def main() -> int:
         )
         + (f" per_case_overrides={len(case_calls)}" if case_calls else "")
     )
-    print(
-        "model latency (latency_us x calls): "
-        + " ".join(
-            f"{phase}={phase_totals.get(phase, 0.0):.3f}us"
-            for phase in ("prefill", "decode", "unknown")
-            if phase in ("prefill", "decode") or phase_totals.get(phase)
-        )
-    )
+    print("TOTAL rows weight cycles, latency, and bytes by calls; sampling rows count in decode here.")
 
     if args.model_summary_dir:
         report_path, summary_text = write_model_latency_summary(

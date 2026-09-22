@@ -458,8 +458,14 @@ measured row also shows `kernel_calls` and `kernel_model_latency_us`, the
 totals over every logical case that kernel serves. For example the decode
 RMSNorm measured once as `linear_attn_decode_rmsnorm` also covers
 `flash_attn_decode_rmsnorm` and `moe_ffn_decode_rmsnorm`, so with the default
-Qwen3.5-122B layer counts its `kernel_calls` is `36 + 12 + 48 = 96`. Two lines
-after the table give the prefill and decode totals of `latency_us x calls`.
+Qwen3.5-122B layer counts its `kernel_calls` is `36 + 12 + 48 = 96`. The
+`TOTAL_prefill`, `TOTAL_decode`, and `TOTAL` rows weight everything by calls:
+`compute_cycles`, latency, and bytes are sums of `value x calls`, `calls` is the
+number of kernel launches per forward, and `achieved_GBps` / `bw_util%` divide
+the call-weighted bytes by the call-weighted cycles of the cases that report
+bytes (the `report_dir` cell says how many cases contributed). Sampling rows
+count in decode in this table; the model summary additionally applies
+`MODEL_SAMPLING_PREFILL_COUNT` per prefill.
 Override single cases with `--case-calls LABEL[@prefill|@decode]=N` or a
 `--calls-file` holding one such entry per line; the model summary applies the
 same call counts and lists the overrides.
