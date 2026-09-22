@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import html
 import math
+import re
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional, Tuple
 
 import matplotlib
 
@@ -64,6 +65,51 @@ DEFAULT_MODEL_CONFIG = {
     "sampling_prefill_count": 1,
     "sampling_decode_count": 1,
 }
+
+# Per-case call-count override: (case label, phase or None for every phase) -> calls.
+CaseCallsKey = Tuple[str, Optional[str]]
+CASE_CALLS_RE = re.compile(
+    r"^\s*(?P<label>[^@=:,\s#]+)(?:@(?P<phase>prefill|decode))?\s*[=:,\s]\s*(?P<calls>[0-9]+)\s*$"
+)
+
+
+def parse_case_calls_entry(text: str) -> tuple[CaseCallsKey, int]:
+    """Parse ``LABEL[@prefill|@decode]=N`` (``:``, ``,`` or spaces also separate)."""
+
+    match = CASE_CALLS_RE.match(text)
+    if not match:
+        raise ValueError(f"expected LABEL[@prefill|@decode]=N, got {text!r}")
+    return (match.group("label"), match.group("phase")), int(match.group("calls"))
+
+
+def load_case_calls(entries: Iterable[str] = (), path: Path | None = None) -> dict[CaseCallsKey, int]:
+    """Collect per-case call counts from a file (one entry per line) and CLI entries.
+
+    CLI entries win over file entries. ``#`` starts a comment, blank lines are
+    skipped, and a leading ``case,calls`` style header line is ignored.
+    """
+
+    case_calls: dict[CaseCallsKey, int] = {}
+    if path is not None:
+        header_allowed = True
+        for lineno, raw in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            first = re.split(r"[=:,\s]", line, maxsplit=1)[0].lower()
+            if header_allowed and first in {"case", "label", "kernel"}:
+                header_allowed = False
+                continue
+            header_allowed = False
+            try:
+                key, calls = parse_case_calls_entry(line)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{lineno}: {exc}") from None
+            case_calls[key] = calls
+    for entry in entries:
+        key, calls = parse_case_calls_entry(entry)
+        case_calls[key] = calls
+    return case_calls
 
 
 def classify_phase(case: str) -> str:
@@ -312,7 +358,35 @@ def model_multiplier(module: str, config: dict[str, int]) -> int:
     return 1
 
 
-def expand_to_model_estimate_cases(cases: list[dict[str, object]], config: dict[str, int]) -> list[dict[str, object]]:
+def case_call_count(
+    case: str,
+    phase: str,
+    config: dict[str, int],
+    case_calls: dict[CaseCallsKey, int] | None = None,
+) -> int:
+    """Number of times a benchmark case's kernel runs in one model forward of `phase`.
+
+    A per-case override wins; otherwise sampling cases use the sampling count of
+    the phase and every other case runs once per layer of its module.
+    """
+
+    if case_calls:
+        for key in ((case, phase), (case, None)):
+            if key in case_calls:
+                return int(case_calls[key])
+    module = classify_module(case)
+    if module == "Sampling":
+        if phase == "prefill":
+            return int(config["sampling_prefill_count"])
+        return int(config["sampling_decode_count"])
+    return model_multiplier(module, config)
+
+
+def expand_to_model_estimate_cases(
+    cases: list[dict[str, object]],
+    config: dict[str, int],
+    case_calls: dict[CaseCallsKey, int] | None = None,
+) -> list[dict[str, object]]:
     model_cases: list[dict[str, object]] = []
     for row in cases:
         base_latency = float(row["latency_us"])
@@ -321,11 +395,8 @@ def expand_to_model_estimate_cases(cases: list[dict[str, object]], config: dict[
         phase = classify_phase(base_case)
 
         if module == "Sampling":
-            for sampling_phase, count_key in (
-                ("prefill", "sampling_prefill_count"),
-                ("decode", "sampling_decode_count"),
-            ):
-                multiplier = config[count_key]
+            for sampling_phase in ("prefill", "decode"):
+                multiplier = case_call_count(base_case, sampling_phase, config, case_calls)
                 if multiplier <= 0:
                     continue
                 copied = dict(row)
@@ -339,7 +410,7 @@ def expand_to_model_estimate_cases(cases: list[dict[str, object]], config: dict[
                 model_cases.append(copied)
             continue
 
-        multiplier = model_multiplier(module, config)
+        multiplier = case_call_count(base_case, phase, config, case_calls)
         if multiplier <= 0:
             continue
         copied = dict(row)
@@ -646,6 +717,7 @@ def write_markdown_report(
     model_config: dict[str, int],
     duplicates: list[dict[str, str]],
     chart_files: list[Path],
+    case_calls: dict[CaseCallsKey, int] | None = None,
 ) -> None:
     total = float(model_summary["total_us"])
     covered_total = float(covered_summary["total_us"])
@@ -656,7 +728,8 @@ def write_markdown_report(
         f"Source: `{source_name}`.",
         "",
         "This report contains two views: the raw covered-case subtotal from the selected benchmark cases, and a "
-        "model estimate that applies layer-count multipliers.",
+        "model estimate that multiplies each case by the number of times its kernel is called in one model "
+        "forward of that phase (layer count of its module, sampling count, or a per-case override).",
         "",
         "## Model Configuration",
         "",
@@ -738,10 +811,17 @@ def write_markdown_report(
         [
             "## Top Case Contributions",
             "",
-            markdown_table(["phase", "module", "case", "multiplier", "base_latency_us", "model_latency_us"], top_rows),
+            markdown_table(["phase", "module", "case", "calls", "base_latency_us", "model_latency_us"], top_rows),
             "",
         ]
     )
+
+    if case_calls:
+        override_rows = [
+            [f"`{label}`", phase or "all", str(calls)]
+            for (label, phase), calls in sorted(case_calls.items(), key=lambda item: (item[0][0], item[0][1] or ""))
+        ]
+        lines.extend(["## Per-Case Call Overrides", "", markdown_table(["case", "phase", "calls"], override_rows), ""])
 
     expanded = [row for row in duplicates if row.get("status") == "expanded"]
     missing = [row for row in duplicates if row.get("status") != "expanded"]
@@ -769,6 +849,7 @@ def write_model_latency_summary(
     source_name: str,
     bench_out_dir: Path | None = None,
     model_config: dict[str, int] | None = None,
+    case_calls: dict[CaseCallsKey, int] | None = None,
 ) -> tuple[Path, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     expanded, duplicates = expand_deduped_cases(cases, bench_out_dir)
@@ -776,7 +857,7 @@ def write_model_latency_summary(
     if model_config:
         effective_config.update(model_config)
     covered_summary = aggregate_cases(expanded)
-    model_cases = expand_to_model_estimate_cases(expanded, effective_config)
+    model_cases = expand_to_model_estimate_cases(expanded, effective_config, case_calls)
     model_summary = aggregate_cases(model_cases)
 
     chart_files = [
@@ -808,5 +889,7 @@ def write_model_latency_summary(
     write_pie_chart(chart_files[7], "Decode Operator Share", operator_rows(model_summary, "decode"), limit=14)
 
     report_path = out_dir / "model_latency_summary.md"
-    write_markdown_report(report_path, title, source_name, model_summary, covered_summary, effective_config, duplicates, chart_files)
+    write_markdown_report(
+        report_path, title, source_name, model_summary, covered_summary, effective_config, duplicates, chart_files, case_calls
+    )
     return report_path, console_summary(model_summary)

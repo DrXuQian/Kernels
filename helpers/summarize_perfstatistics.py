@@ -3,6 +3,19 @@
 
 Each benchmark case is expected to have its own directory containing
 perfstatistics.log and, optionally, bench_metadata.txt written by bench_all.sh.
+
+Each case measures one kernel call. The table also reports how many times that
+kernel is called in one model forward of the case's phase (`calls`) and the
+resulting model-level latency (`model_latency_us` = latency_us x calls). The
+count follows the bench script case list: every case runs once per layer of
+its module (--full-attn-layers, --linear-attn-layers, --dense-ffn-layers,
+--moe-ffn-layers) and sampling cases use the sampling counts. When bench_all.sh
+dedupes identical commands, the logical cases that share one measured kernel
+are listed as `deduped from <case>` rows, and the measured row also shows
+`kernel_calls` / `kernel_model_latency_us`, the totals over every logical case
+that kernel serves. Override single cases with
+--case-calls LABEL[@prefill|@decode]=N or a --calls-file with one entry per
+line; the model summary applies the same call counts.
 """
 
 from __future__ import annotations
@@ -11,7 +24,15 @@ import argparse
 import re
 from pathlib import Path
 
-from model_latency_summary import parse_case_log_metadata, write_model_latency_summary
+from model_latency_summary import (
+    DEFAULT_MODEL_CONFIG,
+    case_call_count,
+    classify_phase,
+    expand_to_model_estimate_cases,
+    load_case_calls,
+    parse_case_log_metadata,
+    write_model_latency_summary,
+)
 
 
 COMPUTE_CYCLES_RE = re.compile(r"\bcompute_cycles\s*=\s*([0-9][0-9,]*)")
@@ -139,14 +160,41 @@ def expand_deduped_summary_rows(
         copied = dict(source)
         copied["case"] = label
         copied["report_dir"] = f"deduped from {duplicate_of}"
+        copied["_deduped_from"] = duplicate_of
         by_case[label] = copied
         expanded.append(copied)
 
     return expanded
 
 
+def aggregate_kernel_calls(rows: list[dict[str, object]]) -> None:
+    """Sum calls of every logical case that shares one measured kernel.
+
+    Deduped rows carry `_deduped_from`; the measured row gets `kernel_calls`
+    and `kernel_model_latency_us` covering itself plus those duplicates.
+    """
+
+    measured = {str(row["case"]): row for row in rows if "_deduped_from" not in row}
+    for row in measured.values():
+        row["_kernel_calls"] = int(row["calls"])
+        row["_kernel_model_latency_us"] = float(row["_model_latency_us"])
+    for row in rows:
+        source = measured.get(str(row.get("_deduped_from", "")))
+        if source is None:
+            continue
+        source["_kernel_calls"] = int(source["_kernel_calls"]) + int(row["calls"])
+        source["_kernel_model_latency_us"] = float(source["_kernel_model_latency_us"]) + float(row["_model_latency_us"])
+    for row in rows:
+        if "_kernel_calls" in row:
+            row["kernel_calls"] = row["_kernel_calls"]
+            row["kernel_model_latency_us"] = f"{float(row['_kernel_model_latency_us']):.3f}"
+        else:
+            row["kernel_calls"] = ""
+            row["kernel_model_latency_us"] = ""
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "paths",
         nargs="*",
@@ -155,6 +203,19 @@ def main() -> int:
     )
     parser.add_argument("--ghz", type=float, default=1.5, help="Clock frequency for latency conversion. Default: 1.5")
     parser.add_argument("--peak-gbps", type=float, default=0.0, help="Peak memory bandwidth in GB/s for utilization calculation.")
+    parser.add_argument(
+        "--case-calls",
+        action="append",
+        default=[],
+        metavar="LABEL[@PHASE]=N",
+        help="Override how many times a case's kernel is called in one model forward. "
+        "PHASE is prefill or decode; without it the count applies to every phase. Repeatable.",
+    )
+    parser.add_argument(
+        "--calls-file",
+        type=Path,
+        help="File with one LABEL[@PHASE]=N entry per line ('#' comments allowed). --case-calls entries win.",
+    )
     parser.add_argument("--tsv", action="store_true", help="Print TSV instead of a padded table.")
     parser.add_argument("--model-summary-dir", type=Path, help="Write model-level latency tables and SVG charts here.")
     parser.add_argument(
@@ -164,6 +225,15 @@ def main() -> int:
     )
     add_model_config_args(parser)
     args = parser.parse_args()
+
+    try:
+        case_calls = load_case_calls(args.case_calls, args.calls_file)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    model_config = model_config_from_args(args)
+    effective_config = dict(DEFAULT_MODEL_CONFIG)
+    if model_config:
+        effective_config.update(model_config)
 
     roots = args.paths or [discover_default_root()]
     log_paths: list[Path] = []
@@ -215,6 +285,7 @@ def main() -> int:
             "executable": executable or "-",
             "compute_cycles": selected_cycles,
             latency_header: f"{latency_us:.3f}",
+            "_latency_us": latency_us,
             "read_bytes": read_bytes if total_bytes > 0 else "",
             "write_bytes": write_bytes if total_bytes > 0 else "",
             "total_bytes": total_bytes if total_bytes > 0 else "",
@@ -241,7 +312,28 @@ def main() -> int:
     rows = expand_deduped_summary_rows(rows, bench_out_dir)
     rows.sort(key=lambda row: str(row["case"]))
 
-    headers = ["case", "executable", "compute_cycles", latency_header]
+    # Call counts depend on the (possibly deduped) label, so apply them after expansion.
+    for row in rows:
+        label = str(row["case"])
+        phase = classify_phase(label)
+        calls = case_call_count(label, phase, effective_config, case_calls)
+        row["phase"] = phase
+        row["calls"] = calls
+        row["_model_latency_us"] = float(row["_latency_us"]) * calls
+        row["model_latency_us"] = f"{row['_model_latency_us']:.3f}"
+    aggregate_kernel_calls(rows)
+
+    headers = [
+        "case",
+        "executable",
+        "compute_cycles",
+        latency_header,
+        "phase",
+        "calls",
+        "model_latency_us",
+        "kernel_calls",
+        "kernel_model_latency_us",
+    ]
     if has_bandwidth:
         headers.extend(["read_bytes", "write_bytes", "total_bytes", "achieved_GBps"])
         if args.peak_gbps > 0:
@@ -265,6 +357,11 @@ def main() -> int:
             "executable": "",
             "compute_cycles": total_cycles,
             latency_header: f"{total_cycles / (args.ghz * 1000.0):.3f}",
+            "phase": "",
+            "calls": "",
+            "model_latency_us": f"{sum(float(r['_model_latency_us']) for r in rows):.3f}",
+            "kernel_calls": "",
+            "kernel_model_latency_us": f"{sum(float(r.get('_kernel_model_latency_us', 0.0)) for r in rows):.3f}",
             "read_bytes": total_read,
             "write_bytes": total_write,
             "total_bytes": total_all,
@@ -282,6 +379,39 @@ def main() -> int:
     else:
         print(format_table(rows, headers))
 
+    # Phase totals use the same expansion as the model summary, so sampling
+    # cases count once per prefill and once per decode step.
+    estimate_input = [
+        {"case": row["case"], "latency_us": row["_latency_us"]} for row in rows if row.get("case") != "TOTAL"
+    ]
+    phase_totals: dict[str, float] = {}
+    for case in expand_to_model_estimate_cases(estimate_input, effective_config, case_calls):
+        phase_totals[str(case["phase"])] = phase_totals.get(str(case["phase"]), 0.0) + float(case["latency_us"])
+    print()
+    print(
+        "model calls per forward: "
+        + " ".join(
+            f"{key}={effective_config[key]}"
+            for key in (
+                "full_attn_layers",
+                "linear_attn_layers",
+                "dense_ffn_layers",
+                "moe_ffn_layers",
+                "sampling_prefill_count",
+                "sampling_decode_count",
+            )
+        )
+        + (f" per_case_overrides={len(case_calls)}" if case_calls else "")
+    )
+    print(
+        "model latency (latency_us x calls): "
+        + " ".join(
+            f"{phase}={phase_totals.get(phase, 0.0):.3f}us"
+            for phase in ("prefill", "decode", "unknown")
+            if phase in ("prefill", "decode") or phase_totals.get(phase)
+        )
+    )
+
     if args.model_summary_dir:
         report_path, summary_text = write_model_latency_summary(
             model_rows,
@@ -289,7 +419,8 @@ def main() -> int:
             title="Perfstatistics Model Latency Summary",
             source_name="perfstatistics",
             bench_out_dir=bench_out_dir,
-            model_config=model_config_from_args(args),
+            model_config=model_config,
+            case_calls=case_calls,
         )
         print()
         print(summary_text)

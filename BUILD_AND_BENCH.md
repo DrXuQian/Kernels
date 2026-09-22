@@ -445,6 +445,25 @@ python helpers/summarize_ncu_cycles.py <OUT_DIR>/ncu --detail \
   --model-summary-dir <OUT_DIR>/model_latency_ncu
 ```
 
+Each perfstatistics case measures one kernel call. The per-case table adds
+`phase`, `calls`, and `model_latency_us`, where `calls` is how many times that
+logical case runs in one model forward of the phase and `model_latency_us` is
+`latency_us x calls`. The count follows the bench script case list: each case
+runs once per layer of its module (`MODEL_FULL_ATTN_LAYERS`,
+`MODEL_LINEAR_ATTN_LAYERS`, `MODEL_DENSE_FFN_LAYERS`, `MODEL_MOE_FFN_LAYERS`,
+passed through `--full-attn-layers` and friends) and sampling cases use the
+sampling counts. Logical cases that `BENCH_DEDUPE` folded into one measured
+kernel appear as `deduped from <case>` rows with their own counts, and the
+measured row also shows `kernel_calls` and `kernel_model_latency_us`, the
+totals over every logical case that kernel serves. For example the decode
+RMSNorm measured once as `linear_attn_decode_rmsnorm` also covers
+`flash_attn_decode_rmsnorm` and `moe_ffn_decode_rmsnorm`, so with the default
+Qwen3.5-122B layer counts its `kernel_calls` is `36 + 12 + 48 = 96`. Two lines
+after the table give the prefill and decode totals of `latency_us x calls`.
+Override single cases with `--case-calls LABEL[@prefill|@decode]=N` or a
+`--calls-file` holding one such entry per line; the model summary applies the
+same call counts and lists the overrides.
+
 The model-level reports split latency into prefill and decode, then into
 Flash-Attn, Linear-Attn, MoE-FFN, and Sampling. They also report total covered
 model latency and generate phase/module/operator pie and bar charts. When
