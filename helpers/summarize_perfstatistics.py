@@ -403,6 +403,12 @@ def main() -> int:
     )
     parser.add_argument("--status-only", action="store_true", help="Print only the case status report (which cases ran or are missing).")
     parser.add_argument("--print-missing", action="store_true", help="Print only the labels of expected cases without a report, one per line.")
+    parser.add_argument(
+        "--phase",
+        choices=("prefill", "decode", "all"),
+        default="all",
+        help="Restrict the missing-case report and --print-missing to one phase. Sampling cases belong to both. Default: all",
+    )
     parser.add_argument("--measured-seq-len", type=int, default=3823, help="Prefill tokens the benchmarks ran with (PREFILL_TOKENS). Default: 3823")
     parser.add_argument(
         "--measured-used-len",
@@ -547,6 +553,8 @@ def main() -> int:
             continue
         info = case_logs.get(label)
         phase = classify_phase(label)
+        # Sampling runs after prefill and after decode, so it is missing from both.
+        phases = ("prefill", "decode") if classify_module(label) == "Sampling" else (phase,)
         missing_rows.append(
             {
                 "case": label,
@@ -564,16 +572,33 @@ def main() -> int:
                 "report_dir": describe_missing_case(info),
                 "_missing": True,
                 "_log": (info or {}).get("log", ""),
+                "_phases": phases,
             }
         )
     missing_cases = [
-        {"case": str(m["case"]), "calls": str(m["calls"]), "reason": str(m["report_dir"]), "log": str(m["_log"])}
+        {
+            "case": str(m["case"]),
+            "calls": str(m["calls"]),
+            "reason": str(m["report_dir"]),
+            "log": str(m["_log"]),
+            "phases": m["_phases"],
+        }
         for m in missing_rows
     ]
+    phase_filter = ("prefill", "decode") if args.phase == "all" else (args.phase,)
+    missing_by_phase = {
+        phase: [entry for entry in missing_cases if phase in entry["phases"]]  # type: ignore[operator]
+        for phase in ("prefill", "decode", "unknown")
+    }
 
     if args.print_missing:
-        for entry in missing_cases:
-            print(entry["case"])
+        printed: list[str] = []
+        for phase in phase_filter + (("unknown",) if args.phase == "all" else ()):
+            for entry in missing_by_phase[phase]:
+                if entry["case"] not in printed:
+                    printed.append(str(entry["case"]))
+        for label in printed:
+            print(label)
         return 0
 
     measured_count = sum(1 for row in rows if "_kernel_source" not in row)
@@ -640,7 +665,7 @@ def main() -> int:
             coverage = f"{len(subset)} cases"
             if bw_rows and len(bw_rows) != len(subset):
                 coverage += f", bandwidth from {len(bw_rows)}"
-            omitted = sum(1 for r in missing_rows if not phase or r["phase"] == phase)
+            omitted = sum(1 for r in missing_rows if not phase or phase in r["_phases"])  # type: ignore[operator]
             if omitted:
                 coverage += f", {omitted} not run"
             total: dict[str, object] = {
@@ -749,10 +774,19 @@ def main() -> int:
     if not args.tsv or quiet:
         print()
         expected_note = f"expected cases from {expected_source}" if expected_source else "no expected case list (only per-case logs were checked)"
-        print(f"case status: measured={measured_count} deduped={deduped_count} not_run={len(missing_rows)} ({expected_note})")
-        for entry in missing_cases:
-            log_note = f"  [{entry['log']}]" if entry["log"] else ""
-            print(f"  {entry['case']}: {entry['reason']}{log_note}")
+        print(
+            f"case status: measured={measured_count} deduped={deduped_count} not_run={len(missing_rows)} "
+            f"(prefill={len(missing_by_phase['prefill'])} decode={len(missing_by_phase['decode'])}"
+            + (f" unknown={len(missing_by_phase['unknown'])}" if missing_by_phase["unknown"] else "")
+            + f"; {expected_note})"
+        )
+        for phase in phase_filter + (("unknown",) if args.phase == "all" and missing_by_phase["unknown"] else ()):
+            entries = missing_by_phase[phase]
+            print(f"  {phase}: {len(entries)} not run")
+            for entry in entries:
+                log_note = f"  [{entry['log']}]" if entry["log"] else ""
+                both = "  (sampling: needed after prefill and after decode)" if len(entry["phases"]) > 1 else ""  # type: ignore[arg-type]
+                print(f"    {entry['case']}: {entry['reason']}{log_note}{both}")
         if missing_rows:
             print("TOTAL rows and the model summary omit the cases above.")
     elif missing_rows:

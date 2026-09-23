@@ -482,9 +482,12 @@ report, or has no log at all. Those rows are excluded from the TOTAL rows and
 the model summary, which also lists them under "Cases Not Measured". For runs
 made before `expected_cases.txt` existed, pass
 `--bench-script ./bench_Qwen3.5-122B-A10B-GPTQ.sh` (its `--list` output is the
-expected list) or `--expected-cases FILE`. `--status-only` prints just the
-status block and `--print-missing` prints only the missing labels, which can be
-fed back to the bench script to rerun them:
+expected list) or `--expected-cases FILE`. The status block groups the missing
+cases by phase (sampling cases are listed under both prefill and decode).
+`--status-only` prints just that block, `--print-missing` prints only the
+missing labels, and `--phase prefill` / `--phase decode` restricts either one
+to a single phase, so the labels can be fed back to the bench script to rerun
+them:
 
 ```bash
 OUT=.bench_logs/bench_20260922_100657
