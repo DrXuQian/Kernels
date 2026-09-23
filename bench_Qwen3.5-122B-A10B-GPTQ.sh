@@ -201,7 +201,8 @@ Usage:
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --nsys-latency          # nsys kernel-duration fallback
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh LABEL [LABEL ...]       # run selected cases
 
-Case matching accepts exact labels or substrings. Examples:
+Case matching accepts exact labels or substrings; the filters `prefill` and
+`decode` also select the sampling cases, which run after both phases. Examples:
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh w4a16_decode_linear_attn_in_proj_qkv_cublas
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case moe_gate_up_decode_vllm
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh decode_vllm
@@ -222,6 +223,11 @@ Environment variables:
   PERF_STATISTICS_MP       perf_statistics_gen --mp value. Default: 16
   PERF_STATISTICS_GHZ      Clock used for latency summary. Default: 1.5.
   PERF_STATISTICS_SUMMARY  Set to 0 to skip the final perfstatistics table.
+  PERF_STATISTICS_PEAK_GBPS  Peak memory bandwidth in GB/s for perfstatistics utilization.
+  PERF_STATISTICS_SCALE    Comma-separated SEQ[:USED] targets, e.g. 8192,16384:65536.
+                           The summary projects latency to SEQ prefill tokens and a
+                           USED-token KV cache (prefill ~SEQ, attention ~SEQ*USED,
+                           decode attention ~USED).
   PERFRAWLOG_CLEAR         Set to 0 to keep an existing perfrawlog before each case.
   PERFRAWLOG_POSTPROCESS   Set to 0 to skip perfrawlog post-processing.
   BENCH_DEDUPE             Set to 0 to rerun duplicate benchmark commands/shapes.
@@ -280,6 +286,8 @@ add_case_filter() {
   done
   IFS="$old_ifs"
 }
+
+SCRIPT_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -457,6 +465,23 @@ command_dedupe_key() {
   quote_command "$@"
 }
 
+write_expected_cases() {
+  # Record the selected case labels before running anything, so the summary
+  # can report cases that never ran even if a later case aborts the script.
+  # Existing entries are kept, so a resumed run in the same OUT_DIR still
+  # expects every case of the original run.
+  local expected="$OUT_DIR/expected_cases.txt"
+  local listed=""
+  listed="$("$0" --list ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"} 2>/dev/null \
+    | awk '$1 == "ok" || $1 == "missing" { print $2 }')" || true
+  {
+    if [[ -f "$expected" ]]; then
+      cat "$expected"
+    fi
+    printf '%s\n' "$listed"
+  } | awk 'NF && !seen[$0]++' >"$expected.tmp" && mv "$expected.tmp" "$expected"
+}
+
 label_matches_filter() {
   local label="$1"
   local filter="$2"
@@ -468,7 +493,8 @@ label_matches_filter() {
     return
   fi
   if [[ "$filter" == "prefill" ]]; then
-    [[ "$label" == *prefill* ]]
+    # Sampling runs after prefill as well as after every decode step.
+    [[ "$label" == *prefill* || "$label" == sampling_* ]]
     return
   fi
 
@@ -867,9 +893,22 @@ summarize_perfstatistics() {
   echo
   echo "=== perfstatistics summary ==="
   set +e
+  local peak_gbps_args=()
+  if [[ -n "${PERF_STATISTICS_PEAK_GBPS:-}" ]]; then
+    peak_gbps_args=(--peak-gbps "$PERF_STATISTICS_PEAK_GBPS")
+  fi
+  local scale_args=()
+  local scale_target
+  for scale_target in ${PERF_STATISTICS_SCALE:+${PERF_STATISTICS_SCALE//,/ }}; do
+    scale_args+=(--scale "$scale_target")
+  done
   python "$ROOT_DIR/helpers/summarize_perfstatistics.py" \
     "$report_base" \
     --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
+    ${peak_gbps_args[@]+"${peak_gbps_args[@]}"} \
+    ${scale_args[@]+"${scale_args[@]}"} \
+    --measured-seq-len "$PREFILL_TOKENS" \
+    --measured-used-len "$CTX_LEN" \
     --bench-out-dir "$OUT_DIR" \
     --model-summary-dir "$model_summary_dir" \
     "${MODEL_SUMMARY_ARGS[@]}" 2>&1 | tee "$summary_log"
@@ -1302,6 +1341,7 @@ if [[ "$LIST_CASES" != 1 ]]; then
     PERF_STATISTICS_DIR="$ROOT_DIR/$PERF_STATISTICS_DIR"
   fi
   mkdir -p "$OUT_DIR"
+  write_expected_cases
 fi
 
 if [[ "$LIST_CASES" == 1 ]]; then

@@ -452,9 +452,12 @@ logical case runs in one model forward of the phase and `model_latency_us` is
 runs once per layer of its module (`MODEL_FULL_ATTN_LAYERS`,
 `MODEL_LINEAR_ATTN_LAYERS`, `MODEL_DENSE_FFN_LAYERS`, `MODEL_MOE_FFN_LAYERS`,
 passed through `--full-attn-layers` and friends) and sampling cases use the
-sampling counts. Logical cases that `BENCH_DEDUPE` folded into one measured
-kernel appear as `deduped from <case>` rows with their own counts, and the
-measured row also shows `kernel_calls` and `kernel_model_latency_us`, the
+sampling counts. Sampling runs after prefill and after every decode step, so
+each sampling case is listed twice, as `<case>__prefill` and `<case>__decode`,
+and the `prefill` / `decode` case filters of the bench scripts select the
+sampling cases as well. Logical cases that `BENCH_DEDUPE` folded into one
+measured kernel appear as `deduped from <case>` rows with their own counts, and
+the measured row also shows `kernel_calls` and `kernel_model_latency_us`, the
 totals over every logical case that kernel serves. For example the decode
 RMSNorm measured once as `linear_attn_decode_rmsnorm` also covers
 `flash_attn_decode_rmsnorm` and `moe_ffn_decode_rmsnorm`, so with the default
@@ -463,12 +466,44 @@ Qwen3.5-122B layer counts its `kernel_calls` is `36 + 12 + 48 = 96`. The
 `compute_cycles`, latency, and bytes are sums of `value x calls`, `calls` is the
 number of kernel launches per forward, and `achieved_GBps` / `bw_util%` divide
 the call-weighted bytes by the call-weighted cycles of the cases that report
-bytes (the `report_dir` cell says how many cases contributed). Sampling rows
-count in decode in this table; the model summary additionally applies
-`MODEL_SAMPLING_PREFILL_COUNT` per prefill.
+bytes (the `report_dir` cell says how many cases contributed).
 Override single cases with `--case-calls LABEL[@prefill|@decode]=N` or a
 `--calls-file` holding one such entry per line; the model summary applies the
 same call counts and lists the overrides.
+
+The summary also reports which expected cases have no report. The bench
+scripts write the selected labels to `<OUT_DIR>/expected_cases.txt` before the
+first case runs (a resumed run in the same `OUT_DIR` merges into it), and every
+case leaves `<OUT_DIR>/<case>.log`. Each expected case without a
+`perfstatistics.log` is printed as a `not run: ...` row whose `report_dir`
+cell gives the reason: the benchmark failed (`exit_status`), finished without
+a perfstatistics report, never finished, was deduped from a case that has no
+report, or has no log at all. Those rows are excluded from the TOTAL rows and
+the model summary, which also lists them under "Cases Not Measured". For runs
+made before `expected_cases.txt` existed, pass
+`--bench-script ./bench_Qwen3.5-122B-A10B-GPTQ.sh` (its `--list` output is the
+expected list) or `--expected-cases FILE`. `--status-only` prints just the
+status block and `--print-missing` prints only the missing labels, which can be
+fed back to the bench script to rerun them:
+
+```bash
+OUT=.bench_logs/bench_20260922_100657
+python helpers/summarize_perfstatistics.py $OUT/perfstatistics --bench-out-dir $OUT \
+  --bench-script ./bench_Qwen3.5-122B-A10B-GPTQ.sh --status-only
+missing=$(python helpers/summarize_perfstatistics.py $OUT/perfstatistics --bench-out-dir $OUT \
+  --bench-script ./bench_Qwen3.5-122B-A10B-GPTQ.sh --print-missing | paste -sd, -)
+RUN_DIR=<RUNTIME_WORKDIR> OUT_DIR=$OUT ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case "$missing"
+```
+
+`--scale SEQ[:USED]` (repeatable; `PERF_STATISTICS_SCALE=8192,16384:65536` from
+the bench scripts) appends a projected-latency table for a longer prefill of
+`SEQ` tokens and a KV cache of `USED` tokens (`USED` defaults to `SEQ`). In
+prefill every kernel except the attention core scales linearly with `SEQ` and
+the attention core scales with `SEQ x USED`, which is `SEQ` squared for a full
+prefill; in decode only the attention core changes, linearly with `USED`;
+sampling never scales. The measured lengths come from `--measured-seq-len`
+(`PREFILL_TOKENS`) and `--measured-used-len` (`CTX_LEN`), which the bench
+scripts pass automatically.
 
 The model-level reports split latency into prefill and decode, then into
 Flash-Attn, Linear-Attn, MoE-FFN, and Sampling. They also report total covered

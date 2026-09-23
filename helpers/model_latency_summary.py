@@ -236,12 +236,18 @@ def sanitize_svg_text(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-def display_label(label: object, max_len: int = 72) -> str:
+def strip_phase_suffix(label: object) -> str:
+    """Drop the `__prefill` / `__decode` suffix used for phase-split rows."""
+
     text = str(label)
-    if text.endswith("__prefill"):
-        text = text[: -len("__prefill")]
-    elif text.endswith("__decode"):
-        text = text[: -len("__decode")]
+    for suffix in ("__prefill", "__decode"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def display_label(label: object, max_len: int = 72) -> str:
+    text = strip_phase_suffix(label)
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
@@ -370,8 +376,9 @@ def case_call_count(
     the phase and every other case runs once per layer of its module.
     """
 
+    base = strip_phase_suffix(case)
     if case_calls:
-        for key in ((case, phase), (case, None)):
+        for key in ((base, phase), (base, None), (case, phase), (case, None)):
             if key in case_calls:
                 return int(case_calls[key])
     module = classify_module(case)
@@ -718,6 +725,7 @@ def write_markdown_report(
     duplicates: list[dict[str, str]],
     chart_files: list[Path],
     case_calls: dict[CaseCallsKey, int] | None = None,
+    missing_cases: list[dict[str, str]] | None = None,
 ) -> None:
     total = float(model_summary["total_us"])
     covered_total = float(covered_summary["total_us"])
@@ -834,6 +842,21 @@ def write_markdown_report(
         lines.append(markdown_table(["case", "missing_source"], [[f"`{d['case']}`", f"`{d['duplicate_of']}`"] for d in missing]))
         lines.append("")
 
+    if missing_cases:
+        lines.extend(
+            [
+                "## Cases Not Measured",
+                "",
+                "These expected cases have no perfstatistics report, so every total above omits them.",
+                "",
+                markdown_table(
+                    ["case", "calls", "reason"],
+                    [[f"`{m['case']}`", str(m.get("calls", "")), str(m.get("reason", ""))] for m in missing_cases],
+                ),
+                "",
+            ]
+        )
+
     if model_summary["phase_totals"].get("unknown", 0.0):  # type: ignore[index]
         lines.append("Unknown-phase cases are included in `model_estimate_total` but omitted from prefill/decode charts.")
         lines.append("")
@@ -850,6 +873,7 @@ def write_model_latency_summary(
     bench_out_dir: Path | None = None,
     model_config: dict[str, int] | None = None,
     case_calls: dict[CaseCallsKey, int] | None = None,
+    missing_cases: list[dict[str, str]] | None = None,
 ) -> tuple[Path, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     expanded, duplicates = expand_deduped_cases(cases, bench_out_dir)
@@ -890,6 +914,15 @@ def write_model_latency_summary(
 
     report_path = out_dir / "model_latency_summary.md"
     write_markdown_report(
-        report_path, title, source_name, model_summary, covered_summary, effective_config, duplicates, chart_files, case_calls
+        report_path,
+        title,
+        source_name,
+        model_summary,
+        covered_summary,
+        effective_config,
+        duplicates,
+        chart_files,
+        case_calls,
+        missing_cases,
     )
     return report_path, console_summary(model_summary)

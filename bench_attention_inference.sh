@@ -115,6 +115,25 @@ add_case_filter() {
   IFS="$old_ifs"
 }
 
+SCRIPT_ARGS=("$@")
+
+write_expected_cases() {
+  # Record the selected case labels before running anything, so the summary
+  # can report cases that never ran even if a later case aborts the script.
+  # Existing entries are kept, so a resumed run in the same OUT_DIR still
+  # expects every case of the original run.
+  local expected="$OUT_DIR/expected_cases.txt"
+  local listed=""
+  listed="$("$0" --list ${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"} 2>/dev/null \
+    | awk 'NF == 1 && $1 !~ /:$/ { print $1 }')" || true
+  {
+    if [[ -f "$expected" ]]; then
+      cat "$expected"
+    fi
+    printf '%s\n' "$listed"
+  } | awk 'NF && !seen[$0]++' >"$expected.tmp" && mv "$expected.tmp" "$expected"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --case|--kernel|--only)
@@ -457,9 +476,18 @@ summarize_perfstatistics() {
   echo
   echo "=== perfstatistics summary ==="
   set +e
+  local scale_args=()
+  local scale_target
+  for scale_target in ${PERF_STATISTICS_SCALE:+${PERF_STATISTICS_SCALE//,/ }}; do
+    scale_args+=(--scale "$scale_target")
+  done
   python "$ROOT_DIR/helpers/summarize_perfstatistics.py" \
     "$report_base" \
-    --ghz "${PERF_STATISTICS_GHZ:-1.5}" 2>&1 | tee "$summary_log"
+    --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
+    ${scale_args[@]+"${scale_args[@]}"} \
+    --measured-seq-len "$PREFILL_TOKENS" \
+    --measured-used-len "$CTX_LEN" \
+    --bench-out-dir "$OUT_DIR" 2>&1 | tee "$summary_log"
   local status=${PIPESTATUS[0]}
   set -e
   if [[ "$status" != 0 ]]; then
@@ -494,6 +522,7 @@ if [[ "$LIST_CASES" != 1 ]]; then
     PERF_STATISTICS_DIR="$ROOT_DIR/$PERF_STATISTICS_DIR"
   fi
   mkdir -p "$OUT_DIR" "$TRITON_CACHE_DIR"
+  write_expected_cases
   cd "$RUN_DIR"
 fi
 
