@@ -500,7 +500,11 @@ RUN_DIR=<RUNTIME_WORKDIR> OUT_DIR=$OUT ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case 
 
 `--scale SEQ[:USED]` (repeatable; `PERF_STATISTICS_SCALE=8192,16384:65536` from
 the bench scripts) appends a projected-latency table for a longer prefill of
-`SEQ` tokens and a KV cache of `USED` tokens (`USED` defaults to `SEQ`). In
+`SEQ` tokens and a KV cache of `USED` tokens (`USED` defaults to `SEQ`, and
+`:USED` keeps the measured prefill length). `--phase prefill` / `--phase decode`
+limits the projection to one phase, for example `--scale 20000:80000 --phase
+prefill` for a 20K-token prefill against an 80K KV cache and
+`--scale :100000 --phase decode` for decode with a 100K KV cache. In
 prefill every kernel except the attention core scales linearly with `SEQ` and
 the attention core scales with `SEQ x USED`, which is `SEQ` squared for a full
 prefill; in decode only the attention core changes, linearly with `USED`;

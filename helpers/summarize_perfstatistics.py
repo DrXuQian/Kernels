@@ -95,14 +95,16 @@ def model_config_from_args(args: argparse.Namespace) -> dict[str, int] | None:
 
 
 def parse_scale_arg(value: str) -> tuple[int, int]:
+    """SEQ[:USED] or :USED. 0 means "keep the measured length" and is resolved later."""
+
     seq_text, _, used_text = value.strip().partition(":")
     try:
-        seq_len = int(seq_text)
+        seq_len = int(seq_text) if seq_text else 0
         used_len = int(used_text) if used_text else seq_len
     except ValueError:
-        raise argparse.ArgumentTypeError(f"expected SEQ[:USED] with integers, got {value!r}") from None
-    if seq_len <= 0 or used_len <= 0:
-        raise argparse.ArgumentTypeError("SEQ and USED must be positive")
+        raise argparse.ArgumentTypeError(f"expected SEQ[:USED] or :USED with integers, got {value!r}") from None
+    if seq_len < 0 or used_len < 0 or (seq_len == 0 and used_len == 0):
+        raise argparse.ArgumentTypeError("SEQ and USED must be positive (SEQ may be omitted as :USED)")
     return seq_len, used_len
 
 
@@ -407,7 +409,8 @@ def main() -> int:
         "--phase",
         choices=("prefill", "decode", "all"),
         default="all",
-        help="Restrict the missing-case report and --print-missing to one phase. Sampling cases belong to both. Default: all",
+        help="Restrict the missing-case report, --print-missing, and the --scale projection to one phase. "
+        "Sampling cases belong to both. Default: all",
     )
     parser.add_argument("--measured-seq-len", type=int, default=3823, help="Prefill tokens the benchmarks ran with (PREFILL_TOKENS). Default: 3823")
     parser.add_argument(
@@ -421,7 +424,8 @@ def main() -> int:
         default=[],
         type=parse_scale_arg,
         metavar="SEQ[:USED]",
-        help="Project latencies to SEQ prefill tokens and USED KV-cache tokens (USED defaults to SEQ). Repeatable.",
+        help="Project latencies to SEQ prefill tokens and USED KV-cache tokens (USED defaults to SEQ; "
+        ":USED keeps the measured prefill length). Repeatable.",
     )
     parser.add_argument("--tsv", action="store_true", help="Print TSV instead of a padded table.")
     parser.add_argument("--model-summary-dir", type=Path, help="Write model-level latency tables and SVG charts here.")
@@ -719,10 +723,13 @@ def main() -> int:
         print("TOTAL rows weight cycles, latency, and bytes by calls; sampling is counted after prefill and after each decode step.")
 
         for target_seq, target_used in args.scale:
+            target_seq = target_seq or measured_seq_len
+            target_used = target_used or measured_used_len
             seq_ratio = target_seq / measured_seq_len
             used_ratio = target_used / measured_used_len
+            projected_rows = [r for r in measured_rows if args.phase == "all" or r["phase"] == args.phase]
             scaled_rows: list[dict[str, object]] = []
-            for row in measured_rows:
+            for row in projected_rows:
                 factor = scale_factor(str(row["case"]), str(row["phase"]), seq_ratio, used_ratio)
                 scaled_latency = float(row["_latency_us"]) * factor
                 scaled_rows.append(
@@ -760,7 +767,8 @@ def main() -> int:
                 )
             print()
             print(
-                f"=== projected latency @ seq_len={target_seq} used_len={target_used} "
+                f"=== projected {args.phase if args.phase != 'all' else 'prefill+decode'} latency "
+                f"@ seq_len={target_seq} used_len={target_used} "
                 f"(measured seq_len={measured_seq_len} used_len={measured_used_len}; "
                 f"prefill: x{seq_ratio:.3f}, prefill attention: x{seq_ratio * used_ratio:.3f}, "
                 f"decode attention: x{used_ratio:.3f}) ==="
