@@ -48,17 +48,21 @@ summary, and also fills in attention cases that did not run.
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+from case_shape_model import case_estimates, projected_estimates
 from model_latency_summary import (
     DEFAULT_MODEL_CONFIG,
     case_call_count,
     classify_module,
     classify_phase,
+    compute_model_summary,
     load_case_calls,
+    markdown_table,
     strip_phase_suffix,
     write_model_latency_summary,
 )
@@ -363,21 +367,24 @@ def is_attention_core(label: str) -> bool:
     return strip_phase_suffix(label).lower().endswith("_full_attn")
 
 
-def scale_factor(label: str, phase: str, seq_ratio: float, used_ratio: float) -> float:
+def scale_factor(
+    label: str, phase: str, measured_seq: int, measured_used: int, target_seq: int, target_used: int
+) -> float:
     """How a case's latency scales with prefill length and KV-cache length.
 
-    Prefill: attention core ~ SEQ x USED, everything else ~ SEQ.
-    Decode: attention core ~ USED, everything else is per token and fixed.
-    Sampling depends on the vocabulary only.
+    Prefill: the attention core scales with its causal (query, key) pair count
+    (SEQ new tokens over a USED-token context, SEQ squared for a full prefill),
+    everything else linearly with SEQ. Decode: only the attention core changes,
+    linearly with USED. Sampling depends on the vocabulary only.
     """
 
     if classify_module(label) == "Sampling":
         return 1.0
-    attention = is_attention_core(label)
+    if is_attention_core(label) and phase in ("prefill", "decode"):
+        base_pairs = attention_pairs(phase, measured_seq, measured_used)
+        return attention_pairs(phase, target_seq, target_used) / base_pairs if base_pairs > 0 else 1.0
     if phase == "prefill":
-        return seq_ratio * used_ratio if attention else seq_ratio
-    if phase == "decode":
-        return used_ratio if attention else 1.0
+        return target_seq / measured_seq
     return 1.0
 
 
@@ -431,6 +438,23 @@ def analytic_attention_latency_us(
     return flops / (peak_tflops * 1e12 * util) * 1e6
 
 
+def attach_shape_estimates(row: dict[str, object]) -> None:
+    """FLOPs and modeled traffic of one call, from the recorded benchmark command."""
+
+    command = str(row.get("_command", ""))
+    estimates = case_estimates(command) if command else {"exe": "", "opts": {}, "flops": math.nan, "bytes": math.nan}
+    row["_exe"] = estimates["exe"]
+    row["_opts"] = estimates["opts"]
+    row["_flops"] = float(estimates["flops"])  # type: ignore[arg-type]
+    row["_model_bytes"] = float(estimates["bytes"])  # type: ignore[arg-type]
+
+
+def utilization_text(value: float, seconds: float, peak_per_second: float) -> str:
+    if math.isnan(value) or seconds <= 0 or peak_per_second <= 0:
+        return ""
+    return f"{value / seconds / peak_per_second * 100.0:.2f}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -440,7 +464,7 @@ def main() -> int:
         help="perfstatistics root(s) or individual report directories. Default: latest .bench_logs/bench_*/perfstatistics",
     )
     parser.add_argument("--ghz", type=float, default=1.5, help="Clock frequency for latency conversion. Default: 1.5")
-    parser.add_argument("--peak-gbps", type=float, default=0.0, help="Peak memory bandwidth in GB/s for utilization calculation.")
+    parser.add_argument("--peak-gbps", type=float, default=0.0, help="Peak memory bandwidth in GB/s; enables the mbu%% columns.")
     parser.add_argument(
         "--case-calls",
         action="append",
@@ -492,7 +516,12 @@ def main() -> int:
         metavar="UTIL",
         help="Replace attention core cases by FLOPs / (--peak-tflops x UTIL), e.g. 0.7 for 70%% MFU. Also fills in unrun attention cases.",
     )
-    parser.add_argument("--peak-tflops", type=float, default=0.0, help="Peak FP16 compute in TFLOPS for --fa-util-overwrite, e.g. 250.")
+    parser.add_argument(
+        "--peak-tflops",
+        type=float,
+        default=0.0,
+        help="Peak FP16 compute in TFLOPS, e.g. 250; enables the gflop / mfu%% columns and is required by --fa-util-overwrite.",
+    )
     parser.add_argument("--attn-heads", type=int, default=32, help="Query heads of the full-attention layers. Default: 32")
     parser.add_argument("--attn-head-dim", type=int, default=256, help="Head dimension of the full-attention layers. Default: 256")
     parser.add_argument(
@@ -600,7 +629,8 @@ def main() -> int:
             "_command": metadata.get("command", ""),
         }
         if args.peak_gbps > 0:
-            row["bw_util%"] = bw_util
+            row["mbu%"] = bw_util
+        attach_shape_estimates(row)
         rows.append(row)
 
         model_rows.append(
@@ -658,8 +688,10 @@ def main() -> int:
                 "_missing": True,
                 "_log": (info or {}).get("log", ""),
                 "_phases": phases,
+                "_command": (info or {}).get("command", ""),
             }
         )
+        attach_shape_estimates(missing_rows[-1])
     detected_seq, detected_used, detected_from = detect_measured_lengths(rows)
     measured_seq_len = args.measured_seq_len or detected_seq or 3823
     measured_used_len = args.measured_used_len or detected_used or measured_seq_len
@@ -672,26 +704,50 @@ def main() -> int:
     )
 
     fa_note = ""
-    if args.fa_util is not None:
+    analytic_labels: dict[str, float] = {}
+    analytic_shapes: dict[str, tuple[str, dict]] = {}
 
-        def analytic_fa(phase: str, seq_len: int, used_len: int) -> float:
-            return analytic_attention_latency_us(
-                phase, seq_len, used_len, args.attn_heads, args.attn_head_dim, args.peak_tflops, args.fa_util
-            )
+    def analytic_fa(phase: str, seq_len: int, used_len: int, nbytes: float = math.nan) -> float:
+        """Compute-bound attention latency, floored at peak bandwidth when --peak-gbps is set."""
+
+        latency_us = analytic_attention_latency_us(
+            phase, seq_len, used_len, args.attn_heads, args.attn_head_dim, args.peak_tflops, args.fa_util or 1.0
+        )
+        if args.peak_gbps > 0 and not math.isnan(nbytes):
+            latency_us = max(latency_us, nbytes / (args.peak_gbps * 1e9) * 1e6)
+        return latency_us
+
+    def projected_latency_us(label: str, phase: str, latency_us: float, target_seq: int, target_used: int) -> float:
+        """Per-call latency of one case at the target lengths."""
+
+        if label in analytic_labels:
+            exe, opts = analytic_shapes.get(label, ("", {}))
+            nbytes = math.nan
+            if exe:
+                _, nbytes = projected_estimates(exe, opts, phase, target_seq / measured_seq_len, target_seq, target_used)
+            return analytic_fa(phase, target_seq, target_used, nbytes)
+        return latency_us * scale_factor(label, phase, measured_seq_len, measured_used_len, target_seq, target_used)
+
+    if args.fa_util is not None:
 
         def apply_fa_override(row: dict[str, object], was_missing: bool) -> None:
             phase = classify_phase(str(row["case"]))
             previous = float(row.get("_latency_us", 0.0))
-            latency_us = analytic_fa(phase, measured_seq_len, measured_used_len)
+            model_bytes = float(row.get("_model_bytes", math.nan))
+            compute_us = analytic_fa(phase, measured_seq_len, measured_used_len)
+            latency_us = analytic_fa(phase, measured_seq_len, measured_used_len, model_bytes)
+            memory_bound = latency_us > compute_us
             row["_latency_us"] = latency_us
             row[latency_header] = f"{latency_us:.3f}"
             row["compute_cycles"] = int(round(latency_us * args.ghz * 1000.0))
-            for key in ("read_bytes", "write_bytes", "total_bytes", "achieved_GBps", "bw_util%"):
+            for key in ("read_bytes", "write_bytes", "total_bytes", "achieved_GBps", "mbu%"):
                 if key in row:
                     row[key] = ""
             row["_analytic"] = True
-            row["report_dir"] = f"analytic: {args.fa_util:.0%} of {args.peak_tflops:g} TFLOPS" + (
-                " (case did not run)" if was_missing else f" (measured {previous:.3f} us)"
+            row["report_dir"] = (
+                f"analytic: {args.fa_util:.0%} of {args.peak_tflops:g} TFLOPS"
+                + (f", floored at {args.peak_gbps:g} GB/s" if memory_bound else "")
+                + (" (case did not run)" if was_missing else f" (measured {previous:.3f} us)")
             )
 
         for row in rows:
@@ -709,6 +765,7 @@ def main() -> int:
                 kept_missing.append(row)
         missing_rows = kept_missing
         analytic_labels = {str(row["case"]): float(row["_latency_us"]) for row in rows if row.get("_analytic")}
+        analytic_shapes = {str(row["case"]): (str(row.get("_exe", "")), row.get("_opts", {})) for row in rows if row.get("_analytic")}  # type: ignore[misc]
         for entry in model_rows:
             if str(entry["case"]) in analytic_labels:
                 entry["latency_us"] = analytic_labels[str(entry["case"])]
@@ -717,6 +774,7 @@ def main() -> int:
             f"attention core rows use analytic latency: {args.fa_util:.0%} of {args.peak_tflops:g} TFLOPS, "
             f"heads={args.attn_heads} head_dim={args.attn_head_dim}, FLOPs = 4 x heads x head_dim x pairs "
             f"(prefill causal seq_len x used_len, decode 1 x used_len)"
+            + (f"; latency floored at modeled bytes / {args.peak_gbps:g} GB/s" if args.peak_gbps > 0 else "")
         )
 
     missing_cases = [
@@ -767,6 +825,9 @@ def main() -> int:
             row["calls"] = calls
             row["_model_latency_us"] = float(row["_latency_us"]) * calls
             row["model_latency_us"] = f"{row['_model_latency_us']:.3f}"
+            flops = float(row.get("_flops", math.nan))
+            row["gflop"] = "" if math.isnan(flops) else f"{flops / 1e9:.3f}"
+            row["mfu%"] = utilization_text(flops, float(row["_latency_us"]) * 1e-6, args.peak_tflops * 1e12)
         aggregate_kernel_calls(rows)
         measured_rows = [row for row in rows if not row.get("_missing")]
 
@@ -781,10 +842,12 @@ def main() -> int:
             "kernel_calls",
             "kernel_model_latency_us",
         ]
+        if args.peak_tflops > 0:
+            headers.extend(["gflop", "mfu%"])
         if has_bandwidth:
             headers.extend(["read_bytes", "write_bytes", "total_bytes", "achieved_GBps"])
             if args.peak_gbps > 0:
-                headers.append("bw_util%")
+                headers.append("mbu%")
         headers.append("report_dir")
 
         def weighted_total_row(label: str, phase: str, subset: list[dict[str, object]]) -> dict[str, object]:
@@ -806,9 +869,16 @@ def main() -> int:
                 gbps_text = f"{gbps:.3f}"
                 if args.peak_gbps > 0:
                     util_text = f"{gbps / args.peak_gbps * 100.0:.2f}"
+            flops_rows = [r for r in subset if not math.isnan(float(r.get("_flops", math.nan)))]
+            flops_w = sum(float(r["_flops"]) * int(r["calls"]) for r in flops_rows)
+            flops_cycles_w = sum(int(r["compute_cycles"]) * int(r["calls"]) for r in flops_rows)
+            gflop_text = f"{flops_w / 1e9:.3f}" if flops_rows else ""
+            mfu_text = utilization_text(flops_w, flops_cycles_w / (args.ghz * 1e9), args.peak_tflops * 1e12) if flops_rows else ""
             coverage = f"{len(subset)} cases"
             if bw_rows and len(bw_rows) != len(subset):
                 coverage += f", bandwidth from {len(bw_rows)}"
+            if flops_rows and len(flops_rows) != len(subset):
+                coverage += f", flops from {len(flops_rows)}"
             omitted = sum(1 for r in missing_rows if not phase or phase in r["_phases"])  # type: ignore[operator]
             if omitted:
                 coverage += f", {omitted} not run"
@@ -830,10 +900,12 @@ def main() -> int:
                 "write_bytes": write_w if bw_rows else "",
                 "total_bytes": bytes_w if bw_rows else "",
                 "achieved_GBps": gbps_text,
+                "gflop": gflop_text,
+                "mfu%": mfu_text,
                 "report_dir": coverage,
             }
             if args.peak_gbps > 0:
-                total["bw_util%"] = util_text
+                total["mbu%"] = util_text
             return total
 
         total_rows: list[dict[str, object]] = []
@@ -842,6 +914,10 @@ def main() -> int:
             if subset:
                 total_rows.append(weighted_total_row(f"TOTAL_{phase}", phase, subset))
         total_rows.append(weighted_total_row("TOTAL", "", measured_rows))
+        baseline_metrics = {
+            str(t["phase"] or "all"): {"mfu": str(t.get("mfu%", "")), "mbu": str(t.get("mbu%", ""))} for t in total_rows
+        }
+        projection_metrics: dict[tuple[int, int], dict[str, dict[str, str]]] = {}
 
         print_rows(rows + total_rows, headers, args.tsv)
         print()
@@ -873,12 +949,34 @@ def main() -> int:
             projected_rows = [r for r in measured_rows if args.phase == "all" or r["phase"] == args.phase]
             scaled_rows: list[dict[str, object]] = []
             for row in projected_rows:
-                if row.get("_analytic"):
-                    scaled_latency = analytic_fa(str(row["phase"]), target_seq, target_used)
-                    factor = scaled_latency / float(row["_latency_us"]) if float(row["_latency_us"]) > 0 else 0.0
+                base_label = strip_phase_suffix(str(row["case"])) if row.get("_analytic") else str(row["case"])
+                scaled_latency = projected_latency_us(
+                    base_label if row.get("_analytic") else str(row["case"]),
+                    str(row["phase"]),
+                    float(row["_latency_us"]),
+                    target_seq,
+                    target_used,
+                )
+                factor = scaled_latency / float(row["_latency_us"]) if float(row["_latency_us"]) > 0 else 0.0
+                # FLOPs and traffic at the target lengths from the shape model; measured
+                # bytes are rescaled by the modeled ratio so the baseline stays measured.
+                flops_t = math.nan
+                bytes_t = math.nan
+                if row.get("_exe"):
+                    flops_t, bytes_t = projected_estimates(
+                        str(row["_exe"]), row["_opts"], str(row["phase"]), seq_ratio, target_seq, target_used  # type: ignore[arg-type]
+                    )
+                measured_bytes = float(row["total_bytes"]) if isinstance(row.get("total_bytes"), int) else math.nan
+                model_bytes_measured = float(row.get("_model_bytes", math.nan))
+                if not math.isnan(measured_bytes) and not math.isnan(bytes_t) and model_bytes_measured > 0:
+                    projected_bytes = measured_bytes * bytes_t / model_bytes_measured
+                elif not math.isnan(bytes_t):
+                    projected_bytes = bytes_t
+                elif not math.isnan(measured_bytes):
+                    projected_bytes = measured_bytes * factor
                 else:
-                    factor = scale_factor(str(row["case"]), str(row["phase"]), seq_ratio, used_ratio)
-                    scaled_latency = float(row["_latency_us"]) * factor
+                    projected_bytes = math.nan
+                scaled_seconds = scaled_latency * 1e-6
                 scaled_rows.append(
                     {
                         "case": row["case"],
@@ -889,8 +987,15 @@ def main() -> int:
                         "scaled_latency_us": f"{scaled_latency:.3f}",
                         "model_latency_us": row["model_latency_us"],
                         "scaled_model_latency_us": f"{scaled_latency * int(row['calls']):.3f}",
+                        "scaled_gflop": "" if math.isnan(flops_t) else f"{flops_t / 1e9:.3f}",
+                        "scaled_mfu%": utilization_text(flops_t, scaled_seconds, args.peak_tflops * 1e12),
+                        "scaled_GBps": "" if math.isnan(projected_bytes) or scaled_seconds <= 0 else f"{projected_bytes / scaled_seconds / 1e9:.3f}",
+                        "scaled_mbu%": utilization_text(projected_bytes, scaled_seconds, args.peak_gbps * 1e9),
                         "_scaled_model_latency_us": scaled_latency * int(row["calls"]),
                         "_model_latency_us": row["_model_latency_us"],
+                        "_flops_t": flops_t,
+                        "_bytes_t": projected_bytes,
+                        "_scaled_latency_us": scaled_latency,
                     }
                 )
             scaled_totals: list[dict[str, object]] = []
@@ -900,6 +1005,15 @@ def main() -> int:
                     continue
                 base_total = sum(float(r["_model_latency_us"]) for r in subset)
                 scaled_total = sum(float(r["_scaled_model_latency_us"]) for r in subset)
+                flops_rows = [r for r in subset if not math.isnan(float(r["_flops_t"]))]
+                flops_total = sum(float(r["_flops_t"]) * int(r["calls"]) for r in flops_rows)
+                flops_seconds = sum(float(r["_scaled_latency_us"]) * int(r["calls"]) for r in flops_rows) * 1e-6
+                bytes_rows = [r for r in subset if not math.isnan(float(r["_bytes_t"]))]
+                bytes_total = sum(float(r["_bytes_t"]) * int(r["calls"]) for r in bytes_rows)
+                bytes_seconds = sum(float(r["_scaled_latency_us"]) * int(r["calls"]) for r in bytes_rows) * 1e-6
+                mfu_text = utilization_text(flops_total, flops_seconds, args.peak_tflops * 1e12) if flops_rows else ""
+                mbu_text = utilization_text(bytes_total, bytes_seconds, args.peak_gbps * 1e9) if bytes_rows else ""
+                projection_metrics.setdefault((target_seq, target_used), {})[phase or "all"] = {"mfu": mfu_text, "mbu": mbu_text}
                 scaled_totals.append(
                     {
                         "case": f"TOTAL_{phase}" if phase else "TOTAL",
@@ -910,6 +1024,10 @@ def main() -> int:
                         "scaled_latency_us": f"{scaled_total:.3f}",
                         "model_latency_us": f"{base_total:.3f}",
                         "scaled_model_latency_us": f"{scaled_total:.3f}",
+                        "scaled_gflop": f"{flops_total / 1e9:.3f}" if flops_rows else "",
+                        "scaled_mfu%": mfu_text,
+                        "scaled_GBps": f"{bytes_total / bytes_seconds / 1e9:.3f}" if bytes_rows and bytes_seconds > 0 else "",
+                        "scaled_mbu%": mbu_text,
                     }
                 )
             print()
@@ -921,15 +1039,19 @@ def main() -> int:
                 + (
                     "attention: analytic at the target lengths"
                     if fa_note
-                    else f"prefill attention: x{seq_ratio * used_ratio:.3f}, decode attention: x{used_ratio:.3f}"
+                    else (
+                        f"prefill attention: x{attention_pairs('prefill', target_seq, target_used) / max(attention_pairs('prefill', measured_seq_len, measured_used_len), 1):.3f}, "
+                        f"decode attention: x{used_ratio:.3f}"
+                    )
                 )
                 + ") ==="
             )
-            print_rows(
-                scaled_rows + scaled_totals,
-                ["case", "phase", "calls", "latency_us", "scale", "scaled_latency_us", "model_latency_us", "scaled_model_latency_us"],
-                args.tsv,
-            )
+            projection_headers = ["case", "phase", "calls", "latency_us", "scale", "scaled_latency_us", "model_latency_us", "scaled_model_latency_us"]
+            if args.peak_tflops > 0:
+                projection_headers.extend(["scaled_gflop", "scaled_mfu%"])
+            if args.peak_gbps > 0:
+                projection_headers.extend(["scaled_GBps", "scaled_mbu%"])
+            print_rows(scaled_rows + scaled_totals, projection_headers, args.tsv)
 
     if not args.tsv or quiet:
         print()
@@ -972,7 +1094,110 @@ def main() -> int:
         print(summary_text)
         print()
         print(f"Model latency summary: {report_path}")
+
+        if args.scale:
+            # One chart set per --scale target, built from the projected per-call
+            # latencies of the measured cases, under scaled_seq<SEQ>_used<USED>/.
+            baseline = compute_model_summary(model_rows, bench_out_dir, model_config, case_calls)
+            def metrics_cells(metrics: dict[str, dict[str, str]]) -> list[str]:
+                return [
+                    metrics.get("prefill", {}).get("mfu", ""),
+                    metrics.get("prefill", {}).get("mbu", ""),
+                    metrics.get("decode", {}).get("mfu", ""),
+                    metrics.get("decode", {}).get("mbu", ""),
+                ]
+
+            comparison_rows = [
+                [
+                    f"measured (seq_len={measured_seq_len} used_len={measured_used_len})",
+                    fmt_us_value(baseline["phase_totals"].get("prefill", 0.0)),  # type: ignore[union-attr]
+                    fmt_us_value(baseline["phase_totals"].get("decode", 0.0)),  # type: ignore[union-attr]
+                    fmt_us_value(baseline["total_us"]),
+                    *metrics_cells(baseline_metrics),
+                    f"[{report_path.name}]({report_path.name})",
+                ]
+            ]
+            for target_seq, target_used in args.scale:
+                target_seq = target_seq or measured_seq_len
+                target_used = target_used or measured_used_len
+                scaled_model_rows: list[dict[str, object]] = []
+                for entry in model_rows:
+                    label = str(entry["case"])
+                    phase = classify_phase(label)
+                    if args.phase != "all" and classify_module(label) != "Sampling" and phase != args.phase:
+                        continue
+                    scaled_entry = dict(entry)
+                    scaled_entry["latency_us"] = projected_latency_us(
+                        label, phase, float(entry["latency_us"]), target_seq, target_used
+                    )
+                    scaled_entry["source"] = f"{entry['source']} (projected)"
+                    scaled_model_rows.append(scaled_entry)
+                scaled_config = dict(model_config or {})
+                if args.phase == "prefill":
+                    scaled_config["sampling_decode_count"] = 0
+                elif args.phase == "decode":
+                    scaled_config["sampling_prefill_count"] = 0
+                sub_dir = args.model_summary_dir / f"scaled_seq{target_seq}_used{target_used}"
+                target_note = f"seq_len={target_seq} used_len={target_used}"
+                sub_report, _ = write_model_latency_summary(
+                    scaled_model_rows,
+                    sub_dir,
+                    title=f"Perfstatistics Model Latency Summary (projected @ {target_note})",
+                    source_name=(
+                        f"perfstatistics projected to {target_note} from measured "
+                        f"seq_len={measured_seq_len} used_len={measured_used_len}"
+                        + (f", {fa_note}" if fa_note else "")
+                        + (f", {args.phase} only" if args.phase != "all" else "")
+                    ),
+                    bench_out_dir=bench_out_dir,
+                    model_config=scaled_config or None,
+                    case_calls=case_calls,
+                    missing_cases=missing_cases,
+                    chart_suffix=f" @ seq {target_seq} / KV {target_used}",
+                )
+                scaled = compute_model_summary(scaled_model_rows, bench_out_dir, scaled_config or None, case_calls)
+                comparison_rows.append(
+                    [
+                        f"projected ({target_note})",
+                        fmt_us_value(scaled["phase_totals"].get("prefill", 0.0)),  # type: ignore[union-attr]
+                        fmt_us_value(scaled["phase_totals"].get("decode", 0.0)),  # type: ignore[union-attr]
+                        fmt_us_value(scaled["total_us"]),
+                        *metrics_cells(projection_metrics.get((target_seq, target_used), {})),
+                        f"[{sub_dir.name}/{sub_report.name}]({sub_dir.name}/{sub_report.name})",
+                    ]
+                )
+                print(f"Projected model summary ({target_note}): {sub_report}")
+            with report_path.open("a") as handle:
+                handle.write("\n## Projected Latency\n\n")
+                handle.write(
+                    "Each `--scale` target has the same charts and tables under `scaled_seq<SEQ>_used<USED>/`, "
+                    "built from the projected per-call latencies (prefill kernels ~SEQ, attention core ~SEQ x USED "
+                    "in prefill and ~USED in decode, sampling fixed"
+                    + ("; attention core analytic" if fa_note else "")
+                    + ").\n\n"
+                )
+                handle.write(
+                    markdown_table(
+                        [
+                            "scope",
+                            "prefill_us",
+                            "decode_us",
+                            "model_estimate_total_us",
+                            "prefill_mfu%",
+                            "prefill_mbu%",
+                            "decode_mfu%",
+                            "decode_mbu%",
+                            "report",
+                        ],
+                        comparison_rows,
+                    )
+                )
+                handle.write("\n")
     return 0
+
+
+def fmt_us_value(value: object) -> str:
+    return f"{float(value):.3f}"
 
 
 if __name__ == "__main__":

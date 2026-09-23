@@ -464,7 +464,7 @@ RMSNorm measured once as `linear_attn_decode_rmsnorm` also covers
 Qwen3.5-122B layer counts its `kernel_calls` is `36 + 12 + 48 = 96`. The
 `TOTAL_prefill`, `TOTAL_decode`, and `TOTAL` rows weight everything by calls:
 `compute_cycles`, latency, and bytes are sums of `value x calls`, `calls` is the
-number of kernel launches per forward, and `achieved_GBps` / `bw_util%` divide
+number of kernel launches per forward, and `achieved_GBps` / `mbu%` divide
 the call-weighted bytes by the call-weighted cycles of the cases that report
 bytes (the `report_dir` cell says how many cases contributed).
 Override single cases with `--case-calls LABEL[@prefill|@decode]=N` or a
@@ -506,12 +506,18 @@ limits the projection to one phase, for example `--scale 20000:80000 --phase
 prefill` for a 20K-token prefill against an 80K KV cache and
 `--scale :100000 --phase decode` for decode with a 100K KV cache. In
 prefill every kernel except the attention core scales linearly with `SEQ` and
-the attention core scales with `SEQ x USED`, which is `SEQ` squared for a full
-prefill; in decode only the attention core changes, linearly with `USED`;
+the attention core scales with its causal (query, key) pair count
+(`SEQ x (USED - SEQ) + SEQ x (SEQ + 1) / 2`, about `SEQ` squared for a full
+prefill); in decode only the attention core changes, linearly with `USED`;
 sampling never scales. The measured lengths come from `--measured-seq-len`
 (`PREFILL_TOKENS`) and `--measured-used-len` (`CTX_LEN`), which the bench
 scripts pass automatically; a manual run reads them back from the recorded
-`flash_attn` benchmark commands and prints them under the table.
+`flash_attn` benchmark commands and prints them under the table. With
+`--model-summary-dir`, every `--scale` target also gets the same chart set and
+`model_latency_summary.md` under `<model-summary-dir>/scaled_seq<SEQ>_used<USED>/`,
+built from the projected per-call latencies, and the main report ends with a
+"Projected Latency" table comparing the measured and projected prefill, decode,
+and total latency of each target.
 
 `--fa-util-overwrite UTIL --peak-tflops TFLOPS` (from the bench scripts:
 `PERF_STATISTICS_FA_UTIL=0.7 PERF_STATISTICS_PEAK_TFLOPS=250`) replaces every
@@ -526,7 +532,29 @@ measured one: `FLOPs / (TFLOPS x UTIL)` with
 into the TOTAL rows, the `--scale` projections (which then recompute the
 formula at the target lengths instead of ratio-scaling), and the model
 summary, and also fills in attention cases that did not run. Decode attention
-is usually memory bound, so its analytic compute time is a lower bound.
+is usually memory bound, so when `--peak-gbps` is also given the analytic latency is
+floored at the attention core's modeled bytes divided by that bandwidth, and the row says
+`floored at <peak> GB/s` when the floor applied.
+
+`--peak-tflops` on its own (from the bench scripts: `PERF_STATISTICS_PEAK_TFLOPS`)
+adds `gflop` and `mfu%` columns, and `--peak-gbps` (`PERF_STATISTICS_PEAK_GBPS`)
+adds `mbu%` (the former `bw_util%`). FLOPs come from each case's recorded
+command through `helpers/case_shape_model.py`: `2 x M x N x K` for dense and
+W4A16 GEMMs, `2 x experts x m_per_expert x N x K` for grouped MoE GEMMs,
+`2 x tokens x topk x K x N` for Marlin MoE, `4 x heads x head_dim x pairs` for
+the attention core, a recurrent-form lower bound for gated delta net, and zero
+for elementwise kernels (RMSNorm, residual add, activations, routing,
+sampling), which still count in the phase denominator. The TOTAL rows report
+the phase MFU (`sum(FLOPs x calls) / (sum(latency x calls) x peak)`) and MBU
+(measured bytes) and note when some cases had no FLOPs model. The projection
+tables add `scaled_gflop`, `scaled_mfu%`, `scaled_GBps`, and `scaled_mbu%`:
+FLOPs are re-evaluated at the target lengths, and the measured bytes of each
+case are rescaled by the modeled traffic ratio of the same helper (attention
+Q/O with `SEQ`, K/V with `USED`; activation traffic with tokens, weights
+fixed). Because latency and FLOPs scale together, a case's MFU is unchanged by
+the projection unless the attention core is analytic; the phase MFU/MBU still
+move because the attention share changes. The "Projected Latency" table in
+the model summary lists the prefill and decode MFU/MBU of every target.
 
 The model-level reports split latency into prefill and decode, then into
 Flash-Attn, Linear-Attn, MoE-FFN, and Sampling. They also report total covered

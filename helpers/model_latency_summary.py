@@ -864,6 +864,31 @@ def write_markdown_report(
     path.write_text("\n".join(lines).rstrip() + "\n")
 
 
+def compute_model_summary(
+    cases: list[dict[str, object]],
+    bench_out_dir: Path | None = None,
+    model_config: dict[str, int] | None = None,
+    case_calls: dict[CaseCallsKey, int] | None = None,
+) -> dict[str, object]:
+    """Expand deduped cases, apply call counts, and aggregate; no files written."""
+
+    expanded, duplicates = expand_deduped_cases(cases, bench_out_dir)
+    effective_config = dict(DEFAULT_MODEL_CONFIG)
+    if model_config:
+        effective_config.update(model_config)
+    covered_summary = aggregate_cases(expanded)
+    model_cases = expand_to_model_estimate_cases(expanded, effective_config, case_calls)
+    model_summary = aggregate_cases(model_cases)
+    return {
+        "model_summary": model_summary,
+        "covered_summary": covered_summary,
+        "duplicates": duplicates,
+        "effective_config": effective_config,
+        "phase_totals": dict(model_summary["phase_totals"]),  # type: ignore[arg-type]
+        "total_us": float(model_summary["total_us"]),
+    }
+
+
 def write_model_latency_summary(
     cases: list[dict[str, object]],
     out_dir: Path,
@@ -874,15 +899,14 @@ def write_model_latency_summary(
     model_config: dict[str, int] | None = None,
     case_calls: dict[CaseCallsKey, int] | None = None,
     missing_cases: list[dict[str, str]] | None = None,
+    chart_suffix: str = "",
 ) -> tuple[Path, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    expanded, duplicates = expand_deduped_cases(cases, bench_out_dir)
-    effective_config = dict(DEFAULT_MODEL_CONFIG)
-    if model_config:
-        effective_config.update(model_config)
-    covered_summary = aggregate_cases(expanded)
-    model_cases = expand_to_model_estimate_cases(expanded, effective_config, case_calls)
-    model_summary = aggregate_cases(model_cases)
+    computed = compute_model_summary(cases, bench_out_dir, model_config, case_calls)
+    model_summary: dict[str, object] = computed["model_summary"]  # type: ignore[assignment]
+    covered_summary: dict[str, object] = computed["covered_summary"]  # type: ignore[assignment]
+    duplicates: list[dict[str, str]] = computed["duplicates"]  # type: ignore[assignment]
+    effective_config: dict[str, int] = computed["effective_config"]  # type: ignore[assignment]
 
     chart_files = [
         out_dir / "model_latency_phase_bar.png",
@@ -898,19 +922,19 @@ def write_model_latency_summary(
     phase_totals: dict[str, float] = model_summary["phase_totals"]  # type: ignore[assignment]
     write_bar_chart(
         chart_files[0],
-        "Model Latency By Phase",
+        f"Model Latency By Phase{chart_suffix}",
         [
             ("prefill", phase_totals.get("prefill", 0.0), "#6B8FD6"),
             ("decode", phase_totals.get("decode", 0.0), "#D67C4E"),
         ],
     )
-    write_bar_chart(chart_files[1], "Model Latency By Module", module_rows(model_summary))
-    write_pie_chart(chart_files[2], "Prefill Module Share", module_rows(model_summary, "prefill"), limit=8)
-    write_pie_chart(chart_files[3], "Decode Module Share", module_rows(model_summary, "decode"), limit=8)
-    write_bar_chart(chart_files[4], "Prefill Operator Latencies", operator_rows(model_summary, "prefill", limit=30), "Latency (us)")
-    write_pie_chart(chart_files[5], "Prefill Operator Share", operator_rows(model_summary, "prefill"), limit=14)
-    write_bar_chart(chart_files[6], "Decode Operator Latencies", operator_rows(model_summary, "decode", limit=30), "Latency (us)")
-    write_pie_chart(chart_files[7], "Decode Operator Share", operator_rows(model_summary, "decode"), limit=14)
+    write_bar_chart(chart_files[1], f"Model Latency By Module{chart_suffix}", module_rows(model_summary))
+    write_pie_chart(chart_files[2], f"Prefill Module Share{chart_suffix}", module_rows(model_summary, "prefill"), limit=8)
+    write_pie_chart(chart_files[3], f"Decode Module Share{chart_suffix}", module_rows(model_summary, "decode"), limit=8)
+    write_bar_chart(chart_files[4], f"Prefill Operator Latencies{chart_suffix}", operator_rows(model_summary, "prefill", limit=30), "Latency (us)")
+    write_pie_chart(chart_files[5], f"Prefill Operator Share{chart_suffix}", operator_rows(model_summary, "prefill"), limit=14)
+    write_bar_chart(chart_files[6], f"Decode Operator Latencies{chart_suffix}", operator_rows(model_summary, "decode", limit=30), "Latency (us)")
+    write_pie_chart(chart_files[7], f"Decode Operator Share{chart_suffix}", operator_rows(model_summary, "decode"), limit=14)
 
     report_path = out_dir / "model_latency_summary.md"
     write_markdown_report(

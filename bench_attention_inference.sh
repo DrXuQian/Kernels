@@ -95,7 +95,7 @@ Environment variables:
   PERF_STATISTICS_SCALE   Comma-separated SEQ[:USED] latency projection targets.
   PERF_STATISTICS_FA_UTIL Replace attention core cases by an analytic latency at this
                           utilization of PERF_STATISTICS_PEAK_TFLOPS, e.g. 0.7 with 250.
-  PERF_STATISTICS_PEAK_TFLOPS Peak FP16 TFLOPS used with PERF_STATISTICS_FA_UTIL.
+  PERF_STATISTICS_PEAK_TFLOPS Peak FP16 TFLOPS; adds gflop/mfu% columns and is used by PERF_STATISTICS_FA_UTIL.
 
 For a clean nsys capture of Python kernels that use cudaProfilerStart/Stop:
   nsys profile --trace=cuda --capture-range=cudaProfilerApi \
@@ -486,8 +486,11 @@ summarize_perfstatistics() {
     scale_args+=(--scale "$scale_target")
   done
   local fa_args=()
+  if [[ -n "${PERF_STATISTICS_PEAK_TFLOPS:-}" ]]; then
+    fa_args+=(--peak-tflops "$PERF_STATISTICS_PEAK_TFLOPS")
+  fi
   if [[ -n "${PERF_STATISTICS_FA_UTIL:-}" ]]; then
-    fa_args=(--fa-util-overwrite "$PERF_STATISTICS_FA_UTIL" --peak-tflops "${PERF_STATISTICS_PEAK_TFLOPS:?set PERF_STATISTICS_PEAK_TFLOPS with PERF_STATISTICS_FA_UTIL}")
+    fa_args+=(--fa-util-overwrite "$PERF_STATISTICS_FA_UTIL")
   fi
   python "$ROOT_DIR/helpers/summarize_perfstatistics.py" \
     "$report_base" \
