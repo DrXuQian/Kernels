@@ -45,7 +45,27 @@ struct OrderedNamedBarriers {
 
   CUTE_DEVICE
   ~OrderedNamedBarriers() {
-    // FIXME: this will be a problem for persistent scheduler
+    // Nothing here: every warp group must call drain() before the CTA exits (see below).
+  }
+
+  // Leave every named barrier at zero pending arrivals before the CTA exits.
+  //
+  // init() pre-arrives on the barriers of the lower-ranked warp groups, and each
+  // ordered_or_wait()/notify_next_blocked() round restores that same state, so at
+  // the end barrier i still holds (NumWG - 1 - i) warp groups' worth of arrivals.
+  // NVIDIA hardware discards per-CTA named-barrier state when the CTA retires, but
+  // a simulator (or a persistent scheduler) that keeps it per SM/CE would hand the
+  // residue to the next CTA: its init() then completes barrier 0 with no waiter and
+  // warp group 0's first ordered_or_wait() blocks forever (seen as a deadlock on the
+  // second wave when the grid exceeds the CE count). Warp group w completes every
+  // barrier i >= w with a full sync: pending (NumWG - 1 - i) + participants (i + 1)
+  // = NumWG, so each barrier fires exactly once and resets, and no warp group can
+  // block because every participant eventually arrives.
+  CUTE_DEVICE
+  void drain(int wg_idx) {  // wg_idx in participants; call after the last round
+    for (int i = wg_idx; i < NumWG; ++i) {
+      cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup * NumWG, mapping_[i]);
+    }
   }
 
   CUTE_DEVICE

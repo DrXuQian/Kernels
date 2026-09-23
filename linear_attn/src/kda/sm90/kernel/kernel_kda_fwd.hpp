@@ -584,6 +584,8 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
                     math_barriers,
                     storage.tensors.mainloop);
             }
+            // Leave the ordered named barriers clean for the next CTA on this SM/CE.
+            math_barriers.drain(warp_group_idx - 1);
         } else if (warp_group_role == WarpGroupRole::MathA) {
             DPRINTF0_WG(
                 "Compute[aux]: warp_group_idx:%d, RegisterRequirement:%d\n", warp_group_idx, AuxMmaRegisterRequirement);

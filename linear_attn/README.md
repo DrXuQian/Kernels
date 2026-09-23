@@ -27,6 +27,17 @@ The experimental variants remain under `studies/linear_prefill_flashinfer_gdn`;
 the production binary uses the same single-translation-unit build style, without
 changing the benchmark interface.
 
+The kernel launches one CTA per v-head (64 CTAs for Qwen3.5-122B) with about
+186 KiB of dynamic shared memory, so each SM/CE holds one CTA and a device with
+fewer CEs than heads runs several waves. The two state math warp groups order
+their WGMMA batches with hardware named barriers (`flat/math_order_barrier.hpp`)
+that are pre-armed in `init()`, which used to leave pending arrivals on barrier 0
+when a CTA retired. NVIDIA hardware resets that state per CTA, but a simulator
+that keeps named-barrier state per CE handed the residue to the next wave and
+deadlocked its first `ordered_or_wait()` (a 20-CE PPU simulation passed with 20
+CTAs and hung with 40). Both math warp groups now call `drain()` after their
+last tile so every barrier is left at zero; the same fix is in the KDA kernel.
+
 ## vLLM Triton GDN 提取
 
 `src/vllm_triton_gdn/ops/` 是从 vLLM 的 Gated Delta Net / FLA Triton 路径抽出来的最小 standalone copy，去掉了 vLLM runtime 依赖，只依赖 PyTorch 和 Triton。
