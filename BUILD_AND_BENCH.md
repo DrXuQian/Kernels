@@ -510,7 +510,23 @@ the attention core scales with `SEQ x USED`, which is `SEQ` squared for a full
 prefill; in decode only the attention core changes, linearly with `USED`;
 sampling never scales. The measured lengths come from `--measured-seq-len`
 (`PREFILL_TOKENS`) and `--measured-used-len` (`CTX_LEN`), which the bench
-scripts pass automatically.
+scripts pass automatically; a manual run reads them back from the recorded
+`flash_attn` benchmark commands and prints them under the table.
+
+`--fa-util-overwrite UTIL --peak-tflops TFLOPS` (from the bench scripts:
+`PERF_STATISTICS_FA_UTIL=0.7 PERF_STATISTICS_PEAK_TFLOPS=250`) replaces every
+attention core case (`*_full_attn`) by an analytic latency instead of the
+measured one: `FLOPs / (TFLOPS x UTIL)` with
+`FLOPs = 4 x heads x head_dim x pairs`, where prefill pairs are causal
+(`SEQ` new tokens over a `USED`-token context, so
+`SEQ x (USED - SEQ) + SEQ x (SEQ + 1) / 2`) and decode is one query token over
+`USED` keys. The heads and head dimension come from `--attn-heads` /
+`--attn-head-dim` (`FULL_ATTN_Q_HEADS` / `FULL_ATTN_HEAD_DIM`, default 32 /
+256). The override marks the rows as `analytic: 70% of 250 TFLOPS`, flows
+into the TOTAL rows, the `--scale` projections (which then recompute the
+formula at the target lengths instead of ratio-scaling), and the model
+summary, and also fills in attention cases that did not run. Decode attention
+is usually memory bound, so its analytic compute time is a lower bound.
 
 The model-level reports split latency into prefill and decode, then into
 Flash-Attn, Linear-Attn, MoE-FFN, and Sampling. They also report total covered

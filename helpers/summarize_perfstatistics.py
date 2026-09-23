@@ -34,7 +34,15 @@ a KV cache of USED tokens: in prefill every kernel except the attention core
 scales linearly with SEQ and the attention core scales with SEQ x USED (SEQ
 squared when USED = SEQ); in decode only the attention core changes, linearly
 with USED. Sampling never scales. --measured-seq-len / --measured-used-len
-give the lengths the benchmarks ran with (PREFILL_TOKENS / CTX_LEN).
+give the lengths the benchmarks ran with (PREFILL_TOKENS / CTX_LEN); when
+omitted they are read from the recorded flash_attn benchmark commands.
+
+--fa-util-overwrite UTIL with --peak-tflops TFLOPS replaces every attention
+core case (`*_full_attn`) by an analytic latency: FLOPs / (TFLOPS x UTIL) with
+FLOPs = 4 x heads x head_dim x (query, key) pairs, causal for prefill (SEQ new
+tokens over a USED-token context) and one query token over USED keys for
+decode. It applies to the table, the totals, the projections, and the model
+summary, and also fills in attention cases that did not run.
 """
 
 from __future__ import annotations
@@ -61,6 +69,10 @@ MEMORY_READ_BYTES_RE = re.compile(r"\bmemory_read_bytes\s*=\s*([0-9][0-9,]*)")
 MEMORY_WRITE_BYTES_RE = re.compile(r"\bmemory_write_bytes\s*=\s*([0-9][0-9,]*)")
 
 CASE_LOG_HEADER_KEYS = ("label", "status", "duplicate_of", "dedupe_duplicate_of", "command", "executable")
+# Recorded flash_attn benchmark commands: `prefill SEQ ... [--ctx USED]`, `decode USED ...`.
+ATTN_PREFILL_CMD_RE = re.compile(r"\bprefill\s+([0-9]+)\b")
+ATTN_CTX_CMD_RE = re.compile(r"--ctx[=\s]+([0-9]+)\b")
+ATTN_DECODE_CMD_RE = re.compile(r"\bdecode\s+([0-9]+)\b")
 CASE_LOG_FOOTER_KEYS = ("finished_at", "failed_at", "exit_status")
 CASE_LOG_OUTPUT_MARKER = "---- output ----"
 
@@ -369,6 +381,56 @@ def scale_factor(label: str, phase: str, seq_ratio: float, used_ratio: float) ->
     return 1.0
 
 
+def detect_measured_lengths(rows: list[dict[str, object]]) -> tuple[int | None, int | None, str]:
+    """Read PREFILL_TOKENS / CTX_LEN back from the recorded attention commands."""
+
+    seq_len: int | None = None
+    used_len: int | None = None
+    source = ""
+    for row in rows:
+        label = str(row["case"])
+        command = str(row.get("_command", ""))
+        if not is_attention_core(label) or not command:
+            continue
+        phase = classify_phase(label)
+        if phase == "prefill":
+            seq_match = ATTN_PREFILL_CMD_RE.search(command)
+            ctx_match = ATTN_CTX_CMD_RE.search(command)
+            if seq_match and seq_len is None:
+                seq_len = int(seq_match.group(1))
+                source = label
+            if used_len is None:
+                if ctx_match:
+                    used_len = int(ctx_match.group(1))
+                elif seq_match:
+                    used_len = int(seq_match.group(1))  # no --ctx: context defaults to seq
+        elif phase == "decode" and used_len is None:
+            decode_match = ATTN_DECODE_CMD_RE.search(command)
+            if decode_match:
+                used_len = int(decode_match.group(1))
+                source = source or label
+    return seq_len, used_len, source
+
+
+def attention_pairs(phase: str, seq_len: int, used_len: int, decode_tokens: int = 1) -> int:
+    """(query token, key token) pairs of one attention call, causal and bottom-right aligned."""
+
+    if phase == "prefill":
+        queries, context = seq_len, max(used_len, seq_len)
+    elif phase == "decode":
+        queries, context = decode_tokens, max(used_len, decode_tokens)
+    else:
+        return 0
+    return queries * (context - queries) + queries * (queries + 1) // 2
+
+
+def analytic_attention_latency_us(
+    phase: str, seq_len: int, used_len: int, heads: int, head_dim: int, peak_tflops: float, util: float
+) -> float:
+    flops = 4.0 * heads * head_dim * attention_pairs(phase, seq_len, used_len)
+    return flops / (peak_tflops * 1e12 * util) * 1e6
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -412,12 +474,27 @@ def main() -> int:
         help="Restrict the missing-case report, --print-missing, and the --scale projection to one phase. "
         "Sampling cases belong to both. Default: all",
     )
-    parser.add_argument("--measured-seq-len", type=int, default=3823, help="Prefill tokens the benchmarks ran with (PREFILL_TOKENS). Default: 3823")
+    parser.add_argument(
+        "--measured-seq-len",
+        type=int,
+        help="Prefill tokens the benchmarks ran with (PREFILL_TOKENS). Default: read from the flash_attn prefill command, else 3823",
+    )
     parser.add_argument(
         "--measured-used-len",
         type=int,
-        help="KV-cache length the attention benchmarks ran with (CTX_LEN). Default: same as --measured-seq-len",
+        help="KV-cache length the attention benchmarks ran with (CTX_LEN). Default: read from the flash_attn commands, else the prefill length",
     )
+    parser.add_argument(
+        "--fa-util-overwrite",
+        "--fa-utils-overwrite",
+        dest="fa_util",
+        type=float,
+        metavar="UTIL",
+        help="Replace attention core cases by FLOPs / (--peak-tflops x UTIL), e.g. 0.7 for 70%% MFU. Also fills in unrun attention cases.",
+    )
+    parser.add_argument("--peak-tflops", type=float, default=0.0, help="Peak FP16 compute in TFLOPS for --fa-util-overwrite, e.g. 250.")
+    parser.add_argument("--attn-heads", type=int, default=32, help="Query heads of the full-attention layers. Default: 32")
+    parser.add_argument("--attn-head-dim", type=int, default=256, help="Head dimension of the full-attention layers. Default: 256")
     parser.add_argument(
         "--scale",
         action="append",
@@ -445,10 +522,13 @@ def main() -> int:
     effective_config = dict(DEFAULT_MODEL_CONFIG)
     if model_config:
         effective_config.update(model_config)
-    measured_seq_len = args.measured_seq_len
-    measured_used_len = args.measured_used_len or measured_seq_len
-    if measured_seq_len <= 0 or measured_used_len <= 0:
-        parser.error("--measured-seq-len and --measured-used-len must be positive")
+    if args.fa_util is not None:
+        if not 0.0 < args.fa_util <= 1.0:
+            parser.error("--fa-util-overwrite must be in (0, 1]")
+        if args.peak_tflops <= 0:
+            parser.error("--fa-util-overwrite needs --peak-tflops > 0")
+        if args.attn_heads <= 0 or args.attn_head_dim <= 0:
+            parser.error("--attn-heads and --attn-head-dim must be positive")
     quiet = args.status_only or args.print_missing
 
     roots = args.paths or [discover_default_root()]
@@ -517,6 +597,7 @@ def main() -> int:
             "total_bytes": total_bytes if total_bytes > 0 else "",
             "achieved_GBps": achieved_gbps,
             "report_dir": str(report_dir),
+            "_command": metadata.get("command", ""),
         }
         if args.peak_gbps > 0:
             row["bw_util%"] = bw_util
@@ -579,6 +660,65 @@ def main() -> int:
                 "_phases": phases,
             }
         )
+    detected_seq, detected_used, detected_from = detect_measured_lengths(rows)
+    measured_seq_len = args.measured_seq_len or detected_seq or 3823
+    measured_used_len = args.measured_used_len or detected_used or measured_seq_len
+    if measured_seq_len <= 0 or measured_used_len <= 0:
+        parser.error("--measured-seq-len and --measured-used-len must be positive")
+    lengths_note = (
+        f"measured lengths: seq_len={measured_seq_len} used_len={measured_used_len}"
+        + (" (from --measured-* args)" if args.measured_seq_len or args.measured_used_len else "")
+        + (f" (from {detected_from} command)" if detected_from and not (args.measured_seq_len and args.measured_used_len) else "")
+    )
+
+    fa_note = ""
+    if args.fa_util is not None:
+
+        def analytic_fa(phase: str, seq_len: int, used_len: int) -> float:
+            return analytic_attention_latency_us(
+                phase, seq_len, used_len, args.attn_heads, args.attn_head_dim, args.peak_tflops, args.fa_util
+            )
+
+        def apply_fa_override(row: dict[str, object], was_missing: bool) -> None:
+            phase = classify_phase(str(row["case"]))
+            previous = float(row.get("_latency_us", 0.0))
+            latency_us = analytic_fa(phase, measured_seq_len, measured_used_len)
+            row["_latency_us"] = latency_us
+            row[latency_header] = f"{latency_us:.3f}"
+            row["compute_cycles"] = int(round(latency_us * args.ghz * 1000.0))
+            for key in ("read_bytes", "write_bytes", "total_bytes", "achieved_GBps", "bw_util%"):
+                if key in row:
+                    row[key] = ""
+            row["_analytic"] = True
+            row["report_dir"] = f"analytic: {args.fa_util:.0%} of {args.peak_tflops:g} TFLOPS" + (
+                " (case did not run)" if was_missing else f" (measured {previous:.3f} us)"
+            )
+
+        for row in rows:
+            if is_attention_core(str(row["case"])) and classify_phase(str(row["case"])) in ("prefill", "decode"):
+                apply_fa_override(row, False)
+        kept_missing: list[dict[str, object]] = []
+        for row in missing_rows:
+            label = str(row["case"])
+            if is_attention_core(label) and classify_phase(label) in ("prefill", "decode"):
+                row.pop("_missing", None)
+                apply_fa_override(row, True)
+                rows.append(row)
+                model_rows.append({"case": label, "latency_us": row["_latency_us"], "cycles": row["compute_cycles"], "source": "analytic"})
+            else:
+                kept_missing.append(row)
+        missing_rows = kept_missing
+        analytic_labels = {str(row["case"]): float(row["_latency_us"]) for row in rows if row.get("_analytic")}
+        for entry in model_rows:
+            if str(entry["case"]) in analytic_labels:
+                entry["latency_us"] = analytic_labels[str(entry["case"])]
+                entry["source"] = "analytic"
+        fa_note = (
+            f"attention core rows use analytic latency: {args.fa_util:.0%} of {args.peak_tflops:g} TFLOPS, "
+            f"heads={args.attn_heads} head_dim={args.attn_head_dim}, FLOPs = 4 x heads x head_dim x pairs "
+            f"(prefill causal seq_len x used_len, decode 1 x used_len)"
+        )
+
     missing_cases = [
         {
             "case": str(m["case"]),
@@ -721,6 +861,9 @@ def main() -> int:
             + (f" per_case_overrides={len(case_calls)}" if case_calls else "")
         )
         print("TOTAL rows weight cycles, latency, and bytes by calls; sampling is counted after prefill and after each decode step.")
+        print(lengths_note)
+        if fa_note:
+            print(fa_note)
 
         for target_seq, target_used in args.scale:
             target_seq = target_seq or measured_seq_len
@@ -730,8 +873,12 @@ def main() -> int:
             projected_rows = [r for r in measured_rows if args.phase == "all" or r["phase"] == args.phase]
             scaled_rows: list[dict[str, object]] = []
             for row in projected_rows:
-                factor = scale_factor(str(row["case"]), str(row["phase"]), seq_ratio, used_ratio)
-                scaled_latency = float(row["_latency_us"]) * factor
+                if row.get("_analytic"):
+                    scaled_latency = analytic_fa(str(row["phase"]), target_seq, target_used)
+                    factor = scaled_latency / float(row["_latency_us"]) if float(row["_latency_us"]) > 0 else 0.0
+                else:
+                    factor = scale_factor(str(row["case"]), str(row["phase"]), seq_ratio, used_ratio)
+                    scaled_latency = float(row["_latency_us"]) * factor
                 scaled_rows.append(
                     {
                         "case": row["case"],
@@ -770,8 +917,13 @@ def main() -> int:
                 f"=== projected {args.phase if args.phase != 'all' else 'prefill+decode'} latency "
                 f"@ seq_len={target_seq} used_len={target_used} "
                 f"(measured seq_len={measured_seq_len} used_len={measured_used_len}; "
-                f"prefill: x{seq_ratio:.3f}, prefill attention: x{seq_ratio * used_ratio:.3f}, "
-                f"decode attention: x{used_ratio:.3f}) ==="
+                f"prefill: x{seq_ratio:.3f}, "
+                + (
+                    "attention: analytic at the target lengths"
+                    if fa_note
+                    else f"prefill attention: x{seq_ratio * used_ratio:.3f}, decode attention: x{used_ratio:.3f}"
+                )
+                + ") ==="
             )
             print_rows(
                 scaled_rows + scaled_totals,

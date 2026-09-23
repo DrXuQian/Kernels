@@ -92,6 +92,10 @@ Environment variables:
   FLASHINFER_BACKEND      Optional FlashInfer prefill backend, e.g. fa2/fa3/auto.
   PERFRAWLOG_POSTPROCESS  Set to 0 to skip perfrawlog post-processing.
   PERF_STATISTICS_SUMMARY Set to 0 to skip final perfstatistics summary.
+  PERF_STATISTICS_SCALE   Comma-separated SEQ[:USED] latency projection targets.
+  PERF_STATISTICS_FA_UTIL Replace attention core cases by an analytic latency at this
+                          utilization of PERF_STATISTICS_PEAK_TFLOPS, e.g. 0.7 with 250.
+  PERF_STATISTICS_PEAK_TFLOPS Peak FP16 TFLOPS used with PERF_STATISTICS_FA_UTIL.
 
 For a clean nsys capture of Python kernels that use cudaProfilerStart/Stop:
   nsys profile --trace=cuda --capture-range=cudaProfilerApi \
@@ -481,12 +485,19 @@ summarize_perfstatistics() {
   for scale_target in ${PERF_STATISTICS_SCALE:+${PERF_STATISTICS_SCALE//,/ }}; do
     scale_args+=(--scale "$scale_target")
   done
+  local fa_args=()
+  if [[ -n "${PERF_STATISTICS_FA_UTIL:-}" ]]; then
+    fa_args=(--fa-util-overwrite "$PERF_STATISTICS_FA_UTIL" --peak-tflops "${PERF_STATISTICS_PEAK_TFLOPS:?set PERF_STATISTICS_PEAK_TFLOPS with PERF_STATISTICS_FA_UTIL}")
+  fi
   python "$ROOT_DIR/helpers/summarize_perfstatistics.py" \
     "$report_base" \
     --ghz "${PERF_STATISTICS_GHZ:-1.5}" \
     ${scale_args[@]+"${scale_args[@]}"} \
+    ${fa_args[@]+"${fa_args[@]}"} \
     --measured-seq-len "$PREFILL_TOKENS" \
     --measured-used-len "$CTX_LEN" \
+    --attn-heads "$FULL_ATTN_HEADS" \
+    --attn-head-dim "$FULL_ATTN_HEAD_DIM" \
     --bench-out-dir "$OUT_DIR" 2>&1 | tee "$summary_log"
   local status=${PIPESTATUS[0]}
   set -e
