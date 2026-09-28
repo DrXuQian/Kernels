@@ -239,8 +239,9 @@ Run selected single cases:
 ./bench_all.sh --case w4a16_decode_linear_attn_out_proj_fpA_intB
 ```
 
-GDN prefill uses the cuLA-derived SM90 implementation from GDN-QSA-sm80.
-Set `GDN_QSA_ROOT` and `GDN_QSA_SM90_EXTENSION` as described in
+GDN prefill calls `actlize_la.gdn_forward` using actlizeLA's registered SM90
+bundle. Use the same Python environment as the actlizeLA installation; no
+extension path is needed. Setup and diagnostic overrides are described in
 [linear_attn/README.md](linear_attn/README.md#cula--actlize-gdn-prefill-script).
 
 Direct GDN commands when bypassing `bench_all.sh`:

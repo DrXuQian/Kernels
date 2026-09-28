@@ -12,7 +12,7 @@ Qwen3.5 DeltaNet layer 的 standalone CUDA/Triton kernel bench。
 | `../general/bench_cublas_gemm` | `in_proj_a` / `in_proj_b` dense GEMM | cuBLAS FP16/BF16 GEMM | SM80+ | Prefill + Decode |
 | `bench_gated_delta_net` | `gated_delta_net_cuda` | [llama.cpp](https://github.com/ggml-org/llama.cpp) | SM80+ | Prefill + Decode |
 | `bench_gdn_prefill` | FlashInfer DeltaRule/GDN prefill standalone | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | SM90 | Prefill |
-| `src/bench_actlize_gdn_prefill.py` | cuLA-derived `fused_sm90` | GDN-QSA-sm80 | CUDA SM90 / PPU1.7 target | Prefill |
+| `src/bench_actlize_gdn_prefill.py` | `actlize_la.gdn_forward`, cuLA-derived SM90 | actlizeLA | CUDA SM90 / explicit PPU1.7 diagnostics | Prefill |
 | `bench_kda_prefill` | `launch_kda_fwd_prefill_kernel` | [cuLA](https://github.com/inclusionAI/cuLA) | SM90 | Prefill (chunked) |
 | `src/bench_vllm_triton_gdn_prefill.py` | `fused_post_conv_prep` + `chunk_gated_delta_rule` | vLLM FLA/GDN Triton | NVIDIA CUDA/Triton | Prefill |
 | `src/bench_vllm_triton_gdn_decode.py` | `fused_recurrent_gated_delta_rule_packed_decode` | vLLM FLA/GDN Triton | NVIDIA CUDA/Triton | Decode |
@@ -20,34 +20,44 @@ Qwen3.5 DeltaNet layer 的 standalone CUDA/Triton kernel bench。
 ## cuLA / actlize GDN prefill script
 
 `bench_all.sh` and the Qwen3.5 model scripts use
-`src/bench_actlize_gdn_prefill.py`, which calls the cuLA-derived `fused_sm90`
-implementation in GDN-QSA-sm80. The case label remains
+`src/bench_actlize_gdn_prefill.py`, which calls the installed
+`actlize_la.gdn_forward` API and its cuLA-derived SM90 kernels. The case label remains
 `linear_prefill_gdn_qsa_sm80` for compatibility with the patch's reports;
-the executed algorithm is SM90, not the original SM80 scan/reset path.
+the old package name is not used for loading.
 
-Use a GDN-QSA-sm80 checkout with the SM90 interface (tested against source
-revision `3dd407f`) and its already-built extension:
+After `actlizeLA/tools/install_sm90.sh` reports `registered=True`, run the
+benchmark with the same Python environment used by the installer. No
+`GDN_QSA_ROOT`, `GDN_QSA_SM90_EXTENSION`, or manual configuration is required:
 
 ```bash
-export GDN_QSA_ROOT=/path/to/GDN-QSA-sm80
-export GDN_QSA_SM90_EXTENSION=/path/to/build/_gdn_fused_sm90.cpython-312-x86_64-linux-gnu.so
-export GDN_QSA_SM90_BACKEND=cuda_sm90
-export GDN_QSA_SM90_CONFIGURATION=control
 # From the Kernels repo root:
+export PYTHON="$(command -v python)"  # Python used to install actlizeLA
 ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case linear_prefill_gdn_qsa_sm80
 ./bench_Qwen3.5-122B-A10B-GPTQ_TP2.sh --case linear_prefill_gdn_qsa_sm80
 ./bench_Qwen3.5_27B.sh --case linear_prefill_gdn_qsa_sm80
-python3 linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 --bench 0 1
+"$PYTHON" linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 --bench 0 1
 ```
 
-The package may instead be installed or placed in a sibling `GDN-QSA-sm80`
-checkout. Build the extension in that project with `tools/build_gdn_sm90.py`;
-this runner does not compile or search for a configuration during measurement.
-`control`, `value64`, `value64-local-inverse`, and `value128-paired` are supported,
-and the selected configuration and target must match the extension. Native
-PPU1.7 uses `GDN_QSA_SM90_BACKEND=ppu17` and a native PPU1.7 extension.
-Its explicit CUDA source-check build additionally requires
-`GDN_QSA_SM90_SOURCE_CHECK=1`; this mode enforces one call and prints no timing.
+The default is `configuration=auto`. `load_sm90()` preloads the registered
+bundle before timing without launching a warmup kernel, then `gdn_forward`
+reuses it. actlizeLA selects `value64`, `value64-local-inverse`, or
+`value128-paired` from shape/device metadata. The runner logs the selected
+configuration and selection basis. It never compiles or autotunes a kernel.
+This integration uses the public API from actlizeLA revision `7616123`.
+
+For a relocated bundle, set `ACTLIZE_LA_SM90_BUNDLE` to its absolute directory
+(the directory containing `bundle.json`). `ACTLIZE_LA_ROOT` optionally selects
+a source checkout; an installed package needs no source path. Legacy
+`GDN_QSA_SM90_*` variables do not affect the normal automatic path.
+
+Fixed configurations remain diagnostic overrides via `--configuration NAME
+--extension /path/to/binary.so`. For model scripts, use
+`ACTLIZE_LA_SM90_CONFIGURATION=NAME` and `GDN_QSA_SM90_EXTENSION` instead.
+`control` is a separately built diagnostic binary, not a member of the
+three-candidate automatic bundle. PPU1.7 additionally requires an explicit
+`--backend ppu17` (or `ACTLIZE_LA_BACKEND=ppu17`) and matching PPU binary;
+the CUDA source-check build requires `--source-check` (or
+`ACTLIZE_LA_SOURCE_CHECK=1`). Source-check enforces one call and prints no timing.
 
 Q/K/V/beta are BF16, gates are FP32 natural-log decay increments, and the final
 state is FP32 `[B,Hv,K,V]`. Input generation and normalization run on CPU before

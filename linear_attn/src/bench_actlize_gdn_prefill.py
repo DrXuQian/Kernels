@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Benchmark GDN-QSA-sm80's cuLA-derived fused_sm90 forward.
+"""Benchmark actlizeLA's installed cuLA-derived SM90 forward.
 
 Usage: bench_actlize_gdn_prefill.py [seq_len] [q_heads] [v_heads] --bench 0 1
-Set GDN_QSA_ROOT to the source checkout (or install its Python package), and
-GDN_QSA_SM90_EXTENSION to the already-built extension. No compilation occurs
-in this runner. Inputs are prepared on CPU before the measured forward call.
+Uses `from actlize_la import gdn_forward` and the bundle registered by
+actlizeLA's tools/install_sm90.sh. No extension path is needed for normal use.
+No compilation occurs here. Inputs are prepared on CPU before measurement.
 """
 
 import argparse
+from functools import partial
 import importlib
 import json
 import os
@@ -16,7 +17,7 @@ import statistics
 import sys
 
 
-CONFIGURATIONS = ("control", "value64", "value64-local-inverse", "value128-paired")
+CONFIGURATIONS = ("auto", "control", "value64", "value64-local-inverse", "value128-paired")
 
 
 def parse_args():
@@ -30,15 +31,16 @@ def parse_args():
                         help="fused_sm90 accepts BF16 Q/K/V/beta only")
     parser.add_argument("--bench", type=int, nargs=2, metavar=("WARMUP", "ITERS"))
     parser.add_argument("--backend", choices=("cuda_sm90", "ppu17"),
-                        default=os.environ.get("GDN_QSA_SM90_BACKEND", "cuda_sm90"))
+                        default=os.environ.get("ACTLIZE_LA_BACKEND", "cuda_sm90"))
     parser.add_argument("--configuration", choices=CONFIGURATIONS,
-                        default=os.environ.get("GDN_QSA_SM90_CONFIGURATION", "control"))
+                        default=os.environ.get("ACTLIZE_LA_SM90_CONFIGURATION", "auto"),
+                        help="auto uses actlizeLA's registered shape-dispatched bundle")
     parser.add_argument("--source-check", action="store_true",
-                        default=os.environ.get("GDN_QSA_SM90_SOURCE_CHECK") == "1",
+                        default=os.environ.get("ACTLIZE_LA_SOURCE_CHECK") == "1",
                         help="PPU-fork CUDA simulation input; one call, no timing")
-    parser.add_argument("--repo", default=os.environ.get("GDN_QSA_ROOT"),
-                        help="GDN-QSA-sm80 checkout containing gdn_qsa_sm80/")
-    parser.add_argument("--extension", default=os.environ.get("GDN_QSA_SM90_EXTENSION"))
+    parser.add_argument("--repo", default=os.environ.get("ACTLIZE_LA_ROOT"),
+                        help="optional actlizeLA checkout; normally use the installed package")
+    parser.add_argument("--extension", help="explicit diagnostic binary; requires a fixed --configuration")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the call contract without importing Torch or launching")
     args = parser.parse_args()
@@ -49,8 +51,12 @@ def parse_args():
     if max(args.num_seqs * args.seq_len, args.num_seqs * args.v_heads,
            args.v_heads * args.head_dim) > 2**31 - 1:
         parser.error("shape exceeds the fused_sm90 int32 extent/grid limits")
-    if args.backend not in ("cuda_sm90", "ppu17") or args.configuration not in CONFIGURATIONS:
-        parser.error("invalid GDN_QSA_SM90_BACKEND or GDN_QSA_SM90_CONFIGURATION")
+    if args.backend not in ("cuda_sm90", "ppu17"):
+        parser.error("ACTLIZE_LA_BACKEND must be cuda_sm90 or ppu17")
+    if args.configuration not in CONFIGURATIONS:
+        parser.error("invalid ACTLIZE_LA_SM90_CONFIGURATION")
+    if args.configuration == "auto" and (args.backend != "cuda_sm90" or args.source_check or args.extension):
+        parser.error("auto uses the installed CUDA SM90 bundle; diagnostics/PPU require a fixed --configuration")
     warmup, iters = args.bench if args.bench is not None else (0, 1)
     if warmup < 0 or iters <= 0:
         parser.error("--bench requires warmup >= 0 and iters > 0")
@@ -60,34 +66,47 @@ def parse_args():
 
 
 def load_forward(args):
-    # A sibling checkout is convenient, but never hardcode a developer's path.
-    repo = Path(args.repo).expanduser() if args.repo else Path(__file__).resolve().parents[3] / "GDN-QSA-sm80"
-    if args.repo or repo.is_dir():
-        if not (repo / "gdn_qsa_sm80" / "gdn_sm90_interface.py").is_file():
-            raise RuntimeError(f"missing cuLA fused_sm90 interface under {repo}; set GDN_QSA_ROOT")
+    if args.repo:
+        repo = Path(args.repo).expanduser()
+        if not (repo / "actlize_la" / "gdn_interface.py").is_file():
+            raise RuntimeError(f"missing actlize_la under {repo}; check ACTLIZE_LA_ROOT")
         sys.path.insert(0, str(repo.resolve()))
-    if not args.extension or not Path(args.extension).expanduser().is_file():
-        raise RuntimeError("set GDN_QSA_SM90_EXTENSION (or --extension) to the built SM90 extension")
-    extension = str(Path(args.extension).expanduser().resolve())
-    os.environ["GDN_QSA_SM90_EXTENSION"] = extension
     try:
-        interface = importlib.import_module("gdn_qsa_sm80.gdn_sm90_interface")
-        loading = importlib.import_module("gdn_qsa_sm80.backends.loading")
+        from actlize_la import gdn_forward, load_sm90
     except ImportError as exc:
-        raise RuntimeError("cannot import GDN-QSA-sm80; set GDN_QSA_ROOT or install its package") from exc
+        raise RuntimeError(
+            f"cannot import actlize_la with {sys.executable}; run the benchmark with the Python "
+            "used by tools/install_sm90.sh (set PYTHON=/path/to/that/python in the model .sh)"
+        ) from exc
+    if args.configuration == "auto":
+        # Preload/verify the registered bundle without a warmup kernel. The
+        # public gdn_forward call then reuses this cached bundle during timing.
+        automatic = load_sm90()
+        return partial(gdn_forward, algorithm="auto", backend="cuda_sm90"), automatic.select
+
+    # Fixed configurations and PPU are explicit diagnostics. Old GDN variables
+    # must not override the normal installed actlizeLA automatic path.
+    supplied = args.extension or os.environ.get("GDN_QSA_SM90_EXTENSION")
+    if not supplied or not Path(supplied).expanduser().is_file():
+        raise RuntimeError("fixed --configuration requires --extension pointing to its built SM90 binary")
+    extension = str(Path(supplied).expanduser().resolve())
+    os.environ["GDN_QSA_SM90_EXTENSION"] = extension
+    interface = importlib.import_module("actlize_la.gdn_sm90_interface")
+    loading = importlib.import_module("actlize_la.backends.loading")
     # Preload the DSO without a warmup kernel, so module loading is outside timing.
     module = loading._load("_gdn_fused_sm90", extension)
     target = args.backend + ("-source-check" if args.source_check else "")
     if (module.target != target or module.math_contract != interface.MATH_CONTRACT
             or getattr(module, "configuration", None) != args.configuration):
         raise RuntimeError("SM90 extension target, math contract or configuration does not match the request")
-    return interface.gdn_chunk_sm90
+    return partial(interface.gdn_chunk_sm90, backend=args.backend,
+                   source_check=args.source_check, configuration=args.configuration), None
 
 
 def main():
     args = parse_args()
     warmup, iters = args.bench if args.bench is not None else (0, 1)
-    contract = dict(algorithm="fused_sm90", backend=args.backend,
+    contract = dict(provider="actlize_la", algorithm="fused_sm90", backend=args.backend,
                     configuration=args.configuration, source_check=args.source_check,
                     batch=args.num_seqs, seq_len=args.seq_len, q_heads=args.q_heads,
                     v_heads=args.v_heads, head_dim=args.head_dim, dtype=args.dtype,
@@ -98,7 +117,7 @@ def main():
         return 0
 
     import torch
-    forward = load_forward(args)
+    forward, select = load_forward(args)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA-compatible device is not available")
     torch.set_num_threads(1)
@@ -114,11 +133,13 @@ def main():
     beta_cpu = torch.empty(gate_shape, dtype=torch.float32, device="cpu").uniform_(0.25, 0.75, generator=rng).bfloat16()
     inputs = tuple(t.cuda() for t in (q_cpu, k_cpu, v_cpu, g_cpu, beta_cpu))
     torch.cuda.synchronize()
+    if select is not None:
+        choice = select(inputs[0], inputs[2])
+        print(f"actlizeLA SM90 selection: configuration={choice.configuration} "
+              f"basis={choice.basis} policy={choice.policy_id}", flush=True)
 
     def run_once():
-        return forward(*inputs, initial_state=None, output_final_state=True,
-                       backend=args.backend, source_check=args.source_check,
-                       configuration=args.configuration)
+        return forward(*inputs, initial_state=None, output_final_state=True)
 
     for _ in range(warmup):
         run_once()

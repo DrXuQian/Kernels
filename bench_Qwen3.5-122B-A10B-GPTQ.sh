@@ -258,11 +258,12 @@ Environment variables:
   LM_HEAD_GEMV_OP          Local lm_head GEMV op. Default: ptx_tma_ws.
   LM_HEAD_GEMV_K_UNROLL    Local lm_head GEMV --k-unroll. Default: 8.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
-  GDN_QSA_ROOT             GDN-QSA-sm80 checkout; otherwise use the installed package or sibling checkout.
-  GDN_QSA_SM90_EXTENSION   Built cuLA fused_sm90 extension used for GDN prefill.
-  GDN_QSA_SM90_BACKEND     cuda_sm90 (default) or ppu17; must match the extension.
-  GDN_QSA_SM90_CONFIGURATION  control (default), value64, value64-local-inverse, or value128-paired.
-  GDN_QSA_SM90_SOURCE_CHECK  Set to 1 for PPU-fork CUDA simulation input, not native PPU execution.
+  ACTLIZE_LA_ROOT          Optional source checkout; normally use actlize_la installed in PYTHON.
+  ACTLIZE_LA_SM90_BUNDLE   Optional absolute bundle directory; default: actlizeLA's registered installation.
+  ACTLIZE_LA_BACKEND       cuda_sm90 (default); ppu17 requires a fixed diagnostic configuration/binary.
+  ACTLIZE_LA_SM90_CONFIGURATION  auto (default); fixed names are diagnostic overrides.
+  GDN_QSA_SM90_EXTENSION   Only needed for a fixed diagnostic configuration, not the installed auto bundle.
+  ACTLIZE_LA_SOURCE_CHECK  Set to 1 for an explicit PPU-fork CUDA source-check build.
   LINEAR_GDN_DTYPE         GDN prefill dtype, currently bf16 only; separate from LINEAR_ATTN_DTYPE.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
