@@ -7,6 +7,7 @@ Standalone full-attention benchmark entry points.
 | Path | Contents |
 |---|---|
 | `bench_flash_attn.py` | FlashAttention-3 Python inference benchmark |
+| `bench_flash_attn3_prefill_noncausal.py` | FA3 BF16 non-causal prefill: B=1, Q/KV=1024, Hq/Hkv=56, Dq/Dv=128 |
 | `bench_flash_infer.py` | FlashInfer Python attention benchmark |
 | `bench_rmsnorm` | Category-local build of `general/bench_rmsnorm.cu` |
 
@@ -61,4 +62,15 @@ The Qwen and MiniMax model shell scripts share this Python entry point, so their
 ```bash
 ./bench_all.sh --case flash_attn_prefill_full_attn
 ./bench_all.sh --case flash_attn_decode_full_attn
+```
+
+Run the standalone BF16 MHA prefill case with `causal=False`. Q, K, and V all
+have shape `[1, 1024, 56, 128]`. Inputs are initialized on CPU and then copied
+to CUDA. The default makes one FA3 forward call without warmup or CUDA events.
+
+```bash
+python3 flash_attn/bench_flash_attn3_prefill_noncausal.py
+
+# Optional CUDA-event timing on a physical GPU:
+python3 flash_attn/bench_flash_attn3_prefill_noncausal.py --bench 20 100
 ```
