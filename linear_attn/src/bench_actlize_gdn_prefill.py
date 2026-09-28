@@ -8,6 +8,7 @@ No compilation occurs here. Inputs are prepared on CPU before measurement.
 """
 
 import argparse
+from dataclasses import asdict
 from functools import partial
 import importlib
 import json
@@ -30,6 +31,10 @@ def parse_args():
     parser.add_argument("--dtype", choices=("bf16",), default="bf16",
                         help="fused_sm90 accepts BF16 Q/K/V/beta only")
     parser.add_argument("--bench", type=int, nargs=2, metavar=("WARMUP", "ITERS"))
+    parser.add_argument("--mode", choices=("device", "perfmodel"), default="device",
+                        help="perfmodel uses configured metadata and exactly one untimed forward")
+    parser.add_argument("--sm-count", type=int,
+                        help="explicit model SM count (e.g. 20); requires --mode perfmodel")
     parser.add_argument("--backend", choices=("cuda_sm90", "ppu17"),
                         default=os.environ.get("ACTLIZE_LA_BACKEND", "cuda_sm90"))
     parser.add_argument("--configuration", choices=CONFIGURATIONS,
@@ -60,6 +65,13 @@ def parse_args():
     warmup, iters = args.bench if args.bench is not None else (0, 1)
     if warmup < 0 or iters <= 0:
         parser.error("--bench requires warmup >= 0 and iters > 0")
+    if args.mode == "perfmodel":
+        if args.sm_count is None or args.sm_count <= 0:
+            parser.error("--mode perfmodel requires an explicit positive --sm-count")
+        if (warmup, iters) != (0, 1):
+            parser.error("--mode perfmodel requires exactly one call (--bench 0 1)")
+    elif args.sm_count is not None:
+        parser.error("--sm-count is a model input; it requires --mode perfmodel")
     if args.source_check and (args.backend != "ppu17" or (warmup, iters) != (0, 1)):
         parser.error("--source-check requires --backend ppu17 and exactly one call (--bench 0 1)")
     return args
@@ -78,11 +90,24 @@ def load_forward(args):
             f"cannot import actlize_la with {sys.executable}; run the benchmark with the Python "
             "used by tools/install_sm90.sh (set PYTHON=/path/to/that/python in the model .sh)"
         ) from exc
+    profile_options = {}
+    if args.mode == "perfmodel":
+        try:
+            from actlize_la import get_device_profile
+        except ImportError as exc:
+            raise RuntimeError(
+                "perfmodel requires actlizeLA's updated Python frontend (6f6a2b7 or later); "
+                "update the frontend in this Python environment"
+            ) from exc
+        profile = get_device_profile(mode=args.mode, backend=args.backend, sm_count=args.sm_count)
+        print("actlizeLA device profile: " + json.dumps(asdict(profile)), flush=True)
+        profile_options = dict(mode=args.mode, sm_count=args.sm_count)
     if args.configuration == "auto":
         # Preload/verify the registered bundle without a warmup kernel. The
         # public gdn_forward call then reuses this cached bundle during timing.
         automatic = load_sm90()
-        return partial(gdn_forward, algorithm="auto", backend="cuda_sm90"), automatic.select
+        return (partial(gdn_forward, algorithm="auto", backend="cuda_sm90", **profile_options),
+                partial(automatic.select, **profile_options))
 
     # Fixed configurations and PPU are explicit diagnostics. Old GDN variables
     # must not override the normal installed actlizeLA automatic path.
@@ -108,6 +133,7 @@ def main():
     warmup, iters = args.bench if args.bench is not None else (0, 1)
     contract = dict(provider="actlize_la", algorithm="fused_sm90", backend=args.backend,
                     configuration=args.configuration, source_check=args.source_check,
+                    mode=args.mode, sm_count=args.sm_count,
                     batch=args.num_seqs, seq_len=args.seq_len, q_heads=args.q_heads,
                     v_heads=args.v_heads, head_dim=args.head_dim, dtype=args.dtype,
                     gate="fp32 natural-log increments", state="fp32 [B,Hv,K,V]",
@@ -118,7 +144,7 @@ def main():
 
     import torch
     forward, select = load_forward(args)
-    if not torch.cuda.is_available():
+    if args.mode == "device" and not torch.cuda.is_available():
         raise RuntimeError("CUDA-compatible device is not available")
     torch.set_num_threads(1)
     rng = torch.Generator(device="cpu").manual_seed(1234)
@@ -144,10 +170,12 @@ def main():
     for _ in range(warmup):
         run_once()
     torch.cuda.synchronize()
-    timed = args.bench is not None and not args.source_check
+    physical = args.mode == "device" and not args.source_check
+    timed = args.bench is not None and physical
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)] if timed else []
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)] if timed else []
-    torch.cuda.profiler.start()
+    if physical:
+        torch.cuda.profiler.start()
     try:
         for i in range(iters):
             if timed:
@@ -157,7 +185,8 @@ def main():
                 ends[i].record()
         torch.cuda.synchronize()
     finally:
-        torch.cuda.profiler.stop()
+        if physical:
+            torch.cuda.profiler.stop()
     if timed:
         times = [s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends)]
         print(f"  Kernel time: median={statistics.median(times):.1f} us, "

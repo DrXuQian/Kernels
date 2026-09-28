@@ -6,6 +6,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS="qwen27,minimax-tp1,minimax-tp2,minimax-tp4"
 PHASE="decode"
 BACKEND="${BANDWIDTH_BACKEND:-nsys}"
+# This suite profiles physical H800 hardware, so query its actual metadata.
+export LINEAR_GDN_MODE="${LINEAR_GDN_MODE:-device}"
 RUN_PREFLIGHT=1
 CONTINUE_ON_ERROR=0
 EXTRA_ARGS=()

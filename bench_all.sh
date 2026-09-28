@@ -28,6 +28,12 @@ LINEAR_HEAD_DIM=128
 LINEAR_SMALL_PROJ_N=64
 LINEAR_ATTN_DTYPE="${LINEAR_ATTN_DTYPE:-bf16}"
 LINEAR_GDN_DTYPE="${LINEAR_GDN_DTYPE:-bf16}"
+LINEAR_GDN_MODE="${LINEAR_GDN_MODE:-perfmodel}"
+LINEAR_GDN_SM_COUNT="${LINEAR_GDN_SM_COUNT:-20}"
+LINEAR_GDN_MODE_ARGS=(--mode "$LINEAR_GDN_MODE")
+if [[ "$LINEAR_GDN_MODE" == perfmodel ]]; then
+  LINEAR_GDN_MODE_ARGS+=(--sm-count "$LINEAR_GDN_SM_COUNT")
+fi
 
 MOE_EXPERTS=8
 MOE_ROUTER_EXPERTS=256
@@ -200,6 +206,8 @@ Environment variables:
   GDN_QSA_SM90_EXTENSION   Only needed for a fixed diagnostic configuration, not the installed auto bundle.
   ACTLIZE_LA_SOURCE_CHECK  Set to 1 for an explicit PPU-fork CUDA source-check build.
   LINEAR_GDN_DTYPE         GDN prefill dtype, currently bf16 only; separate from LINEAR_ATTN_DTYPE.
+  LINEAR_GDN_MODE          perfmodel (default, single untimed call) or device (physical GPU profiling).
+  LINEAR_GDN_SM_COUNT      Model SM count passed only in perfmodel mode. Default: 20.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
   MODEL_FULL_ATTN_LAYERS   Model summary full-attention multiplier. Default: 12.
@@ -563,6 +571,10 @@ run_case() {
   fi
 
   require_bin "${cmd[0]}"
+  if [[ "$label" == linear_prefill_gdn_qsa_sm80 && "$LINEAR_GDN_MODE" == perfmodel && "$NCU_CYCLES" == 1 ]]; then
+    echo "[bench_all][error] GDN perfmodel runs once without profiler replay; use LINEAR_GDN_MODE=device for NCU." >&2
+    exit 1
+  fi
   if [[ "$NCU_CYCLES" == 1 ]] && ! command -v ncu >/dev/null 2>&1; then
     echo "[bench_all][error] --ncu-cycles requested but ncu is not in PATH" >&2
     exit 1
@@ -1152,7 +1164,7 @@ run_case "linear_prefill_conv1d_fwd" \
 run_case "linear_prefill_gdn_qsa_sm80" \
   --require-file "$LINEAR_GDN_SCRIPT" \
   "$PYTHON_BIN" "$LINEAR_GDN_SCRIPT" "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" \
-  --head-dim "$LINEAR_HEAD_DIM" --dtype "$LINEAR_GDN_DTYPE" --bench 0 1
+  --head-dim "$LINEAR_HEAD_DIM" --dtype "$LINEAR_GDN_DTYPE" "${LINEAR_GDN_MODE_ARGS[@]}" --bench 0 1
 
 run_linear_fused_rms_gate_case "linear_attn_decode_fused_rms_norm_gate" "$LINEAR_V_HEADS"
 run_linear_fused_rms_gate_case "linear_attn_prefill_fused_rms_norm_gate" "$((PREFILL_TOKENS * LINEAR_V_HEADS))"

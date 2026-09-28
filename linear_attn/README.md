@@ -35,15 +35,35 @@ export PYTHON="$(command -v python)"  # Python used to install actlizeLA
 ./bench_Qwen3.5-122B-A10B-GPTQ.sh --case linear_prefill_gdn_qsa_sm80
 ./bench_Qwen3.5-122B-A10B-GPTQ_TP2.sh --case linear_prefill_gdn_qsa_sm80
 ./bench_Qwen3.5_27B.sh --case linear_prefill_gdn_qsa_sm80
-"$PYTHON" linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 --bench 0 1
+"$PYTHON" linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 \
+  --mode perfmodel --sm-count 20 --bench 0 1
 ```
+
+The model shell scripts default to `LINEAR_GDN_MODE=perfmodel` and
+`LINEAR_GDN_SM_COUNT=20`, forwarding `--mode perfmodel --sm-count 20` to GDN.
+This matches actlizeLA's `tools/run_sm90_gdn.py`: SM count is configured
+metadata, not a hardware query, grid override or GPU partition. The Python
+selection call and public forward both receive the mode and SM count.
+Automatic selection reports `perfmodel-unmeasured-default` (currently
+`value64`); it does not apply the physical H800 winner table to a 20-SM model.
+Perfmodel enforces exactly one forward, prepares inputs on CPU, skips the
+Python CUDA availability query, and creates no CUDA timing events or profiler
+range. Use the external model's trace/cycles for performance; this runner does
+not report event time as simulated kernel time. Existing native binding checks
+and kernel geometry are unchanged.
+
+For physical GPU runs, use `LINEAR_GDN_MODE=device` with a model shell script,
+or `--mode device` for the Python entry (its standalone default). The model
+scripts omit `--sm-count` in device mode. `bench_h800_bandwidth.sh` defaults to
+device mode; NCU/nsys are rejected for a selected perfmodel GDN case.
 
 The default is `configuration=auto`. `load_sm90()` preloads the registered
 bundle before timing without launching a warmup kernel, then `gdn_forward`
 reuses it. actlizeLA selects `value64`, `value64-local-inverse`, or
 `value128-paired` from shape/device metadata. The runner logs the selected
 configuration and selection basis. It never compiles or autotunes a kernel.
-This integration uses the public API from actlizeLA revision `7616123`.
+Perfmodel requires the Python API from actlizeLA revision `6f6a2b7` or later.
+It reuses the installed native bundle without compiling new kernels.
 
 For a relocated bundle, set `ACTLIZE_LA_SM90_BUNDLE` to its absolute directory
 (the directory containing `bundle.json`). `ACTLIZE_LA_ROOT` optionally selects

@@ -241,14 +241,17 @@ Run selected single cases:
 
 GDN prefill calls `actlize_la.gdn_forward` using actlizeLA's registered SM90
 bundle. Use the same Python environment as the actlizeLA installation; no
-extension path is needed. Setup and diagnostic overrides are described in
+extension path is needed. Model scripts default to `LINEAR_GDN_MODE=perfmodel`
+and `LINEAR_GDN_SM_COUNT=20` for one untimed GDN call. Set
+`LINEAR_GDN_MODE=device` for physical GPU profiling; the H800 bandwidth wrapper
+selects device mode by default. Setup and diagnostic overrides are described in
 [linear_attn/README.md](linear_attn/README.md#cula--actlize-gdn-prefill-script).
 
 Direct GDN commands when bypassing `bench_all.sh`:
 
 ```bash
 linear_attn/bench_gated_delta_net 1 64 128 1 --bench 0 1
-python3 linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 --head-dim 128 --bench 0 1
+python3 linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 --head-dim 128 --mode perfmodel --sm-count 20 --bench 0 1
 linear_attn/bench_fused_rms_norm_gate 64 128 --bench 0 1
 linear_attn/bench_fused_rms_norm_gate $((2048 * 64)) 128 --bench 0 1
 ```
