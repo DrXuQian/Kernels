@@ -209,7 +209,11 @@ Run selected single cases:
 ```
 
 The core FlashAttention cases are Python-backed and require the active Python
-environment to provide the attention package used by `flash_attn/bench_flash_attn.py`.
+environment to provide FlashAttention-3 for `flash_attn/bench_flash_attn.py`.
+The runner supports the current `flash_attn_3.flash_attn_interface` package and
+the older top-level `flash_attn_interface` FA3 package used by the platform fork.
+It prints the loaded interface path and fails if FA3 is unavailable. This also
+applies to the Qwen and MiniMax model scripts that call the same runner.
 
 ## Linear-Attn
 

@@ -29,7 +29,26 @@ sys.path = [
 
 import torch
 import numpy as np
-from flash_attn import flash_attn_func
+
+try:
+    import flash_attn_3.flash_attn_interface as flash_attn_interface
+except ModuleNotFoundError as exc:
+    if exc.name not in ("flash_attn_3", "flash_attn_3.flash_attn_interface"):
+        raise
+    # Older FA3 releases, including flash-attention-for-sail, install this
+    # interface as a top-level module backed by flash_attn_3._C.
+    try:
+        import flash_attn_interface
+    except ModuleNotFoundError as legacy_exc:
+        if legacy_exc.name != "flash_attn_interface":
+            raise
+        raise SystemExit(
+            "bench_flash_attn: FlashAttention-3 is required. Install the hopper/ "
+            "package from FlashAttention or your platform's FA3 fork into the "
+            "active Python environment."
+        ) from legacy_exc
+
+flash_attn_func = flash_attn_interface.flash_attn_func
 
 # Parse --bench and --ctx flags
 bench_mode = False
@@ -69,6 +88,8 @@ if mode != "decode" and context_len < seq_len:
     context_len = seq_len
 
 print(f"bench flash_attn {mode}: heads={NUM_HEADS} kv_heads={NUM_KV_HEADS} dim={HEAD_DIM} seq={seq_len} ctx={context_len}")
+print(f"FlashAttention backend: FA3 interface={flash_attn_interface.__name__} "
+      f"path={flash_attn_interface.__file__}", flush=True)
 
 # ── Allocate on CPU, copy to GPU ──
 if mode == "decode":
