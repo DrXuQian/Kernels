@@ -621,6 +621,19 @@ def sampling_bytes(opts, log_text):
     return total, f"sampling_{op}(hidden={hidden},vocab={vocab},top_k={top_k},lower_bound)"
 
 
+def actlize_gdn_bytes(opts):
+    pos = opts.get("_positional", [])
+    tokens, q_heads, v_heads = pos_int(pos, 0, 2048), pos_int(pos, 1, 16), pos_int(pos, 2, 64)
+    dim, batch = int_opt(opts, "head-dim", 128), int_opt(opts, "num-seqs", 1)
+    if None in (tokens, q_heads, v_heads, dim, batch):
+        return math.nan, ""
+    # BF16 Q/K/V/O, FP32 log gate, BF16 beta, FP32 final state. No initial
+    # state or materialized per-chunk intermediates in the fused prefill call.
+    total = batch * tokens * (4 * dim * (q_heads + v_heads) + 6 * v_heads)
+    total += batch * v_heads * dim * dim * 4
+    return total, f"fused_gdn(batch={batch},tokens={tokens},q_heads={q_heads},v_heads={v_heads},dim={dim},lower_bound)"
+
+
 def estimate_bytes(exe, opts, log_text):
     if exe in {"bench_cublas_gemm", "bench_cuda_core_gemv", "bench_vllm_linear"}:
         return gemm_bytes(opts, allow_fp8=True)
@@ -628,6 +641,9 @@ def estimate_bytes(exe, opts, log_text):
         pos = opts.get("_positional", [])
         if any(value.endswith("bench_flash_attn.py") for value in pos):
             return flash_attn_bytes(opts, log_text)
+        for index, value in enumerate(pos):
+            if value.endswith("bench_actlize_gdn_prefill.py"):
+                return actlize_gdn_bytes(dict(opts, _positional=pos[index + 1:]))
     if exe == "bench_cutlass_block_fp8_gemm":
         return block_fp8_bytes(opts)
     if exe == "bench_moe_fp8_blockscale_gemm":
@@ -644,6 +660,8 @@ def estimate_bytes(exe, opts, log_text):
         return conv1d_update_bytes(opts, log_text)
     if exe == "bench_gated_delta_net":
         return gated_delta_net_bytes(opts, log_text)
+    if exe == "bench_actlize_gdn_prefill.py":
+        return actlize_gdn_bytes(opts)
     if exe == "bench_expand_input_rows":
         return expand_input_rows_bytes(opts, log_text)
     if exe == "bench_finalize_moe_routing":

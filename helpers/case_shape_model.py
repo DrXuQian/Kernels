@@ -87,6 +87,7 @@ TOKEN_FIELDS: dict[str, Tuple[str, ...]] = {
     "bench_fused_rms_norm_gate": ("pos", 0),
     "bench_conv1d_fwd": ("pos", 0),
     "bench_gdn_prefill": ("pos", 0),
+    "bench_actlize_gdn_prefill.py": ("pos", 0),
     "bench_conv1d_update": ("pos", 2),
     "bench_gated_delta_net": ("pos", 0),
     "bench_flash_attn.py": ("attn",),
@@ -223,9 +224,12 @@ def estimate_flops(exe: str, opts: dict) -> tuple[float, str]:
         mode, seq, heads, _kv_heads, head_dim, ctx = shape
         pairs = attention_pairs(mode, seq, ctx)
         return 4.0 * heads * head_dim * pairs, f"attention_{mode}(seq={seq},ctx={ctx},heads={heads},dim={head_dim},causal)"
-    if exe in {"bench_gated_delta_net", "bench_gdn_prefill", "bench_vllm_triton_gdn_prefill.py", "bench_vllm_triton_gdn_decode.py"}:
+    if exe in {"bench_gated_delta_net", "bench_gdn_prefill", "bench_actlize_gdn_prefill.py", "bench_vllm_triton_gdn_prefill.py", "bench_vllm_triton_gdn_decode.py"}:
         if exe == "bench_gated_delta_net":
             tokens, heads, head_dim, seqs = pos_int(pos, 0), pos_int(pos, 1), pos_int(pos, 2), pos_int(pos, 3, 1)
+        elif exe == "bench_actlize_gdn_prefill.py":
+            tokens, heads = pos_int(pos, 0, 2048), pos_int(pos, 2, 64)
+            head_dim, seqs = int_opt(opts, "head-dim", 128), int_opt(opts, "num-seqs", 1)
         else:
             tokens, heads, head_dim, seqs = pos_int(pos, 0), pos_int(pos, 2), pos_int(pos, 3), pos_int(pos, 4, 1)
         if None in (tokens, heads, head_dim, seqs):

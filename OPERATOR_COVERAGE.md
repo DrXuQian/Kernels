@@ -74,7 +74,7 @@ the decode gate/up and down shapes.
 | 5 | `in_proj_z` W4A16 GEMM | `(2048,3072)->(2048,8192)` | covered | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | `w4a16_prefill_linear_attn_in_proj_z_cutlass55` |
 | 6 | Gate prep, `g = -exp(A) * softplus(a + dt_bias)` | `(2048,64)` | missing | none | missing: no CUDA standalone in repo |
 | 7 | Conv1d forward | `(2048,12288)` | covered | `linear_attn/bench_conv1d_fwd` | `linear_prefill_conv1d_fwd` |
-| 8 | Gated Delta Net prefill | `tokens=2048, q_heads=16, v_heads=64, head_dim=128` | covered | `linear_attn/bench_gdn_prefill` | `linear_prefill_flashinfer_gdn` |
+| 8 | Gated Delta Net prefill | `tokens=2048, q_heads=16, v_heads=64, head_dim=128` | covered | `linear_attn/src/bench_actlize_gdn_prefill.py` (GDN-QSA-sm80 cuLA `fused_sm90`) | `linear_prefill_gdn_qsa_sm80` |
 | 9 | Fused RMSNorm gate | `(2048*64,128)` | covered | `linear_attn/bench_fused_rms_norm_gate` | `linear_attn_prefill_fused_rms_norm_gate` |
 | 10 | Output projection W4A16 GEMM | `(2048,8192)->(2048,3072)` | covered | `general/w4a16_gemm/machete_standalone`, CUTLASS55 backend | `w4a16_prefill_linear_attn_out_proj_cutlass55` |
 | 11 | Residual add | `(2048,3072)+(2048,3072)` | covered | `linear_attn/bench_linear_ops` | `linear_attn_prefill_residual_add` |

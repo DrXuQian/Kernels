@@ -27,6 +27,7 @@ LINEAR_V_HEADS=64
 LINEAR_HEAD_DIM=128
 LINEAR_SMALL_PROJ_N=64
 LINEAR_ATTN_DTYPE="${LINEAR_ATTN_DTYPE:-bf16}"
+LINEAR_GDN_DTYPE="${LINEAR_GDN_DTYPE:-bf16}"
 
 MOE_EXPERTS=8
 MOE_ROUTER_EXPERTS=256
@@ -103,6 +104,7 @@ MOE_VLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/vllm/auxiliary")"
 LINEAR_RMSNORM_BIN="$(repo_path "linear_attn/bench_rmsnorm")"
 LINEAR_OPS_BIN="$(repo_path "linear_attn/bench_linear_ops")"
 LINEAR_FUSED_RMS_GATE_BIN="$(repo_path "linear_attn/bench_fused_rms_norm_gate")"
+LINEAR_GDN_SCRIPT="$(repo_path "${GDN_QSA_SM80_ENTRY:-linear_attn/src/bench_actlize_gdn_prefill.py}")"
 FLASH_RMSNORM_BIN="$(repo_path "flash_attn/bench_rmsnorm")"
 FLASH_ATTN_SCRIPT="$(repo_path "flash_attn/bench_flash_attn.py")"
 MOE_RMSNORM_BIN="$(repo_path "moe_ffn/bench_rmsnorm")"
@@ -191,6 +193,12 @@ Environment variables:
   LM_HEAD_GEMV_OP          Local lm_head GEMV op. Default: ptx_tma_ws.
   LM_HEAD_GEMV_K_UNROLL    Local lm_head GEMV --k-unroll. Default: 8.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
+  GDN_QSA_ROOT             GDN-QSA-sm80 checkout; otherwise use the installed package or sibling checkout.
+  GDN_QSA_SM90_EXTENSION   Built cuLA fused_sm90 extension used for GDN prefill.
+  GDN_QSA_SM90_BACKEND     cuda_sm90 (default) or ppu17; must match the extension.
+  GDN_QSA_SM90_CONFIGURATION  control (default), value64, value64-local-inverse, or value128-paired.
+  GDN_QSA_SM90_SOURCE_CHECK  Set to 1 for PPU-fork CUDA simulation input, not native PPU execution.
+  LINEAR_GDN_DTYPE         GDN prefill dtype, currently bf16 only; separate from LINEAR_ATTN_DTYPE.
   ATTN_BENCH_WARMUP        Warmup iterations for Python full-attention cases. Default: 0.
   ATTN_BENCH_ITERS         Timed iterations for Python full-attention cases. Default: 1.
   MODEL_FULL_ATTN_LAYERS   Model summary full-attention multiplier. Default: 12.
@@ -1140,8 +1148,10 @@ run_case "linear_decode_gdn" \
 run_case "linear_prefill_conv1d_fwd" \
   linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
-run_case "linear_prefill_flashinfer_gdn" \
-  linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
+run_case "linear_prefill_gdn_qsa_sm80" \
+  --require-file "$LINEAR_GDN_SCRIPT" \
+  "$PYTHON_BIN" "$LINEAR_GDN_SCRIPT" "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" \
+  --head-dim "$LINEAR_HEAD_DIM" --dtype "$LINEAR_GDN_DTYPE" --bench 0 1
 
 run_linear_fused_rms_gate_case "linear_attn_decode_fused_rms_norm_gate" "$LINEAR_V_HEADS"
 run_linear_fused_rms_gate_case "linear_attn_prefill_fused_rms_norm_gate" "$((PREFILL_TOKENS * LINEAR_V_HEADS))"

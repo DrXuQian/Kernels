@@ -158,8 +158,9 @@ Useful log/runtime variables:
 Qwen3.5-27B wrapper status:
 
 - Dense GEMM/GEMV payloads use fp16.
-- Linear-attention conv1d, fused RMSNorm gate, GDN decode input/output, and
-  FlashInfer GDN prefill run with `LINEAR_ATTN_DTYPE=fp16`.
+- Linear-attention conv1d, fused RMSNorm gate, and GDN decode input/output run
+  with `LINEAR_ATTN_DTYPE=fp16`. The cuLA-derived GDN prefill script uses the
+  separate `LINEAR_GDN_DTYPE=bf16`, as required by `fused_sm90`.
 - `linear_decode_gdn` uses the existing CUDA recurrent-state kernel from
   llama.cpp. That kernel keeps the recurrent state and math in fp32 by design,
   while Q/K/V and output tensors follow `LINEAR_ATTN_DTYPE`.
@@ -230,7 +231,7 @@ Run all Linear-Attn cases:
 Run selected single cases:
 
 ```bash
-./bench_all.sh --case linear_prefill_flashinfer_gdn
+./bench_all.sh --case linear_prefill_gdn_qsa_sm80
 ./bench_all.sh --case linear_decode_gdn
 ./bench_all.sh --case linear_attn_prefill_fused_rms_norm_gate
 ./bench_all.sh --case linear_attn_decode_fused_rms_norm_gate
@@ -238,11 +239,15 @@ Run selected single cases:
 ./bench_all.sh --case w4a16_decode_linear_attn_out_proj_fpA_intB
 ```
 
+GDN prefill uses the cuLA-derived SM90 implementation from GDN-QSA-sm80.
+Set `GDN_QSA_ROOT` and `GDN_QSA_SM90_EXTENSION` as described in
+[linear_attn/README.md](linear_attn/README.md#cula--actlize-gdn-prefill-script).
+
 Direct GDN commands when bypassing `bench_all.sh`:
 
 ```bash
 linear_attn/bench_gated_delta_net 1 64 128 1 --bench 0 1
-linear_attn/bench_gdn_prefill 2048 16 64 128 1 --bench 0 1
+python3 linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 --head-dim 128 --bench 0 1
 linear_attn/bench_fused_rms_norm_gate 64 128 --bench 0 1
 linear_attn/bench_fused_rms_norm_gate $((2048 * 64)) 128 --bench 0 1
 ```
