@@ -90,7 +90,7 @@ Force an SM90 TMA CUTLASS config:
 
 ```
 general/w4a16_gemm/fpA_intB_standalone/build_cmake_release/test_fpA_intB_gemm \
-  --m=3823 --n=12288 --k=3072 --group_size=128 \
+  --m=2048 --n=12288 --k=3072 --group_size=128 \
   --config=sm90:128x256x128:2x1x1
 ```
 

@@ -41,7 +41,7 @@ Qwen3.5-122B-A10B MoE settings used here:
 
 | Item | Value |
 |------|-------|
-| prefill tokens | 3823 |
+| prefill tokens | 2048 |
 | decode tokens | 1 |
 | experts | 256 router experts, 8 active experts for grouped GEMM bench |
 | topk | 8 |
@@ -155,26 +155,26 @@ The breakdown was generated with Nsight Systems `cuda_gpu_kern_sum` reports.
 Representative component commands:
 
 ```bash
-moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating 3823 256 8 --bench 0 1
-moe_ffn/w4a16/vllm/auxiliary/bench_moe_align 3823 256 8 16 --bench 0 1
-moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 3072 2048 --balanced --no-topk-weights --bench 0 1
-moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul 3823 8 1024 --bench 0 1
-moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 3823 256 8 1024 3072 --balanced --bench 0 1
-moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum 3823 8 3072 --bench 0 1
+moe_ffn/w4a16/vllm/auxiliary/bench_topk_gating 2048 256 8 --bench 0 1
+moe_ffn/w4a16/vllm/auxiliary/bench_moe_align 2048 256 8 16 --bench 0 1
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 2048 256 8 3072 2048 --balanced --no-topk-weights --bench 0 1
+moe_ffn/w4a16/vllm/auxiliary/bench_silu_and_mul 2048 8 1024 --bench 0 1
+moe_ffn/w4a16/vllm/marlin/bench_marlin_moe 2048 256 8 1024 3072 --balanced --bench 0 1
+moe_ffn/w4a16/vllm/auxiliary/bench_moe_sum 2048 8 3072 --bench 0 1
 
-moe_ffn/w4a16/trtllm/auxiliary/bench_custom_moe_routing 3823 256 8 fp16 --bench 0 1
-moe_ffn/w4a16/trtllm/auxiliary/bench_expert_map 3823 256 8 auto --bench 0 1
-moe_ffn/w4a16/trtllm/auxiliary/bench_expand_input_rows 3823 8 2048 fp16 --bench 0 1
+moe_ffn/w4a16/trtllm/auxiliary/bench_custom_moe_routing 2048 256 8 fp16 --bench 0 1
+moe_ffn/w4a16/trtllm/auxiliary/bench_expert_map 2048 256 8 auto --bench 0 1
+moe_ffn/w4a16/trtllm/auxiliary/bench_expand_input_rows 2048 8 2048 fp16 --bench 0 1
 moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
-  --dtype=fp16 --experts=8 --m_per_expert=3823 --n=2048 --k=3072 \
+  --dtype=fp16 --experts=8 --m_per_expert=2048 --n=2048 --k=3072 \
   --group_size=128 --tactic=moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
-moe_ffn/w4a16/trtllm/auxiliary/bench_gated_activation 3823 8 1024 fp16 --bench 0 1
+moe_ffn/w4a16/trtllm/auxiliary/bench_gated_activation 2048 8 1024 fp16 --bench 0 1
 moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
-  --dtype=fp16 --experts=8 --m_per_expert=3823 --n=3072 --k=1024 \
+  --dtype=fp16 --experts=8 --m_per_expert=2048 --n=3072 --k=1024 \
   --group_size=128 --tactic=moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
-moe_ffn/w4a16/trtllm/auxiliary/bench_finalize_moe_routing 3823 8 3072 fp16 --bench 0 1
+moe_ffn/w4a16/trtllm/auxiliary/bench_finalize_moe_routing 2048 8 3072 fp16 --bench 0 1
 ```
 
-Use the same commands with `3823` replaced by `1` for decode.
+Use the same commands with `2048` replaced by `1` for decode.

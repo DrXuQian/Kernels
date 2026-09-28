@@ -72,9 +72,9 @@ The fusion is isolated as one standalone CUDA kernel so it can be profiled
 separately.
 
 ```bash
-general/bench_cublas_gemm --m=3823 --n=256 --k=3072 --dtype fp16 --bench 0 1
-general/bench_cublas_gemm --m=3823 --n=1 --k=3072 --dtype fp16 --bench 0 1
-moe_ffn/bench_shared_expert --op=sigmoid_mul_add --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
+general/bench_cublas_gemm --m=2048 --n=256 --k=3072 --dtype fp16 --bench 0 1
+general/bench_cublas_gemm --m=2048 --n=1 --k=3072 --dtype fp16 --bench 0 1
+moe_ffn/bench_shared_expert --op=sigmoid_mul_add --tokens=2048 --hidden=3072 --dtype fp16 --bench 0 1
 ```
 
 For the full MoE-FFN execution order and `bench_all.sh` labels, see

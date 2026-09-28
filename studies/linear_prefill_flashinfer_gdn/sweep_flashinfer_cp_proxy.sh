@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-SEQLEN="${SEQLEN:-3823}"
+SEQLEN="${SEQLEN:-2048}"
 H_QK="${H_QK:-16}"
 H_V="${H_V:-64}"
 HEAD_DIM="${HEAD_DIM:-128}"

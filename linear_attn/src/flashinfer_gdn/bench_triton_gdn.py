@@ -40,7 +40,7 @@ print(f"Config: q_heads={num_q_heads}, v_heads={num_v_heads}, dim={head_dim}")
 print(f"{'seqlen':<8} {'Triton fla (ms)':>16} {'min':>10} {'max':>10}")
 print("-" * 50)
 
-for total_seqlen in [256, 1024, 2048, 3823, 8192]:
+for total_seqlen in [256, 1024, 2048, 2048, 8192]:
     # fla expects: q [B, H, T, D], k [B, H, T, D], v [B, Hv, T, D]
     # with GQA/GVA: q/k have fewer heads, v has more
     q = torch.randn(batch, num_q_heads, total_seqlen, head_dim,

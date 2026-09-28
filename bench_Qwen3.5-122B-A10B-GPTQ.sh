@@ -37,9 +37,10 @@ detect_peak_gbps() {
 }
 
 MODEL_NAME="${MODEL_NAME:-Qwen3.5-122B-A10B-GPTQ}"
-PREFILL_TOKENS="${PREFILL_TOKENS:-3823}"
+PREFILL_TOKENS="${PREFILL_TOKENS:-2048}"
 DECODE_TOKENS="${DECODE_TOKENS:-1}"
-CTX_LEN="${CTX_LEN:-3823}"
+CTX_LEN="${CTX_LEN:-2048}"
+DECODE_CTX_LEN="${DECODE_CTX_LEN:-100000}"
 LINEAR_DIM="${LINEAR_DIM:-12288}"
 HIDDEN_DIM="${HIDDEN_DIM:-3072}"
 CONV_WIDTH="${CONV_WIDTH:-4}"
@@ -482,7 +483,24 @@ write_expected_cases() {
       cat "$expected"
     fi
     printf '%s\n' "$listed"
-  } | awk 'NF && !seen[$0]++' >"$expected.tmp" && mv "$expected.tmp" "$expected"
+  } | awk '
+    NF {
+      labels[++n] = $0
+      if ($0 == "linear_prefill_gdn_qsa_sm80") {
+        has_sm80_gdn = 1
+      }
+    }
+    END {
+      for (i = 1; i <= n; ++i) {
+        if (has_sm80_gdn && labels[i] == "linear_prefill_flashinfer_gdn") {
+          continue
+        }
+        if (!seen[labels[i]]++) {
+          print labels[i]
+        }
+      }
+    }
+  ' >"$expected.tmp" && mv "$expected.tmp" "$expected"
 }
 
 label_matches_filter() {
@@ -1368,6 +1386,7 @@ else
   echo "prefill tokens: $PREFILL_TOKENS"
   echo "decode tokens:  $DECODE_TOKENS"
   echo "ctx len:        $CTX_LEN"
+  echo "decode ctx len: $DECODE_CTX_LEN"
   echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     $DECODE_MOE_BACKEND components"
   echo "moe gemm:       $MOE_GEMM_BACKEND"
@@ -1429,8 +1448,10 @@ run_case "linear_decode_gdn" \
 run_case "linear_prefill_conv1d_fwd" \
   linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
-run_case "linear_prefill_flashinfer_gdn" \
-  linear_attn/bench_gdn_prefill "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" "$LINEAR_HEAD_DIM" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
+GDN_QSA_SM80_ENTRY="${GDN_QSA_SM80_ENTRY:-/Users/qianxu/GDN-QSA-sm80/run_gdn_chunk.py}"
+run_case "linear_prefill_gdn_qsa_sm80" \
+  --require-file "$GDN_QSA_SM80_ENTRY" \
+  "$PYTHON_BIN" "$GDN_QSA_SM80_ENTRY" "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
 run_w4a16_prefill_gemm_cublas_case "w4a16_prefill_linear_attn_in_proj_qkv_cublas" \
   "$PREFILL_TOKENS" "$W4A16_LINEAR_QKV_N" "$W4A16_LINEAR_QKV_K"
@@ -1501,7 +1522,7 @@ run_rmsnorm_shape_case "flash_attn_decode_k_norm" \
   "$FLASH_RMSNORM_BIN" "$((DECODE_TOKENS * FULL_ATTN_KV_HEADS))" "$FULL_ATTN_HEAD_DIM"
 
 run_flash_attn_core_case "flash_attn_decode_full_attn" \
-  decode "$CTX_LEN"
+  decode "$DECODE_CTX_LEN"
 
 run_w4a16_decode_gemv_cublas_case "w4a16_decode_full_attn_o_proj_cublas" \
   "$DECODE_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"

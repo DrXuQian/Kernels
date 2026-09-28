@@ -177,8 +177,8 @@ Qwen MoE shapes in `tactics_h800.cache`
 ---------------------------------------
 The checked-in cache contains FP16 and BF16 tactics for these Qwen MoE GEMMs:
 
-- gate/up prefill: `experts=8, m_per_expert=3823, n=2048, k=3072`
-- down prefill: `experts=8, m_per_expert=3823, n=3072, k=1024`
+- gate/up prefill: `experts=8, m_per_expert=2048, n=2048, k=3072`
+- down prefill: `experts=8, m_per_expert=2048, n=3072, k=1024`
 - gate/up decode: `experts=8, m_per_expert=1, n=2048, k=3072`
 - down decode: `experts=8, m_per_expert=1, n=3072, k=1024`
 

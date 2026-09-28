@@ -50,7 +50,7 @@ namespace
 struct Args
 {
     int experts = 8;
-    int m_per_expert = 3823;
+    int m_per_expert = 2048;
     int n = 3072;
     int k = 3072;
     int warmup = 0;
@@ -98,8 +98,8 @@ void usage(char const* prog)
         "MiniMax examples:\n"
         "  gate/up decode:   %s --m_per_expert=1 --n=3072 --k=3072 --bench 0 1\n"
         "  down decode:      %s --m_per_expert=1 --n=3072 --k=1536 --bench 0 1\n"
-        "  gate/up prefill:  %s --m_per_expert=3823 --n=3072 --k=3072 --bench 0 1\n"
-        "  down prefill:     %s --m_per_expert=3823 --n=3072 --k=1536 --bench 0 1\n",
+        "  gate/up prefill:  %s --m_per_expert=2048 --n=3072 --k=3072 --bench 0 1\n"
+        "  down prefill:     %s --m_per_expert=2048 --n=3072 --k=1536 --bench 0 1\n",
         prog, prog, prog, prog, prog);
 }
 

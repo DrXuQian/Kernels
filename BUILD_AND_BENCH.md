@@ -242,9 +242,9 @@ Direct GDN commands when bypassing `bench_all.sh`:
 
 ```bash
 linear_attn/bench_gated_delta_net 1 64 128 1 --bench 0 1
-linear_attn/bench_gdn_prefill 3823 16 64 128 1 --bench 0 1
+linear_attn/bench_gdn_prefill 2048 16 64 128 1 --bench 0 1
 linear_attn/bench_fused_rms_norm_gate 64 128 --bench 0 1
-linear_attn/bench_fused_rms_norm_gate $((3823 * 64)) 128 --bench 0 1
+linear_attn/bench_fused_rms_norm_gate $((2048 * 64)) 128 --bench 0 1
 ```
 
 ## Dense-FFN
@@ -299,7 +299,7 @@ Direct MoE commands when bypassing `bench_all.sh`:
 
 ```bash
 moe_ffn/w4a16/trtllm/moe_w4a16_standalone/build_cmake_release/test_moe_w4a16_gemm \
-  --dtype=fp16 --experts=8 --m_per_expert=3823 \
+  --dtype=fp16 --experts=8 --m_per_expert=2048 \
   --n=2048 --k=3072 --group_size=128 \
   --tactic=moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache \
   --warmup=0 --iters=1
@@ -308,7 +308,7 @@ moe_ffn/w4a16/vllm/marlin/bench_marlin_moe \
   1 256 8 3072 2048 --balanced --no-topk-weights --bench 0 1
 
 moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation \
-  3823 1024 fp16 --bench 0 1
+  2048 1024 fp16 --bench 0 1
 
 moe_ffn/w4a16/trtllm/auxiliary/bench_shared_expert_activation \
   1 1024 fp16 --bench 0 1
@@ -319,7 +319,7 @@ The isolated MoE finalize study is separate from default builds:
 ```bash
 cd studies/ppu_finalize_moe_routing
 make
-./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 0 1
+./bench_finalize_moe_routing_study 2048 8 1024 fp16 --mode optimized --bench 0 1
 ```
 
 ## Sampling
@@ -573,7 +573,7 @@ launching the executable.
 Machete CUTLASS55 prefill cache key:
 
 ```bash
-grep -F "3823,12288,3072,128,fp16|" \
+grep -F "2048,12288,3072,128,fp16|" \
   general/w4a16_gemm/machete_standalone/cutlass55_tactics_h800.cache
 ```
 

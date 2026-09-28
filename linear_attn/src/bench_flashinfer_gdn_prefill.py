@@ -3,12 +3,12 @@
 Bench: FlashInfer Python chunk_gated_delta_rule prefill.
 
 Default Qwen3.5-122B DeltaNet GVA shape:
-  Q/K [3823, 16, 128], V/O [3823, 64, 128], gate/beta [3823, 64]
+  Q/K [2048, 16, 128], V/O [2048, 64, 128], gate/beta [2048, 64]
 
 Usage:
   python3 linear_attn/src/bench_flashinfer_gdn_prefill.py
-  python3 linear_attn/src/bench_flashinfer_gdn_prefill.py 3823 16 64 128 1
-  python3 linear_attn/src/bench_flashinfer_gdn_prefill.py 3823 --bench 20 100
+  python3 linear_attn/src/bench_flashinfer_gdn_prefill.py 2048 16 64 128 1
+  python3 linear_attn/src/bench_flashinfer_gdn_prefill.py 2048 --bench 20 100
 
 Default single-run mode is intended for nsys/ncu captures. Add --bench W I for
 CUDA-event timing. All input data is created on CPU and copied to GPU before the
@@ -53,7 +53,7 @@ def parse_args():
             clean_args.append(args[i])
             i += 1
 
-    seq_len = int(clean_args[0]) if len(clean_args) > 0 else 3823
+    seq_len = int(clean_args[0]) if len(clean_args) > 0 else 2048
     q_heads = int(clean_args[1]) if len(clean_args) > 1 else 16
     v_heads = int(clean_args[2]) if len(clean_args) > 2 else 64
     head_dim = int(clean_args[3]) if len(clean_args) > 3 else 128

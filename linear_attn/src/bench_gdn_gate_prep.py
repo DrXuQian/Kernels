@@ -11,7 +11,7 @@ found in TensorRT-LLM or in the extracted standalone CUDA kernels; CUDA GDN
 benches consume already prepared g/beta.
 
 Default Qwen3.5-122B shape:
-  a,b:     [3823, 64]
+  a,b:     [2048, 64]
   A_log:   [64]
   dt_bias: [64]
 
@@ -75,7 +75,7 @@ def _gdn_gate_prep_kernel(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tokens", type=int, default=3823)
+    parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--bench", nargs=2, metavar=("WARMUP", "ITERS"), type=int)

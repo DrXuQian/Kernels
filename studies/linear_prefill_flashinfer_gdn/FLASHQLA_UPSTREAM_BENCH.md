@@ -28,7 +28,7 @@ Qwen3.5-122B-A10B TP1-like shape used by this repo:
 
 ```bash
 python3 studies/linear_prefill_flashinfer_gdn/bench_flashqla_upstream.py \
-  --seqlen 3823 --h-qk 16 --h-v 64 --warmup 10 --repeats 50
+  --seqlen 2048 --h-qk 16 --h-v 64 --warmup 10 --repeats 50
 ```
 
 Low-head upstream benchmark shape where FlashQLA's auto-CP path is expected to help:
@@ -42,7 +42,7 @@ Current standalone FlashInfer single-translation-unit reference:
 
 ```bash
 studies/linear_prefill_flashinfer_gdn/bench_gdn_tile_study_single_tu \
-  3823 16 64 128 1 --bench 10 50
+  2048 16 64 128 1 --bench 10 50
 ```
 
 Correctness-relaxed CP proxy using the local CUDA/FlashInfer kernel:
@@ -55,19 +55,19 @@ Forced upstream FlashQLA sequence-CP diagnostic:
 
 ```bash
 python3 studies/linear_prefill_flashinfer_gdn/bench_flashqla_force_cp.py \
-  --seqlen 3823 --h-qk 16 --h-v 64 --warmup 10 --repeats 50
+  --seqlen 2048 --h-qk 16 --h-v 64 --warmup 10 --repeats 50
 ```
 
 ## H800 Results
 
 | Shape | Case | Time |
 |---|---|---:|
-| `T=3823,Hqk=16,Hv=64` | FlashQLA `auto_cp=True` | 0.455 ms |
-| `T=3823,Hqk=16,Hv=64` | FlashQLA `auto_cp=False` | 0.464 ms |
-| `T=3823,Hqk=16,Hv=64` | FlashQLA forced sequence-CP | 0.505 ms |
-| `T=3823,Hqk=16,Hv=64` | FlashInfer Python | 0.272 ms |
-| `T=3823,Hqk=16,Hv=64` | Local FlashInfer single-TU standalone | 0.263 ms |
-| `T=3823,Hqk=16,Hv=64` | Local CUDA `block_DV=64` single-TU study | 0.505 ms |
+| `T=2048,Hqk=16,Hv=64` | FlashQLA `auto_cp=True` | 0.455 ms |
+| `T=2048,Hqk=16,Hv=64` | FlashQLA `auto_cp=False` | 0.464 ms |
+| `T=2048,Hqk=16,Hv=64` | FlashQLA forced sequence-CP | 0.505 ms |
+| `T=2048,Hqk=16,Hv=64` | FlashInfer Python | 0.272 ms |
+| `T=2048,Hqk=16,Hv=64` | Local FlashInfer single-TU standalone | 0.263 ms |
+| `T=2048,Hqk=16,Hv=64` | Local CUDA `block_DV=64` single-TU study | 0.505 ms |
 | `T=4096,Hqk=16,Hv=64` | FlashQLA `auto_cp=True` | 0.455 ms |
 | `T=4096,Hqk=16,Hv=64` | FlashQLA `auto_cp=False` | 0.455 ms |
 | `T=4096,Hqk=16,Hv=64` | FlashInfer Python | 0.283 ms |
@@ -77,7 +77,7 @@ python3 studies/linear_prefill_flashinfer_gdn/bench_flashqla_force_cp.py \
 
 ## Local CUDA CP Proxy
 
-This proxy splits the total `3823` tokens into multiple independent `cu_seqlens`
+This proxy splits the total `2048` tokens into multiple independent `cu_seqlens`
 entries and runs the same local single-TU FlashInfer GDN kernel. This is not
 mathematically equivalent to one recurrent sequence because the state is reset at
 each segment. It only measures the optimistic performance upper bound of more
@@ -107,7 +107,7 @@ FlashQLA-style CP CUDA port is unlikely to deliver a large gain for the target
 `Hqk=16,Hv=64,T≈4k` shape.
 
 The forced upstream sequence-CP run used FlashQLA's real warmup/correction path
-with `cp_cu_seqlens=[0,1024,2048,3072,3823]`. It measured `0.505 ms`, slower
+with `cp_cu_seqlens=[0,1024,2048,3072,2048]`. It measured `0.505 ms`, slower
 than FlashQLA's default path. This confirms that the sequence-CP part of
 FlashQLA is not the first mechanism to port for this repo's target shape.
 
@@ -148,7 +148,7 @@ For this repo, the useful ideas to borrow are:
 
 ## Nsight Snapshot
 
-For `T=3823,Hqk=16,Hv=64`, one captured call showed:
+For `T=2048,Hqk=16,Hv=64`, one captured call showed:
 
 | Implementation | Kernel breakdown |
 |---|---|

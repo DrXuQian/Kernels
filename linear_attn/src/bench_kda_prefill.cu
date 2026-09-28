@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     timer.parse(argc, argv);
     argc = BenchTimer::strip_bench_args(argc, argv);
 
-    int seq_len   = (argc > 1) ? atoi(argv[1]) : 3823;
+    int seq_len   = (argc > 1) ? atoi(argv[1]) : 2048;
     int num_heads = (argc > 2) ? atoi(argv[2]) : 64;
     int head_dim  = (argc > 3) ? atoi(argv[3]) : 128;
     int num_seqs  = (argc > 4) ? atoi(argv[4]) : 1;

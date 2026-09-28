@@ -9,7 +9,7 @@ Default Qwen3.5-122B attention shape:
 Usage:
   python3 flash_attn/bench_flash_infer.py decode [ctx_len] [num_heads] [num_kv_heads] [head_dim]
   python3 flash_attn/bench_flash_infer.py prefill [seq_len] [num_heads] [num_kv_heads] [head_dim]
-  python3 flash_attn/bench_flash_infer.py decode 3823 --bench 20 100
+  python3 flash_attn/bench_flash_infer.py decode 2048 --bench 20 100
 
 Default single-run mode is intended for nsys/ncu captures. Add
 `--bench W I` for CUDA-event timing. With nsys, use
@@ -30,7 +30,7 @@ import torch
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FlashInfer FlashAttention benchmark")
     parser.add_argument("mode", nargs="?", choices=("decode", "prefill"), default="decode")
-    parser.add_argument("seq_len", nargs="?", type=int, default=3823)
+    parser.add_argument("seq_len", nargs="?", type=int, default=2048)
     parser.add_argument("num_heads", nargs="?", type=int, default=32)
     parser.add_argument("num_kv_heads", nargs="?", type=int, default=2)
     parser.add_argument("head_dim", nargs="?", type=int, default=256)

@@ -3,15 +3,15 @@
 //   num_k_heads=16, num_v_heads=64, head_dim=128
 //
 // Usage: ./bench_gdn_prefill [seqlen] [num_q_heads] [num_v_heads] [head_dim] [num_seqs] [--dtype fp16|bf16] [--bench W I]
-// Defaults: Qwen3.5-122B DeltaNet GVA (seqlen=3823, q=16, v=64, dim=128, seqs=1)
+// Defaults: Qwen3.5-122B DeltaNet GVA (seqlen=2048, q=16, v=64, dim=128, seqs=1)
 // Examples:
 //   ./bench_gdn_prefill                                # defaults
-//   ./bench_gdn_prefill 3823                           # just seqlen
-//   ./bench_gdn_prefill 3823 16 64 128                 # GVA: q=16, v=64
-//   ./bench_gdn_prefill 3823 32 32 128                 # uniform h=32 (TP=2)
-//   ./bench_gdn_prefill 3823 64 64 128                 # uniform h=64
-//   ./bench_gdn_prefill 3823 16 64 128 1 --bench 10 50 # with timing
-//   ncu --set full ./bench_gdn_prefill 3823 16 64 128
+//   ./bench_gdn_prefill 2048                           # just seqlen
+//   ./bench_gdn_prefill 2048 16 64 128                 # GVA: q=16, v=64
+//   ./bench_gdn_prefill 2048 32 32 128                 # uniform h=32 (TP=2)
+//   ./bench_gdn_prefill 2048 64 64 128                 # uniform h=64
+//   ./bench_gdn_prefill 2048 16 64 128 1 --bench 10 50 # with timing
+//   ncu --set full ./bench_gdn_prefill 2048 16 64 128
 
 #include <cstdio>
 #include <cstdlib>
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
     }
 
     // Defaults: Qwen3.5-122B DeltaNet GVA config
-    int total_seqlen  = (positional.size() > 0) ? atoi(positional[0]) : 3823;
+    int total_seqlen  = (positional.size() > 0) ? atoi(positional[0]) : 2048;
     int num_q_heads   = (positional.size() > 1) ? atoi(positional[1]) : 16;
     int num_v_heads   = (positional.size() > 2) ? atoi(positional[2]) : 64;
     int head_dim      = (positional.size() > 3) ? atoi(positional[3]) : 128;

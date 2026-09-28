@@ -25,7 +25,7 @@ namespace
 struct Options
 {
     std::string op = "all";
-    long long tokens = 3823;
+    long long tokens = 2048;
     long long hidden = 3072;
     size_t mib = 0;
     int warmup = 100;

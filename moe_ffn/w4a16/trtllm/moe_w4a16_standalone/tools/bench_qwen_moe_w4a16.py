@@ -16,8 +16,8 @@ FINAL_RE = re.compile(
 
 CASES = [
     # Interprets the user-provided shapes as output(E,M,N), input(E,M,K).
-    ("gate_up_prefill", 8, 3823, 3072, 2048, "prefill"),
-    ("down_prefill", 8, 3823, 1024, 3072, "prefill"),
+    ("gate_up_prefill", 8, 2048, 3072, 2048, "prefill"),
+    ("down_prefill", 8, 2048, 1024, 3072, "prefill"),
     ("gate_up_decode", 8, 1, 3072, 2048, "decode"),
     ("down_decode", 8, 1, 1024, 3072, "decode"),
 ]

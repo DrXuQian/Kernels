@@ -393,7 +393,7 @@ static void usage(char const* argv0) {
   printf("Usage: %s [seqlen] [q_heads] [v_heads] [head_dim] "
          "[--segment-tokens N] [--post-rounds N] [--mode checkpoint|split|both|state_checkpoint|state_split|state_both|scan_transition|scan_split|scan_both|zero_split|correction_full|cluster_scan_split|cluster_scan_both|zero_v_correction_full|stream_segments|stream_segments_post_serial|stream_segments_post_overlap|stream_segments_rms_gate_serial|stream_segments_rms_gate_overlap] [--check] [--bench W I]\n",
          argv0);
-  printf("Default shape: 3823 16 64 128, segment_tokens=1024, mode=split\n");
+  printf("Default shape: 2048 16 64 128, segment_tokens=1024, mode=split\n");
 }
 
 int main(int argc, char** argv) {
@@ -418,7 +418,7 @@ int main(int argc, char** argv) {
   bool check = false;
   argc = strip_check_arg(argc, argv, &check);
 
-  int total_seqlen = (argc > 1) ? atoi(argv[1]) : 3823;
+  int total_seqlen = (argc > 1) ? atoi(argv[1]) : 2048;
   int num_q_heads = (argc > 2) ? atoi(argv[2]) : 16;
   int num_v_heads = (argc > 3) ? atoi(argv[3]) : 64;
   int head_dim = (argc > 4) ? atoi(argv[4]) : 128;

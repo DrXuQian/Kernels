@@ -32,7 +32,7 @@ Default model-repeat assumptions used by `bench_all.sh` and the summary tools:
 | full_attention_layers | 12 |
 | linear_attention_layers | 36 |
 | moe_ffn_layers | 48 |
-| prefill tokens | 3823 |
+| prefill tokens | 2048 |
 | decode tokens | 1 |
 | num_experts | 256 |
 | num_experts_per_tok | 8 |

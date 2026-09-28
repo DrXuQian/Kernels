@@ -37,7 +37,7 @@ Gate/up projection:
 
 ```bash
 moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
-  --experts=8 --m_per_expert=3823 --n=2048 --k=3072 \
+  --experts=8 --m_per_expert=2048 --n=2048 --k=3072 \
   --group_size=128 --tactic=moe_ffn/w4a16/machete/machete_moe_tactics_h800.cache \
   --warmup=20 --iters=100 --no_checksum
 ```
@@ -46,7 +46,7 @@ Down projection:
 
 ```bash
 moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
-  --experts=8 --m_per_expert=3823 --n=3072 --k=1024 \
+  --experts=8 --m_per_expert=2048 --n=3072 --k=1024 \
   --group_size=128 --tactic=moe_ffn/w4a16/machete/machete_moe_tactics_h800.cache \
   --warmup=20 --iters=100 --no_checksum
 ```
@@ -63,7 +63,7 @@ restores the benchmark input and continues with the requested timing loop.
 
 ```bash
 moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
-  --experts=8 --m_per_expert=3823 --n=2048 --k=3072 \
+  --experts=8 --m_per_expert=2048 --n=2048 --k=3072 \
   --group_size=128 --warmup=1 --iters=1 --verify --no_checksum
 ```
 
@@ -76,7 +76,7 @@ it remains usable for the full Qwen prefill shape.
 
 ```bash
 moe_ffn/w4a16/machete/build_cmake_release/bench_machete_moe \
-  --experts=8 --m_per_expert=3823 --n=2048 --k=3072 \
+  --experts=8 --m_per_expert=2048 --n=2048 --k=3072 \
   --group_size=128 --warmup=1 --iters=1 --verify_reference \
   --verify_samples=4096 --no_checksum
 ```
@@ -88,8 +88,8 @@ Measured with CUDA events on H800, FP16 activations, INT4 weights, group size
 
 | Shape | Machete grouped MoE | TRT-LLM grouped MoE | Speedup |
 |---|---:|---:|---:|
-| gate/up `experts=8,m=3823,n=2048,k=3072` | 604.848 us | 1240.5 us | 2.05x |
-| down `experts=8,m=3823,n=3072,k=1024` | 358.692 us | 682.7 us | 1.90x |
+| gate/up `experts=8,m=2048,n=2048,k=3072` | 604.848 us | 1240.5 us | 2.05x |
+| down `experts=8,m=2048,n=3072,k=1024` | 358.692 us | 682.7 us | 1.90x |
 
 TRT-LLM baseline commands used the checked-in
 `moe_ffn/w4a16/trtllm/moe_w4a16_standalone/tactics_h800.cache`.

@@ -18,15 +18,15 @@
     "MoERunner",
     2
   ],
-  "('trtllm::fused_moe::gemm1', 'MoERunner', ((3823, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((2048, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
     "MoERunner",
     11
   ],
-  "('trtllm::fused_moe::gemm1', 'MoERunner', ((3823, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((2048, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
     "MoERunner",
     1
   ],
-  "('trtllm::fused_moe::gemm1', 'MoERunner', ((3823, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
+  "('trtllm::fused_moe::gemm1', 'MoERunner', ((2048, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
     "MoERunner",
     2
   ],
@@ -42,15 +42,15 @@
     "MoERunner",
     19
   ],
-  "('trtllm::fused_moe::gemm2', 'MoERunner', ((3823, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((2048, 3072), (8, 1536, 3072), (0,), (8, 3072, 768), (0,)))": [
     "MoERunner",
     20
   ],
-  "('trtllm::fused_moe::gemm2', 'MoERunner', ((3823, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((2048, 3072), (8, 3072, 3072), (0,), (8, 3072, 1536), (0,)))": [
     "MoERunner",
     20
   ],
-  "('trtllm::fused_moe::gemm2', 'MoERunner', ((3823, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
+  "('trtllm::fused_moe::gemm2', 'MoERunner', ((2048, 3072), (8, 768, 3072), (0,), (8, 3072, 384), (0,)))": [
     "MoERunner",
     21
   ]

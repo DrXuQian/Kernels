@@ -16,9 +16,10 @@ OUT_DIR="${OUT_DIR:-$ROOT_DIR/.bench_logs/attention_$BENCH_RUN_ID}"
 PYTHON="${PYTHON:-python3}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$ROOT_DIR/.triton_cache}"
 
-PREFILL_TOKENS="${PREFILL_TOKENS:-3823}"
+PREFILL_TOKENS="${PREFILL_TOKENS:-2048}"
 DECODE_TOKENS="${DECODE_TOKENS:-1}"
-CTX_LEN="${CTX_LEN:-3823}"
+CTX_LEN="${CTX_LEN:-2048}"
+DECODE_CTX_LEN="${DECODE_CTX_LEN:-100000}"
 
 LINEAR_Q_HEADS="${LINEAR_Q_HEADS:-16}"
 LINEAR_V_HEADS="${LINEAR_V_HEADS:-64}"
@@ -80,11 +81,11 @@ Environment variables:
   RUN_DIR                 Benchmark working directory. Default: PERF_MODEL_DIR or repo root.
   OUT_DIR                 Log output directory. Default: .bench_logs/attention_<timestamp>
   TRITON_CACHE_DIR        Triton JIT cache. Default: .triton_cache
-  PREFILL_TOKENS          Default: 3823
+  PREFILL_TOKENS          Default: 2048
   CTX_LEN                 FlashAttention KV cache / context length, used for the
                           decode case and as the prefill context length (the
                           PREFILL_TOKENS new tokens attend to CTX_LEN context).
-                          Default: 3823
+                          Default: 2048
   BENCH_WARMUP            Default: 0
   BENCH_ITERS             Default: 1
   TRITON_DTYPE            fp16 or bf16. Default: bf16
@@ -553,6 +554,7 @@ else
   echo "prefill tokens: $PREFILL_TOKENS"
   echo "decode tokens:  $DECODE_TOKENS"
   echo "ctx len:        $CTX_LEN"
+  echo "decode ctx len: $DECODE_CTX_LEN"
   echo "bench:          warmup=$BENCH_WARMUP iters=$BENCH_ITERS"
   if [[ ${#CASE_FILTERS[@]} -gt 0 ]]; then
     echo "case filters:   ${CASE_FILTERS[*]}"
@@ -580,7 +582,7 @@ run_python_case "linear_triton_prefill_gdn_core_only" \
 
 run_python_case "flashinfer_decode_full_attn" \
   "flash_attn/bench_flash_infer.py" \
-  decode "$CTX_LEN" "$FULL_ATTN_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
+  decode "$DECODE_CTX_LEN" "$FULL_ATTN_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
   --dtype "$FLASH_DTYPE" --use-tensor-cores --bench "$BENCH_WARMUP" "$BENCH_ITERS"
 
 flashinfer_prefill_extra=()
@@ -595,7 +597,7 @@ run_python_case "flashinfer_prefill_full_attn" \
 
 run_python_case "flash_attn_decode_full_attn" \
   "flash_attn/bench_flash_attn.py" \
-  decode "$CTX_LEN" "$FULL_ATTN_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
+  decode "$DECODE_CTX_LEN" "$FULL_ATTN_HEADS" "$FULL_ATTN_KV_HEADS" "$FULL_ATTN_HEAD_DIM" \
   --bench "$BENCH_WARMUP" "$BENCH_ITERS"
 
 run_python_case "flash_attn_prefill_full_attn" \

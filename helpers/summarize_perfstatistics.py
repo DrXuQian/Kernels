@@ -79,6 +79,9 @@ ATTN_CTX_CMD_RE = re.compile(r"--ctx[=\s]+([0-9]+)\b")
 ATTN_DECODE_CMD_RE = re.compile(r"\bdecode\s+([0-9]+)\b")
 CASE_LOG_FOOTER_KEYS = ("finished_at", "failed_at", "exit_status")
 CASE_LOG_OUTPUT_MARKER = "---- output ----"
+CASE_REPLACEMENTS = {
+    "linear_prefill_flashinfer_gdn": "linear_prefill_gdn_qsa_sm80",
+}
 
 MODEL_CONFIG_ARGS = (
     ("model_layers", "model_layers"),
@@ -501,7 +504,7 @@ def main() -> int:
     parser.add_argument(
         "--measured-seq-len",
         type=int,
-        help="Prefill tokens the benchmarks ran with (PREFILL_TOKENS). Default: read from the flash_attn prefill command, else 3823",
+        help="Prefill tokens the benchmarks ran with (PREFILL_TOKENS). Default: read from the flash_attn prefill command, else 2048",
     )
     parser.add_argument(
         "--measured-used-len",
@@ -659,9 +662,19 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
+    expected_set = set(expected)
+    superseded = {old for old, new in CASE_REPLACEMENTS.items() if new in expected_set}
+    if superseded:
+        expected = [label for label in expected if label not in superseded]
+        case_logs = {label: info for label, info in case_logs.items() if label not in superseded}
+        rows = [row for row in rows if str(row["case"]) not in superseded]
+        model_rows = [row for row in model_rows if str(row["case"]) not in superseded]
+
     rows = expand_deduped_summary_rows(rows, case_logs)
     present = {str(row["case"]) for row in rows}
-    candidates = list(expected) + [label for label in case_logs if label not in expected]
+    # expected_cases.txt is the logical case set. Ignore stale logs left by
+    # superseded implementations; use logs as the fallback for older runs only.
+    candidates = list(expected) if expected else list(case_logs)
     missing_rows: list[dict[str, object]] = []
     for label in candidates:
         if label in present:
@@ -693,7 +706,7 @@ def main() -> int:
         )
         attach_shape_estimates(missing_rows[-1])
     detected_seq, detected_used, detected_from = detect_measured_lengths(rows)
-    measured_seq_len = args.measured_seq_len or detected_seq or 3823
+    measured_seq_len = args.measured_seq_len or detected_seq or 2048
     measured_used_len = args.measured_used_len or detected_used or measured_seq_len
     if measured_seq_len <= 0 or measured_used_len <= 0:
         parser.error("--measured-seq-len and --measured-used-len must be positive")
@@ -919,7 +932,13 @@ def main() -> int:
         }
         projection_metrics: dict[tuple[int, int], dict[str, dict[str, str]]] = {}
 
-        print_rows(rows + total_rows, headers, args.tsv)
+        if args.phase != "all":
+            display_rows = [r for r in rows if r.get("phase") == args.phase]
+            display_totals = [t for t in total_rows if t["phase"] == args.phase]
+        else:
+            display_rows = rows
+            display_totals = total_rows
+        print_rows(display_rows + display_totals, headers, args.tsv)
         print()
         print(
             "model calls per forward: "
@@ -1080,15 +1099,59 @@ def main() -> int:
         return 1
 
     if args.model_summary_dir:
+        chart_phases_arg = ("prefill", "decode") if args.phase == "all" else (args.phase,)
+        summary_model_rows = model_rows
+        summary_config = model_config
+        summary_missing = missing_cases
+        if args.phase != "all":
+            summary_model_rows = [
+                e for e in model_rows
+                if classify_phase(str(e["case"])) == args.phase or classify_module(str(e["case"])) == "Sampling"
+            ]
+            summary_config = dict(model_config or {})
+            if args.phase == "prefill":
+                summary_config["sampling_decode_count"] = 0
+            elif args.phase == "decode":
+                summary_config["sampling_prefill_count"] = 0
+            summary_config = summary_config or None
+            summary_missing = [m for m in missing_cases if args.phase in m["phases"]]
+        top_title = "Perfstatistics Model Latency Summary"
+        top_source = "perfstatistics"
+        top_suffix = ""
+        if args.scale:
+            # Promote the first --scale target: the top-level charts and tables
+            # use its projected per-call latencies instead of the measured baseline.
+            top_seq, top_used = args.scale[0]
+            top_seq = top_seq or measured_seq_len
+            top_used = top_used or measured_used_len
+            projected_rows: list[dict[str, object]] = []
+            for entry in summary_model_rows:
+                label = str(entry["case"])
+                proj = dict(entry)
+                proj["latency_us"] = projected_latency_us(
+                    label, classify_phase(label), float(entry["latency_us"]), top_seq, top_used
+                )
+                proj["source"] = f"{entry['source']} (projected)"
+                projected_rows.append(proj)
+            summary_model_rows = projected_rows
+            note = f"seq_len={top_seq} used_len={top_used}"
+            top_title = f"Perfstatistics Model Latency Summary (projected @ {note})"
+            top_source = (
+                f"perfstatistics projected to {note} from measured "
+                f"seq_len={measured_seq_len} used_len={measured_used_len}"
+            )
+            top_suffix = f" @ seq {top_seq} / KV {top_used}"
         report_path, summary_text = write_model_latency_summary(
-            model_rows,
+            summary_model_rows,
             args.model_summary_dir,
-            title="Perfstatistics Model Latency Summary",
-            source_name="perfstatistics",
+            title=top_title,
+            source_name=top_source,
             bench_out_dir=bench_out_dir,
-            model_config=model_config,
+            model_config=summary_config,
             case_calls=case_calls,
-            missing_cases=missing_cases,
+            missing_cases=summary_missing,
+            chart_suffix=top_suffix,
+            chart_phases=chart_phases_arg,
         )
         print()
         print(summary_text)
@@ -1154,6 +1217,7 @@ def main() -> int:
                     case_calls=case_calls,
                     missing_cases=missing_cases,
                     chart_suffix=f" @ seq {target_seq} / KV {target_used}",
+                    chart_phases=chart_phases_arg,
                 )
                 scaled = compute_model_summary(scaled_model_rows, bench_out_dir, scaled_config or None, case_calls)
                 comparison_rows.append(

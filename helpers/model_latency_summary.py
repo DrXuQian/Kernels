@@ -900,6 +900,7 @@ def write_model_latency_summary(
     case_calls: dict[CaseCallsKey, int] | None = None,
     missing_cases: list[dict[str, str]] | None = None,
     chart_suffix: str = "",
+    chart_phases: tuple[str, ...] = ("prefill", "decode"),
 ) -> tuple[Path, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     computed = compute_model_summary(cases, bench_out_dir, model_config, case_calls)
@@ -908,33 +909,37 @@ def write_model_latency_summary(
     duplicates: list[dict[str, str]] = computed["duplicates"]  # type: ignore[assignment]
     effective_config: dict[str, int] = computed["effective_config"]  # type: ignore[assignment]
 
+    phase_colors = {"prefill": "#6B8FD6", "decode": "#D67C4E"}
+    phase_totals: dict[str, float] = model_summary["phase_totals"]  # type: ignore[assignment]
+
     chart_files = [
         out_dir / "model_latency_phase_bar.png",
         out_dir / "model_latency_module_bar.png",
-        out_dir / "model_latency_prefill_modules_pie.png",
-        out_dir / "model_latency_decode_modules_pie.png",
-        out_dir / "model_latency_prefill_operators_bar.png",
-        out_dir / "model_latency_prefill_operators_pie.png",
-        out_dir / "model_latency_decode_operators_bar.png",
-        out_dir / "model_latency_decode_operators_pie.png",
     ]
-
-    phase_totals: dict[str, float] = model_summary["phase_totals"]  # type: ignore[assignment]
     write_bar_chart(
         chart_files[0],
         f"Model Latency By Phase{chart_suffix}",
-        [
-            ("prefill", phase_totals.get("prefill", 0.0), "#6B8FD6"),
-            ("decode", phase_totals.get("decode", 0.0), "#D67C4E"),
-        ],
+        [(ph, phase_totals.get(ph, 0.0), phase_colors[ph]) for ph in chart_phases],
     )
     write_bar_chart(chart_files[1], f"Model Latency By Module{chart_suffix}", module_rows(model_summary))
-    write_pie_chart(chart_files[2], f"Prefill Module Share{chart_suffix}", module_rows(model_summary, "prefill"), limit=8)
-    write_pie_chart(chart_files[3], f"Decode Module Share{chart_suffix}", module_rows(model_summary, "decode"), limit=8)
-    write_bar_chart(chart_files[4], f"Prefill Operator Latencies{chart_suffix}", operator_rows(model_summary, "prefill", limit=30), "Latency (us)")
-    write_pie_chart(chart_files[5], f"Prefill Operator Share{chart_suffix}", operator_rows(model_summary, "prefill"), limit=14)
-    write_bar_chart(chart_files[6], f"Decode Operator Latencies{chart_suffix}", operator_rows(model_summary, "decode", limit=30), "Latency (us)")
-    write_pie_chart(chart_files[7], f"Decode Operator Share{chart_suffix}", operator_rows(model_summary, "decode"), limit=14)
+    for ph in chart_phases:
+        pie = out_dir / f"model_latency_{ph}_modules_pie.png"
+        op_bar = out_dir / f"model_latency_{ph}_operators_bar.png"
+        op_pie = out_dir / f"model_latency_{ph}_operators_pie.png"
+        write_pie_chart(pie, f"{ph.capitalize()} Module Share{chart_suffix}", module_rows(model_summary, ph), limit=8)
+        write_bar_chart(op_bar, f"{ph.capitalize()} Operator Latencies{chart_suffix}", operator_rows(model_summary, ph, limit=30), "Latency (us)")
+        write_pie_chart(op_pie, f"{ph.capitalize()} Operator Share{chart_suffix}", operator_rows(model_summary, ph), limit=14)
+        chart_files.extend([pie, op_bar, op_pie])
+    # Drop stale charts for phases we are not drawing (e.g. prefill charts in a decode-only run).
+    for ph in ("prefill", "decode"):
+        if ph in chart_phases:
+            continue
+        for stale in (
+            out_dir / f"model_latency_{ph}_modules_pie.png",
+            out_dir / f"model_latency_{ph}_operators_bar.png",
+            out_dir / f"model_latency_{ph}_operators_pie.png",
+        ):
+            stale.unlink(missing_ok=True)
 
     report_path = out_dir / "model_latency_summary.md"
     write_markdown_report(

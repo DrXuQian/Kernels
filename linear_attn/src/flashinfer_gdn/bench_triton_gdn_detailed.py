@@ -47,7 +47,7 @@ H = H_v     # sab_heads = max(q, v)
 D = 128
 scale = 1.0 / math.sqrt(D)
 
-for T in [256, 1024, 2048, 3823, 8192]:
+for T in [256, 1024, 2048, 2048, 8192]:
     print(f"═══ seqlen={T}, B={B}, q_heads={H_qk}, v_heads={H_v}, dim={D} ═══")
 
     # fla layout: [B, H, T, D]

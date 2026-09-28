@@ -20,7 +20,7 @@ namespace
 struct Args
 {
     int experts = 8;
-    int m_per_expert = 3823;
+    int m_per_expert = 2048;
     int n = 2048;
     int k = 3072;
     int group_size = 128;

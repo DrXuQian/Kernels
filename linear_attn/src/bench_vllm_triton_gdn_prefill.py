@@ -4,7 +4,7 @@
 Bench vLLM's Triton/FLA GDN prefill path.
 
 Default Qwen3.5-122B linear-attention shape:
-  mixed_qkv [3823, 12288], a/b [3823, 64]
+  mixed_qkv [2048, 12288], a/b [2048, 64]
   q/k heads=16, value heads=64, head_dim=128
 
 The default path matches vLLM prefill after causal_conv1d:
@@ -12,7 +12,7 @@ The default path matches vLLM prefill after causal_conv1d:
 
 Usage:
   python3 linear_attn/src/bench_vllm_triton_gdn_prefill.py
-  python3 linear_attn/src/bench_vllm_triton_gdn_prefill.py 3823 16 64 128 1
+  python3 linear_attn/src/bench_vllm_triton_gdn_prefill.py 2048 16 64 128 1
   python3 linear_attn/src/bench_vllm_triton_gdn_prefill.py --bench 10 100
 """
 
@@ -30,7 +30,7 @@ from vllm_triton_gdn.ops import chunk_gated_delta_rule, fused_post_conv_prep
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("seq_len", nargs="?", type=int, default=3823)
+    parser.add_argument("seq_len", nargs="?", type=int, default=2048)
     parser.add_argument("q_heads", nargs="?", type=int, default=16)
     parser.add_argument("v_heads", nargs="?", type=int, default=64)
     parser.add_argument("head_dim", nargs="?", type=int, default=128)

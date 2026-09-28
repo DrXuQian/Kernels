@@ -32,7 +32,7 @@ __half host_from_float<__half>(float value) {
 }
 
 struct Options {
-    int seq = 3823;
+    int seq = 2048;
     int dim = 12288;
     int width = 4;
     int batch = 1;

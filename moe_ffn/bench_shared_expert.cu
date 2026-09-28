@@ -53,7 +53,7 @@ namespace
 struct Options
 {
     std::string op = "gate_gemv";
-    int tokens = 3823;
+    int tokens = 2048;
     int hidden = 3072;
     int out_dim = 1;
     std::string dtype = "fp16";

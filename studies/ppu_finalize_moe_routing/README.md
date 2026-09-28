@@ -37,26 +37,26 @@ Default shape mirrors the TRT-LLM auxiliary standalone default:
 
 ```bash
 ./bench_finalize_moe_routing_study
-./bench_finalize_moe_routing_study 3823 8 1024 fp16 --bench 20 100
+./bench_finalize_moe_routing_study 2048 8 1024 fp16 --bench 20 100
 ```
 
 Compare both implementations:
 
 ```bash
-./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode both --bench 20 100
+./bench_finalize_moe_routing_study 2048 8 1024 fp16 --mode both --bench 20 100
 ```
 
 Run one implementation only:
 
 ```bash
-./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode baseline --bench 20 100
-./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 20 100
+./bench_finalize_moe_routing_study 2048 8 1024 fp16 --mode baseline --bench 20 100
+./bench_finalize_moe_routing_study 2048 8 1024 fp16 --mode optimized --bench 20 100
 ```
 
 Run exactly one timed optimized launch:
 
 ```bash
-./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 0 1
+./bench_finalize_moe_routing_study 2048 8 1024 fp16 --mode optimized --bench 0 1
 ```
 
 Other options:
@@ -73,7 +73,7 @@ Other options:
 
 ```bash
 nsys profile --trace=cuda -o finalize_study \
-  ./bench_finalize_moe_routing_study 3823 8 1024 fp16 --mode optimized --bench 0 1
+  ./bench_finalize_moe_routing_study 2048 8 1024 fp16 --mode optimized --bench 0 1
 nsys stats finalize_study.nsys-rep --report cuda_gpu_trace
 ```
 
@@ -86,8 +86,8 @@ this Markdown yet.
 | Shape / mode | Baseline median | Optimized median | Speedup |
 |---|---:|---:|---:|
 | `tokens=1 topk=8 hidden=1024 fp16 scales=1` | 0.0133 ms | 0.0061 ms | 2.18x |
-| `tokens=3823 topk=8 hidden=1024 fp16 scales=1` | 0.1104 ms | 0.0473 ms | 2.33x |
-| `tokens=3823 topk=8 hidden=1024 fp16 scales=0` | 0.0865 ms | 0.0470 ms | 1.84x |
+| `tokens=2048 topk=8 hidden=1024 fp16 scales=1` | 0.1104 ms | 0.0473 ms | 2.33x |
+| `tokens=2048 topk=8 hidden=1024 fp16 scales=0` | 0.0865 ms | 0.0470 ms | 1.84x |
 | `tokens=128 topk=8 hidden=1024 bf16 scales=1` | 0.0152 ms | 0.0067 ms | 2.27x |
 
 Correctness checks passed with `max_abs=0` for the rows above. Additional

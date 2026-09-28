@@ -42,13 +42,13 @@ CUDA_ROOT=/path/to/cuda make clean all ARCH=-arch=sm_90a
 Run all cases for the Qwen3.5 prefill shape:
 
 ```bash
-./bench_residual_add_bw --op=all --tokens=3823 --hidden=3072 --warmup=100 --iters=200
+./bench_residual_add_bw --op=all --tokens=2048 --hidden=3072 --warmup=100 --iters=200
 ```
 
 Run larger sequence lengths:
 
 ```bash
-for t in 3823 8192 16384 32768 65536 131072; do
+for t in 2048 8192 16384 32768 65536 131072; do
   ./bench_residual_add_bw --op=all --tokens=$t --hidden=3072 --warmup=100 --iters=200
 done
 ```
@@ -95,9 +95,9 @@ On the local H800 PCIe, the main observations were:
 
 | case | effective bandwidth |
 |---|---:|
-| scalar residual add, Qwen3.5 shape `(3823,3072)` | ~1.36 TB/s |
+| scalar residual add, Qwen3.5 shape `(2048,3072)` | ~1.36 TB/s |
 | scalar residual add, large shape | ~1.43 TB/s |
-| vectorized half8 residual add, Qwen3.5 shape `(3823,3072)` | ~1.68 TB/s |
+| vectorized half8 residual add, Qwen3.5 shape `(2048,3072)` | ~1.68 TB/s |
 | vectorized half8 residual add, large shape | ~1.84 TB/s |
 | SM copy kernel large shape | ~1.77 TB/s |
 | `cudaMemcpyAsync` D2D large shape | ~1.86 TB/s |

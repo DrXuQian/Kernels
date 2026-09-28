@@ -111,16 +111,16 @@ make bench_linear_ops
 ./bench_gated_delta_net [n_tokens] [heads] [head_dim] [n_seqs] --dtype fp16  # default dtype: float
 
 # FP16/BF16 dense adjuncts.
-../general/bench_cublas_gemm --m=3823 --n=64 --k=3072 --dtype fp16 --bench 0 1
-./bench_linear_ops --op=residual_add --tokens=3823 --hidden=3072 --dtype fp16 --bench 0 1
+../general/bench_cublas_gemm --m=2048 --n=64 --k=3072 --dtype fp16 --bench 0 1
+./bench_linear_ops --op=residual_add --tokens=2048 --hidden=3072 --dtype fp16 --bench 0 1
 ./bench_fused_rms_norm_gate 64 128 --dtype fp16 --bench 0 1
 
 # cuLA chunked prefill (Hopper only)
-./bench_kda_prefill [seq_len] [num_heads] [head_dim] [num_seqs] # default: 3823 64 128 1
+./bench_kda_prefill [seq_len] [num_heads] [head_dim] [num_seqs] # default: 2048 64 128 1
 
 # FlashInfer GDN prefill (Hopper only, Qwen3.5 GVA fast path)
-./bench_gdn_prefill [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs] --dtype bf16 # default: 3823 16 64 128 1
-./bench_gdn_prefill 3823 16 48 128 1 --dtype fp16 --bench 0 1 # Qwen3.5-27B fp16 GVA path
+./bench_gdn_prefill [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs] --dtype bf16 # default: 2048 16 64 128 1
+./bench_gdn_prefill 2048 16 48 128 1 --dtype fp16 --bench 0 1 # Qwen3.5-27B fp16 GVA path
 
 # vLLM Triton GDN prefill after causal_conv1d
 python3 src/bench_vllm_triton_gdn_prefill.py [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs]
@@ -132,10 +132,10 @@ python3 src/bench_vllm_triton_gdn_decode.py [batch] [q_heads] [v_heads] [head_di
 ## ncu Profile
 
 ```bash
-ncu --set full --kernel-name "causal_conv1d_fwd"    -o conv_fwd    ./bench_conv1d_fwd 3823 12288 4 1
+ncu --set full --kernel-name "causal_conv1d_fwd"    -o conv_fwd    ./bench_conv1d_fwd 2048 12288 4 1
 ncu --set full --kernel-name "causal_conv1d_update"  -o conv_update ./bench_conv1d_update 12288 4 1
 ncu --set full --kernel-name "gated_delta_net"       -o gdn         ./bench_gated_delta_net 1 64 128 1
-ncu --set full                                       -o kda         ./bench_kda_prefill 3823 64 128 1
+ncu --set full                                       -o kda         ./bench_kda_prefill 2048 64 128 1
 
 # vLLM Triton decode is a single kernel.
 nsys profile --force-overwrite=true -o vllm_gdn_decode \

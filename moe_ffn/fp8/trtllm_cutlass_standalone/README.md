@@ -59,14 +59,14 @@ MiniMax-M2.7 TP=1 gate/up:
 
 ```bash
 moe_ffn/fp8/trtllm_cutlass_standalone/build_cmake_release/bench_moe_fp8_blockscale_gemm \
-  --experts=8 --m_per_expert=3823 --n=3072 --k=3072 --bench 0 1
+  --experts=8 --m_per_expert=2048 --n=3072 --k=3072 --bench 0 1
 ```
 
 MiniMax-M2.7 TP=1 down:
 
 ```bash
 moe_ffn/fp8/trtllm_cutlass_standalone/build_cmake_release/bench_moe_fp8_blockscale_gemm \
-  --experts=8 --m_per_expert=3823 --n=3072 --k=1536 --bench 0 1
+  --experts=8 --m_per_expert=2048 --n=3072 --k=1536 --bench 0 1
 ```
 
 Decode-one-token variants use `--m_per_expert=1`.
@@ -140,7 +140,7 @@ bandwidth reference:
 | gate/up `(experts=8,m=1,n=3072,k=3072)` | `128x64x128` | `64x128x128` | 60.992 us | 50.879 us | 1.486 TB/s |
 | down `(experts=8,m=1,n=3072,k=1536)` | `128x64x128` | `64x128x128` | 30.783 us | 20.352 us | 1.859 TB/s |
 
-For TP1 prefill (`m_per_expert=3823`), the sweep kept the original
+For TP1 prefill (`m_per_expert=2048`), the sweep kept the original
 `128x64x128` tile for both gate/up and down.
 
 An extra decode-only study tried adding `tile_n=32` to the grouped-GEMM static

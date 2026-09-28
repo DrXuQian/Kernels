@@ -6,7 +6,7 @@ Qwen3.5-122B: num_heads=32, num_kv_heads=2, head_dim=256
 Usage:
   python3 bench_flash_attn.py decode [ctx_len] [num_heads] [num_kv_heads] [head_dim]
   python3 bench_flash_attn.py prefill [seq_len] [num_heads] [num_kv_heads] [head_dim] [--ctx ctx_len]
-  python3 bench_flash_attn.py decode 3823 --bench 20 100
+  python3 bench_flash_attn.py decode 2048 --bench 20 100
   python3 bench_flash_attn.py prefill 1024 --ctx 8192 --bench 20 100
 
 --ctx sets the K/V (context) length independently of seq_len, modelling
@@ -53,7 +53,7 @@ while i < len(args):
         i += 1
 
 mode        = clean_args[0] if len(clean_args) > 0 else "decode"
-seq_len     = int(clean_args[1]) if len(clean_args) > 1 else 3823
+seq_len     = int(clean_args[1]) if len(clean_args) > 1 else 2048
 NUM_HEADS   = int(clean_args[2]) if len(clean_args) > 2 else 32
 NUM_KV_HEADS= int(clean_args[3]) if len(clean_args) > 3 else 2
 HEAD_DIM    = int(clean_args[4]) if len(clean_args) > 4 else 256

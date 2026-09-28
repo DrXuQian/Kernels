@@ -4,7 +4,7 @@ This note explains why `linear_prefill_flashinfer_gdn` has low utilization for
 the Qwen3.5-122B-A10B prefill shape:
 
 ```text
-total_seqlen=3823, num_seqs=1, q_heads=16, k_heads=16, v_heads=64, head_dim=128
+total_seqlen=2048, num_seqs=1, q_heads=16, k_heads=16, v_heads=64, head_dim=128
 ```
 
 ## Summary
@@ -120,7 +120,7 @@ single-TU baseline shows the wave-quantization effect:
 ```bash
 for hv in 32 64 96 128; do
   studies/linear_prefill_flashinfer_gdn/bench_gdn_tile_study_single_tu \
-    3823 16 $hv 128 1 --tile 64 --variant default --bench 5 20
+    2048 16 $hv 128 1 --tile 64 --variant default --bench 5 20
 done
 ```
 
@@ -139,10 +139,10 @@ per-segment work.
 
 ## Serial Work Inside Each CTA
 
-For `seqlen=3823` and tile `64`, each CTA processes:
+For `seqlen=2048` and tile `64`, each CTA processes:
 
 ```text
-ceil(3823 / 64) = 60 chunks
+ceil(2048 / 64) = 60 chunks
 ```
 
 These chunks are not independent. The GDN/DeltaRule state update is recurrent, so
@@ -211,7 +211,7 @@ The prototype is functional and memcheck-clean:
 ```bash
 make blockdv_single_tu -j
 compute-sanitizer --tool memcheck --print-limit 1 \
-  ./bench_gdn_blockdv_study_single_tu 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default
+  ./bench_gdn_blockdv_study_single_tu 2048 16 64 128 1 --tile 64 --block-dv 64 --variant default
 ```
 
 However it is slower on H800:
@@ -224,7 +224,7 @@ However it is slower on H800:
 The likely reason is structural: this CUTLASS collective duplicates the QK/KK
 and alpha/beta auxiliary path for every V slice. The V/state work is split, but
 the auxiliary work is not shared across the two `DV=64` CTAs. So for
-`T=3823,Hqk=16,Hv=64,D=128`, extra occupancy is outweighed by duplicated work.
+`T=2048,Hqk=16,Hv=64,D=128`, extra occupancy is outweighed by duplicated work.
 The prototype is intended for performance diagnosis of the fused prefill kernel;
 it should stay isolated and should not replace the default benchmark.
 
@@ -244,7 +244,7 @@ independent logical sequence with `InitStateFromInput=true`, using those boundar
 states as initial state.
 
 This raises only the timed second pass from `1 * 64 = 64` CTAs to
-`segments * 64` CTAs. For the target `T=3823,Hqk=16,Hv=64,D=128`, the best
+`segments * 64` CTAs. For the target `T=2048,Hqk=16,Hv=64,D=128`, the best
 measured split was `segment_tokens=768`, which produces 5 segments and 320 CTAs:
 
 | Path | CTAs | H800 CUDA-event time |
@@ -358,7 +358,7 @@ For systems with NCU counters enabled, the direct metric command is:
 ```bash
 ncu --csv --page raw --print-units base --kernel-name-base demangled \
   -k regex:.*FlatKernelTmaWarpSpecializedDeltaRule.* --launch-count 1 \
-  ./bench_gdn_tile_study_single_tu 3823 16 64 128 --tile 64 --variant default
+  ./bench_gdn_tile_study_single_tu 2048 16 64 128 --tile 64 --variant default
 ```
 
 ### Zero-State Output Plus Prefix Correction
@@ -508,7 +508,7 @@ for one head, and composes the prefix input states consumed by the existing
 init-state GDN split pass. Correctness on the target shape is exact:
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode cluster_scan_both --check
 check: max_abs=0 max_rel=0 elements=31318016
 ```
@@ -570,12 +570,12 @@ preserving Q/K, QK/KK, `S@K`, `NewV`, output, and state-update math.
 The path is exact against the generic correction path:
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --mode zero_v_correction_full --check
 check: max_abs=0 max_rel=0 elements=31318016
 
 compute-sanitizer --tool memcheck --print-limit 1 \
-  ./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+  ./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --mode zero_v_correction_full
 ERROR SUMMARY: 0 errors
 ```
@@ -603,7 +603,7 @@ for segment `i` can run on a separate stream while segment `i+1` is running.
 The study mode is exact for GDN output:
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --post-rounds 32 \
   --mode stream_segments_post_overlap --check
 check: max_abs=0 max_rel=0 elements=31318016
@@ -639,7 +639,7 @@ kernel used by the linear-attention block. The gate is chunk-local and has shape
 `(segment_tokens * num_v_heads, head_dim)`.
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --mode stream_segments_rms_gate_overlap --check
 check: max_abs=0 max_rel=0 elements=31318016
 ```

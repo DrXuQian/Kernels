@@ -15,9 +15,10 @@ PYTHON_BIN="${PYTHON:-$(command -v python3 || true)}"
 ATTN_BENCH_WARMUP="${ATTN_BENCH_WARMUP:-0}"
 ATTN_BENCH_ITERS="${ATTN_BENCH_ITERS:-1}"
 
-PREFILL_TOKENS=3823
+PREFILL_TOKENS=2048
 DECODE_TOKENS=1
-CTX_LEN="${CTX_LEN:-3823}"
+CTX_LEN="${CTX_LEN:-2048}"
+DECODE_CTX_LEN="${DECODE_CTX_LEN:-100000}"
 LINEAR_DIM=12288
 HIDDEN_DIM=3072
 CONV_WIDTH=4
@@ -1089,6 +1090,7 @@ else
   echo "prefill tokens: $PREFILL_TOKENS"
   echo "decode tokens:  $DECODE_TOKENS"
   echo "ctx len:        $CTX_LEN"
+  echo "decode ctx len: $DECODE_CTX_LEN"
   echo "moe prefill:    TensorRT-LLM components"
   echo "moe decode:     $DECODE_MOE_BACKEND components"
   echo "decode dense:   $DECODE_CUBLAS_BACKEND"
@@ -1208,7 +1210,7 @@ run_rmsnorm_shape_case "flash_attn_decode_k_norm" \
   "$FLASH_RMSNORM_BIN" "$((DECODE_TOKENS * FULL_ATTN_KV_HEADS))" "$FULL_ATTN_HEAD_DIM"
 
 run_flash_attn_core_case "flash_attn_decode_full_attn" \
-  decode "$CTX_LEN"
+  decode "$DECODE_CTX_LEN"
 
 run_w4a16_decode_fpa_case "w4a16_decode_full_attn_o_proj_fpA_intB" \
   "$DECODE_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"

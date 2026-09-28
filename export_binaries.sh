@@ -132,9 +132,10 @@ MODULE_FILTERS=()
 DECODE_MOE_BACKEND="${DECODE_MOE_BACKEND:-vllm}"
 DECODE_DENSE_BACKEND="${DECODE_DENSE_BACKEND:-cuda_core}"
 
-PREFILL_TOKENS=3823
+PREFILL_TOKENS=2048
 DECODE_TOKENS=1
-CTX_LEN="${CTX_LEN:-3823}"
+CTX_LEN="${CTX_LEN:-2048}"
+DECODE_CTX_LEN="${DECODE_CTX_LEN:-100000}"
 HIDDEN_DIM=3072
 LINEAR_DIM=12288
 CONV_WIDTH=4
@@ -444,7 +445,7 @@ run_w4a16_decode_fpa_case "w4a16_decode_full_attn_k_proj_fpA_intB" flash_attn "F
 run_w4a16_decode_fpa_case "w4a16_decode_full_attn_v_proj_fpA_intB" flash_attn "Full-attention W4A16 v projection" "$DECODE_TOKENS" "$W4A16_FULL_ATTN_V_PROJ_N" "$W4A16_FULL_ATTN_V_PROJ_K"
 run_rmsnorm_case "flash_attn_decode_q_norm" flash_attn decode "Full-attention q RMSNorm" "$FLASH_RMSNORM_BIN" "$((DECODE_TOKENS * FULL_ATTN_Q_HEADS))" "$FULL_ATTN_HEAD_DIM"
 run_rmsnorm_case "flash_attn_decode_k_norm" flash_attn decode "Full-attention k RMSNorm" "$FLASH_RMSNORM_BIN" "$((DECODE_TOKENS * FULL_ATTN_KV_HEADS))" "$FULL_ATTN_HEAD_DIM"
-run_flash_attn_core_case "flash_attn_decode_full_attn" decode "$CTX_LEN"
+run_flash_attn_core_case "flash_attn_decode_full_attn" decode "$DECODE_CTX_LEN"
 run_w4a16_decode_fpa_case "w4a16_decode_full_attn_o_proj_fpA_intB" flash_attn "Full-attention W4A16 output projection" "$DECODE_TOKENS" "$W4A16_FULL_ATTN_O_PROJ_N" "$W4A16_FULL_ATTN_O_PROJ_K"
 
 # MoE-FFN block.

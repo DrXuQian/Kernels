@@ -16,8 +16,8 @@ STANDALONE_RE = re.compile(
 )
 
 CASES = [
-    ("gate_up_prefill", 3823, 8, 8, 2048, 3072, "prefill"),
-    ("down_prefill", 3823, 8, 8, 3072, 1024, "prefill"),
+    ("gate_up_prefill", 2048, 8, 8, 2048, 3072, "prefill"),
+    ("down_prefill", 2048, 8, 8, 3072, 1024, "prefill"),
     ("gate_up_decode", 1, 8, 8, 2048, 3072, "decode"),
     ("down_decode", 1, 8, 8, 3072, 1024, "decode"),
 ]

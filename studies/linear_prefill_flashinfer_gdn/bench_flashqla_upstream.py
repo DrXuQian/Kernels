@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark upstream FlashQLA GDN prefill")
-    parser.add_argument("--seqlen", type=int, default=3823)
+    parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--h-qk", type=int, default=16)
     parser.add_argument("--h-v", type=int, default=64)
     parser.add_argument("--head-dim", type=int, default=128)

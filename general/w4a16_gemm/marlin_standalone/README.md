@@ -12,7 +12,7 @@ make -C general/w4a16_gemm/marlin_standalone
 
 ```bash
 general/w4a16_gemm/marlin_standalone/marlin_standalone \
-  -m 3823 -n 12288 -k 3072 -g 128 -w 10 -i 100
+  -m 2048 -n 12288 -k 3072 -g 128 -w 10 -i 100
 ```
 
 `bench_marlin.py` and `kernels/marlin/` are the older PyTorch extension bench

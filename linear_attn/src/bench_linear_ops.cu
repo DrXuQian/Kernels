@@ -47,7 +47,7 @@ namespace
 struct Options
 {
     std::string op = "in_proj_a";
-    int tokens = 3823;
+    int tokens = 2048;
     int hidden = 3072;
     int out_dim = 64;
     std::string dtype = "fp16";

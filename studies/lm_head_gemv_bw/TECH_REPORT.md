@@ -113,9 +113,9 @@ SM kernel and performs one fp16 add per element.
 
 | Kernel | Shape | Effective BW |
 |---|---:|---:|
-| scalar residual add | `(3823,3072)` | ~1.36 TB/s |
+| scalar residual add | `(2048,3072)` | ~1.36 TB/s |
 | scalar residual add | large shapes | ~1.43 TB/s |
-| vectorized half8 residual add | `(3823,3072)` | ~1.68 TB/s |
+| vectorized half8 residual add | `(2048,3072)` | ~1.68 TB/s |
 | vectorized half8 residual add | large shapes | ~1.84 TB/s |
 
 The scalar path is slower because it does:

@@ -6,7 +6,7 @@
 // uses raw CUDA pointers instead of torch::Tensor/ATen.
 //
 // Usage:
-//   general/bench_cutlass_block_fp8_gemm --m=3823 --n=6144 --k=3072 --bench 0 1
+//   general/bench_cutlass_block_fp8_gemm --m=2048 --n=6144 --k=3072 --bench 0 1
 //   general/bench_cutlass_block_fp8_gemm --m=1 --n=6144 --k=3072 --bench 0 1
 //
 // vLLM pads Hopper CUTLASS block-FP8 GEMM to M % 4 == 0. This benchmark does
@@ -111,7 +111,7 @@ CUTE_HOST_DEVICE constexpr auto make_packed_stride(cute::Stride<cute::Int<1>, St
 
 struct Options
 {
-    int m = 3823;
+    int m = 2048;
     int n = 6144;
     int k = 3072;
     std::string out_dtype = "fp16";

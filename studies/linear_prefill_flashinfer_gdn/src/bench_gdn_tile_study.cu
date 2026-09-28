@@ -91,7 +91,7 @@ static int strip_variant_arg(int argc, char** argv, int* variant_id, char const*
 static void usage(char const* argv0) {
   printf("Usage: %s [seqlen] [num_q_heads] [num_v_heads] [head_dim] [num_seqs] --tile 64 [--variant default|k2|q3|v3] [--bench W I]\n",
          argv0);
-  printf("Default shape: 3823 16 64 128 1\n");
+  printf("Default shape: 2048 16 64 128 1\n");
 }
 
 int main(int argc, char** argv) {
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
   char const* variant_name = "default";
   argc = strip_variant_arg(argc, argv, &variant_id, &variant_name);
 
-  int total_seqlen = (argc > 1) ? atoi(argv[1]) : 3823;
+  int total_seqlen = (argc > 1) ? atoi(argv[1]) : 2048;
   int num_q_heads = (argc > 2) ? atoi(argv[2]) : 16;
   int num_v_heads = (argc > 3) ? atoi(argv[3]) : 64;
   int head_dim = (argc > 4) ? atoi(argv[4]) : 128;

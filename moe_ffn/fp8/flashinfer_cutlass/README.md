@@ -23,7 +23,7 @@ Generate or update the FlashInfer autotuner tactic cache explicitly:
 
 ```bash
 python3 moe_ffn/fp8/flashinfer_cutlass/bench_flashinfer_cutlass_fp8_moe.py \
-  --tokens 3823 --experts 8 --topk 8 --hidden 3072 --intermediate 1536 \
+  --tokens 2048 --experts 8 --topk 8 --hidden 3072 --intermediate 1536 \
   --tactic-cache moe_ffn/fp8/flashinfer_cutlass/tactics_h800_minimax_tp1.json \
   --tune --warmup 0 --iters 1
 ```
@@ -32,7 +32,7 @@ Run with an existing cache and no hidden tuning:
 
 ```bash
 python3 moe_ffn/fp8/flashinfer_cutlass/bench_flashinfer_cutlass_fp8_moe.py \
-  --tokens 3823 --experts 8 --topk 8 --hidden 3072 --intermediate 1536 \
+  --tokens 2048 --experts 8 --topk 8 --hidden 3072 --intermediate 1536 \
   --tactic-cache moe_ffn/fp8/flashinfer_cutlass/tactics_h800_minimax_tp1.json \
   --warmup 0 --iters 1
 ```

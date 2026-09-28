@@ -3,8 +3,8 @@
 // Computes row-major C[M,N] = A[M,K] * B[K,N].
 //
 // Usage:
-//   general/bench_cublas_gemm --m=3823 --n=64 --k=3072 --dtype=fp16 --bench 0 1
-//   general/bench_cublas_gemm --m=3823 --n=6144 --k=3072 --dtype=fp8 --out-dtype=fp16 --bench 0 1
+//   general/bench_cublas_gemm --m=2048 --n=64 --k=3072 --dtype=fp16 --bench 0 1
+//   general/bench_cublas_gemm --m=2048 --n=6144 --k=3072 --dtype=fp8 --out-dtype=fp16 --bench 0 1
 //   general/bench_cublas_gemm --m=1 --n=248320 --k=3072 --dtype=fp16 --out-dtype=fp32 --bench 0 1
 
 #include <algorithm>
@@ -50,7 +50,7 @@ namespace
 
 struct Options
 {
-    int m = 3823;
+    int m = 2048;
     int n = 64;
     int k = 3072;
     std::string dtype = "fp16";

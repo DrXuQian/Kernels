@@ -27,7 +27,7 @@ def positive_int(value: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tokens", "--m", dest="tokens", type=positive_int, default=3823)
+    parser.add_argument("--tokens", "--m", dest="tokens", type=positive_int, default=2048)
     parser.add_argument("--hidden", type=positive_int, default=3072)
     parser.add_argument("--intermediate", type=positive_int, default=1536)
     parser.add_argument("--experts", type=positive_int, default=8)

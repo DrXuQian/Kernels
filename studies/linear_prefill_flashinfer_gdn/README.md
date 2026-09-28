@@ -17,7 +17,7 @@ The production kernel uses the extracted FlashInfer DeltaNet/GDN prefill path wi
 Qwen3.5-122B-A10B shape:
 
 ```text
-total_seqlen=3823, num_q_heads=16, num_k_heads=16, num_v_heads=64, head_dim=128, num_seqs=1
+total_seqlen=2048, num_q_heads=16, num_k_heads=16, num_v_heads=64, head_dim=128, num_seqs=1
 ```
 
 ## Hypothesis
@@ -79,74 +79,74 @@ make coop_probe -j
 Single launch:
 
 ```bash
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant default
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant k2
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant q3
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant v3
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant default
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant k2
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant q3
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant v3
 ```
 
 CUDA-event timing:
 
 ```bash
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant default --bench 20 100
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant k2 --bench 20 100
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant q3 --bench 20 100
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant v3 --bench 20 100
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant default --bench 20 100
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant k2 --bench 20 100
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant q3 --bench 20 100
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant v3 --bench 20 100
 ```
 
 Single-TU timing:
 
 ```bash
-./bench_gdn_tile_study_single_tu 3823 16 64 128 1 --tile 64 --variant default --bench 20 200
+./bench_gdn_tile_study_single_tu 2048 16 64 128 1 --tile 64 --variant default --bench 20 200
 ```
 
 Block-DV prototype timing:
 
 ```bash
-./bench_gdn_blockdv_study 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
-./bench_gdn_blockdv_study_single_tu 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
+./bench_gdn_blockdv_study 2048 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
+./bench_gdn_blockdv_study_single_tu 2048 16 64 128 1 --tile 64 --block-dv 64 --variant default --bench 10 50
 ```
 
 Checkpointed split-sequence prototype timing:
 
 ```bash
 # Time only the second pass. The first pass prepares segment input states.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode split --bench 5 20
 
 # Time the full current two-pass prototype.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode both --bench 5 20
 
 # Time the two-pass prototype with a state-only checkpoint pass.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode state_both --bench 5 20
 
 # Time the scan-style prototype: per-segment transition, prefix compose, split output.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode scan_both --bench 5 20
 
 # Time per-segment zero-state output plus state transitions.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode zero_split --bench 5 20
 
 # Time the exact prefix correction pass lower bound: V=0 with composed prefix states.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode correction_full --bench 5 20
 
 # Time an exact stream pipeline. GDN still carries state sequentially across
 # segments, while synthetic per-segment post work can overlap on a second stream.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --post-rounds 32 \
   --mode stream_segments_post_overlap --bench 5 20
 
 # Same scheduling test with the real linear-attention fused RMSNorm+sigmoid-gate
 # kernel shape: (segment_tokens*num_v_heads, head_dim).
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --mode stream_segments_rms_gate_overlap --bench 5 20
 
 # Compare the full-sequence checkpoint output against the split output.
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode scan_split --check
 ```
 
@@ -163,10 +163,10 @@ Nsight Systems single-kernel check:
 
 ```bash
 nsys profile -t cuda --force-overwrite=true -o gdn_tile64 \
-  ./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant default
+  ./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant default
 
 nsys profile -t cuda --force-overwrite=true -o gdn_single_tu_default \
-  ./bench_gdn_tile_study_single_tu 3823 16 64 128 1 --tile 64 --variant default
+  ./bench_gdn_tile_study_single_tu 2048 16 64 128 1 --tile 64 --variant default
 ```
 
 ## Notes
@@ -183,10 +183,10 @@ This keeps compile time lower and avoids changing the production FlashInfer GDN 
 
 ## H800 Results
 
-Local H800 CUDA-event timing, shape `3823 16 64 128 1`, command:
+Local H800 CUDA-event timing, shape `2048 16 64 128 1`, command:
 
 ```bash
-./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant <variant> --bench 20 200
+./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant <variant> --bench 20 200
 ```
 
 | Variant | Stages Q/K/V | Median (ms) | Avg (ms) | Min (ms) | Max (ms) | Notes |
@@ -228,7 +228,7 @@ sliced to 64 columns per CTA while Q/K remain 128-dimensional. It is still a
 study prototype, not a replacement kernel. It does not improve this specific
 kernel because every V slice duplicates the QK/KK/alpha-beta auxiliary work. The
 extra CTA parallelism is not enough to pay for the duplicated auxiliary path on
-`T=3823,Hqk=16,Hv=64,D=128`.
+`T=2048,Hqk=16,Hv=64,D=128`.
 
 `block_DV=32` was also checked as a way to raise the target shape from 128 CTAs
 to 256 CTAs. It is not a legal direct instantiation of this CUTLASS collective:
@@ -328,7 +328,7 @@ The NCU command used for machines with enabled counters is:
 ```bash
 ncu --csv --page raw --print-units base --kernel-name-base demangled \
   -k regex:.*FlatKernelTmaWarpSpecializedDeltaRule.* --launch-count 1 \
-  ./bench_gdn_tile_study_single_tu 3823 16 64 128 --tile 64 --variant default
+  ./bench_gdn_tile_study_single_tu 2048 16 64 128 --tile 64 --variant default
 ```
 
 Cooperative single-kernel prefix feasibility was checked with
@@ -432,7 +432,7 @@ computes segment coefficients, synchronizes segment CTAs within each head, and
 composes the prefix states. Correctness on the target shape is exact:
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 768 --mode cluster_scan_both --check
 check: max_abs=0 max_rel=0 elements=31318016
 ```
@@ -467,7 +467,7 @@ keeps Q/K, QK/KK, `S@K`, `NewV`, output, and state-update math. It is exact
 against the generic `correction_full` path:
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --mode zero_v_correction_full --check
 check: max_abs=0 max_rel=0 elements=31318016
 compute-sanitizer: ERROR SUMMARY: 0 errors
@@ -496,7 +496,7 @@ SMs left idle by the 64-CTA GDN launch without changing GDN semantics.
 Correctness for the GDN output is exact:
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --post-rounds 32 \
   --mode stream_segments_post_overlap --check
 check: max_abs=0 max_rel=0 elements=31318016
@@ -524,7 +524,7 @@ linear-attention fused RMSNorm+sigmoid-gate operation. It uses one CTA per
 the gate. Correctness of the GDN output remains exact:
 
 ```text
-./bench_gdn_splitseq_study_single_tu 3823 16 64 128 \
+./bench_gdn_splitseq_study_single_tu 2048 16 64 128 \
   --segment-tokens 1280 --mode stream_segments_rms_gate_overlap --check
 check: max_abs=0 max_rel=0 elements=31318016
 ```
@@ -547,7 +547,7 @@ Validation:
 
 ```bash
 compute-sanitizer --tool memcheck --print-limit 1 \
-  ./bench_gdn_blockdv_study_single_tu 3823 16 64 128 1 --tile 64 --block-dv 64 --variant default
+  ./bench_gdn_blockdv_study_single_tu 2048 16 64 128 1 --tile 64 --block-dv 64 --variant default
 ```
 
 Observed: `ERROR SUMMARY: 0 errors`.
@@ -559,10 +559,10 @@ Single-launch `nsys` checks:
 
 ```bash
 nsys profile -t cuda --force-overwrite=true -o /tmp/gdn_prefill_k2_single \
-  ./bench_gdn_tile_study 3823 16 64 128 1 --tile 64 --variant k2
+  ./bench_gdn_tile_study 2048 16 64 128 1 --tile 64 --variant k2
 
 nsys profile -t cuda --force-overwrite=true -o /tmp/gdn_prefill_single_tu_default \
-  ./bench_gdn_tile_study_single_tu 3823 16 64 128 1 --tile 64 --variant default
+  ./bench_gdn_tile_study_single_tu 2048 16 64 128 1 --tile 64 --variant default
 
 nsys stats --report cuda_gpu_kern_sum --format csv /tmp/gdn_prefill_k2_single.nsys-rep
 nsys stats --report cuda_gpu_kern_sum --format csv /tmp/gdn_prefill_single_tu_default.nsys-rep

@@ -1,0 +1,45 @@
+diff --git a/general/w4a16_gemm/cutlass_w4a16/test_fpA_intB_ppu.cu b/general/w4a16_gemm/cutlass_w4a16/test_fpA_intB_ppu.cu
+index ff6b285..c49a341 100644
+--- a/general/w4a16_gemm/cutlass_w4a16/test_fpA_intB_ppu.cu
++++ b/general/w4a16_gemm/cutlass_w4a16/test_fpA_intB_ppu.cu
+@@ -98,8 +98,8 @@ int main(int argc, char** argv) {
+   // fpA_intB registers non-cutlass backends (e.g. the CUDA kernel via enableCudaKernel) as candidates in the
+   // SAME profiling loop; this is that structure -- dequant+cublas competes here, not in a separate binary.
+   // Uses the official CuTe dequantize_weight (unfused_weight_dequantize.hpp) so the source int4 + scales match
+-  // the mixed-input path. Two entries: offline (weight pre-dequantized -> just the fp16 GEMM, but 2x weight in
+-  // HBM) and per-call (dequant charged every pass).
++  // the mixed-input path. Profile dequant and the cublas fp16 GEMM SEPARATELY, then sum -- this excludes the
++  // inter-kernel launch/scheduling gap that timing dequant();gemm() back-to-back would fold into the number.
+   {
+     using StrideB = cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>;
+     auto shape_b   = cute::make_shape(n, k, 1);
+@@ -109,10 +109,12 @@ int main(int argc, char** argv) {
+       dequantize_weight(Wdq.get(), B.get(), layout_B, scales.get(), Zeros.get(), layout_sz, g);
+     };
+     auto gemm = [&]{ cublas_hgemm_once(Wdq.get(), A.get(), D.get(), m, n, k); };  // cublas in cublas_backend.cpp
+-    auto bench = [&](const char* nm, auto fn, double wbytes){
++    auto time_us = [&](auto fn){
+       fn(); for (int i=0;i<warmup;i++) fn();
+       PpuTimer t; t.start(); for (int i=0;i<iters;i++) fn(); t.stop();
+-      double us = double(t.elapsed_millis())*1e3/iters;
++      return double(t.elapsed_millis())*1e3/iters;
++    };
++    auto report = [&](const char* nm, double us, double wbytes){
+       double tf = 2.0*m*n*k/(us*1e-6)/1e12, gbps = wbytes/(us*1e-6)/1e9;
+       bool ran = (tf <= TF_PEAK) && (gbps <= 1.5*HBM_PEAK);
+       if (ran) std::printf("%-32s %-9.1f %-6.1f %-9.0f %.1f%%\n", nm, tf, 100.0*tf/TF_PEAK, gbps, 100.0*gbps/HBM_PEAK);
+@@ -121,9 +123,11 @@ int main(int argc, char** argv) {
+       if (ran && score > best_score) { best_score=score; best_tf=tf; best_gbps=gbps;
+                                        std::snprintf(best_name,sizeof(best_name),"%s",nm); }
+     };
+-    dequant();  // pre-dequantize once for the offline case
+-    bench("dequant+cublas(offline)", gemm,                       (double)n*k*2 + (double)m*k*2);
+-    bench("dequant+cublas(per-call)", [&]{ dequant(); gemm(); }, (double)n*k/2 + (double)n*k*2*2 + (double)m*k*2);
++    // profile dequant FIRST (also leaves Wdq populated for the gemm profile), THEN the cublas fp16 gemm;
++    // summing the two separate profiles keeps the inter-kernel launch gap out of the reported number.
++    double us_dq = time_us(dequant);
++    double us_gm = time_us(gemm);
++    report("dequant+cublas(per-call)", us_dq + us_gm, (double)n*k/2 + (double)n*k*2*2 + (double)m*k*2);
+   }
+ 
+   std::printf("  WINNER m=%d: %s -> %.1f TFLOP/s (%.1f%% MFU) | %.0f GB/s (%.1f%% HBM)\n",
