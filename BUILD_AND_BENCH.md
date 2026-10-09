@@ -209,11 +209,13 @@ Run selected single cases:
 ```
 
 The core FlashAttention cases are Python-backed and require the active Python
-environment to provide FlashAttention-3 for `flash_attn/bench_flash_attn.py`.
-The runner supports the current `flash_attn_3.flash_attn_interface` package and
-the older top-level `flash_attn_interface` FA3 package used by the platform fork.
-It prints the loaded interface path and fails if FA3 is unavailable. This also
-applies to the Qwen and MiniMax model scripts that call the same runner.
+environment to provide FlashAttention-2 for decode and FlashAttention-3 for
+prefill. `flash_attn/bench_flash_attn.py` loads `flash_attn.flash_attn_interface`
+for decode. For prefill, it supports `flash_attn_3.flash_attn_interface` and the
+older top-level `flash_attn_interface` FA3 package used by the platform fork.
+It imports only the selected backend, prints its name and interface path, and
+fails if that backend is unavailable. This also applies to the Qwen and MiniMax
+model scripts that call the same runner.
 
 ## Linear-Attn
 

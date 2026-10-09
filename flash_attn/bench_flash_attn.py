@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bench: FlashAttention v3 decode + prefill (GQA)
+Bench: FlashAttention v2 decode + v3 prefill (GQA)
 Qwen3.5-122B: num_heads=32, num_kv_heads=2, head_dim=256
 
 Usage:
@@ -30,26 +30,6 @@ sys.path = [
 import torch
 import numpy as np
 
-try:
-    import flash_attn_3.flash_attn_interface as flash_attn_interface
-except ModuleNotFoundError as exc:
-    if exc.name not in ("flash_attn_3", "flash_attn_3.flash_attn_interface"):
-        raise
-    # Older FA3 releases, including flash-attention-for-sail, install this
-    # interface as a top-level module backed by flash_attn_3._C.
-    try:
-        import flash_attn_interface
-    except ModuleNotFoundError as legacy_exc:
-        if legacy_exc.name != "flash_attn_interface":
-            raise
-        raise SystemExit(
-            "bench_flash_attn: FlashAttention-3 is required. Install the hopper/ "
-            "package from FlashAttention or your platform's FA3 fork into the "
-            "active Python environment."
-        ) from legacy_exc
-
-flash_attn_func = flash_attn_interface.flash_attn_func
-
 # Parse --bench and --ctx flags
 bench_mode = False
 warmup = 0
@@ -77,6 +57,41 @@ NUM_HEADS   = int(clean_args[2]) if len(clean_args) > 2 else 32
 NUM_KV_HEADS= int(clean_args[3]) if len(clean_args) > 3 else 2
 HEAD_DIM    = int(clean_args[4]) if len(clean_args) > 4 else 256
 
+# Load only the backend needed by this invocation.
+if mode == "decode":
+    flash_attn_backend = "FA2"
+    try:
+        import flash_attn.flash_attn_interface as flash_attn_interface
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("flash_attn", "flash_attn.flash_attn_interface"):
+            raise
+        raise SystemExit(
+            "bench_flash_attn: FlashAttention-2 is required for decode. Install "
+            "the flash-attn package or your platform's FA2 fork into the "
+            "active Python environment."
+        ) from exc
+else:
+    flash_attn_backend = "FA3"
+    try:
+        import flash_attn_3.flash_attn_interface as flash_attn_interface
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("flash_attn_3", "flash_attn_3.flash_attn_interface"):
+            raise
+        # Older FA3 releases, including flash-attention-for-sail, install this
+        # interface as a top-level module backed by flash_attn_3._C.
+        try:
+            import flash_attn_interface
+        except ModuleNotFoundError as legacy_exc:
+            if legacy_exc.name != "flash_attn_interface":
+                raise
+            raise SystemExit(
+                "bench_flash_attn: FlashAttention-3 is required for prefill. "
+                "Install the hopper/ package from FlashAttention or your "
+                "platform's FA3 fork into the active Python environment."
+            ) from legacy_exc
+
+flash_attn_func = flash_attn_interface.flash_attn_func
+
 # context_len is the K/V (context) length. For prefill it may exceed seq_len
 # (chunked prefill / prefill against an existing KV cache); it defaults to
 # seq_len, which reproduces the original full-attention shapes.
@@ -88,7 +103,7 @@ if mode != "decode" and context_len < seq_len:
     context_len = seq_len
 
 print(f"bench flash_attn {mode}: heads={NUM_HEADS} kv_heads={NUM_KV_HEADS} dim={HEAD_DIM} seq={seq_len} ctx={context_len}")
-print(f"FlashAttention backend: FA3 interface={flash_attn_interface.__name__} "
+print(f"FlashAttention backend: {flash_attn_backend} interface={flash_attn_interface.__name__} "
       f"path={flash_attn_interface.__file__}", flush=True)
 
 # ── Allocate on CPU, copy to GPU ──

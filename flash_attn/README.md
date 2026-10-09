@@ -6,7 +6,7 @@ Standalone full-attention benchmark entry points.
 
 | Path | Contents |
 |---|---|
-| `bench_flash_attn.py` | FlashAttention-3 Python inference benchmark |
+| `bench_flash_attn.py` | FlashAttention-2 decode / FlashAttention-3 prefill benchmark |
 | `bench_flash_attn3_prefill_noncausal.py` | FA3 BF16 non-causal prefill: B=1, Q/KV=1024, Hq/Hkv=56, Dq/Dv=128 |
 | `bench_flash_infer.py` | FlashInfer Python attention benchmark |
 | `bench_rmsnorm` | Category-local build of `general/bench_rmsnorm.cu` |
@@ -18,7 +18,7 @@ The repo-level `bench_all.sh` covers the non-Python full-attention block pieces:
 - hidden RMSNorm
 - W4A16 q/k/v/o projections
 - q/k RMSNorm via `bench_rmsnorm` with `batch=tokens*heads`, `embed=256`
-- FlashAttention-3 core via `bench_flash_attn.py`
+- FlashAttention core via `bench_flash_attn.py`: FA2 for decode, FA3 for prefill
 - residual add
 
 Qwen3-Next full attention has an output gate after attention:
@@ -36,16 +36,20 @@ standalone CUDA MRoPE implementation has been found in the extracted sources.
 The Python attention benchmarks are not compiled by this repo. The Makefile
 builds only shared CUDA kernels needed by the Flash-Attn category.
 
-`bench_flash_attn.py` requires FlashAttention-3 in the active Python environment
-(selected with `PYTHON` in the model shell scripts). Install the `hopper/` package
-from FlashAttention, or the FA3 build of your platform fork (such as
+`bench_flash_attn.py` selects the backend by mode in the active Python environment
+(selected with `PYTHON` in the model shell scripts). Decode requires
+FlashAttention-2, provided by `flash_attn.flash_attn_interface` in the `flash-attn`
+package or your platform's FA2 fork.
+
+Prefill requires FlashAttention-3. Install the `hopper/` package from
+FlashAttention, or the FA3 build of your platform fork (such as
 `flash-attention-for-sail`). The runner supports both FA3 package layouts:
 
 - `flash_attn_3.flash_attn_interface` in current upstream releases.
 - `flash_attn_interface` in older FA3 releases and the local platform fork.
 
-The runner reports the selected interface and its file path. Missing FA3 or
-native-extension dependencies fail explicitly; it never falls back to FA2.
+The runner imports only the selected backend and reports its name, interface,
+and file path. Missing backend or native-extension dependencies fail explicitly.
 
 ```bash
 make -C flash_attn
@@ -57,7 +61,8 @@ make -C flash_attn
 ## Run
 
 The Qwen and MiniMax model shell scripts share this Python entry point, so their
-`flash_attn_prefill_full_attn` and `flash_attn_decode_full_attn` cases use FA3 too.
+`flash_attn_decode_full_attn` cases use FA2 and `flash_attn_prefill_full_attn`
+cases use FA3.
 
 ```bash
 ./bench_all.sh --case flash_attn_prefill_full_attn
