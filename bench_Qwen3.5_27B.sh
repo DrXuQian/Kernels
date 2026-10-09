@@ -22,7 +22,7 @@ export LINEAR_V_HEADS="${LINEAR_V_HEADS:-48}"
 export LINEAR_HEAD_DIM="${LINEAR_HEAD_DIM:-128}"
 export LINEAR_SMALL_PROJ_N="${LINEAR_SMALL_PROJ_N:-64}"
 export LINEAR_ATTN_DTYPE=fp16
-# cuLA fused_sm90 prefill requires BF16, independently of the other linear ops.
+# actlizeLA fused_sm90 prefill requires BF16, independently of the other linear ops.
 export LINEAR_GDN_DTYPE="${LINEAR_GDN_DTYPE:-bf16}"
 
 export W4A16_LINEAR_QKV_N="${W4A16_LINEAR_QKV_N:-10240}"

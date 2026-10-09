@@ -9,6 +9,7 @@ __pycache__/
 .ninja_deps
 .ninja_log
 build.ninja
+.build/
 
 # bench binaries (no extension)
 bench_conv1d_fwd
@@ -18,7 +19,6 @@ bench_fused_rms_norm_gate
 bench_gdn_prefill
 bench_gdn_splitseq_study
 bench_gdn_splitseq_study_single_tu
-bench_kda_prefill
 bench_layernorm
 bench_rmsnorm
 bench_cublas_gemm

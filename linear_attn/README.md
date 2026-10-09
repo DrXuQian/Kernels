@@ -12,29 +12,45 @@ Qwen3.5 DeltaNet layer 的 standalone CUDA/Triton kernel bench。
 | `../general/bench_cublas_gemm` | `in_proj_a` / `in_proj_b` dense GEMM | cuBLAS FP16/BF16 GEMM | SM80+ | Prefill + Decode |
 | `bench_gated_delta_net` | `gated_delta_net_cuda` | [llama.cpp](https://github.com/ggml-org/llama.cpp) | SM80+ | Prefill + Decode |
 | `bench_gdn_prefill` | FlashInfer DeltaRule/GDN prefill standalone | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | SM90 | Prefill |
-| `src/bench_actlize_gdn_prefill.py` | `actlize_la.gdn_forward`, cuLA-derived SM90 | actlizeLA | CUDA SM90 / explicit PPU1.7 diagnostics | Prefill |
-| `bench_kda_prefill` | `launch_kda_fwd_prefill_kernel` | [cuLA](https://github.com/inclusionAI/cuLA) | SM90 | Prefill (chunked) |
+| `src/bench_actlize_gdn_prefill.py` | `actlize_la.gdn_forward`, SM90 | actlizeLA | CUDA SM90 / explicit PPU1.7 diagnostics | Prefill |
 | `src/bench_vllm_triton_gdn_prefill.py` | `fused_post_conv_prep` + `chunk_gated_delta_rule` | vLLM FLA/GDN Triton | NVIDIA CUDA/Triton | Prefill |
 | `src/bench_vllm_triton_gdn_decode.py` | `fused_recurrent_gated_delta_rule_packed_decode` | vLLM FLA/GDN Triton | NVIDIA CUDA/Triton | Decode |
 
-## cuLA / actlize GDN prefill script
+## actlizeLA SM90 GDN prefill
 
 `bench_all.sh` and the Qwen3.5 model scripts use
 `src/bench_actlize_gdn_prefill.py`, which calls the installed
-`actlize_la.gdn_forward` API and its cuLA-derived SM90 kernels. The case label remains
-`linear_prefill_gdn_qsa_sm80` for compatibility with the patch's reports;
-the old package name is not used for loading.
+`actlize_la.gdn_forward` API and its SM90 kernels. The benchmark case is
+`linear_prefill_actlize_gdn`.
 
-After `actlizeLA/tools/install_sm90.sh` reports `registered=True`, run the
-benchmark with the same Python environment used by the installer. No
-`GDN_QSA_ROOT`, `GDN_QSA_SM90_EXTENSION`, or manual configuration is required:
+actlizeLA is pinned as the `third_party/actlizeLA` Git submodule. Install using
+Python >= 3.10 with CUDA-enabled PyTorch, pip, setuptools, and wheel, plus a
+C++17 compiler and an SM90a-capable CUDA toolkit (upstream uses CUDA 12.8):
 
 ```bash
 # From the Kernels repo root:
-export PYTHON="$(command -v python)"  # Python used to install actlizeLA
-./bench_Qwen3.5-122B-A10B-GPTQ.sh --case linear_prefill_gdn_qsa_sm80
-./bench_Qwen3.5-122B-A10B-GPTQ_TP2.sh --case linear_prefill_gdn_qsa_sm80
-./bench_Qwen3.5_27B.sh --case linear_prefill_gdn_qsa_sm80
+git submodule update --init third_party/actlizeLA
+export PYTHON="$(command -v python3)"
+CUDA_ROOT=/usr/local/cuda ./compile.sh build actlize-la
+```
+
+This invokes the pinned `tools/install_sm90.sh`, installs the Python frontend,
+builds all three SM90 candidates into `.build/actlize-la-sm90`, and registers
+the bundle. It checks compile/link/import only and launches no GPU kernels.
+`./compile.sh build linear_attn`, `build default`, and `build all` include this
+installation. Plain `make` builds the local CUDA binaries only. `clean` removes
+the managed native build directory; it does not uninstall the Python frontend.
+The SM90 installer uses the submodule's vendored CUTLASS and does not need its
+optional nested `third_party/actlize` dependency.
+
+After the installer reports `registered=True`, run the benchmark with the same
+`PYTHON`. No extension path or manual configuration is required:
+
+```bash
+# From the Kernels repo root:
+./bench_Qwen3.5-122B-A10B-GPTQ.sh --case linear_prefill_actlize_gdn
+./bench_Qwen3.5-122B-A10B-GPTQ_TP2.sh --case linear_prefill_actlize_gdn
+./bench_Qwen3.5_27B.sh --case linear_prefill_actlize_gdn
 "$PYTHON" linear_attn/src/bench_actlize_gdn_prefill.py 2048 16 64 \
   --mode perfmodel --sm-count 20 --bench 0 1
 ```
@@ -62,8 +78,8 @@ bundle before timing without launching a warmup kernel, then `gdn_forward`
 reuses it. actlizeLA selects `value64`, `value64-local-inverse`, or
 `value128-paired` from shape/device metadata. The runner logs the selected
 configuration and selection basis. It never compiles or autotunes a kernel.
-Perfmodel requires the Python API from actlizeLA revision `6f6a2b7` or later.
-It reuses the installed native bundle without compiling new kernels.
+The pinned actlizeLA frontend supports perfmodel. It reuses the installed native
+bundle without compiling new kernels.
 
 For a relocated bundle, set `ACTLIZE_LA_SM90_BUNDLE` to its absolute directory
 (the directory containing `bundle.json`). `ACTLIZE_LA_ROOT` optionally selects
@@ -88,7 +104,9 @@ MiniMax disables linear attention and does not load this dependency.
 
 ## FlashInfer GDN Prefill CUDA baseline
 
-`bench_gdn_prefill` is available as a standalone comparison. The default module build compiles dispatch
+`bench_gdn_prefill` is a CUDA C++/CuTe/CUTLASS implementation compiled with nvcc;
+the separate `src/bench_vllm_triton_gdn_prefill.py` is the Triton comparison.
+The default module build compiles dispatch
 and main in one translation unit so ptxas can preserve SM90 warpgroup register
 reallocation for this warp-specialized kernel.
 
@@ -105,7 +123,7 @@ when a CTA retired. NVIDIA hardware resets that state per CTA, but a simulator
 that keeps named-barrier state per CE handed the residue to the next wave and
 deadlocked its first `ordered_or_wait()` (a 20-CE PPU simulation passed with 20
 CTAs and hung with 40). Both math warp groups now call `drain()` after their
-last tile so every barrier is left at zero; the same fix is in the KDA kernel.
+last tile so every barrier is left at zero.
 
 ## vLLM Triton GDN 提取
 
@@ -184,9 +202,6 @@ make bench_linear_ops
 ./bench_linear_ops --op=residual_add --tokens=2048 --hidden=3072 --dtype fp16 --bench 0 1
 ./bench_fused_rms_norm_gate 64 128 --dtype fp16 --bench 0 1
 
-# cuLA chunked prefill (Hopper only)
-./bench_kda_prefill [seq_len] [num_heads] [head_dim] [num_seqs] # default: 2048 64 128 1
-
 # FlashInfer GDN prefill (Hopper only, Qwen3.5 GVA fast path)
 ./bench_gdn_prefill [seq_len] [q_heads] [v_heads] [head_dim] [num_seqs] --dtype bf16 # default: 2048 16 64 128 1
 ./bench_gdn_prefill 2048 16 48 128 1 --dtype fp16 --bench 0 1 # Qwen3.5-27B fp16 GVA path
@@ -204,7 +219,6 @@ python3 src/bench_vllm_triton_gdn_decode.py [batch] [q_heads] [v_heads] [head_di
 ncu --set full --kernel-name "causal_conv1d_fwd"    -o conv_fwd    ./bench_conv1d_fwd 2048 12288 4 1
 ncu --set full --kernel-name "causal_conv1d_update"  -o conv_update ./bench_conv1d_update 12288 4 1
 ncu --set full --kernel-name "gated_delta_net"       -o gdn         ./bench_gated_delta_net 1 64 128 1
-ncu --set full                                       -o kda         ./bench_kda_prefill 2048 64 128 1
 
 # vLLM Triton decode is a single kernel.
 nsys profile --force-overwrite=true -o vllm_gdn_decode \

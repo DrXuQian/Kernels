@@ -58,18 +58,20 @@ the top-level command reference.
 | `bench_all.sh` | Qwen3.5-122B-A10B benchmark runner. |
 | `bench_attention_inference.sh` | Python/JIT attention benchmark runner. |
 | `flash_attn/` | Flash-Attn local binaries and Python FlashAttention runner. |
-| `linear_attn/` | Linear-Attn kernels and FlashInfer GDN prefill standalone. |
+| `linear_attn/` | Linear-Attn kernels, actlizeLA SM90 runner, and FlashInfer CUDA GDN baseline. |
 | `moe_ffn/` | MoE-FFN kernels from TRT-LLM and vLLM extractions. |
 | `sampling/` | Sampling benchmarks using vendored FlashInfer headers. |
 | `general/` | Shared kernels used by the modules above. |
 | `studies/` | Isolated experiments outside the default benchmark suite. |
 | `helpers/` | Tactic and benchmark analysis utilities. |
 | `third_party/cutlass/` | CUTLASS submodule. |
+| `third_party/actlizeLA/` | Pinned actlizeLA submodule for SM90 GDN prefill. |
 
 ## Quick Start
 
 ```bash
-git submodule update --init third_party/cutlass
+git submodule update --init third_party/cutlass third_party/actlizeLA
+export PYTHON="$(command -v python3)"  # CUDA-enabled PyTorch environment
 ./compile.sh env
 ./compile.sh build all
 ./bench_all.sh --list
@@ -80,3 +82,7 @@ git submodule update --init third_party/cutlass
 ```
 
 Use [BUILD_AND_BENCH.md](BUILD_AND_BENCH.md) for module-specific commands.
+
+`build all` installs the actlizeLA frontend and builds/registers its SM90 bundle
+in this Python environment. Use `./compile.sh build actlize-la` to install just
+that dependency. The model GDN prefill case is `linear_prefill_actlize_gdn`.

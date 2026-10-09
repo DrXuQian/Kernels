@@ -16,7 +16,7 @@ export LINEAR_Q_HEADS=8
 export LINEAR_V_HEADS=32
 export LINEAR_HEAD_DIM=128
 export LINEAR_SMALL_PROJ_N=64
-# cuLA fused_sm90 prefill uses BF16 at the per-rank GVA shape (8, 32).
+# actlizeLA fused_sm90 prefill uses BF16 at the per-rank GVA shape (8, 32).
 export LINEAR_GDN_DTYPE="${LINEAR_GDN_DTYPE:-bf16}"
 
 export W4A16_LINEAR_QKV_N=6144

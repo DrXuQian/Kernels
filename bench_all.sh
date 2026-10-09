@@ -110,7 +110,7 @@ MOE_VLLM_AUX_DIR="$(repo_path "moe_ffn/w4a16/vllm/auxiliary")"
 LINEAR_RMSNORM_BIN="$(repo_path "linear_attn/bench_rmsnorm")"
 LINEAR_OPS_BIN="$(repo_path "linear_attn/bench_linear_ops")"
 LINEAR_FUSED_RMS_GATE_BIN="$(repo_path "linear_attn/bench_fused_rms_norm_gate")"
-LINEAR_GDN_SCRIPT="$(repo_path "${GDN_QSA_SM80_ENTRY:-linear_attn/src/bench_actlize_gdn_prefill.py}")"
+LINEAR_GDN_SCRIPT="$(repo_path "${ACTLIZE_LA_ENTRY:-linear_attn/src/bench_actlize_gdn_prefill.py}")"
 FLASH_RMSNORM_BIN="$(repo_path "flash_attn/bench_rmsnorm")"
 FLASH_ATTN_SCRIPT="$(repo_path "flash_attn/bench_flash_attn.py")"
 MOE_RMSNORM_BIN="$(repo_path "moe_ffn/bench_rmsnorm")"
@@ -200,6 +200,7 @@ Environment variables:
   LM_HEAD_GEMV_K_UNROLL    Local lm_head GEMV --k-unroll. Default: 8.
   PYTHON                   Python executable for Python attention cases. Default: python3 in PATH.
   ACTLIZE_LA_ROOT          Optional source checkout; normally use actlize_la installed in PYTHON.
+  ACTLIZE_LA_ENTRY         Optional GDN runner override; default: linear_attn/src/bench_actlize_gdn_prefill.py.
   ACTLIZE_LA_SM90_BUNDLE   Optional absolute bundle directory; default: actlizeLA's registered installation.
   ACTLIZE_LA_BACKEND       cuda_sm90 (default); ppu17 requires a fixed diagnostic configuration/binary.
   ACTLIZE_LA_SM90_CONFIGURATION  auto (default); fixed names are diagnostic overrides.
@@ -571,7 +572,7 @@ run_case() {
   fi
 
   require_bin "${cmd[0]}"
-  if [[ "$label" == linear_prefill_gdn_qsa_sm80 && "$LINEAR_GDN_MODE" == perfmodel && "$NCU_CYCLES" == 1 ]]; then
+  if [[ "$label" == linear_prefill_actlize_gdn && "$LINEAR_GDN_MODE" == perfmodel && "$NCU_CYCLES" == 1 ]]; then
     echo "[bench_all][error] GDN perfmodel runs once without profiler replay; use LINEAR_GDN_MODE=device for NCU." >&2
     exit 1
   fi
@@ -1161,7 +1162,7 @@ run_case "linear_decode_gdn" \
 run_case "linear_prefill_conv1d_fwd" \
   linear_attn/bench_conv1d_fwd "$PREFILL_TOKENS" "$LINEAR_DIM" "$CONV_WIDTH" 1 --dtype "$LINEAR_ATTN_DTYPE" --bench 0 1
 
-run_case "linear_prefill_gdn_qsa_sm80" \
+run_case "linear_prefill_actlize_gdn" \
   --require-file "$LINEAR_GDN_SCRIPT" \
   "$PYTHON_BIN" "$LINEAR_GDN_SCRIPT" "$PREFILL_TOKENS" "$LINEAR_Q_HEADS" "$LINEAR_V_HEADS" \
   --head-dim "$LINEAR_HEAD_DIM" --dtype "$LINEAR_GDN_DTYPE" "${LINEAR_GDN_MODE_ARGS[@]}" --bench 0 1

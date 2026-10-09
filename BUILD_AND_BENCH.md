@@ -63,7 +63,8 @@ fallback/default when NCU counters are unavailable or not permitted. Use
 ## Common Setup
 
 ```bash
-git submodule update --init third_party/cutlass
+git submodule update --init third_party/cutlass third_party/actlizeLA
+export PYTHON="$(command -v python3)"  # CUDA-enabled PyTorch environment
 ./compile.sh env
 ./compile.sh list
 ./bench_all.sh --list
@@ -159,7 +160,7 @@ Qwen3.5-27B wrapper status:
 
 - Dense GEMM/GEMV payloads use fp16.
 - Linear-attention conv1d, fused RMSNorm gate, and GDN decode input/output run
-  with `LINEAR_ATTN_DTYPE=fp16`. The cuLA-derived GDN prefill script uses the
+  with `LINEAR_ATTN_DTYPE=fp16`. The actlizeLA GDN prefill script uses the
   separate `LINEAR_GDN_DTYPE=bf16`, as required by `fused_sm90`.
 - `linear_decode_gdn` uses the existing CUDA recurrent-state kernel from
   llama.cpp. That kernel keeps the recurrent state and math in fp32 by design,
@@ -225,6 +226,25 @@ Build:
 ./compile.sh build general linear_attn flashinfer-gdn w4a16-machete w4a16-fpa
 ```
 
+`linear_attn`, `default`, and `all` include installation of the pinned
+`third_party/actlizeLA` dependency. To install only its SM90 backend:
+
+```bash
+git submodule update --init third_party/actlizeLA
+PYTHON=python3 CUDA_ROOT=/usr/local/cuda ./compile.sh build actlize-la
+```
+
+Use Python >= 3.10 with CUDA-enabled PyTorch, pip, setuptools, and wheel already
+installed. The target installs the frontend, builds/registers all three SM90
+candidates, and checks their imports without launching a GPU kernel. It uses
+the compiler selected by `CUDA_ROOT`/`--cuda-root` or PATH and the submodule's
+own pinned CUTLASS headers. Native output is under `.build/actlize-la-sm90`.
+`ACTLIZE_LA_ROOT` can explicitly select another checkout; use the same `PYTHON`
+for installation and model benchmarks.
+
+The standalone FlashInfer GDN prefill baseline is CUDA C++/CuTe/CUTLASS, built
+with nvcc. Triton GDN has separate Python benchmark entry points.
+
 Run all Linear-Attn cases:
 
 ```bash
@@ -237,7 +257,7 @@ Run all Linear-Attn cases:
 Run selected single cases:
 
 ```bash
-./bench_all.sh --case linear_prefill_gdn_qsa_sm80
+./bench_all.sh --case linear_prefill_actlize_gdn
 ./bench_all.sh --case linear_decode_gdn
 ./bench_all.sh --case linear_attn_prefill_fused_rms_norm_gate
 ./bench_all.sh --case linear_attn_decode_fused_rms_norm_gate
@@ -251,7 +271,7 @@ extension path is needed. Model scripts default to `LINEAR_GDN_MODE=perfmodel`
 and `LINEAR_GDN_SM_COUNT=20` for one untimed GDN call. Set
 `LINEAR_GDN_MODE=device` for physical GPU profiling; the H800 bandwidth wrapper
 selects device mode by default. Setup and diagnostic overrides are described in
-[linear_attn/README.md](linear_attn/README.md#cula--actlize-gdn-prefill-script).
+[linear_attn/README.md](linear_attn/README.md#actlizela-sm90-gdn-prefill).
 
 Direct GDN commands when bypassing `bench_all.sh`:
 

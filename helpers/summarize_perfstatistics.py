@@ -80,7 +80,7 @@ ATTN_DECODE_CMD_RE = re.compile(r"\bdecode\s+([0-9]+)\b")
 CASE_LOG_FOOTER_KEYS = ("finished_at", "failed_at", "exit_status")
 CASE_LOG_OUTPUT_MARKER = "---- output ----"
 CASE_REPLACEMENTS = {
-    "linear_prefill_flashinfer_gdn": "linear_prefill_gdn_qsa_sm80",
+    "linear_prefill_flashinfer_gdn": "linear_prefill_actlize_gdn",
 }
 
 MODEL_CONFIG_ARGS = (

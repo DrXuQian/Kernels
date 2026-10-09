@@ -177,7 +177,7 @@ def classify_operator(case: str) -> str:
         return "Residual add"
     if base.startswith("flash_attn_") and base.endswith("_full_attn"):
         return "FlashAttention core"
-    if base in {"linear_decode_gdn", "linear_prefill_flashinfer_gdn", "linear_prefill_gdn_qsa_sm80"}:
+    if base in {"linear_decode_gdn", "linear_prefill_flashinfer_gdn", "linear_prefill_actlize_gdn"}:
         return "Gated Delta Net"
     if base in {"linear_decode_conv1d_update", "linear_prefill_conv1d_fwd"}:
         return "Causal Conv1d"

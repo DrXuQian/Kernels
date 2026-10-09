@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark actlizeLA's installed cuLA-derived SM90 forward.
+"""Benchmark actlizeLA's installed SM90 forward.
 
 Usage: bench_actlize_gdn_prefill.py [seq_len] [q_heads] [v_heads] --bench 0 1
 Uses `from actlize_la import gdn_forward` and the bundle registered by
@@ -87,8 +87,9 @@ def load_forward(args):
         from actlize_la import gdn_forward, load_sm90
     except ImportError as exc:
         raise RuntimeError(
-            f"cannot import actlize_la with {sys.executable}; run the benchmark with the Python "
-            "used by tools/install_sm90.sh (set PYTHON=/path/to/that/python in the model .sh)"
+            f"cannot import actlize_la with {sys.executable}; install it with "
+            "PYTHON=/path/to/that/python ./compile.sh build actlize-la, then use "
+            "the same PYTHON in the model .sh"
         ) from exc
     profile_options = {}
     if args.mode == "perfmodel":
@@ -96,8 +97,8 @@ def load_forward(args):
             from actlize_la import get_device_profile
         except ImportError as exc:
             raise RuntimeError(
-                "perfmodel requires actlizeLA's updated Python frontend (6f6a2b7 or later); "
-                "update the frontend in this Python environment"
+                "perfmodel requires the pinned actlizeLA frontend; run "
+                "./compile.sh build actlize-la using the same PYTHON"
             ) from exc
         profile = get_device_profile(mode=args.mode, backend=args.backend, sm_count=args.sm_count)
         print("actlizeLA device profile: " + json.dumps(asdict(profile)), flush=True)
@@ -138,7 +139,7 @@ def main():
                     v_heads=args.v_heads, head_dim=args.head_dim, dtype=args.dtype,
                     gate="fp32 natural-log increments", state="fp32 [B,Hv,K,V]",
                     output_final_state=True, warmup=warmup, iters=iters)
-    print("bench actlize_gdn_prefill (cuLA): " + json.dumps(contract), flush=True)
+    print("bench actlize_gdn_prefill (SM90): " + json.dumps(contract), flush=True)
     if args.dry_run:
         return 0
 

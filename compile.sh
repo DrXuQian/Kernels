@@ -13,6 +13,9 @@ BUILD_DIR_NAME="${BUILD_DIR_NAME:-build_cmake_release}"
 CUDA_ROOT="${CUDA_ROOT:-}"
 PPU_ROOT="${PPU_ROOT:-}"
 CUTLASS_DIR="${CUTLASS_DIR:-$ROOT_DIR/third_party/cutlass}"
+ACTLIZE_LA_ROOT="${ACTLIZE_LA_ROOT:-$ROOT_DIR/third_party/actlizeLA}"
+ACTLIZE_LA_BUILD_DIR="$ROOT_DIR/.build/actlize-la-sm90"
+PYTHON_BIN="${PYTHON:-python3}"
 PPU_ELF_VERSION="${PPU_ELF_VERSION:-1.7}"
 DRY_RUN=0
 CHECK_ENV=1
@@ -58,17 +61,19 @@ Common examples:
   ./compile.sh env
   ./compile.sh build
   ./compile.sh build general linear_attn flash_attn sampling
+  PYTHON=python3 ./compile.sh build actlize-la
   ./compile.sh build w4a16-fpa w4a16-machete
   ./compile.sh configure w4a16-fpa
   ./compile.sh rebuild moe-vllm
   ./compile.sh clean all
 
 Targets:
-  default              Root Makefile targets: general, linear_attn, flash_attn, moe_ffn, sampling
+  default              Root Makefile targets plus actlizeLA SM90 installation
   all                  Every target listed below
 
   general              general/
-  linear_attn          linear_attn/
+  linear_attn          linear_attn/ plus actlizeLA SM90 installation
+  actlize-la           Install Python frontend; build/register actlizeLA SM90 bundle
   flash_attn           flash_attn/ category-local shared attention ops
   sampling             sampling/ decode sampling stages
   lm-head-gemv         studies/lm_head_gemv_bw/ TMA/CUDA-core lm_head GEMV
@@ -111,6 +116,9 @@ Options:
 Notes:
   The script never hardcodes machine-local SDK paths. Set CUDA_ROOT/PPU_ROOT in
   your shell or pass --cuda-root/--ppu-root when a specific SDK must be used.
+  actlize-la uses PYTHON (default: python3) and ACTLIZE_LA_ROOT (default:
+  third_party/actlizeLA). Initialize that submodule before building. This target
+  requires sm_90a and CUDA-enabled PyTorch in PYTHON. It launches no GPU kernels.
 EOF
 }
 
@@ -199,6 +207,8 @@ print_env() {
   log "build type: $BUILD_TYPE"
   log "build dir name: $BUILD_DIR_NAME"
   log "cutlass dir: $CUTLASS_DIR"
+  log "actlizeLA dir: $ACTLIZE_LA_ROOT"
+  log "actlizeLA Python: $PYTHON_BIN"
   log "cuda root: ${CUDA_ROOT:-<unset>}"
   log "companion sdk root: ${PPU_ROOT:-<unset>}"
   log "required ppu elf version: $PPU_ELF_VERSION"
@@ -219,11 +229,13 @@ check_environment() {
   setup_environment
 
   [[ -n "$NVCC" && -x "$NVCC" ]] || die "nvcc not found. Set CUDA_ROOT or put nvcc in PATH."
-  command -v make >/dev/null 2>&1 || die "make not found in PATH."
-  command -v cmake >/dev/null 2>&1 || die "cmake not found in PATH."
-
-  require_file "$CUTLASS_DIR/include/cutlass/cutlass.h" \
-    "CUTLASS not found under $CUTLASS_DIR. Run: git submodule update --init third_party/cutlass"
+  # actlizeLA vendors its own pinned CUTLASS headers and uses its Python builder.
+  if [[ "${TARGETS[*]:-}" != "actlize-la" ]]; then
+    command -v make >/dev/null 2>&1 || die "make not found in PATH."
+    command -v cmake >/dev/null 2>&1 || die "cmake not found in PATH."
+    require_file "$CUTLASS_DIR/include/cutlass/cutlass.h" \
+      "CUTLASS not found under $CUTLASS_DIR. Run: git submodule update --init third_party/cutlass"
+  fi
 
   if [[ -n "$CUDA_ROOT" && ! -d "$CUDA_ROOT" ]]; then
     die "CUDA_ROOT does not exist: $CUDA_ROOT"
@@ -387,14 +399,23 @@ print_summary() {
   echo "ppu root:    ${PPU_ROOT:-<unset>}"
   echo "nvcc:        ${NVCC:-<not found>}"
   echo "gpu arch:    $GPU_ARCH"
-  echo "linear arch: $LINEAR_ARCH"
-  echo "marlin arch: $MARLIN_ARCH"
-  echo "build type:  $BUILD_TYPE"
-  echo "cutlass dir: $CUTLASS_DIR"
-  if [[ "$CHECK_ELF" == 1 ]]; then
-    echo "elf check:   PPU $PPU_ELF_VERSION"
+  if [[ "${TARGETS[*]}" == actlize-la ]]; then
+    echo "backend:     cuda_sm90"
+    echo "python:      $PYTHON_BIN"
+    echo "actlizeLA:   $ACTLIZE_LA_ROOT"
+    echo "build dir:   $ACTLIZE_LA_BUILD_DIR"
+    echo "cutlass dir: $ACTLIZE_LA_ROOT/third_party/cutlass"
+    echo "elf check:   not applicable (CUDA SM90)"
   else
-    echo "elf check:   disabled"
+    echo "linear arch: $LINEAR_ARCH"
+    echo "marlin arch: $MARLIN_ARCH"
+    echo "build type:  $BUILD_TYPE"
+    echo "cutlass dir: $CUTLASS_DIR"
+    if [[ "$CHECK_ELF" == 1 ]]; then
+      echo "elf check:   PPU $PPU_ELF_VERSION"
+    else
+      echo "elf check:   disabled"
+    fi
   fi
   echo "status:      $SUMMARY_STATUS"
   echo "exit code:   $status"
@@ -453,6 +474,28 @@ build_flashinfer_gdn() {
   run_cmd make -C "$ROOT_DIR/linear_attn/src/flashinfer_gdn" -j "$JOBS" "${vars[@]}"
 }
 
+build_actlize_la() {
+  [[ "$GPU_ARCH" == sm_90a ]] || die "actlize-la builds the SM90a backend; use --arch sm_90a."
+  require_file "$ACTLIZE_LA_ROOT/tools/install_sm90.sh" \
+    "actlizeLA not found under $ACTLIZE_LA_ROOT. Run: git submodule update --init third_party/actlizeLA"
+  if [[ "$DRY_RUN" == 0 ]]; then
+    [[ -n "$NVCC" && -x "$NVCC" ]] || die "actlize-la requires nvcc; set CUDA_ROOT."
+  fi
+  run_cmd "$PYTHON_BIN" -c '
+import importlib.util, sys
+if sys.version_info < (3, 10):
+    sys.exit("actlizeLA requires Python >= 3.10")
+missing = [name for name in ("torch", "pip", "setuptools", "wheel") if importlib.util.find_spec(name) is None]
+if missing:
+    sys.exit("actlizeLA requires these packages in " + sys.executable + ": " + ", ".join(missing))
+import torch
+if torch.version.cuda is None:
+    sys.exit("actlizeLA SM90 requires CUDA-enabled PyTorch in " + sys.executable)
+'
+  run_env_cmd "PYTHON=$PYTHON_BIN" "CONFIGURATION=auto" "OUT=$ACTLIZE_LA_BUILD_DIR" \
+    bash "$ACTLIZE_LA_ROOT/tools/install_sm90.sh" --compiler "${NVCC:-nvcc}"
+}
+
 configure_cmake_target() {
   local src="$1"
   local build="$2"
@@ -502,6 +545,9 @@ clean_w4a16_cublas() {
 
 configure_target() {
   case "$1" in
+    actlize-la)
+      log "actlize-la uses tools/install_sm90.sh; no CMake configure step."
+      ;;
     default|general|linear_attn|flash_attn|sampling|lm-head-gemv|flashinfer-gdn|moe-ffn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
       log "$1 uses a Makefile or direct nvcc build; no CMake configure step."
       ;;
@@ -549,6 +595,9 @@ configure_target() {
 
 build_target() {
   case "$1" in
+    actlize-la)
+      build_actlize_la
+      ;;
     default)
       run_cmd make -C "$ROOT_DIR" -j "$JOBS" "NVCC=$NVCC" "CUDACXX=$NVCC" "CUDA_ROOT=$CUDA_ROOT" "ARCH=-arch=$LINEAR_ARCH" "ARCH_SM90=-arch=$GPU_ARCH"
       verify_ppu_elf_version "$ROOT_DIR/linear_attn/bench_gated_delta_net"
@@ -643,6 +692,9 @@ build_target() {
 
 clean_target() {
   case "$1" in
+    actlize-la)
+      run_cmd rm -rf "$ACTLIZE_LA_BUILD_DIR"
+      ;;
     default)
       run_cmd make -C "$ROOT_DIR" clean
       ;;
@@ -715,7 +767,7 @@ expand_one_target() {
   case "$1" in
     all)
       printf '%s\n' \
-        general linear_attn flash_attn sampling flashinfer-gdn \
+        general linear_attn actlize-la flash_attn sampling flashinfer-gdn \
         moe-ffn moe-trtllm moe-machete moe-fp8-trtllm \
         w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;
@@ -728,8 +780,14 @@ expand_one_target() {
     w4a16)
       printf '%s\n' w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;
-    linear|linear-attention|linear_attention)
-      printf '%s\n' linear_attn
+    default)
+      printf '%s\n' default actlize-la
+      ;;
+    linear_attn|linear|linear-attention|linear_attention)
+      printf '%s\n' linear_attn actlize-la
+      ;;
+    actlizeLA|actlize_la|actlize-la)
+      printf '%s\n' actlize-la
       ;;
     flash|flash-attn|flash_attention|flash-attention)
       printf '%s\n' flash_attn
