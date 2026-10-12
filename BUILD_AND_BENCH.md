@@ -502,11 +502,14 @@ once per logical case, without model-layer multipliers. These are the recorded
 workloads; the comparison does not rescale shapes, rename cases, or normalize
 different warmup/iteration settings. CSV also records cycles and source paths.
 
-The grouped bar chart shows two bars per case, labeled in the legend with each
+The horizontal grouped bar chart shows two bars per case, labeled in the legend with each
 input's frequency, for example `Baseline · 1.5 GHz` and `Candidate · 1 GHz`.
-Bar heights and value labels are latency in microseconds, using the same values
-as the table. Missing measurements are marked `N/A`. Cases are split into panels
-of at most ten for readability; `TOTAL_COMMON` gets its own panel and axis.
+It follows the style of `model_latency_decode_operators_bar.png`: case labels
+on the left, latency in microseconds on the horizontal axis, and values at the
+bar ends. Cases are sorted by the larger of the two latencies, largest at the
+top; cases missing both measurements go last. The chart height grows with the
+number of cases. Values match the table; missing measurements are marked `N/A`.
+`TOTAL_COMMON` gets its own panel and axis.
 The default chart is `comparison.svg` in the current directory, or beside
 `--output` with the same stem. Override it with `--plot PATH.svg`, `.png`, or
 `.pdf`; saved Markdown links to the chart.
