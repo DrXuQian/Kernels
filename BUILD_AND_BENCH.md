@@ -470,12 +470,16 @@ because their estimated traffic is tiny.
 Compare two benchmark result directories:
 
 ```bash
+python3 -m pip install matplotlib
+
+# Saves comparison.svg with two bars per case:
 python3 helpers/compare_bench_dirs.py <BASELINE_OUT_DIR> <CANDIDATE_OUT_DIR>
 
 # Different modeled clocks, selected cases, and saved reports:
 python3 helpers/compare_bench_dirs.py <BASELINE_OUT_DIR>/perfstatistics \
   <CANDIDATE_OUT_DIR>/perfstatistics --baseline-ghz 1.5 --candidate-ghz 1.0 \
-  --phase prefill --case linear_ --output comparison.md --csv comparison.csv
+  --phase prefill --case linear_ --output comparison.md --csv comparison.csv \
+  --plot comparison.png
 ```
 
 The first directory is the baseline. The helper reads raw `perfstatistics.log`
@@ -484,7 +488,8 @@ files, NCU per-case CSVs, or the complete case table in an existing
 1.5 GHz and are used only to convert cycles to microseconds; recorded Nsight
 durations take precedence. For NSYS, first generate the summary with
 `summarize_nsys_kernels.py`; the comparison itself needs no profiler or
-matplotlib. Each directory is detected independently, so a PPU perfstatistics
+GPU. Charts require matplotlib; use `--no-plot` for standard-library-only
+Markdown/CSV output. Each directory is detected independently, so a PPU perfstatistics
 run can be compared to an H800 NCU/NSYS run. If a run contains multiple sources,
 pass the specific `perfstatistics`/`ncu`/`nsys` subdirectory or select `--source`.
 
@@ -496,6 +501,15 @@ unmeasured cases. `TOTAL_COMMON` includes only cases measured on both sides,
 once per logical case, without model-layer multipliers. These are the recorded
 workloads; the comparison does not rescale shapes, rename cases, or normalize
 different warmup/iteration settings. CSV also records cycles and source paths.
+
+The grouped bar chart shows two bars per case, labeled in the legend with each
+input's frequency, for example `Baseline · 1.5 GHz` and `Candidate · 1 GHz`.
+Bar heights and value labels are latency in microseconds, using the same values
+as the table. Missing measurements are marked `N/A`. Cases are split into panels
+of at most ten for readability; `TOTAL_COMMON` gets its own panel and axis.
+The default chart is `comparison.svg` in the current directory, or beside
+`--output` with the same stem. Override it with `--plot PATH.svg`, `.png`, or
+`.pdf`; saved Markdown links to the chart.
 
 perfrawlog post-processing:
 

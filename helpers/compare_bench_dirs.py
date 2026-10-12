@@ -3,7 +3,8 @@
 
 Accepts benchmark OUT_DIRs, perfstatistics directories, NCU CSV directories,
 or directories containing nsys_latency_summary.md / ncu_cycles_summary.md.
-Uses only the Python standard library; does not run profilers or benchmarks.
+Writes a grouped bar chart with matplotlib (use --no-plot for standard-library
+text/CSV output only). Does not run profilers or benchmarks.
 """
 
 from __future__ import annotations
@@ -12,9 +13,12 @@ import argparse
 import csv
 from dataclasses import dataclass, replace
 import math
+import os
 from pathlib import Path
 import re
 import sys
+import textwrap
+from urllib.parse import quote
 
 
 CYCLES_RE = re.compile(r"\bcompute_cycles\s*=\s*([0-9][0-9,]*)")
@@ -238,6 +242,64 @@ def positive_ghz(value: str) -> float:
     return result
 
 
+def write_bar_chart(rows: list[dict[str, object]], total: dict[str, object] | None,
+                    path: Path, baseline_ghz: float, candidate_ghz: float) -> None:
+    """Plot the same converted latencies as the table, preserving missing values."""
+    if path.suffix.lower() not in {".svg", ".png", ".pdf"}:
+        raise ValueError("--plot must have an .svg, .png, or .pdf extension")
+    try:
+        import matplotlib
+    except ImportError as exc:
+        raise ValueError("bar charts require matplotlib; install it with "
+                         "'python3 -m pip install matplotlib', or use --no-plot") from exc
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups = [rows[start:start + 10] for start in range(0, len(rows), 10)]
+    panels = [(group, "Case latency" if len(groups) == 1 else f"Case latency ({i + 1}/{len(groups)})")
+              for i, group in enumerate(groups)]
+    if total is not None:
+        panels.append(([total], "Total of common cases (no layer multipliers)"))
+    series = (("baseline_us", f"Baseline · {baseline_ghz:g} GHz", "#4E79A7", -0.2),
+              ("candidate_us", f"Candidate · {candidate_ghz:g} GHz", "#F28E2B", 0.2))
+    with plt.rc_context({"svg.fonttype": "none", "text.usetex": False}):
+        fig, axes = plt.subplots(len(panels), 1, figsize=(max(9, min(len(rows), 10) * 1.6), 5 * len(panels)),
+                                 squeeze=False, constrained_layout=True)
+        try:
+            for ax, (group, title) in zip(axes[:, 0], panels):
+                positions = list(range(len(group)))
+                for key, legend, color, offset in series:
+                    values = [row[key] for row in group]
+                    x = [position + offset for position in positions]
+                    bars = ax.bar(x, [value if value is not None else float("nan") for value in values],
+                                  width=0.36, label=legend, color=color)
+                    ax.bar_label(bars, labels=[f"{value:.3f}" if value is not None else "" for value in values],
+                                 padding=3, fontsize=8)
+                    for position, value in zip(x, values):
+                        if value is None:
+                            ax.annotate("N/A", (position, 0), xytext=(0, 4), textcoords="offset points",
+                                        ha="center", va="bottom", color=color, fontsize=8)
+                labels = []
+                for row in group:
+                    words = str(row["case"]).replace("_", "_ ")
+                    labels.append("\n".join(line.replace("_ ", "_") for line in textwrap.wrap(words, width=26)))
+                ax.set_xticks(positions, labels, fontsize=8)
+                ax.set_xlim(-0.6, len(group) - 0.4)
+                maximum = max((row[key] for row in group for key, *_ in series if row[key] is not None), default=0)
+                ax.set_ylim(0, maximum * 1.22 if maximum > 0 else 1)
+                ax.set_ylabel("Latency (µs)")
+                ax.set_title(title + " — lower is faster", pad=36)
+                ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.01), ncol=2, frameon=False)
+                ax.set_axisbelow(True)
+                ax.grid(axis="y", alpha=0.25)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=160, format=path.suffix[1:].lower())
+        finally:
+            plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline_dir", type=Path)
@@ -249,6 +311,9 @@ def main() -> int:
     parser.add_argument("--phase", choices=("all", "prefill", "decode"), default="all")
     parser.add_argument("--csv", type=Path, help="also write CSV, including cycles and report paths")
     parser.add_argument("-o", "--output", type=Path, help="also save the Markdown comparison")
+    plots = parser.add_mutually_exclusive_group()
+    plots.add_argument("--plot", type=Path, help="bar chart path (.svg/.png/.pdf; default: comparison.svg, or beside --output)")
+    plots.add_argument("--no-plot", action="store_true", help="skip the chart; no matplotlib dependency")
     args = parser.parse_args()
     try:
         left_source, left = load_directory(args.baseline_dir, args.source, args.baseline_ghz)
@@ -262,9 +327,18 @@ def main() -> int:
         rows = [compare(label, left.get(label, missing), right.get(label, missing)) for label in labels]
         common = [row for row in rows if row["delta_us"] is not None]
         rows.sort(key=lambda row: (row["delta_us"] is None, -abs(row["delta_us"] or 0), row["case"]))
+        total = None
         if common:
-            rows.append(compare("TOTAL_COMMON", Measurement(math.fsum(row["baseline_us"] for row in common)),
-                                Measurement(math.fsum(row["candidate_us"] for row in common))))
+            total = compare("TOTAL_COMMON", Measurement(math.fsum(row["baseline_us"] for row in common)),
+                            Measurement(math.fsum(row["candidate_us"] for row in common)))
+        plot_path = None if args.no_plot else args.plot or (args.output.with_suffix(".svg") if args.output else Path("comparison.svg"))
+        output_paths = [path.resolve() for path in (plot_path, args.output, args.csv) if path is not None]
+        if len(output_paths) != len(set(output_paths)):
+            raise ValueError("chart, Markdown, and CSV output paths must be different")
+        if plot_path is not None:
+            write_bar_chart(rows, total, plot_path, args.baseline_ghz, args.candidate_ghz)
+        if total is not None:
+            rows.append(total)
         headers = ["case", "baseline_us", "candidate_us", "delta_us", "delta_pct", "speedup", "status"]
         lines = [
             "# Benchmark directory comparison", "",
@@ -272,9 +346,15 @@ def main() -> int:
             f"Candidate: `{args.candidate_dir.resolve()}` ({right_source}; cycle conversion {args.candidate_ghz:g} GHz).", "",
             "delta = candidate - baseline; negative delta is faster. speedup = baseline / candidate; >1 is faster.",
             f"Comparable cases: {len(common)}/{len(labels)}. TOTAL_COMMON sums these logical cases once each; no layer multipliers.",
-            "Missing/failed cases are excluded; undefined ratios are shown as '-'.", "",
-            "| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |",
+            "Missing/failed cases are excluded from totals; undefined ratios are shown as '-'.", "",
         ]
+        if plot_path is not None:
+            report_dir = args.output.resolve().parent if args.output else Path.cwd()
+            plot_link = quote(Path(os.path.relpath(plot_path.resolve(), report_dir)).as_posix())
+            prefix = "" if plot_path.suffix.lower() == ".pdf" else "!"
+            lines.extend([f"Bar chart: `{plot_path.resolve()}`. Missing measurements are marked N/A.", "",
+                          f"{prefix}[Case latency comparison]({plot_link})", ""])
+        lines.extend(["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"])
         lines.extend("| " + " | ".join(fmt(row[key]) for key in headers) + " |" for row in rows)
         report = "\n".join(lines) + "\n"
         if args.output:
