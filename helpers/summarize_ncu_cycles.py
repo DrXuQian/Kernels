@@ -4,9 +4,6 @@ import csv
 import math
 from pathlib import Path
 
-from model_latency_summary import write_model_latency_summary
-
-
 LONG_METRICS = {
     "sm__cycles_elapsed.avg",
     "sm__cycles_elapsed.max",
@@ -390,6 +387,8 @@ def main():
             print_missing_rows(files_without_rows)
 
     if args.model_summary_dir:
+        from model_latency_summary import write_model_latency_summary
+
         report_path, summary_text = write_model_latency_summary(
             model_rows,
             args.model_summary_dir,

@@ -467,6 +467,36 @@ because their estimated traffic is tiny.
 | MiniMax-M2.7 TP2 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp2__decode_` | 10277.120 | MoE gate/up FP8 TRT-LLM: 1276.719 GB/s, 38.111%; MoE down FP8 TRT-LLM: 950.065 GB/s, 28.360%; FP8 q/gate projection: 524.995 GB/s, 15.671% |
 | MiniMax-M2.7 TP4 | `.bench_logs/bench_h800_decode_bw_20260604_minimax_tp4__decode_` | 9523.200 | MoE gate/up FP8 TRT-LLM: 1243.467 GB/s, 37.118%; MoE down FP8 TRT-LLM: 666.774 GB/s, 19.904%; FP8 o projection: 424.948 GB/s, 12.685% |
 
+Compare two benchmark result directories:
+
+```bash
+python3 helpers/compare_bench_dirs.py <BASELINE_OUT_DIR> <CANDIDATE_OUT_DIR>
+
+# Different modeled clocks, selected cases, and saved reports:
+python3 helpers/compare_bench_dirs.py <BASELINE_OUT_DIR>/perfstatistics \
+  <CANDIDATE_OUT_DIR>/perfstatistics --baseline-ghz 1.5 --candidate-ghz 1.0 \
+  --phase prefill --case linear_ --output comparison.md --csv comparison.csv
+```
+
+The first directory is the baseline. The helper reads raw `perfstatistics.log`
+files, NCU per-case CSVs, or the complete case table in an existing
+`nsys_latency_summary.md` / `ncu_cycles_summary.md`. Both clocks default to
+1.5 GHz and are used only to convert cycles to microseconds; recorded Nsight
+durations take precedence. For NSYS, first generate the summary with
+`summarize_nsys_kernels.py`; the comparison itself needs no profiler or
+matplotlib. Each directory is detected independently, so a PPU perfstatistics
+run can be compared to an H800 NCU/NSYS run. If a run contains multiple sources,
+pass the specific `perfstatistics`/`ncu`/`nsys` subdirectory or select `--source`.
+
+Cases are matched by label and sorted by absolute latency change. `delta_us`
+and `delta_pct` are candidate minus baseline; negative means faster.
+`speedup` is baseline divided by candidate; greater than 1 means faster.
+The helper expands benchmark dedupe aliases and marks failed, missing, or
+unmeasured cases. `TOTAL_COMMON` includes only cases measured on both sides,
+once per logical case, without model-layer multipliers. These are the recorded
+workloads; the comparison does not rescale shapes, rename cases, or normalize
+different warmup/iteration settings. CSV also records cycles and source paths.
+
 perfrawlog post-processing:
 
 ```bash
