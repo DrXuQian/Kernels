@@ -9,10 +9,15 @@ import re
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
-import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+def pyplot():
+    """Keep model aggregation usable without the optional plotting dependency."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 MODULES = ("Flash-Attn", "Linear-Attn", "Dense-FFN", "MoE-FFN", "Sampling", "Other")
@@ -211,7 +216,7 @@ def classify_operator(case: str) -> str:
 def operator_color(operator: str) -> str:
     if operator in OPERATOR_COLORS:
         return OPERATOR_COLORS[operator]
-    palette = list(plt.get_cmap("tab20").colors)
+    palette = list(pyplot().get_cmap("tab20").colors)
     idx = sum(ord(ch) for ch in operator) % len(palette)
     rgb = palette[idx]
     return "#{:02x}{:02x}{:02x}".format(*(int(channel * 255) for channel in rgb[:3]))
@@ -566,6 +571,7 @@ def write_pie_svg(path: Path, title: str, rows: list[tuple[str, float, str]]) ->
 
 
 def write_bar_chart(path: Path, title: str, rows: list[tuple[str, float, str]], x_label: str = "Latency (us)") -> None:
+    plt = pyplot()
     rows = [(display_label(label), value, color) for label, value, color in rows if value > 0.0]
     rows.sort(key=lambda row: row[1])
     height = max(3.4, 0.34 * len(rows) + 1.4)
@@ -608,6 +614,7 @@ def pie_rows_with_other(rows: list[tuple[str, float, str]], limit: int = 12) -> 
 
 
 def write_pie_chart(path: Path, title: str, rows: list[tuple[str, float, str]], limit: int = 12) -> None:
+    plt = pyplot()
     rows = pie_rows_with_other(rows, limit=limit)
     fig, ax = plt.subplots(figsize=(10.5, 6.6), constrained_layout=True)
     if not rows:

@@ -64,7 +64,7 @@ the top-level command reference.
 | `general/` | Shared kernels used by the modules above. |
 | `studies/` | Isolated experiments outside the default benchmark suite. |
 | `helpers/` | Tactic and benchmark analysis utilities. |
-| `helpers/compare_bench_dirs.py` | Compare two benchmark result directories with separate GHz inputs and horizontal grouped latency bar charts, largest first. |
+| `helpers/compare_bench_dirs.py` | Compare model latency from two result directories using shared call counts, separate GHz inputs, and horizontal operator bar charts. |
 | `third_party/cutlass/` | CUTLASS submodule. |
 | `third_party/actlizeLA/` | Pinned actlizeLA submodule for SM90 GDN prefill. |
 

@@ -472,10 +472,12 @@ Compare two benchmark result directories:
 ```bash
 python3 -m pip install matplotlib
 
-# Saves comparison.svg with two bars per case:
-python3 helpers/compare_bench_dirs.py <BASELINE_OUT_DIR> <CANDIDATE_OUT_DIR>
+# Model decode comparison; saves comparison.svg with two bars per operator:
+python3 helpers/compare_bench_dirs.py <BASELINE_OUT_DIR> <CANDIDATE_OUT_DIR> \
+  --phase decode --baseline-ghz 1.5 --candidate-ghz 1.0 \
+  --bench-script ./bench_Qwen3.5-122B-A10B-GPTQ.sh
 
-# Different modeled clocks, selected cases, and saved reports:
+# Selected cases and saved reports:
 python3 helpers/compare_bench_dirs.py <BASELINE_OUT_DIR>/perfstatistics \
   <CANDIDATE_OUT_DIR>/perfstatistics --baseline-ghz 1.5 --candidate-ghz 1.0 \
   --phase prefill --case linear_ --output comparison.md --csv comparison.csv \
@@ -493,23 +495,44 @@ Markdown/CSV output. Each directory is detected independently, so a PPU perfstat
 run can be compared to an H800 NCU/NSYS run. If a run contains multiple sources,
 pass the specific `perfstatistics`/`ncu`/`nsys` subdirectory or select `--source`.
 
-Cases are matched by label and sorted by absolute latency change. `delta_us`
-and `delta_pct` are candidate minus baseline; negative means faster.
-`speedup` is baseline divided by candidate; greater than 1 means faster.
-The helper expands benchmark dedupe aliases and marks failed, missing, or
-unmeasured cases. `TOTAL_COMMON` includes only cases measured on both sides,
-once per logical case, without model-layer multipliers. These are the recorded
-workloads; the comparison does not rescale shapes, rename cases, or normalize
-different warmup/iteration settings. CSV also records cycles and source paths.
+The default `--mode model` reuses `compute_model_summary` and operator grouping
+from `summarize_perfstatistics.py`. Per-case latency is multiplied by the same
+model call counts: full attention 12, linear attention 36, dense FFN 0, MoE 48,
+and sampling once per phase by default. Model-layer flags, `--case-calls`, and
+`--calls-file` have the same meaning in both tools and apply to both directories.
+`--bench-script` provides expected labels, not model-layer counts. Model mode
+also follows the summary's report selection, dedupe expansion, and superseded
+GDN case handling; it reads raw reports rather than previously rounded tables.
 
-The horizontal grouped bar chart shows two bars per case, labeled in the legend with each
-input's frequency, for example `Baseline · 1.5 GHz` and `Candidate · 1 GHz`.
-It follows the style of `model_latency_decode_operators_bar.png`: case labels
-on the left, latency in microseconds on the horizontal axis, and values at the
-bar ends. Cases are sorted by the larger of the two latencies, largest at the
-top; cases missing both measurements go last. The chart height grows with the
-number of cases. Values match the table; missing measurements are marked `N/A`.
-`TOTAL_COMMON` gets its own panel and axis.
+Use `--phase decode` to match a decode-only summary. Without `--phase`, model
+mode infers a single measured non-sampling phase when possible; otherwise it
+shows separate prefill/decode totals. `--phase all` includes sampling once per
+phase, as the model summary does. `TOTAL_decode` / `TOTAL_prefill` sum each
+directory's own measured model contributions, including cases absent from the
+other directory. `TOTAL_COMMON_decode` / `TOTAL_COMMON_prefill` report the
+shared measured cases separately. Unmeasured cases are excluded from totals.
+Totals show both microseconds and milliseconds; the chart uses microseconds.
+
+Cases are matched by label. `delta_us` and `delta_pct` are candidate minus
+baseline; negative means faster. `speedup` is baseline divided by candidate.
+When an operator or total has different case coverage between directories,
+the report marks that difference and omits its percentage change and speedup.
+Use the common-case totals for that comparison. `--case` filters limit both
+the charts and totals. CSV records per-case model latency, original cycles,
+per-call latency, call counts, and report paths for auditing.
+
+The horizontal grouped chart defaults to operators, using the same categories
+as `model_latency_decode_operators_bar.png`. Each operator has two bars labeled
+in the legend with the input frequencies, for example `Baseline · 1.5 GHz` and
+`Candidate · 1 GHz`. Labels are on the left, values at the bar ends, and the
+largest pair is at the top. Missing measurements are marked `N/A`. Independent
+model totals appear in their own panel. `--group-by case` shows weighted cases
+instead. For the previous unweighted per-call comparison, use `--mode raw`;
+its `TOTAL_AVAILABLE` and `TOTAL_COMMON` contain no model-layer multipliers.
+
+These are the recorded workloads. The comparison does not apply `--scale` or
+analytic `--fa-util-overwrite` projections, rescale shapes, or normalize different
+warmup/iteration settings. `--peak-tflops` is unnecessary for latency comparison.
 The default chart is `comparison.svg` in the current directory, or beside
 `--output` with the same stem. Override it with `--plot PATH.svg`, `.png`, or
 `.pdf`; saved Markdown links to the chart.
