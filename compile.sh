@@ -61,6 +61,7 @@ Common examples:
   ./compile.sh env
   ./compile.sh build
   ./compile.sh build general linear_attn flash_attn sampling
+  ./compile.sh build sol
   PYTHON=python3 ./compile.sh build actlize-la
   ./compile.sh build w4a16-fpa w4a16-machete
   ./compile.sh configure w4a16-fpa
@@ -72,6 +73,7 @@ Targets:
   all                  Every target listed below
 
   general              general/
+  sol                  sol/ read and read/write bandwidth benchmarks
   linear_attn          linear_attn/ plus actlizeLA SM90 installation
   actlize-la           Install Python frontend; build/register actlizeLA SM90 bundle
   flash_attn           flash_attn/ category-local shared attention ops
@@ -232,9 +234,12 @@ check_environment() {
   # actlizeLA vendors its own pinned CUTLASS headers and uses its Python builder.
   if [[ "${TARGETS[*]:-}" != "actlize-la" ]]; then
     command -v make >/dev/null 2>&1 || die "make not found in PATH."
-    command -v cmake >/dev/null 2>&1 || die "cmake not found in PATH."
-    require_file "$CUTLASS_DIR/include/cutlass/cutlass.h" \
-      "CUTLASS not found under $CUTLASS_DIR. Run: git submodule update --init third_party/cutlass"
+    # The standalone SOL benchmarks only need the CUDA toolkit and make.
+    if [[ "${TARGETS[*]:-}" != "sol" ]]; then
+      command -v cmake >/dev/null 2>&1 || die "cmake not found in PATH."
+      require_file "$CUTLASS_DIR/include/cutlass/cutlass.h" \
+        "CUTLASS not found under $CUTLASS_DIR. Run: git submodule update --init third_party/cutlass"
+    fi
   fi
 
   if [[ -n "$CUDA_ROOT" && ! -d "$CUDA_ROOT" ]]; then
@@ -548,7 +553,7 @@ configure_target() {
     actlize-la)
       log "actlize-la uses tools/install_sm90.sh; no CMake configure step."
       ;;
-    default|general|linear_attn|flash_attn|sampling|lm-head-gemv|flashinfer-gdn|moe-ffn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
+    default|general|sol|linear_attn|flash_attn|sampling|lm-head-gemv|flashinfer-gdn|moe-ffn|moe-vllm-marlin|moe-vllm-auxiliary|moe-trtllm-auxiliary|w4a16-marlin|w4a16-cublas)
       log "$1 uses a Makefile or direct nvcc build; no CMake configure step."
       ;;
     moe-machete)
@@ -604,6 +609,11 @@ build_target() {
       ;;
     general)
       build_make_dir general "$LINEAR_ARCH"
+      ;;
+    sol)
+      build_make_dir sol "$GPU_ARCH"
+      verify_ppu_elf_version "$ROOT_DIR/sol/read_heavy_bw"
+      verify_ppu_elf_version "$ROOT_DIR/sol/copy_bw"
       ;;
     linear_attn)
       build_linear_attn
@@ -701,6 +711,9 @@ clean_target() {
     general)
       clean_make_dir general
       ;;
+    sol)
+      clean_make_dir sol
+      ;;
     linear_attn)
       clean_make_dir linear_attn
       ;;
@@ -767,7 +780,7 @@ expand_one_target() {
   case "$1" in
     all)
       printf '%s\n' \
-        general linear_attn actlize-la flash_attn sampling flashinfer-gdn \
+        general sol linear_attn actlize-la flash_attn sampling flashinfer-gdn \
         moe-ffn moe-trtllm moe-machete moe-fp8-trtllm \
         w4a16-marlin w4a16-fpa w4a16-machete w4a16-cutlass55 w4a16-cublas
       ;;

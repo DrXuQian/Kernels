@@ -62,6 +62,7 @@ the top-level command reference.
 | `moe_ffn/` | MoE-FFN kernels from TRT-LLM and vLLM extractions. |
 | `sampling/` | Sampling benchmarks using vendored FlashInfer headers. |
 | `general/` | Shared kernels used by the modules above. |
+| `sol/` | Standalone read and read/write memory-bandwidth benchmarks. |
 | `studies/` | Isolated experiments outside the default benchmark suite. |
 | `helpers/` | Tactic and benchmark analysis utilities. |
 | `helpers/compare_bench_dirs.py` | Compare model latency from two result directories using shared call counts, separate GHz inputs, and horizontal operator bar charts. |

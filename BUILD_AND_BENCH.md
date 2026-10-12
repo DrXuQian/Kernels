@@ -390,6 +390,41 @@ sampling/bench_sampling \
   --op=top_p --hidden=3072 --vocab=248320 --top-k=50 --top-p=0.9 --bench 0 1
 ```
 
+## SOL Memory Bandwidth
+
+Build both standalone bandwidth tests:
+
+```bash
+bash compile.sh sol
+# Select a toolkit or architecture when needed:
+bash compile.sh sol --cuda-root <CUDA_ROOT> --arch sm_90a
+```
+
+The `sol` target needs only the CUDA toolkit and make. It is also included in
+`compile.sh all` and the root Makefile. `compile.sh clean sol` and
+`compile.sh rebuild sol` operate on both binaries.
+
+```bash
+# Read bandwidth: [rows] [cols] [iterations]
+./sol/read_heavy_bw 12288 12288 100
+
+# Read + write bandwidth: [buffer size in MiB]
+./sol/copy_bw 288
+```
+
+These are the defaults when no arguments are given. Both programs warm up ten
+times and use CUDA events to time the repeated kernel launches. Initialization
+is outside the timed region. `copy_bw` uses 100 timed iterations.
+
+| Program | Kernel and traffic per invocation | Reported bandwidth |
+|---|---|---|
+| `read_heavy_bw` | One 128-thread block reads each BF16-sized row as `uint4` values, reduces a checksum, and writes 4 bytes per row. Default: 288 MiB read, 48 KiB written. Columns must be a multiple of 8. | Read bytes / time, plus a separate total read + write rate. |
+| `copy_bw` | Each thread copies one `uint4`: 16 bytes read and 16 bytes written, with 256 threads per block. Default: 288 MiB read and 288 MiB written. | `2 * buffer_bytes / time`, labeled `GB/s (read + write)`. |
+
+Bandwidth is effective traffic divided by event time, in decimal GB/s; buffer
+sizes use MiB/KiB. These are standalone tests and do not contribute to model
+latency summaries.
+
 ## Profiling
 
 H800 nsys single-case capture:

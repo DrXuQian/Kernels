@@ -10,6 +10,8 @@ __pycache__/
 .ninja_log
 build.ninja
 .build/
+/sol/read_heavy_bw
+/sol/copy_bw
 
 # bench binaries (no extension)
 bench_conv1d_fwd
