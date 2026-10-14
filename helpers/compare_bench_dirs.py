@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare model latency from two benchmark result directories.
 
-Accepts benchmark OUT_DIRs, perfstatistics directories, NCU CSV directories,
-or directories containing nsys_latency_summary.md / ncu_cycles_summary.md.
+Accepts benchmark OUT_DIRs, perfstatistics directories, NCU/ACU CSV directories,
+or directories containing exported NSYS/NCU/ACU summaries.
 Writes a horizontal grouped bar chart with matplotlib (use --no-plot for standard-library
 text/CSV output only). Does not run profilers or benchmarks.
 Model call counts and operator groups match summarize_perfstatistics.py.
@@ -136,6 +136,16 @@ def read_summary(path: Path, ghz: float) -> dict[str, Measurement]:
     return rows
 
 
+def read_acu(root: Path) -> dict[str, Measurement]:
+    from summarize_acu_kernels import collect_cases
+
+    cases, _, missing = collect_cases(root)
+    rows = {row['case']: Measurement(row['latency_us'], status='ok', source=row['source']) for row in cases}
+    for row in missing:
+        rows[row['case']] = Measurement(status=row['reason'], source=str(root))
+    return rows
+
+
 def apply_case_logs(rows: dict[str, Measurement], bench_dir: Path) -> None:
     aliases = {}
     manifest = bench_dir / "expected_cases.txt"
@@ -181,10 +191,13 @@ def load_directory(root: Path, requested: str, ghz: float, *, apply_logs: bool =
     perf_root = root / "perfstatistics" if (root / "perfstatistics").is_dir() else root
     perf_paths = sorted(perf_root.rglob("perfstatistics.log"))
     ncu_root = root / "ncu" if (root / "ncu").is_dir() else root
-    ncu_paths = sorted(ncu_root.glob("*.csv"))
-    bench_dir = root.parent if root.name in {"perfstatistics", "ncu", "nsys"} else root
+    ncu_paths = sorted(path for path in ncu_root.glob("*.csv") if not path.name.endswith(".acu.csv"))
+    acu_root = root / "acu" if (root / "acu").is_dir() else root
+    acu_present = any(acu_root.glob("*.acu.csv")) or any(acu_root.glob("*.metadata.json"))
+    bench_dir = bench_directory(root)
     summaries = {name: bench_dir / filename for name, filename in (
         ("ncu", "ncu_cycles_summary.md"), ("nsys", "nsys_latency_summary.md"),
+        ("acu", "acu_latency_summary.md"),
     )}
     available = []
     if perf_paths:
@@ -193,13 +206,15 @@ def load_directory(root: Path, requested: str, ghz: float, *, apply_logs: bool =
         available.append("ncu")
     if summaries["nsys"].is_file():
         available.append("nsys")
+    if acu_present or summaries["acu"].is_file():
+        available.append("acu")
     if requested == "auto":
         if root.name in available:
             source = root.name
         elif len(available) > 1:
             raise ValueError(f"multiple report sources in {root}: {', '.join(available)}; choose --source or a specific report directory")
         elif not available:
-            raise ValueError(f"no supported reports in {root}; expected perfstatistics.log, NCU CSV, or an exported NSYS/NCU case summary")
+            raise ValueError(f"no supported reports in {root}; expected perfstatistics.log, NCU/ACU CSV, or an exported NSYS/NCU/ACU case summary")
         else:
             source = available[0]
     else:
@@ -210,15 +225,17 @@ def load_directory(root: Path, requested: str, ghz: float, *, apply_logs: bool =
         rows = read_perfstatistics(perf_paths, ghz)
     elif source == "ncu" and ncu_paths:
         rows = read_ncu(ncu_paths, ghz)
+    elif source == "acu" and acu_present:
+        rows = read_acu(acu_root)
     else:
         rows = read_summary(summaries[source], ghz)
-    if apply_logs:
+    if apply_logs or source == "acu":
         apply_case_logs(rows, bench_dir)
     return source, rows
 
 
 def bench_directory(root: Path) -> Path:
-    return root.parent if root.name in {"perfstatistics", "ncu", "nsys"} else root
+    return root.parent if root.name in {"perfstatistics", "ncu", "nsys", "acu"} else root
 
 
 def model_measurements(rows: dict[str, Measurement], root: Path, selected_phase: str,
@@ -352,7 +369,8 @@ def positive_ghz(value: str) -> float:
 
 def write_bar_chart(rows: list[dict[str, object]], totals: list[dict[str, object]],
                     path: Path, baseline_ghz: float, candidate_ghz: float,
-                    title: str, total_title: str) -> None:
+                    title: str, total_title: str, baseline_label: str | None = None,
+                    candidate_label: str | None = None) -> None:
     """Plot converted latencies horizontally, with the largest pair at the top."""
     if path.suffix.lower() not in {".svg", ".png", ".pdf"}:
         raise ValueError("--plot must have an .svg, .png, or .pdf extension")
@@ -371,8 +389,8 @@ def write_bar_chart(rows: list[dict[str, object]], totals: list[dict[str, object
     panels = [(ordered, title)]
     if totals:
         panels.append((totals, total_title))
-    series = (("baseline_us", f"Baseline · {baseline_ghz:g} GHz", "#4E79A7", -0.2),
-              ("candidate_us", f"Candidate · {candidate_ghz:g} GHz", "#F28E2B", 0.2))
+    series = (("baseline_us", baseline_label or f"Baseline · {baseline_ghz:g} GHz", "#4E79A7", -0.2),
+              ("candidate_us", candidate_label or f"Candidate · {candidate_ghz:g} GHz", "#F28E2B", 0.2))
     heights = [max(3.4, 0.6 * len(group) + 1.4) for group, _ in panels]
     with plt.rc_context({"svg.fonttype": "none", "text.usetex": False}):
         fig, axes = plt.subplots(len(panels), 1, figsize=(12.5, sum(heights)),
@@ -412,7 +430,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline_dir", type=Path)
     parser.add_argument("candidate_dir", type=Path)
-    parser.add_argument("--source", choices=("auto", "perfstatistics", "ncu", "nsys"), default="auto")
+    sources = ("auto", "perfstatistics", "ncu", "nsys", "acu")
+    parser.add_argument("--source", choices=sources, default="auto")
+    parser.add_argument("--baseline-source", choices=sources, help="Override --source for the baseline.")
+    parser.add_argument("--candidate-source", choices=sources, help="Override --source for the candidate.")
+    parser.add_argument("--baseline-label", help="Chart legend, e.g. 'H800 1.5 GHz'.")
+    parser.add_argument("--candidate-label", help="Chart legend, e.g. 'PPU1.7 ACU 1.0 GHz'.")
     parser.add_argument("--baseline-ghz", type=positive_ghz, default=1.5, help="cycle-to-us frequency for baseline (default: 1.5)")
     parser.add_argument("--candidate-ghz", type=positive_ghz, default=1.5, help="cycle-to-us frequency for candidate (default: 1.5)")
     parser.add_argument("--case", action="append", default=[], help="case-name substring filter; repeatable")
@@ -432,8 +455,8 @@ def main() -> int:
     plots.add_argument("--no-plot", action="store_true", help="skip the chart; no matplotlib dependency")
     args = parser.parse_args()
     try:
-        left_source, left = load_directory(args.baseline_dir, args.source, args.baseline_ghz, apply_logs=args.mode == "raw")
-        right_source, right = load_directory(args.candidate_dir, args.source, args.candidate_ghz, apply_logs=args.mode == "raw")
+        left_source, left = load_directory(args.baseline_dir, args.baseline_source or args.source, args.baseline_ghz, apply_logs=args.mode == "raw")
+        right_source, right = load_directory(args.candidate_dir, args.candidate_source or args.source, args.candidate_ghz, apply_logs=args.mode == "raw")
         selected_phase = args.phase
         if selected_phase == "auto":
             selected_phase = infer_phase(left, right) if args.mode == "model" else "all"
@@ -472,7 +495,9 @@ def main() -> int:
         if plot_path is not None:
             title = f"{selected_phase.capitalize()} {grouping} latency" if selected_phase != "all" else f"{grouping.capitalize()} latency by phase"
             total_title = "Model latency by phase (each directory's measured cases)" if args.mode == "model" else "Per-call subtotal (each directory's measured cases)"
-            write_bar_chart(chart_rows, totals, plot_path, args.baseline_ghz, args.candidate_ghz, title, total_title)
+            write_bar_chart(chart_rows, totals, plot_path, args.baseline_ghz, args.candidate_ghz, title, total_title,
+                            args.baseline_label or ("Baseline · ACU device time" if left_source == "acu" else None),
+                            args.candidate_label or ("Candidate · ACU device time" if right_source == "acu" else None))
         headers = ["case", "baseline_us", "candidate_us", "delta_us", "delta_pct", "speedup", "status"]
         lines = [
             "# Benchmark directory comparison", "",
@@ -480,6 +505,7 @@ def main() -> int:
             f"Candidate: `{args.candidate_dir.resolve()}` ({right_source}; cycle conversion {args.candidate_ghz:g} GHz).", "",
             f"Mode: **{args.mode}**; phase: **{selected_phase}**; chart grouping: **{grouping}**. Units: µs (totals also shown in ms).", "",
             "delta = candidate - baseline; negative delta is faster. speedup = baseline / candidate; >1 is faster.",
+            "Device durations (including ACU) are used directly. GHz inputs only convert cycle measurements.",
             f"Comparable cases: {len(common)}/{len(labels)}. TOTAL uses each directory's measured cases; TOTAL_COMMON uses only cases measured on both sides.",
             "Unmeasured cases are excluded. Percentage change and speedup are omitted when case coverage differs; undefined ratios are shown as '-'.", "",
         ]

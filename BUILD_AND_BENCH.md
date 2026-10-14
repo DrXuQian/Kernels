@@ -425,6 +425,126 @@ Bandwidth is effective traffic divided by event time, in decimal GB/s; buffer
 sizes use MiB/KiB. These are standalone tests and do not contribute to model
 latency summaries.
 
+For ACU or a perfmodel application invocation, use:
+
+```bash
+./sol/read_heavy_bw 12288 12288 --single-launch
+./sol/copy_bw 288 --single-launch
+```
+
+This mode prepares inputs on CPU, copies them to the device, launches only the
+target kernel once, and verifies the result on CPU. There is no initialization
+kernel, warmup, or event loop. Use ACU device duration or perfmodel cycles to
+calculate time/bandwidth. An explicit read-test iteration argument must be 1.
+The original repeated event-timing mode is unchanged.
+
+## PPU1.7 Hardware With ACU
+
+Build the selected executables and Python extensions with the **native PPU1.7
+SDK/toolchain** first. The runner does not compile or replace implementations.
+A CUDA build or ACU CLI check does not establish native execution or numerical
+correctness. No hardware settings are changed by these scripts.
+
+```bash
+export ACU=/path/to/your/ppu-sdk/asight/bin/acu
+export PYTHON=python3                 # Needs matplotlib for model charts
+export PPU_DEVICE_LABEL='PPU1.7'       # Optional metadata
+# export PPU_SM_COUNT=<actual count>
+# export PPU_CLOCK_GHZ=<actual clock>
+
+# Inspect commands without touching the device or writing output files.
+bash bench_ppu17_hardware.sh --models all --phase all --dry-run
+
+# Same shapes/case labels as the existing H800/perfmodel wrappers.
+OUT_DIR="$PWD/.bench_logs/ppu17_qwen122_decode" \
+  bash bench_ppu17_hardware.sh --models qwen122 --phase decode
+
+# Both SOL tests, one target invocation each; size overrides are optional.
+OUT_DIR="$PWD/.bench_logs/ppu17_sol" \
+  SOL_ROWS=12288 SOL_COLS=12288 SOL_MIB=288 \
+  bash bench_ppu17_hardware.sh --models sol
+
+# Existing model wrappers also accept ACU directly.
+bash bench_Qwen3.5_27B.sh --acu-latency --case decode
+```
+
+Models: `qwen27`, `qwen122`, `qwen122-tp2`, `minimax-tp1`, `minimax-tp2`,
+`minimax-tp4`, `sol`; `minimax` and `all` expand to suites. `--phase all` runs both
+model phases; SOL is independent of phase. `--case` selects model cases, or
+`read_heavy_bw`/`copy_bw` for SOL. Multiple models receive separate directories
+under `PPU17_OUT_ROOT` (default `.bench_logs`). `OUT_DIR` requires one model.
+Use a fresh directory for another capture; existing per-case reports are never
+overwritten. `--continue-on-error` permits the remaining models to run.
+
+GDN prefill selects `LINEAR_GDN_MODE=device` and defaults to backend `ppu17`.
+Supply a native extension and its matching fixed configuration:
+
+```bash
+ACTLIZE_LA_SM90_CONFIGURATION=control \
+GDN_QSA_SM90_EXTENSION=/path/to/native/gdn_extension.so \
+  bash bench_ppu17_hardware.sh --models qwen122 --case linear_prefill_actlize_gdn
+```
+
+The installed CUDA SM90 auto bundle and source-check simulation mode are
+rejected for this case. Other attention/MoE extensions must also be installed
+for the hardware SDK; the runner does not substitute another implementation.
+
+Each capture retains `acu/<case>.acurep`, `<case>.acu.csv`, capture/export logs,
+and `<case>.metadata.json`: command, ACU version/hash, binary/script hashes,
+repository revision/status, device metadata, and profiler settings. A native
+report without the `.acurep` extension is also accepted. Failed captures are
+recorded as FAILED and cannot contribute time. The aggregate is
+`acu_latency_summary.md`; model charts including
+`model_latency_decode_operators_bar.png` go under `model_latency_acu/`.
+Set `ACU_MODEL_SUMMARY=0` for text summaries without matplotlib.
+
+Timing uses **`ppu__time_duration.sum`**, converting the exported ns/us/ms/s unit
+to microseconds. GHz never rescales measured duration. Default capture requests
+only duration, with kernel replay and `ACU_CACHE_CONTROL=all`. `ACU_METRICS` may
+add counters but must retain duration. Record the SDK/cache policy: some SDKs
+still flush L1/L2 for `none`. ACU replay time differs from unprofiled event-loop
+time and end-to-end model TPOT.
+
+Model commands use zero warmup and one invocation. Capture starts at process
+start, following the H800 workflow. Summaries omit the same known initializer
+names (`init_`, `initialize_tensor`, `fill_half_kernel`) and sum **all remaining
+launches**, including required reducers/helpers. Inspect `--detail` for new
+runners: unknown initialization/autotuning launches must be separated from the
+subject. `helpers/profile_acu.py` also accepts `--include-kernel`, repeatable
+`--exclude-kernel`, and `--expect-kernels` for explicit capture contracts.
+SOL enforces one selected target launch. Model totals reuse existing dedupe and
+call counts; missing measurements make the result incomplete.
+
+```bash
+# Re-summarize saved exports without ACU/device access.
+python helpers/summarize_acu_kernels.py "$OUT/acu" \
+  --bench-out-dir "$OUT" --phase decode --detail \
+  --model-summary-dir "$OUT/model_latency_acu"
+
+# Compare cycles converted at 1.0 GHz with measured ACU device time.
+python helpers/compare_bench_dirs.py "$PERFMODEL_OUT" "$PPU17_OUT" \
+  --baseline-source perfstatistics --candidate-source acu \
+  --baseline-ghz 1.0 --baseline-label 'perfmodel 1.0 GHz' \
+  --candidate-label 'PPU1.7 ACU' --phase decode \
+  --bench-script ./bench_Qwen3.5-122B-A10B-GPTQ.sh --plot comparison.png
+
+python helpers/compare_bench_dirs.py "$H800_OUT" "$PPU17_OUT" \
+  --baseline-source nsys --candidate-source acu \
+  --baseline-label H800 --candidate-label 'PPU1.7 ACU' \
+  --phase decode --plot h800_vs_ppu17.png
+
+# SOL has no model-layer multipliers.
+python helpers/compare_bench_dirs.py "$SOL_BASELINE" "$SOL_CANDIDATE" \
+  --mode raw --source acu --plot sol_comparison.png
+```
+
+Match model wrapper, shape, dtype, call-count overrides and intended cache
+conditions. Pass the same model-layer options to summary/comparison helpers
+as the model wrapper; their defaults describe Qwen3.5-122B. Actual hardware
+CU/SM count and clock are separate from perfmodel configuration inputs.
+SOL bandwidth is effective bytes/time: read bytes for read bandwidth, read +
+write bytes for copy traffic. This is not a measured DRAM-byte counter.
+
 ## Profiling
 
 H800 nsys single-case capture:

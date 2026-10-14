@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #define CUDA_CHECK(expr)                                                     \
@@ -87,9 +88,19 @@ void read_heavy_kernel(
 }
 
 int main(int argc, char ** argv) {
+    bool single_launch = false;
+    int positional = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--single-launch") == 0) {
+            single_launch = true;
+        } else {
+            argv[positional++] = argv[i];
+        }
+    }
+    argc = positional;
     int rows       = 12288;
     int cols       = 12288;
-    int iterations = 100;
+    int iterations = single_launch ? 1 : 100;
 
     if (argc > 1) {
         rows = std::atoi(argv[1]);
@@ -101,10 +112,11 @@ int main(int argc, char ** argv) {
         iterations = std::atoi(argv[3]);
     }
 
-    if (rows <= 0 || cols <= 0 || iterations <= 0) {
+    if (argc > 4 || rows <= 0 || cols <= 0 || iterations <= 0 || (single_launch && iterations != 1)) {
         std::fprintf(
             stderr,
-            "usage: %s [rows] [cols] [iterations]\n",
+            "usage: %s [rows] [cols] [iterations] [--single-launch]\n"
+            "--single-launch requires iterations=1; CPU initialization, no warmup/events.\n",
             argv[0]);
         return EXIT_FAILURE;
     }
@@ -132,6 +144,43 @@ int main(int argc, char ** argv) {
 
     CUDA_CHECK(cudaMalloc(&src, input_bytes));
     CUDA_CHECK(cudaMalloc(&dst, output_bytes));
+
+    if (single_launch) {
+        // No initialization kernel or event-timing loop in profiler/simulator mode.
+        std::vector<uint4> host_src(vector_count);
+        std::vector<uint32_t> expected(rows, 0), actual(rows, 0);
+        for (size_t i = 0; i < vector_count; ++i) {
+            const uint32_t x = (uint32_t) i;
+            const uint4 value = make_uint4(
+                x * 1664525u + 1013904223u,
+                x * 22695477u + 1u,
+                x * 1103515245u + 12345u,
+                x * 214013u + 2531011u);
+            host_src[i] = value;
+            expected[i / (size_t) vecs_per_row] += value.x + value.y + value.z + value.w;
+        }
+        CUDA_CHECK(cudaMemcpy(src, host_src.data(), input_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst, actual.data(), output_bytes, cudaMemcpyHostToDevice));
+        read_heavy_kernel<<<rows, threads>>>(src, dst, vecs_per_row);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(actual.data(), dst, output_bytes, cudaMemcpyDeviceToHost));
+        uint64_t checksum = 0;
+        for (int row = 0; row < rows; ++row) {
+            if (actual[row] != expected[row]) {
+                std::fprintf(stderr, "read_heavy verification failed at row %d\n", row);
+                return EXIT_FAILURE;
+            }
+            checksum += actual[row];
+        }
+        std::printf("mode: single-launch (warmup=0, iters=1, CPU reference passed)\n");
+        std::printf("shape: %d x %d BF16; read_bytes=%zu write_bytes=%zu\n", rows, cols, input_bytes, output_bytes);
+        std::printf("checksum: %llu\n", (unsigned long long) checksum);
+        std::printf("time/bandwidth: use ACU device duration or perfmodel cycles\n");
+        CUDA_CHECK(cudaFree(src));
+        CUDA_CHECK(cudaFree(dst));
+        return EXIT_SUCCESS;
+    }
 
     int init_blocks =
         (int) ((vector_count + 255) / 256);

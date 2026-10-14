@@ -175,6 +175,7 @@ RESUME_FOUND=0
 NCU_CYCLES=0
 NCU_BANDWIDTH=0
 NSYS_LATENCY=0
+ACU_LATENCY=0
 if [[ -n "${NCU_METRICS+x}" ]]; then
   NCU_METRICS_ENV_SET=1
 else
@@ -208,6 +209,7 @@ Usage:
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --ncu-cycles            # run selected cases under Nsight Compute
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --ncu-bandwidth         # ncu cycles + DRAM bandwidth metrics
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh --nsys-latency          # nsys kernel-duration fallback
+  ./bench_Qwen3.5-122B-A10B-GPTQ.sh --acu-latency           # PPU1.7 hardware duration
   ./bench_Qwen3.5-122B-A10B-GPTQ.sh LABEL [LABEL ...]       # run selected cases
 
 Case matching accepts exact labels or substrings; the filters `prefill` and
@@ -288,6 +290,13 @@ Environment variables:
   NCU_PEAK_GBPS            Peak DRAM GB/s used for computed bandwidth utilization. Default: 3350.
   NCU_LAUNCH_SKIP          Optional Nsight Compute --launch-skip value.
   NCU_LAUNCH_COUNT         Optional Nsight Compute --launch-count value.
+  ACU                     ACU executable for --acu-latency. Default: acu in PATH.
+  ACU_METRICS             Default: ppu__time_duration.sum (required in overrides).
+  ACU_CACHE_CONTROL       all (default) or none; semantics depend on the SDK.
+  ACU_MODEL_SUMMARY       Set to 0 to skip model PNGs; the text summary is still written.
+  PPU_DEVICE_LABEL        Optional physical device description saved with ACU reports.
+  PPU_SM_COUNT            Optional actual device CU/SM count; not a perfmodel setting.
+  PPU_CLOCK_GHZ           Optional actual device clock; never rescales ACU duration.
 
 Profiler note:
   Use --nsys-latency for Nsight Systems kernel duration when NCU counters are
@@ -352,6 +361,14 @@ while [[ $# -gt 0 ]]; do
       PERFRAWLOG_POSTPROCESS=0
       shift
       ;;
+    --acu-latency|--acu)
+      ACU_LATENCY=1
+      PERFRAWLOG_POSTPROCESS=0
+      # Hardware profiling uses the device's metadata, not simulator inputs.
+      LINEAR_GDN_MODE=device
+      LINEAR_GDN_MODE_ARGS=(--mode device)
+      shift
+      ;;
     --ncu-launch-skip)
       NCU_LAUNCH_SKIP="${2:?missing value for $1}"
       shift 2
@@ -406,6 +423,18 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if (( NCU_CYCLES + NSYS_LATENCY + ACU_LATENCY > 1 )); then
+  echo "[bench][error] choose only one profiler: NCU, NSYS, or ACU" >&2
+  exit 1
+fi
+if [[ "$ACU_LATENCY" == 1 ]]; then
+  if [[ "$ATTN_BENCH_WARMUP" != 0 || "$ATTN_BENCH_ITERS" != 1 ]]; then
+    echo "[bench][error] ACU model summaries require ATTN_BENCH_WARMUP=0 and ATTN_BENCH_ITERS=1" >&2
+    exit 1
+  fi
+  export ACTLIZE_LA_BACKEND="${ACTLIZE_LA_BACKEND:-ppu17}"
+fi
 
 if [[ -n "$RESUME_FROM" ]]; then
   RESUME_SEEN=0
@@ -701,6 +730,18 @@ run_case() {
     echo "[bench][error] --nsys-latency requested but nsys is not in PATH" >&2
     exit 1
   fi
+  if [[ "$ACU_LATENCY" == 1 ]]; then
+    if ! command -v "${ACU:-acu}" >/dev/null 2>&1; then
+      echo "[bench][error] ACU not found; set ACU=/path/to/acu" >&2
+      exit 1
+    fi
+    if [[ "$label" == linear_prefill_actlize_gdn ]]; then
+      if [[ "$ACTLIZE_LA_BACKEND" != ppu17 || "${ACTLIZE_LA_SOURCE_CHECK:-0}" == 1 || "${ACTLIZE_LA_SM90_CONFIGURATION:-auto}" == auto ]]; then
+        echo "[bench][error] ACU GDN requires backend ppu17, a fixed ACTLIZE_LA_SM90_CONFIGURATION, and its native extension via GDN_QSA_SM90_EXTENSION; source-check/SM90 auto is not a hardware path." >&2
+        exit 1
+      fi
+    fi
+  fi
   local required_file
   for required_file in "${required_files[@]}"; do
     require_file "$required_file"
@@ -800,6 +841,10 @@ run_case() {
     } >>"$log"
 
     (cd "$RUN_DIR" && "${ncu_cmd[@]}" "${cmd[@]}") 2>&1 | tee -a "$log" | tee "$ncu_log"
+    status=${PIPESTATUS[0]}
+  elif [[ "$ACU_LATENCY" == 1 ]]; then
+    (cd "$RUN_DIR" && "$PYTHON_BIN" "$ROOT_DIR/helpers/profile_acu.py" \
+      --output-prefix "$OUT_DIR/acu/$safe" -- "${cmd[@]}") 2>&1 | tee -a "$log"
     status=${PIPESTATUS[0]}
   elif [[ "$NSYS_LATENCY" == 1 ]]; then
     local nsys_dir nsys_base nsys_report
@@ -1056,6 +1101,25 @@ summarize_nsys_latency() {
   echo "[bench] nsys latency summary: $summary_log"
   echo "[bench] nsys model latency summary: $model_summary_dir/model_latency_summary.md"
   echo "[bench][note] nsys records kernel duration. Use bench_h800_bandwidth.sh for nsys-derived effective bandwidth, or --ncu-bandwidth for DRAM-counter bandwidth."
+}
+
+summarize_acu_latency() {
+  [[ "$ACU_LATENCY" == 1 ]] || return 0
+  local summary_log="$OUT_DIR/acu_latency_summary.md"
+  local -a plot_args=()
+  if [[ "${ACU_MODEL_SUMMARY:-1}" != 0 ]]; then
+    plot_args=(--model-summary-dir "$OUT_DIR/model_latency_acu")
+  fi
+  set +e
+  "$PYTHON_BIN" "$ROOT_DIR/helpers/summarize_acu_kernels.py" "$OUT_DIR/acu" \
+    --detail --bench-out-dir "$OUT_DIR" "${plot_args[@]}" \
+    "${MODEL_SUMMARY_ARGS[@]}" 2>&1 | tee "$summary_log"
+  local status=${PIPESTATUS[0]}
+  set -e
+  if [[ "$status" != 0 ]]; then
+    echo "[bench][error] ACU summary is incomplete; see $summary_log" >&2
+    FAILED=1
+  fi
 }
 
 run_w4a16_prefill_gemm_cublas_case() {
@@ -1441,6 +1505,9 @@ else
     echo "nsys latency:   enabled"
     echo "bandwidth:      nsys duration only here; bench_h800_bandwidth.sh derives effective bandwidth from shapes"
   fi
+  if [[ "$ACU_LATENCY" == 1 ]]; then
+    echo "acu latency:    enabled; one call, cache-control=${ACU_CACHE_CONTROL:-all}, replay=kernel"
+  fi
   if [[ "$BENCH_DEDUPE" != 0 ]]; then
     echo "dedupe:         enabled"
   else
@@ -1739,5 +1806,6 @@ echo "============================================================"
 summarize_perfstatistics
 summarize_ncu_cycles
 summarize_nsys_latency
+summarize_acu_latency
 
 exit "$FAILED"
